@@ -30,6 +30,7 @@ Limits that are deliberate
 """
 import argparse
 import base64
+import itertools
 import json
 import os
 import re
@@ -50,6 +51,25 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOL_OPEN = "<tool_call>"
 TOOL_CLOSE = "</tool_call>"
 
+# VKOP_SERVE_DUMP_DIR writes every request body verbatim. A client's real
+# prompt is the only trustworthy input for reproducing a tool-loop failure:
+# a hand-built approximation of it decodes differently.
+DUMP_DIR = os.environ.get("VKOP_SERVE_DUMP_DIR", "")
+_dump_seq = itertools.count(1)
+
+
+def _dump_request(path, raw):
+    if not DUMP_DIR:
+        return
+    name = "%03d_%s.json" % (next(_dump_seq),
+                             path.strip("/").replace("/", "_") or "root")
+    try:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        with open(os.path.join(DUMP_DIR, name), "wb") as f:
+            f.write(raw)
+    except OSError as e:
+        sys.stderr.write(f"[serve] request dump failed: {e}\n")
+
 
 # --------------------------------------------------------------------------
 # Backend: one llm_serve process, one request at a time.
@@ -59,6 +79,7 @@ class Backend:
         self.max_kv = max_kv
         self.argv = argv
         self.env = env
+        self.abi = 1
         self._lock = threading.Lock()
         self._spawn()
 
@@ -130,6 +151,7 @@ class Backend:
             line = self._recv()
             kind, _, rest = line.partition(" ")
             if kind == "READY":
+                self.abi = int(rest or 1)
                 return
             if kind == "FATAL":
                 raise RuntimeError(base64.b64decode(rest).decode("utf-8", "replace"))
@@ -178,6 +200,18 @@ class Backend:
                     return
                 elif kind == "ERROR":
                     raise RuntimeError(_decode_err(rest))
+
+    def stop(self, rid="0"):
+        """End the round in flight.
+
+        Deliberately takes no lock: the caller is the thread already inside
+        generate(), suspended at a yield. The backend reads this between decode
+        steps, so the reply stops within one token instead of running to the
+        output cap. An abi-2 backend has no STOP: it would read the line as its
+        next command and desynchronise, so there the round just runs to its cap.
+        """
+        if self.abi >= 3:
+            self._send(f"STOP {rid}")
 
     def close(self):
         try:
@@ -315,10 +349,17 @@ def to_backend_messages(req):
     Consecutive tool_result blocks become one user turn, matching the template
     (it opens <|im_start|>user for the first of a run and closes it after the
     last)."""
-    system = _text_of(req.get("system"))
-    preamble = _tools_preamble(req.get("tools"))
-    if preamble:
-        system = (system + "\n\n" + preamble) if system else preamble
+    msgs_in = req.get("messages", [])
+    # Claude Code's SDK sends most of its instructions as a `system` message
+    # *inside* messages, after the user turn. ChatML has one system turn at the
+    # top, so it has to be hoisted: left in place it renders as a second user
+    # turn and the environment/slash-command wall lands between the question
+    # and the answer. The tool preamble stays last, where the template puts it.
+    hoisted = [_text_of(m.get("content")) for m in msgs_in
+               if m.get("role") == "system"]
+    parts = [_text_of(req.get("system"))] + hoisted
+    parts.append(_tools_preamble(req.get("tools")))
+    system = "\n\n".join(p for p in parts if p)
 
     out = []
     if system:
@@ -331,8 +372,10 @@ def to_backend_messages(req):
             out.append(("user", "\n".join(pending_tool_results)))
             pending_tool_results.clear()
 
-    for msg in req.get("messages", []):
+    for msg in msgs_in:
         role = msg.get("role")
+        if role == "system":
+            continue
         if role == "tool":
             # Not an Anthropic role; tolerate OpenAI-shaped histories.
             content = msg.get("content")
@@ -394,8 +437,23 @@ def trim_to_window(msgs, max_tokens, budget, count=None):
 # --------------------------------------------------------------------------
 # Model output -> Anthropic content blocks
 # --------------------------------------------------------------------------
+def _tool_block(inner):
+    name, args = _parse_tool_call(inner)
+    return {
+        "type": "tool_use",
+        "id": "toolu_" + secrets.token_hex(12),
+        "name": name,
+        "input": args,
+    }
+
+
 def parse_output(text):
-    """Split generated text into text / tool_use blocks."""
+    """Split generated text into text / tool_use blocks.
+
+    A call is delimited by its balanced JSON object or by the closing marker,
+    whichever comes first: the model sometimes skips the marker and rambles on,
+    and requiring it would turn a usable call into one unusable raw blob.
+    """
     blocks = []
     rest = text
     while True:
@@ -406,20 +464,28 @@ def parse_output(text):
             break
         if i > 0:
             blocks.append({"type": "text", "text": rest[:i]})
-        j = rest.find(TOOL_CLOSE, i + len(TOOL_OPEN))
-        if j < 0:
-            inner = rest[i + len(TOOL_OPEN):]
-            rest = ""
+        body = rest[i + len(TOOL_OPEN):]
+        end = _json_end(body)
+        j = body.find(TOOL_CLOSE)
+        over = True
+        if end is not None and (j < 0 or end <= j):
+            inner = body[:end]
+            tail = body[end:]
+            if _after_json(tail) == "close":
+                rest = tail.lstrip()[len(TOOL_CLOSE):]
+                over = False
+            else:
+                rest = ""
+        elif j >= 0:
+            inner = body[:j]
+            rest = body[j + len(TOOL_CLOSE):]
+            over = False
         else:
-            inner = rest[i + len(TOOL_OPEN):j]
-            rest = rest[j + len(TOOL_CLOSE):]
-        name, args = _parse_tool_call(inner)
-        blocks.append({
-            "type": "tool_use",
-            "id": "toolu_" + secrets.token_hex(12),
-            "name": name,
-            "input": args,
-        })
+            inner = body
+            rest = ""
+        blocks.append(_tool_block(inner))
+        if over:
+            break
     return blocks
 
 
@@ -433,18 +499,17 @@ def _loads_dict(text):
     return obj if isinstance(obj, dict) else None
 
 
-def _close_json(text):
-    """Append the closing delimiters a structurally truncated JSON value lacks.
+def _scan_json(text):
+    """Walk the first JSON value in `text` with string/escape state.
 
-    Qwen3-VL drops the final brace on some tool calls deterministically, and the
-    raw fallback below then hands the client an argument object no tool schema
-    accepts -- which the client retries forever. Braces inside strings do not
-    count, and a value cut mid-string is left alone: closing it would invent
-    content the model never wrote.
+    Returns (end, closers, in_string): `end` is the index just past a balanced
+    value or None if it never closes, `closers` the delimiters still missing,
+    `in_string` whether the text ends inside a string literal. Braces inside a
+    string never count -- a tool argument is routinely a path or a regex.
     """
     stack = []
     in_str = esc = False
-    for ch in text:
+    for k, ch in enumerate(text):
         if in_str:
             if esc:
                 esc = False
@@ -459,6 +524,43 @@ def _close_json(text):
         elif ch in "}]":
             if stack and stack[-1] == ch:
                 stack.pop()
+                if not stack:
+                    return k + 1, [], False
+    return None, stack, in_str
+
+
+def _json_end(text):
+    """Index just past the first balanced JSON object in `text`, else None."""
+    return _scan_json(text)[0]
+
+
+def _after_json(tail):
+    """What follows a balanced tool-call object: 'close', 'wait' or 'other'.
+
+    'close' means the closing marker is there and the call is well formed.
+    'wait' means only whitespace so far, or a prefix of either marker -- more
+    tokens are needed to tell. 'other' means the model skipped its closing
+    marker: whatever it generates next is degeneration, not reply content.
+    """
+    s = tail.lstrip()
+    if s.startswith(TOOL_CLOSE):
+        return "close"
+    if s.startswith(TOOL_OPEN):
+        return "other"
+    if not s or any(m.startswith(s) for m in (TOOL_CLOSE, TOOL_OPEN)):
+        return "wait"
+    return "other"
+
+
+def _close_json(text):
+    """Append the closing delimiters a structurally truncated JSON value lacks.
+
+    Qwen3-VL drops the final brace on some tool calls deterministically, and the
+    raw fallback below then hands the client an argument object no tool schema
+    accepts -- which the client retries forever. A value cut mid-string is left
+    alone: closing it would invent content the model never wrote.
+    """
+    _, stack, in_str = _scan_json(text)
     if in_str or not stack:
         return None
     return text + "".join(reversed(stack))
@@ -497,10 +599,13 @@ class StreamWriter:
 
     Holds back the tail of the text buffer so a `<tool_call>` split across
     tokens is never emitted as text first, and honours stop sequences the same
-    way.
+    way. `blocks` accumulates the same content as Anthropic blocks, which is
+    what the non-streaming path returns -- one parser, so the two paths cannot
+    disagree about where a tool call ends.
     """
 
-    def __init__(self, wfile, model, max_tokens, stop_sequences, write):
+    def __init__(self, wfile, model, max_tokens, stop_sequences, write,
+                 on_over=None):
         self.wfile = wfile
         self.model = model
         self.max_tokens = max_tokens
@@ -509,6 +614,7 @@ class StreamWriter:
                             [max(0, len(s) - 1) for s in self.stop_sequences])
         self.buf = ""
         self.in_tool = False
+        self.after_tool = False
         self.text_buf = ""
         self.index = 0
         self.text_open = False
@@ -517,7 +623,9 @@ class StreamWriter:
         self.stop_sequence = None
         self.text_emitted = 0
         self.saw_tool = False
+        self.blocks = []
         self._write = write
+        self._on_over = on_over
 
     # -- SSE ---------------------------------------------------------------
     def event(self, name, payload):
@@ -561,6 +669,10 @@ class StreamWriter:
             return
         self._open_text()
         self.text_emitted += len(chunk)
+        if self.blocks and self.blocks[-1]["type"] == "text":
+            self.blocks[-1]["text"] += chunk
+        else:
+            self.blocks.append({"type": "text", "text": chunk})
         self.event("content_block_delta", {
             "type": "content_block_delta",
             "index": self.index,
@@ -568,16 +680,17 @@ class StreamWriter:
         })
 
     def _emit_tool(self, inner):
-        name, args = _parse_tool_call(inner)
+        block = _tool_block(inner)
         self._close_text()
         idx = self.index
+        self.blocks.append(block)
         self.event("content_block_start", {
             "type": "content_block_start",
             "index": idx,
             "content_block": {
                 "type": "tool_use",
-                "id": "toolu_" + secrets.token_hex(12),
-                "name": name,
+                "id": block["id"],
+                "name": block["name"],
                 "input": {},
             },
         })
@@ -585,7 +698,8 @@ class StreamWriter:
             "type": "content_block_delta",
             "index": idx,
             "delta": {"type": "input_json_delta",
-                      "partial_json": json.dumps(args, ensure_ascii=False)},
+                      "partial_json": json.dumps(block["input"],
+                                                 ensure_ascii=False)},
         })
         self.event("content_block_stop",
                    {"type": "content_block_stop", "index": idx})
@@ -596,40 +710,83 @@ class StreamWriter:
     def feed(self, delta):
         if self.stopped:
             return
-        if self.in_tool:
-            self.buf += delta
-            j = self.buf.find(TOOL_CLOSE)
-            if j >= 0:
-                self._emit_tool(self.buf[:j])
-                self.buf = self.buf[j + len(TOOL_CLOSE):]
-                self.in_tool = False
-                self._pump()
-            return
         self.buf += delta
-        self._pump()
+        if self.after_tool:
+            self._resolve_after_tool()
+        else:
+            self._pump()
 
     def _pump(self):
         while not self.stopped:
-            i = self.buf.find(TOOL_OPEN)
-            if i >= 0:
+            if not self.in_tool:
+                i = self.buf.find(TOOL_OPEN)
+                if i < 0:
+                    # Nothing to open yet: emit everything that cannot start a
+                    # marker or a stop sequence. The sequence has to be searched
+                    # for in the whole buffer -- cutting a fixed tail off and
+                    # then looking only at the emitted part splits a sequence
+                    # across the boundary, and neither half ever matches again.
+                    k, hit = -1, None
+                    for s in self.stop_sequences:
+                        p = self.buf.find(s)
+                        if p >= 0 and (k < 0 or p < k):
+                            k, hit = p, s
+                    if k >= 0:
+                        self._emit_text(self.buf[:k])
+                        self.stopped = True
+                        self.stop_reason = "stop_sequence"
+                        self.stop_sequence = hit
+                        self.buf = ""
+                        return
+                    keep = self.holdback
+                    if len(self.buf) > keep:
+                        self._emit_text(self.buf[:len(self.buf) - keep])
+                        self.buf = self.buf[len(self.buf) - keep:]
+                    return
                 self._emit_safe(self.buf[:i])
                 self._close_text()
                 self.buf = self.buf[i + len(TOOL_OPEN):]
                 self.in_tool = True
-                j = self.buf.find(TOOL_CLOSE)
-                if j < 0:
-                    return
-                self._emit_tool(self.buf[:j])
-                self.buf = self.buf[j + len(TOOL_CLOSE):]
+            # Inside a call the only delimiters are its own balanced JSON and
+            # the closing marker. Searching for another opening marker here
+            # would emit this call's JSON as prose when the model skips the
+            # closer and starts a second one.
+            end = _json_end(self.buf)
+            j = self.buf.find(TOOL_CLOSE)
+            if end is not None and (j < 0 or end <= j):
+                inner, self.buf = self.buf[:end], self.buf[end:]
                 self.in_tool = False
+                self.after_tool = True
+                self._emit_tool(inner)
+                self._resolve_after_tool()
+                return
+            if j >= 0:
+                inner, self.buf = self.buf[:j], self.buf[j + len(TOOL_CLOSE):]
+                self.in_tool = False
+                self._emit_tool(inner)
                 continue
-            # Nothing to open yet: emit everything that cannot start a marker
-            # or a stop sequence.
-            keep = self.holdback
-            if len(self.buf) > keep:
-                self._emit_safe(self.buf[:len(self.buf) - keep])
-                self.buf = self.buf[len(self.buf) - keep:]
             return
+
+    def _resolve_after_tool(self):
+        verdict = _after_json(self.buf)
+        if verdict == "wait":
+            return
+        self.after_tool = False
+        if verdict == "close":
+            self.buf = self.buf.lstrip()[len(TOOL_CLOSE):]
+            self._pump()
+        else:
+            self._end_reply()
+
+    def _end_reply(self):
+        """A tool call finished without its closing marker. The reply is over:
+        tell the backend to stop instead of paying for the degeneration that
+        follows, which runs to the output cap at hundreds of ms per token."""
+        self.stopped = True
+        self.stop_reason = "tool_use"
+        self.buf = ""
+        if self._on_over is not None:
+            self._on_over()
 
     def _emit_safe(self, chunk):
         """Emit text, honouring stop sequences inside it."""
@@ -653,7 +810,7 @@ class StreamWriter:
                 # Generation ended inside a tool call: emit what we have as a
                 # tool_use rather than dropping it.
                 self._emit_tool(tail)
-            else:
+            elif not self.after_tool:
                 self._emit_safe(tail)
         self._close_text()
         if self.stop_reason is None:
@@ -728,7 +885,9 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length <= 0:
             return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        raw = self.rfile.read(length)
+        _dump_request(self._path_only(), raw)
+        return json.loads(raw.decode("utf-8"))
 
     # -- routes ------------------------------------------------------------
     # Claude Code appends query parameters (e.g. ?beta=true) to the path, and
@@ -839,7 +998,8 @@ class Handler(BaseHTTPRequestHandler):
         self._sse_start()
 
         writer = StreamWriter(self.wfile, model, max_tokens, stop_sequences,
-                              self._sse_write)
+                              self._sse_write,
+                              on_over=lambda: self.backend.stop(msg_id))
         out_tokens = 0
         started = False
         done_reason = "stop"
@@ -880,7 +1040,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _messages_sync(self, req, msgs, model, max_tokens, stop_sequences,
                        msg_id):
-        text_parts = []
+        # The streaming writer with the SSE sink discarded: one parser decides
+        # where a tool call ends, so a reply cannot be a usable tool_use over
+        # SSE and an unusable raw blob here.
+        writer = StreamWriter(None, model, max_tokens, stop_sequences,
+                              lambda data: None,
+                              on_over=lambda: self.backend.stop(msg_id))
         reason = "stop"
         out_tokens = 0
         input_tokens = 0
@@ -890,42 +1055,22 @@ class Handler(BaseHTTPRequestHandler):
                 if frame[0] == "tokens_in":
                     input_tokens = frame[1]
                 elif frame[0] == "delta":
-                    text_parts.append(frame[1])
+                    writer.feed(frame[1])
                 elif frame[0] == "done":
                     reason, out_tokens = frame[1], frame[2]
         except Exception as e:
             self._error(500, "api_error", str(e))
             return
 
-        text = "".join(text_parts)
-        # Stop sequences first: they cut the visible text.
-        stop_sequence = None
-        for s in stop_sequences:
-            k = text.find(s)
-            if k >= 0:
-                text = text[:k]
-                reason = "stop"
-                stop_sequence = s
-                break
-
-        blocks = parse_output(text)
-        if any(b["type"] == "tool_use" for b in blocks):
-            stop_reason = "tool_use"
-        elif stop_sequence is not None:
-            stop_reason = "stop_sequence"
-        elif reason == "length":
-            stop_reason = "max_tokens"
-        else:
-            stop_reason = "end_turn"
-
+        writer.finish(reason, out_tokens)
         self._json(200, {
             "id": msg_id,
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": blocks,
-            "stop_reason": stop_reason,
-            "stop_sequence": stop_sequence,
+            "content": writer.blocks,
+            "stop_reason": writer.stop_reason,
+            "stop_sequence": writer.stop_sequence,
             "usage": {"input_tokens": input_tokens,
                       "output_tokens": out_tokens},
         })

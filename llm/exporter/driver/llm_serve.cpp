@@ -16,10 +16,13 @@
 //     [temperature top_k top_p]          → DONE <id> <stop_reason> <n_out>
 //       三个采样参数可省略；负值＝客户端没传，用后端默认（贪心）。
 //   出错                                 → ERROR <id> <msg-b64>
+//   STOP <id>                          → （无独立响应；本轮以 DONE 收尾）
+//     生成期间唯一可发的行：客户端已从流里解析出可用的 tool call，
+//     不必再为剩下的 max_new 付 GPU 时间。decode 每步之间轮询一次。
 //   RESET                              → OK
 //   BYE                                → BYE
 //
-// stop_reason: "stop"（命中停止符）/ "length"（max_new 用尽）。
+// stop_reason: "stop"（命中停止符或收到 STOP）/ "length"（max_new 用尽）。
 //
 // 与 llm_chat 的关系：prefill/decode 的数值路径与它逐位同构（同样的
 // embed 查表、causal bias、KVCache 语义、present→past 只改逻辑长度），但**故意
@@ -61,6 +64,7 @@
 #include <io.h>
 #else
 #include <unistd.h>
+#include <poll.h>
 #endif
 
 #include <fcntl.h>
@@ -98,12 +102,25 @@ inline int os_open_for_fsync(const char *p) { return _open(p, _O_WRONLY); }
 inline int os_replace(const char *from, const char *to) {
     return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
 }
+// True when a read would not block. The CRT has no non-blocking read on a pipe
+// fd, but PeekNamedPipe reports the bytes waiting in the anonymous pipe the
+// parent handed us.
+inline bool os_readable(int fd) {
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    DWORD avail = 0;
+    if (h == INVALID_HANDLE_VALUE) return false;
+    return PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) && avail > 0;
+}
 #else
 using io_count_t = std::size_t;
 inline int os_fsync(int fd) { return ::fsync(fd); }
 inline int os_open_for_fsync(const char *p) { return ::open(p, O_RDONLY); }
 inline int os_replace(const char *from, const char *to) {
     return std::rename(from, to);
+}
+inline bool os_readable(int fd) {
+    struct pollfd p = {fd, POLLIN, 0};
+    return ::poll(&p, 1, 0) > 0 && (p.revents & POLLIN) != 0;
 }
 #endif
 
@@ -189,6 +206,33 @@ class LineReader {
                 pos_ = 0;
             }
             char tmp[65536];
+            const auto n = ::read(fd_, tmp, static_cast<io_count_t>(sizeof(tmp)));
+            if (n <= 0) return false;
+            buf_.append(tmp, static_cast<std::size_t>(n));
+        }
+    }
+
+    // True once a STOP line has arrived, without blocking. Any other line is
+    // left buffered for getline(): the main loop still has to see it. Called
+    // between decode steps, where a blocking read would stall the round until
+    // the client sent something it has no reason to send.
+    bool poll_stop() {
+        for (;;) {
+            const std::size_t nl = buf_.find('\n', pos_);
+            if (nl != std::string::npos) {
+                std::string line(buf_, pos_, nl - pos_);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line != "STOP" && line.compare(0, 5, "STOP ") != 0)
+                    return false;
+                pos_ = nl + 1;
+                return true;
+            }
+            if (pos_ > 0) {
+                buf_.erase(0, pos_);
+                pos_ = 0;
+            }
+            if (!os_readable(fd_)) return false;
+            char tmp[4096];
             const auto n = ::read(fd_, tmp, static_cast<io_count_t>(sizeof(tmp)));
             if (n <= 0) return false;
             buf_.append(tmp, static_cast<std::size_t>(n));
@@ -1024,10 +1068,16 @@ class InferenceServer {
     // registered special tokens (151657/151658) — skipping them would strip
     // the markers and leave a bare JSON object behind, which the HTTP layer
     // would report as prose instead of a tool call.
+    //
+    // `should_stop` is polled between decode steps. A client that has already
+    // parsed a usable tool call out of the stream must not have to pay for the
+    // rest of max_new: at hundreds of ms per token that is minutes of GPU time
+    // for text it will throw away.
     std::string generate(const std::vector<uint32_t> &ids, int max_new,
                          std::vector<uint32_t> &out_ids,
                          const std::function<void(uint32_t)> &on_token,
-                         const SampleParams &sp) {
+                         const SampleParams &sp,
+                         const std::function<bool()> &should_stop = nullptr) {
         // Rewind the RNG every round: with a fixed --seed the same prompt and
         // the same parameters must give the same reply, which a process-wide
         // stream advancing across requests would not.
@@ -1203,6 +1253,13 @@ class InferenceServer {
         } else {
             std::vector<uint16_t> zeros;
             for (int step = 1; step < max_new; ++step) {
+                // Checked here rather than after on_token: the previous step
+                // already fed its token back and streamed it, so out_ids still
+                // holds exactly one token the KV cache has not consumed.
+                if (should_stop && should_stop()) {
+                    reason = "stop";
+                    break;
+                }
                 auto cur = embed_lookup(embed_table_,
                                         {static_cast<uint32_t>(next_id)},
                                         vocab_, arch_.hidden);
@@ -1465,7 +1522,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[serve] startup failed: %s\n", e.what());
         return 1;
     }
-    emit(rpc_out, "READY 2");
+    emit(rpc_out, "READY 3");
 
     LineReader in(rpc_in);
     std::string line;
@@ -1499,7 +1556,7 @@ int main(int argc, char **argv) {
             emit(rpc_out, "BYE");
             break;
         }
-        if (cmd == "HELLO") { emit(rpc_out, "READY 2"); continue; }
+        if (cmd == "HELLO") { emit(rpc_out, "READY 3"); continue; }
         if (cmd == "RESET") {
             try { srv->reset(); emit(rpc_out, "OK"); }
             catch (const std::exception &e) {
@@ -1595,7 +1652,8 @@ int main(int argc, char **argv) {
             if (req_top_k >= 0) sp.top_k = req_top_k;
             if (req_top_p >= 0.0f) sp.top_p = req_top_p;
             const std::string reason =
-                srv->generate(ids, max_new, out_ids, cb, sp);
+                srv->generate(ids, max_new, out_ids, cb, sp,
+                              [&in]() { return in.poll_stop(); });
             const std::string tail = srv->tok().emit_delta_flush(st);
             if (!tail.empty()) {
                 streamed += tail;
