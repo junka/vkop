@@ -52,6 +52,54 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 TOOL_OPEN = "<tool_call>"
 TOOL_CLOSE = "</tool_call>"
 
+# Client telemetry lines that ride inside the system prompt. Claude Code sends
+# its build identity as the FIRST system block:
+#
+#   x-anthropic-billing-header: cc_version=2.1.325.a12; cc_entrypoint=sdk-cli;
+#
+# which tokenizes to about 22 tokens -- and then the whole 11k-token agent
+# prompt follows it. The KV prefix cache is keyed on the rendered id stream, so
+# a build change rewrites token 22 and every row after it stops matching: the
+# client waits a full cold prefill (~45 s here) for a 5-character difference
+# that the model is not supposed to answer from.
+#
+# Rewriting the value to a fixed placeholder keeps the strings and their
+# position identical while removing the variation, so a build bump no longer
+# invalidates the prefix. Only the VALUE changes -- the line still occupies the
+# same slot, so a prompt whose telemetry differs is bit-identical to the cached
+# one. This is a deliberate, narrow exception to "send the client's bytes
+# verbatim": it must stay limited to lines that carry no instruction.
+_TELEMETRY_LINE = re.compile(
+    r"^(x-anthropic-[a-z-]+:)\s*(.*)$", re.IGNORECASE)
+# The fields inside such a line that identify the client build rather than say
+# anything to the model.
+_TELEMETRY_VOLATILE = re.compile(
+    r"\b(cc_version|cc_entrypoint)=([^;\s]*)", re.IGNORECASE)
+
+
+def _stabilise_telemetry(text):
+    """Replace the varying values in client telemetry lines with a placeholder.
+
+    Returns (text, changed). A line is only touched when it both starts with
+    x-anthropic- (so it is client metadata, not prose that happens to mention
+    a version) and carries one of the known volatile keys.
+    """
+    if not text or "x-anthropic-" not in text.lower():
+        return text, False
+    changed = False
+    out = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        ending = line[len(stripped):]
+        if _TELEMETRY_LINE.match(stripped) and _TELEMETRY_VOLATILE.search(stripped):
+            new = _TELEMETRY_VOLATILE.sub(lambda m: m.group(1) + "=<v>", stripped)
+            if new != stripped:
+                changed = True
+            out.append(new + ending)
+        else:
+            out.append(line)
+    return ("".join(out), changed)
+
 # VKOP_SERVE_DUMP_DIR writes every request body verbatim. A client's real
 # prompt is the only trustworthy input for reproducing a tool-loop failure:
 # a hand-built approximation of it decodes differently.
@@ -360,7 +408,13 @@ def to_backend_messages(req):
                if m.get("role") == "system"]
     parts = [_text_of(req.get("system"))] + hoisted
     parts.append(_tools_preamble(req.get("tools")))
-    system = "\n\n".join(p for p in parts if p)
+    # Client build telemetry rides in the system text and changes on every
+    # Claude Code upgrade; left as-is it invalidates the KV prefix ~22 tokens
+    # in and costs a full cold prefill. See _stabilise_telemetry.
+    parts = [p for p in parts if p]
+    for i, p in enumerate(parts):
+        parts[i], _ = _stabilise_telemetry(p)
+    system = "\n\n".join(parts)
 
     out = []
     if system:

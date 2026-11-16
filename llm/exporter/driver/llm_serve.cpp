@@ -1134,6 +1134,37 @@ class InferenceServer {
                                           ids.size() ? ids.size() - 1 : 0);
             while (match < limit && covered_ids_[match] == ids[match]) ++match;
         }
+        // VKOP_SERVE_PREFIX_DEBUG: why the prefix stopped matching. A short
+        // reuse is otherwise indistinguishable from "the client sent a
+        // different prompt" -- which is what it was blamed on once -- so dump
+        // the ids and their pieces on both sides of the divergence.
+        if (const char *pd = std::getenv("VKOP_SERVE_PREFIX_DEBUG")) {
+            if (pd[0] != '\0' && pd[0] != '0') {
+                const size_t lo = match > 40 ? match - 40 : 0;
+                const size_t hi = std::min(match + 40,
+                                           std::max(covered_ids_.size(),
+                                                    ids.size()));
+                std::fprintf(stderr,
+                             "[prefix] covered=%zu incoming=%zu match=%zu\n",
+                             covered_ids_.size(), ids.size(), match);
+                for (size_t i = lo; i < hi; ++i) {
+                    const bool have_a = i < covered_ids_.size();
+                    const bool have_b = i < ids.size();
+                    const uint32_t a = have_a ? covered_ids_[i] : 0;
+                    const uint32_t b = have_b ? ids[i] : 0;
+                    const std::string pa =
+                        have_a ? tok_.id_to_piece(a, false) : std::string("<end>");
+                    const std::string pb =
+                        have_b ? tok_.id_to_piece(b, false) : std::string("<end>");
+                    const char *mark = (i == match) ? " <-- diverges" : "";
+                    std::fprintf(
+                        stderr, "[prefix] %6zu %s %6u %-28s | %6u %-28s%s\n",
+                        i, (have_a && have_b && a == b) ? "=" : "!", a,
+                        pa.c_str(), b, pb.c_str(), mark);
+                }
+                std::fflush(stderr);
+            }
+        }
         const int P = static_cast<int>(match);
         const int S = L - P;
         // Reusing less than the whole covered stream means this round's
