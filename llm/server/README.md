@@ -220,10 +220,55 @@ python3 llm/server/anthropic_server.py --model llm/exporter/llm_fp8_kv.vkopbin \
 | 你要问的 | 看哪里 | 精度 |
 |---|---|---|
 | 这个请求多少 token、多慢、首字多久 | `[req]` 行（stderr） | 最准；token 数是后端 tokenizer 的真实计数 |
+| 上面这些的聚合与历史，可由程序查询 | `GET /metrics` | 与 `[req]` 同源，进程内保留最近 256 条 |
 | prompt 单独多少 token | `POST /v1/messages/count_tokens` | 真实计数（不是估算） |
 | 客户端视角 | 响应里的 `usage` | `output_tokens` 含未消费的 stop token |
 | prefill / decode 分相耗时 | `[serve] prefill ...` / `VKOP_SERVE_VERBOSE=1` 的 `r<N>` 行 | 见下面两个坑 |
 | GPU 按算子 | `VKOP_SUBMIT_PROF=1` | 每轮打印一次 op-type 表 + 最慢 op |
+
+### `GET /metrics`：TTFT / TPOT 的查询接口
+
+`[req]` 是给人看的日志，`/metrics` 是给程序和终端查询用的同一批数据。默认端口上：
+
+```bash
+curl -s localhost:8787/metrics | python3 -m json.tool
+curl -s 'localhost:8787/metrics?limit=5'      # recent 只看最近 5 条；limit=0 = 整个窗口
+```
+
+返回（节选）：
+
+```json
+{"uptime_s": 16.8, "completed_since_start": 2, "window": 2,
+ "all":    {"requests": 2, "errors": 0, "input_tokens": 27, "output_tokens": 20,
+            "ttft_s": {"n": 2, "min": 0.2713, "p50": 0.2713, "p90": 0.3109,
+                       "max": 0.3109, "mean": 0.2911},
+            "tpot_s": {"n": 2, "min": 0.0823, ..., "mean": 0.0837},
+            "wall_s": {"n": 2, ...},
+            "decode_tokens": 18, "decode_tokens_per_s": 11.9},
+ "recent": { ... 同结构，只覆盖最近 limit 条 ... },
+ "requests": [{"id": "msg_...", "stream": false, "input_tokens": 15,
+               "output_tokens": 8, "wall_s": 0.8477, "ttft_s": 0.2713,
+               "tpot_s": 0.0823, "decode_tokens": 7, "stop_reason": "end_turn",
+               "trimmed": false, "at": 1794816567.8}, ...]}
+```
+
+**TTFT 和 TPOT 是两个不能混的量：**
+
+| | 定义 | 变动因素 |
+|---|---|---|
+| `ttft_s` | 请求到达到第一个 token | 整个 prefill：prompt 长度、chunk 数、KV 前缀是否命中 |
+| `tpot_s` | **首个 token 之后**每个 token 的平均耗时 | decode 速度：模型大小、带宽、batch |
+
+首个 token 是 prefill 的产物，所以从 TPOT 的分母里扣掉（`decode_tokens = out - 1`）。
+把它算进 TPOT，TPOT 就变成「第二个 TTFT」，长 prompt 会显得 decode 也慢。
+`out=1` 时没有 decode 步可平均，`tpot_s` 为 `null` 而不是 0。失败请求也占一条，
+计入 `errors`，但不进 `ttft_s`/`tpot_s` 的统计（`ttft_s` 为 `null`）。
+
+`decode_tokens_per_s` 是**按 token 加权**的总速率（Σtoken / Σdecode 秒），不是各请求
+TPOT 的平均——一条 100 token 的回复和一条 1 token 的回复不该等权。
+
+窗口是进程内最近 256 条，进程重启即清零；`completed_since_start` 是累计值。要跨重启
+留存就把 `[req]` 行落到文件里另存。
 
 `[req]` 是每个请求结束（或失败）时写的一行，直接回答「这个请求花了多少」：
 

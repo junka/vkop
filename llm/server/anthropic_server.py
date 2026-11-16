@@ -30,6 +30,7 @@ Limits that are deliberate
 """
 import argparse
 import base64
+import collections
 import itertools
 import json
 import os
@@ -831,6 +832,144 @@ class StreamWriter:
 
 
 # --------------------------------------------------------------------------
+# Metrics
+# --------------------------------------------------------------------------
+class Metrics:
+    """Per-request latency and token accounting, queryable over HTTP.
+
+    The [req] log line already carries these numbers, but a log is not a
+    query surface: from a terminal you cannot ask "what was the median TTFT
+    over the last 20 requests" without parsing it, and a client cannot see it
+    at all. This keeps the same measurements in memory, in a bounded deque so
+    a long-lived server cannot grow without limit.
+
+    Two rates, and the distinction matters for a serving comparison:
+
+    * TTFT -- request arrival to the first token. Contains the whole prefill,
+      so it is the number that moves when the prompt gets longer or the KV
+      prefix fails to hit.
+    * TPOT -- time per output token, over the tokens AFTER the first one.
+      The first token is prefill's product; including it would make TPOT a
+      function of prompt length, which is exactly what TTFT already reports.
+      This is the decode rate people mean when they compare hardware.
+
+    Threading: requests are serialised by the backend lock, but the deque is
+    touched from the handler thread and read from another, so it gets a lock
+    of its own. Cheap -- a few appends per request.
+    """
+
+    def __init__(self, capacity=256):
+        self._lock = threading.Lock()
+        self._rows = collections.deque(maxlen=capacity)
+        self._started = time.time()
+        self._total = 0
+
+    def record(self, msg_id, stream, t0, t_first, input_tokens, out_tokens,
+               stop_reason, trimmed, error=None, t_end=None):
+        """t_end is for tests: production passes None and the clock is read
+        here, so callers cannot accidentally measure the wrong span."""
+        t_end = time.time() if t_end is None else t_end
+        wall = t_end - t0
+        ttft = (t_first - t0) if t_first is not None else None
+        n_out = out_tokens or 0
+        # Tokens after the first: what TPOT averages over.
+        n_dec = max(0, n_out - 1)
+        dec_s = 0.0
+        if ttft is not None and n_dec > 0:
+            # Decode span is wall minus the prefill+first-token part. It can
+            # round to <= 0 on a timer-granularity edge, hence the clamp.
+            dec_s = max(0.0, wall - ttft)
+        row = {
+            "id": msg_id,
+            "at": t_end,
+            "stream": bool(stream),
+            "input_tokens": input_tokens,
+            "output_tokens": n_out,
+            "wall_s": round(wall, 4),
+            "ttft_s": None if ttft is None else round(ttft, 4),
+            "tpot_s": round(dec_s / n_dec, 4) if n_dec > 0 else None,
+            "decode_tokens": n_dec,
+            # Unrounded, so the aggregate rate below is not built from
+            # already-rounded per-request values.
+            "_decode_s": dec_s,
+            "stop_reason": stop_reason,
+            "trimmed": bool(trimmed),
+        }
+        if error is not None:
+            row["error"] = error
+        with self._lock:
+            self._rows.append(row)
+            self._total += 1
+        return row
+
+    @staticmethod
+    def _percentile(sorted_vals, q):
+        """Nearest-rank percentile on an already-sorted list. q in [0, 100].
+
+        Nearest-rank rather than interpolated: with a handful of samples a
+        server operator wants an actual observed value, not a synthetic point
+        between two of them, and it never reports a number better than the
+        best or worse than the worst that really happened.
+        """
+        if not sorted_vals:
+            return None
+        k = max(0, min(len(sorted_vals) - 1,
+                       int(round((q / 100.0) * (len(sorted_vals) - 1)))))
+        return sorted_vals[k]
+
+    def _summary(self, rows):
+        def stats(key):
+            vals = sorted(r[key] for r in rows if r[key] is not None)
+            if not vals:
+                return {"n": 0, "min": None, "p50": None, "p90": None,
+                        "max": None, "mean": None}
+            return {"n": len(vals),
+                    "min": round(vals[0], 4),
+                    "p50": round(self._percentile(vals, 50), 4),
+                    "p90": round(self._percentile(vals, 90), 4),
+                    "max": round(vals[-1], 4),
+                    "mean": round(sum(vals) / len(vals), 4)}
+
+        ok = [r for r in rows if "error" not in r]
+        out = {
+            "requests": len(rows),
+            "errors": len(rows) - len(ok),
+            "input_tokens": sum(r["input_tokens"] for r in rows),
+            "output_tokens": sum(r["output_tokens"] for r in rows),
+            "ttft_s": stats("ttft_s"),
+            "tpot_s": stats("tpot_s"),
+            "wall_s": stats("wall_s"),
+        }
+        # Decode tokens/second is what people quote against other engines.
+        # Derived from summed tokens over summed decode time, so a long reply
+        # counts more than a one-token one (per-request TPOTs would not).
+        dec_tokens = sum(r["decode_tokens"] for r in ok)
+        dec_s = sum(r["_decode_s"] for r in ok)
+        out["decode_tokens"] = dec_tokens
+        out["decode_tokens_per_s"] = (
+            round(dec_tokens / dec_s, 2) if dec_s > 0 else None)
+        return out
+
+    def snapshot(self, limit=20):
+        with self._lock:
+            rows = list(self._rows)
+            total = self._total
+        recent = rows[-limit:] if limit and limit > 0 else rows
+        # _decode_s is an aggregate input, not part of the public row shape.
+        public_recent = [{k: v for k, v in r.items() if not k.startswith("_")}
+                         for r in reversed(recent)]
+        return {
+            "uptime_s": round(time.time() - self._started, 1),
+            "completed_since_start": total,
+            "window": len(rows),
+            "all": self._summary(rows),
+            "recent": self._summary(recent),
+            "recent_n": len(recent),
+            "requests": public_recent,
+        }
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -838,6 +977,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "vkop-anthropic/1"
 
     backend: Backend = None
+    metrics: Metrics = None
     default_model = "vkop-qwen3-vl-2b"
     max_output = 1024
 
@@ -906,6 +1046,26 @@ class Handler(BaseHTTPRequestHandler):
         path = self._path_only()
         if path in ("/health", "/healthz"):
             self._json(200, {"status": "ok"})
+        elif path in ("/metrics", "/v1/metrics"):
+            # GET /metrics?limit=N -- N most recent requests in "recent" and
+            # in the per-request list; "all" always covers the whole window.
+            # ?limit=0 makes "recent" the whole window too.
+            limit = 20
+            qs = self.path.split("?", 1)
+            if len(qs) == 2:
+                for part in qs[1].split("&"):
+                    k, _, v = part.partition("=")
+                    if k == "limit":
+                        try:
+                            limit = int(v)
+                        except ValueError:
+                            self._error(400, "invalid_request_error",
+                                        f"limit must be an integer, got {v!r}")
+                            return
+            if self.metrics is None:
+                self._error(503, "api_error", "metrics not initialised")
+                return
+            self._json(200, self.metrics.snapshot(limit))
         elif path.startswith("/v1/models"):
             self._json(200, {"data": [{"id": self.default_model,
                                        "type": "model"}],
@@ -993,9 +1153,10 @@ class Handler(BaseHTTPRequestHandler):
         # per-token rate is over the tokens after it. With 0 or 1 out there is
         # no decode span to average and the field is left out.
         dec = ""
-        if n_out > 1:
+        n_dec = n_out - 1
+        if n_dec > 0:
             span = max(1e-6, wall - ttft)
-            dec = f" decode={1000.0 * span / (n_out - 1):.1f}ms/tok"
+            dec = f" tpot={1000.0 * span / n_dec:.1f}ms/tok"
         tag = "req" if error is None else "req!"
         sys.stderr.write(
             f"[{tag}] {msg_id} {'stream' if stream else 'sync'} "
@@ -1005,6 +1166,11 @@ class Handler(BaseHTTPRequestHandler):
             + (f" error={error}" if error is not None else "")
             + "\n")
         sys.stderr.flush()
+        # Same measurements, kept for GET /metrics. Recorded even on failure
+        # so an error appears in the counters rather than vanishing from them.
+        if self.metrics is not None:
+            self.metrics.record(msg_id, stream, t0, t_first, input_tokens,
+                                out_tokens, stop_reason, trimmed, error)
 
     def _messages(self, req):
         model = req.get("model") or self.default_model
@@ -1424,8 +1590,11 @@ def main():
     print(f"[serve] ready: http://{args.host}:{args.port}", file=sys.stderr)
 
     Handler.backend = backend
+    Handler.metrics = Metrics()
     Handler.default_model = args.model_name
     Handler.max_output = args.max_output
+    print(f"[serve] metrics: http://{args.host}:{args.port}/metrics",
+          file=sys.stderr)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     try:
