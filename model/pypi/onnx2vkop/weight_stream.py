@@ -100,6 +100,26 @@ def exports_weight_values(quant: Optional[str], unify: bool,
 # conversion, because one of their inputs is an activation.
 _WEIGHT_ONLY_CONSUMERS = frozenset({"MatMul", "Gemm", "Conv"})
 
+# Pure VIEWS: they move a tensor's indices around and nothing else, so a
+# weight's bytes mean the same thing on either side of one -- the consumer can
+# do the same arithmetic off the source layout instead of a materialized copy.
+# `Transpose` is the one that matters in practice: an exporter that runs with
+# constant folding off emits `Transpose(w)` into MatMul's B position for every
+# linear, which on the 27B is 497 weights and 48.9 GiB of the 49.3 GiB total.
+#
+# A weight reachable from its consumer through ONLY these is still never read
+# by the converter. What must not qualify is anything that reads a value:
+# `Cast` changes the element type (a byte-format payload would be the wrong
+# width), and `Mul`/`Add`/`Exp`/`Div` compute something the pipeline may fold.
+_VIEW_OPS = frozenset({"Transpose", "Reshape", "Squeeze", "Unsqueeze",
+                       "Identity", "Flatten"})
+
+# How far to follow a view chain before giving up. The graphs that need this
+# are one or two hops (`Transpose -> MatMul`, the shape every folding-off
+# exporter emits); a bound keeps a pathological chain from turning the gate
+# into a graph walk.
+_VIEW_CHAIN_MAX = 8
+
 _ENV_ENABLE = "VKOP_STREAM_WEIGHTS"
 _ENV_MIN_MIB = "VKOP_STREAM_MIN_MIB"
 
@@ -324,9 +344,14 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
     declared = {name for name in keep_in_file}
     graph = model.graph
     consumers: Dict[str, Counter] = {}
+    # name -> [(node, operand_index)] for _reachable_as_weight. Built once: the
+    # 27B asks about 850 weights, and rebuilding it per weight would walk the
+    # 12.6k-node graph 850 times.
+    uses: Dict[str, list] = {}
     for node in graph.node:
-        for name in node.input:
+        for i, name in enumerate(node.input):
             consumers.setdefault(name, Counter())[node.op_type] += 1
+            uses.setdefault(name, []).append((node, i))
 
     refusal = deferral_refusal(quant, unify, rgba)
     cap = stream_min_bytes() if refusal is None else 0
@@ -366,7 +391,11 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 (init.data_type in _PASS_THROUGH_DATA_TYPES
                  or byte_quantizes)
                 and length == payload_bytes(init)
-                and _only_weight_consumers(consumers.get(init.name)))
+                # Direct MatMul/Gemm/Conv, or the same thing one view deeper.
+                # The second form is what an exporter with constant folding off
+                # produces, and on the 27B it is 48.9 GiB of the 49.3 GiB.
+                and (_only_weight_consumers(consumers.get(init.name))
+                     or _reachable_as_weight(uses, init.name)))
         if keep_in_file_gates:
             entry = _stream_entry(
                 init, base_dir, location, offset, length,
@@ -455,6 +484,55 @@ def _only_weight_consumers(ops: Optional[Counter]) -> bool:
     if not ops:
         return False
     return set(ops) <= _WEIGHT_ONLY_CONSUMERS
+
+
+def _reachable_as_weight(uses: Dict[str, list], name) -> bool:
+    """Is every path from `name` to a live consumer a pure view chain?
+
+    `_only_weight_consumers` answers this only for a weight wired *directly*
+    into MatMul/Gemm/Conv. An exporter run with constant folding off wires it
+    through a `Transpose` instead (see `_VIEW_OPS`), and that one hop is the
+    difference between a 27B conversion fitting in RAM and OOMing: on
+    qwen3_8_27b, 497 of 850 weights arrive as `Transpose(w) -> MatMul`, and
+    hydrating them is 48.9 GiB.
+
+    A view moves indices, not values, so a weight that reaches its consumer
+    through only views is still never READ by the converter -- the same
+    argument `_only_weight_consumers` makes, one hop longer. Anything that
+    inspects or rewrites a value disqualifies the chain, `Cast` included (a
+    byte-format payload has to be the width it ships as).
+
+    Everything on the chain must also be single-consumer. A view feeding two
+    nodes is fine in principle, but the gate's promise is about THE tensor whose
+    bytes are being left on disk, and a branch means one of those paths is
+    somewhere the reasoning has not looked.
+
+    `uses` is name -> [(node, operand_index)], built once by `prepare` rather
+    than rebuilt per weight. Returns True only for a chain that ENDS at a
+    weight position.
+    """
+    cur = name
+    for _ in range(_VIEW_CHAIN_MAX):
+        consumers = uses.get(cur, [])
+        if len(consumers) != 1:
+            # Nobody reads it (a dead initializer: the writer prunes it anyway,
+            # so deferring gives nothing back), or several do (a branch).
+            return False
+        node, operand = consumers[0]
+        op = node.op_type
+        if op in _WEIGHT_ONLY_CONSUMERS:
+            # Reached a consumer. It must be reading this in a weight position;
+            # a weight in an activation slot would mean the op computes on it.
+            return operand >= 1
+        if op not in _VIEW_OPS:
+            return False
+        # A view with several outputs (Split) would not be a view of the same
+        # tensor; `_VIEW_OPS` holds none, but the check keeps that honest if
+        # the set grows.
+        if len(node.output) != 1:
+            return False
+        cur = node.output[0]
+    return False
 
 
 def slot_sources(model, base_dir: str, slot_names) -> Dict[str, tuple]:

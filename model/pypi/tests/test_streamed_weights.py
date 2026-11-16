@@ -173,6 +173,158 @@ def test_weight_a_pass_could_read_is_hydrated_not_streamed(tmp_path, capsys):
     assert len(loaded.graph.initializer[0].raw_data) == ELEMS * 2
 
 
+def _chained_weight_model(tmp_path, *, perm=(1, 0), views=(), value_op=None,
+                          branch=False, activation_slot=False, n=64,
+                          location="c.bin"):
+    """An external fp16 weight reaching MatMul through a chain of ops.
+
+    Models what an exporter emits with constant folding OFF: instead of a folded
+    constant, every linear's weight arrives as `Transpose(w)` in MatMul's B
+    position. It is not a detail -- on qwen3_8_27b it is 497 of 850 weights and
+    48.9 GiB, so a gate that rejects the chain hydrates the whole model.
+
+    `views` inserts extra pure views (`"Identity"`) before the MatMul;
+    `value_op` inserts an op that reads the value (`"Cast"`); `branch` gives the
+    final view a second consumer; `activation_slot` puts the weight in MatMul's
+    A position instead of B.
+    """
+    w = numpy.ones((n, n), dtype=numpy.float16)
+    inits = [helper.make_tensor("W", TensorProto.FLOAT16, [n, n],
+                                w.tobytes(), raw=True)]
+    nodes = []
+    cur = "W"
+
+    if perm is not None:
+        nodes.append(helper.make_node("Transpose", [cur], ["T0"],
+                                      perm=list(perm), name="t0"))
+        cur = "T0"
+    for i, vop in enumerate(views):
+        out = "V%d" % i
+        nodes.append(helper.make_node(vop, [cur], [out], name="v%d" % i))
+        cur = out
+    if value_op is not None:
+        nodes.append(helper.make_node(value_op, [cur], ["C0"],
+                                      to=TensorProto.FLOAT, name="c0"))
+        cur = "C0"
+
+    if activation_slot:
+        # The weight is MatMul's A: the op computes on it, so it is not a
+        # weight position however the chain got there.
+        nodes.append(helper.make_node("MatMul", [cur, "X"], ["Y"], name="mm"))
+        x_shape = [n, n]
+    elif branch:
+        # Two readers of the chain's result: no single path to reason about.
+        nodes.append(helper.make_node("MatMul", ["X", cur], ["Y"], name="mm0"))
+        nodes.append(helper.make_node("MatMul", ["X", cur], ["Y2"], name="mm1"))
+        x_shape = [1, n]
+    else:
+        nodes.append(helper.make_node("MatMul", ["X", cur], ["Y"], name="mm"))
+        x_shape = [1, n]
+
+    outputs = [helper.make_tensor_value_info("Y", TensorProto.FLOAT16, [1, n])]
+    if branch:
+        outputs.append(
+            helper.make_tensor_value_info("Y2", TensorProto.FLOAT16, [1, n]))
+    graph = helper.make_graph(
+        nodes, "g",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT16, x_shape)],
+        outputs, inits)
+    model = helper.make_model(graph, producer_name="test")
+    model.opset_import[0].version = 17
+    model.ir_version = 8
+    external_data_helper.convert_model_to_external_data(
+        model, all_tensors_to_one_file=True, location=location,
+        size_threshold=0)
+    onnx.save_model(model, str(tmp_path / "c.onnx"))
+    return tmp_path / "c.onnx"
+
+
+def _chained_plan(tmp_path, monkeypatch, **kw):
+    """Build the chained model and return (deferral plan, reloaded model)."""
+    monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    src = _chained_weight_model(tmp_path, **kw)
+    loaded = onnx.load(str(src), load_external_data=False)
+    return ws.prepare(loaded, str(tmp_path), quant="fp16"), loaded
+
+
+def test_a_weight_behind_a_pure_view_is_still_streamed(tmp_path, monkeypatch):
+    """`Transpose(w) -> MatMul(B)` must defer -- it is the 27B's main case.
+
+    A view moves indices, not values, so the converter still never reads these
+    bytes: the `transB=1` fusion rewrites the MatMul to read the source layout
+    directly. Rejecting the chain is what made the streamed 27B conversion
+    hydrate 48.9 GiB and get OOM-killed.
+    """
+    plan, loaded = _chained_plan(tmp_path, monkeypatch)
+    assert sorted(plan) == ["W"], "the view chain should not block deferral"
+    assert ws.is_deferred(loaded.graph.initializer[0])
+    assert len(loaded.graph.initializer[0].raw_data) == 0
+
+
+def test_a_longer_pure_view_chain_is_still_streamed(tmp_path, monkeypatch):
+    """The walk is not a one-hop special case: Transpose -> Identity defers."""
+    plan, _ = _chained_plan(tmp_path, monkeypatch, views=("Identity",))
+    assert sorted(plan) == ["W"]
+
+
+def test_a_value_op_on_the_chain_hydrates_the_weight(tmp_path, monkeypatch):
+    """`Cast` reads the value, so the chain stops being a pure view.
+
+    A byte-format payload has to ship at the width the graph declares; letting a
+    Cast through would let the converter quantize bytes the graph still expects
+    at another width.
+    """
+    plan, loaded = _chained_plan(tmp_path, monkeypatch, value_op="Cast")
+    assert plan == {}, "Cast is not a view"
+    assert len(loaded.graph.initializer[0].raw_data) > 0
+
+
+def test_a_branching_view_hydrates_the_weight(tmp_path, monkeypatch):
+    """A view with two consumers means one path the walk did not look at."""
+    plan, _ = _chained_plan(tmp_path, monkeypatch, branch=True)
+    assert plan == {}
+
+
+def test_a_weight_in_the_activation_slot_is_not_a_weight_position(
+        tmp_path, monkeypatch):
+    """MatMul's A operand is computed on; only operand >= 1 is a weight.
+
+    The view has to be present for this to test anything. `_reachable_as_weight`
+    is an ALTERNATIVE to `_only_weight_consumers`, and that older gate looks
+    only at the CONSUMER's op type, never at which operand the tensor landed in
+    -- so a direct `MatMul(W, X)` is deferred by the original path and this walk
+    is never consulted. Keeping the `Transpose` puts the tensor one hop away
+    from its consumer, which is the case the new rule governs.
+    """
+    plan, _ = _chained_plan(tmp_path, monkeypatch, perm=(1, 0),
+                            activation_slot=True)
+    # `MatMul(T0, X)`: the weight reached MatMul, but as its A operand.
+    assert plan == {}
+
+
+def test_no_view_at_all_still_defers(tmp_path, monkeypatch):
+    """The original case has to keep working: MatMul(W) directly."""
+    plan, _ = _chained_plan(tmp_path, monkeypatch, perm=None)
+    assert sorted(plan) == ["W"]
+
+
+def test_a_view_chain_over_a_float32_weight_hydrates(tmp_path, monkeypatch):
+    """The walk must not widen the dtype gate: fp32 is not pass-through.
+
+    `_reachable_as_weight` is an alternative to the CONSUMER gate only. The
+    dtype, length and name gates all still apply, or a weight the quantizer
+    would rewrite could slip through on the strength of a view.
+    """
+    monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    src = _chained_weight_model(tmp_path, n=64)
+    loaded = onnx.load(str(src), load_external_data=False)
+    loaded.graph.initializer[0].data_type = TensorProto.FLOAT  # not pass-through
+    plan = ws.prepare(loaded, str(tmp_path), quant="fp16")
+    assert plan == {}, "fp32 is not a pass-through dtype"
+
+
 def test_deferral_is_refused_when_a_payload_would_be_rewritten(monkeypatch):
     monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
     # 4-bit and AWQ need the weight's magnitudes in hand to pick their scale
