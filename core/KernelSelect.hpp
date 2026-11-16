@@ -270,6 +270,13 @@ struct MatmulKnobs {
     // VKOP_COOP_SPLITK_FORCE=<ks_n>: pin the split-K depth (>=2). 0 = auto
     // (selector picks based on occupancy, like ks_depth_for for tiled_ks).
     int coop_split = 0;
+    // VKOP_KERNEL_DEBUG=1: trace every rule walk to stderr. Off by default
+    // because selection runs once per MatMul per round -- at 142 MatMuls and
+    // ~20 candidate rules that was >2000 lines per decode step, which drowned
+    // the server's own request/prefill lines out of the log. It lives in the
+    // knobs (not a getenv inside select_matmul) so the selector stays pure and
+    // a test can pin it by value, like every other switch here.
+    bool trace = false;
 };
 
 MatmulKnobs matmul_knobs_from_env();

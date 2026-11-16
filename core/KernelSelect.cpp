@@ -1059,6 +1059,9 @@ MatmulKnobs matmul_knobs_from_env() {
     if (flag("VKOP_COOP_SK_LAST") && k.coop_split == 0) {
         k.coop_split = -1; // auto depth
     }
+    // VKOP_KERNEL_DEBUG: trace the rule walk. Purely diagnostic; the chosen
+    // plan is identical with or without it.
+    k.trace = flag("VKOP_KERNEL_DEBUG");
     return k;
 }
 
@@ -1073,27 +1076,35 @@ MatmulPlan select_matmul(const DeviceTraits &traits, const MatmulShape &shape,
                          const MatmulKnobs &knobs) {
     const DeviceProfile &profile = device_profile_for(traits);
     Ctx c = make_ctx(traits, profile, shape, features, availability, knobs);
-    std::fprintf(stderr, "[ksel] m=%d n=%d k=%d fp16=%d weight_fp16=%d coop_split=%d force_coop=%d coopmat_av=%d\n",
-                 shape.m, shape.n, shape.k, features.fp16,
-                 features.weight == WeightKind::kFp16, knobs.coop_split,
-                 knobs.force_coop, availability.coopmat);
+    if (knobs.trace) {
+        std::fprintf(stderr, "[ksel] m=%d n=%d k=%d fp16=%d weight_fp16=%d coop_split=%d force_coop=%d coopmat_av=%d\n",
+                     shape.m, shape.n, shape.k, features.fp16,
+                     features.weight == WeightKind::kFp16, knobs.coop_split,
+                     knobs.force_coop, availability.coopmat);
+    }
     // --- Coopmat smart selector runs before the fixed-order rule table ---
     // If it produces a plan, return it directly; otherwise fall through to
     // the original walk which handles every non-coopmat route unchanged.
     MatmulPlan smart = coopmat_select_smart(c);
     if (smart.route != MatmulRoute::kReduce) {
-        std::fprintf(stderr, "[ksel] SMART CHOSE %s coop_split=%d reason=%s\n",
-                     smart.tag, smart.coop_split,
-                     smart.route_reason ? smart.route_reason : "(none)");
+        if (knobs.trace) {
+            std::fprintf(stderr, "[ksel] SMART CHOSE %s coop_split=%d reason=%s\n",
+                         smart.tag, smart.coop_split,
+                         smart.route_reason ? smart.route_reason : "(none)");
+        }
         return smart;
     }
     for (const MatmulRule &rule : kMatmulRules) {
         bool a = rule.applies(c);
-        std::fprintf(stderr, "[ksel] rule %s -> %d\n", rule.tag, a);
+        if (knobs.trace) {
+            std::fprintf(stderr, "[ksel] rule %s -> %d\n", rule.tag, a);
+        }
         if (a) {
             MatmulPlan p = apply_rule(c, rule);
-            std::fprintf(stderr, "[ksel] CHOSE %s coop_split=%d ks_n=%d\n",
-                         rule.tag, p.coop_split, p.ks_n);
+            if (knobs.trace) {
+                std::fprintf(stderr, "[ksel] CHOSE %s coop_split=%d ks_n=%d\n",
+                             rule.tag, p.coop_split, p.ks_n);
+            }
             return p;
         }
     }
