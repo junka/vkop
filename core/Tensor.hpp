@@ -1385,17 +1385,48 @@ template <typename T> class Tensor : public ITensor {
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
+            // The host copy below is issued on the HOST and, per
+            // VK_EXT_host_image_copy, may be executed asynchronously by the
+            // driver — so three things must hold, and none did:
+            //   * the image must be in a layout a host copy may write (it was
+            //     left in UNDEFINED on this path; see below),
+            //   * the image must have no GPU work in flight,
+            //   * `ptr` must stay alive until the copy has consumed it — it is
+            //     a local vector, so an async copy read freed memory.
+            // Together those lost the device (-4) in roughly half of
+            // ModelTest's runs on ARL, and occasionally corrupted the heap.
+            // These copies only happen for image-backed initializers and
+            // preprocessed inputs — never per decode step — so the waits cost
+            // nothing that matters.
+            dev->wait_all_done();
             std::vector<T> ptr(img->getImageSize() / sizeof(T));
             if (!rgba) {
                 convertTensorToRGBA(ptr.data(), src);
             } else {
                 memcpy(ptr.data(), src, img->getImageSize());
             }
+            // The image is still in VK_IMAGE_LAYOUT_UNDEFINED here: nothing
+            // transitions it on this path (as_output_image does it for the
+            // write path, but the upload path never did). A host copy into an
+            // UNDEFINED-layout image is not a valid operation, and this was
+            // the actual cause of the device loss — draining alone left ~7% of
+            // runs failing. Move it to GENERAL first: that is the layout a
+            // host transfer may write, and the read barrier below transitions
+            // it on to SHADER_READ_ONLY for the consumers.
+            img->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
             img->hostImageCopyToDevice(ptr.data());
+            // Before the layout transition below touches the image and before
+            // `ptr` is destroyed: the copy must have completed.
+            dev->wait_all_done();
             cmd.begin();
             img->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(dev->getComputeQueue());
+            // Complete before returning: the caller's next command buffer (or
+            // the next host-side transition on this image) must not observe a
+            // half-finished upload. The graph path in particular keeps
+            // recording buffers that reference this image right afterwards.
+            dev->wait_all_done();
         } else
 #endif
         {
@@ -2113,8 +2144,15 @@ template <typename T> class Tensor : public ITensor {
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
+            // Same async contract as copyToGPUImage: the host copy may still
+            // be running when it returns, and `rgba` is a local vector read
+            // immediately afterwards, so drain before it starts (no GPU work
+            // may be in flight on this image) and again after it (the bytes
+            // must be there before convertRGBAToTensor reads them).
+            dev->wait_all_done();
             std::vector<T> rgba((img->getImageSize() / sizeof(T)));
             img->hostImageCopyToHost(rgba.data());
+            dev->wait_all_done();
             convertRGBAToTensor(rgba.data());
         } else
 #endif

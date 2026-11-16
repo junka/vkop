@@ -107,7 +107,22 @@ class Topk : public Operator {
         // contract holds; reshape_view preserves the element count, and a
         // terminal output has no other consumer that would observe the
         // flattened view.
+        //
+        // The flattening is only equivalent when the top-k runs along the LAST
+        // axis: {..., rows, last} -> {rows, last} keeps "the last axis"
+        // meaning the same thing, but any other axis is renumbered by it (a
+        // rank-3 axis 1 becomes axis 1 of a 2-D view, i.e. the last axis).
+        // The old code flattened unconditionally, so such an input was
+        // silently reduced along the wrong axis instead of being refused.
+        const int rank_axis = para_.axis < 0 ? para_.axis + rank : para_.axis;
         if (rank > 2) {
+            if (rank_axis != rank - 1) {
+                throw std::runtime_error(
+                    "TopK: only a rank-2 input, or a rank-N input whose axis "
+                    "is the last one, is implemented (got rank " +
+                    std::to_string(rank) + ", axis " +
+                    std::to_string(para_.axis) + ")");
+            }
             int64_t rows = 1;
             for (int i = 0; i < rank - 1; ++i) {
                 rows *= inshape[i];
