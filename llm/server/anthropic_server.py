@@ -858,18 +858,30 @@ class StreamWriter:
         self._emit_text(chunk)
 
     def finish(self, reason, output_tokens):
+        # A tool call cut off by the output cap is not usable. _parse_tool_call
+        # would close its JSON and hand the client an argument blob like
+        # {"raw": "{\"name\": \"Bash\", \"comm..."} -- the client then reports
+        # "Invalid tool parameters", feeds that back, and the model regenerates
+        # into the same cap: a loop that never terminates on its own. Report
+        # max_tokens instead, which tells the client why and lets it retry the
+        # turn with more room (or not at all).
+        truncated_in_call = self.in_tool and reason == "length"
         if not self.stopped:
             tail = self.buf
             self.buf = ""
             if self.in_tool:
-                # Generation ended inside a tool call: emit what we have as a
-                # tool_use rather than dropping it.
-                self._emit_tool(tail)
+                if not truncated_in_call:
+                    # Generation ended inside a tool call for some other
+                    # reason (client STOP, a stop token): the call is still
+                    # complete enough to be worth delivering.
+                    self._emit_tool(tail)
             elif not self.after_tool:
                 self._emit_safe(tail)
         self._close_text()
         if self.stop_reason is None:
-            if getattr(self, "saw_tool", False):
+            if truncated_in_call:
+                self.stop_reason = "max_tokens"
+            elif getattr(self, "saw_tool", False):
                 self.stop_reason = "tool_use"
             elif reason == "length":
                 self.stop_reason = "max_tokens"

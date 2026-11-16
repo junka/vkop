@@ -154,5 +154,37 @@ check("real degenerate shape recovers the first call",
       and blocks[0]["input"] == {"file_path": "D:/third_party/claude-config/settings.json"},
       json.dumps(blocks)[:200])
 
+# A call cut off by the output cap must not be delivered as a tool_use.
+# _parse_tool_call closes the JSON, so the client would receive an unusable
+# argument blob, report "Invalid tool parameters", and the model would
+# regenerate into the same cap -- an endless loop. Report max_tokens instead.
+def finish_cut(text, reason, stopped=False):
+    w = m.StreamWriter(None, "test-model", 16, [], lambda b: None)
+    w.feed(text)
+    if stopped:
+        w.stopped = True
+    w.finish(reason, 16)
+    return w.blocks, w.stop_reason
+
+
+cut_mid = OPEN + '\n{"name": "Bash", "arguments": {"command": "ec'
+bl, rs = finish_cut(cut_mid, "length")
+check("truncated call reports max_tokens", rs == "max_tokens", rs)
+check("truncated call emits no tool_use", kinds(bl) == [], bl)
+
+# A call that completed before the cut is still usable: the client can run it,
+# and the truncation applies to whatever followed it.
+bl, rs = finish_cut(OPEN + "\n" + CALL + "\n" + CLOSE + "then more text", "length")
+check("completed call survives a later cut",
+      kinds(bl) == ["tool_use", "text"] and rs == "tool_use",
+      "kinds=%s reason=%s" % (kinds(bl), rs))
+
+# An unclosed call that ended for a non-length reason (client STOP) is kept:
+# that is the "stop decoding once a tool call is usable" path, not a cap.
+bl, rs = finish_cut(OPEN + "\n" + CALL, "stop")
+check("unclosed call kept when not truncated",
+      kinds(bl) == ["tool_use"] and rs == "tool_use",
+      "kinds=%s reason=%s" % (kinds(bl), rs))
+
 print("\n%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)
