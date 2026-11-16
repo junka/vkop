@@ -1263,6 +1263,13 @@ def load_preset(path, want=None):
     base = os.path.dirname(os.path.abspath(path))
     out: dict = {}
     for key, value in raw.items():
+        if key == "_comment" or key.startswith("_comment_"):
+            # JSON has no comment syntax, and the shipped example earns its keep
+            # by explaining each preset in place. Exactly `_comment`/`_comment_*`
+            # and nothing else: a blanket "any leading underscore" rule would
+            # swallow `_max-kv`, which is a typo, and silently dropping a typo is
+            # the failure the check below exists to prevent.
+            continue
         norm = key.replace("_", "-")
         if norm not in _PRESET_OPTIONS:
             raise SystemExit(

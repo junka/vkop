@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "Launch presets for anthropic_server.py. Usage:",
+    "  python3 llm/server/anthropic_server.py --config llm/server/presets.json",
+    "  python3 llm/server/anthropic_server.py --config llm/server/presets.json --preset qwen3-vl-2b-fp8kv",
+    "Precedence is command line > preset > environment variable > built-in default, so",
+    "anything typed on the command line still wins. Paths resolve against THIS file's",
+    "directory, not the cwd. _comment keys are ignored; anything else unknown is refused"
+  ],
+
+  "default": "qwen3-vl-2b",
+
+  "presets": {
+    "qwen3-vl-2b": {
+      "_comment": "The 2B fp16 artifact the README's numbers come from. An ~11k-token agent prompt needs the 16384 window and the 256 chunk; kv-cache makes a restart skip the re-prefill.",
+      "model": "../exporter/llm.vkopbin",
+      "embed": "../exporter/embed_tokens.bin",
+      "tokenizer": "../tokenizer/qwen3_vl.bin",
+      "model-name": "vkop-qwen3-vl-2b",
+      "max-kv": 16384,
+      "prefill-chunk": 256,
+      "max-output": 1024,
+      "kv-cache": "../exporter/kv_prefix.bin"
+    },
+
+    "qwen3-vl-2b-fp8kv": {
+      "_comment": "Same model, e4m3 KV cache: half the bytes per row, so a larger window fits. Needs the fp8 variant artifact (llm/exporter/make_kv_variant.py --fp8), not just this preset -- if it is not built the server says 'missing:' and stops.",
+      "model": "../exporter/llm_fp8_kv.vkopbin",
+      "embed": "../exporter/embed_tokens.bin",
+      "tokenizer": "../tokenizer/qwen3_vl.bin",
+      "model-name": "vkop-qwen3-vl-2b-fp8kv",
+      "max-kv": 24576,
+      "prefill-chunk": 256,
+      "max-output": 1024
+    },
+
+    "qwen3-vl-2b-short": {
+      "_comment": "Short-prompt benchmarking: a wide chunk is ~2x faster, but only while q x covered rows stays clear of the device-lost wall (see README). kv-cache is empty on purpose, so presets do not share one file across window sizes.",
+      "model": "../exporter/llm.vkopbin",
+      "embed": "../exporter/embed_tokens.bin",
+      "tokenizer": "../tokenizer/qwen3_vl.bin",
+      "model-name": "vkop-qwen3-vl-2b-short",
+      "max-kv": 4096,
+      "prefill-chunk": 1024,
+      "max-output": 256,
+      "kv-cache": ""
+    }
+  }
+}

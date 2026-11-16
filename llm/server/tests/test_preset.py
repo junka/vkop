@@ -151,6 +151,20 @@ refused("preset is not an object",
         write("notobj.json", {"presets": {"a": 5}}), needle="must be an object")
 refused("missing file", os.path.join(tmp, "nope.json"), needle="nope.json")
 
+# ------------------------------------------------------------- _comment -----
+# JSON has no comment syntax and the shipped presets.json explains each preset
+# in place, so `_comment` is ignored. The rule is deliberately narrower than
+# "any leading underscore": a blanket version swallows `_max-kv`, which is a
+# typo, and silently dropping a typo is what the unknown-key check is for.
+_, got = m.load_preset(write("c1.json", {"_comment": "hi", "max-kv": 4096}))
+check("_comment is ignored", got == {"max_kv": 4096}, repr(got))
+_, got = m.load_preset(write("c2.json", {"_comment_1": "hi", "max-kv": 1}))
+check("_comment_N is ignored too", got == {"max_kv": 1}, repr(got))
+refused("an underscored typo is still refused",
+        write("c3.json", {"_max-kv": 4096}), needle="unknown key")
+refused("_comment is case-sensitive",
+        write("c4.json", {"_Comment": "x", "max-kv": 1}), needle="unknown key")
+
 # ------------------------------------------------- that ._PRESET_OPTIONS ---
 # The table has to cover every option the parser defines, or a preset could not
 # set it and the "known keys" list in the error message would be a lie.

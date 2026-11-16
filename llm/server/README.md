@@ -56,12 +56,21 @@ JSON，`--preset` 在同一份文件里选一套：
 python3 llm/server/anthropic_server.py --config ~/vkop_serve/serve.json
 ```
 
+仓库里 `llm/server/presets.json` 是可直接用的例子（2B 的 fp16 / fp8-KV / 短 prompt 三份）。
+
 - 键名就是长选项名（`max-kv`，下划线也接受）。相对路径**按配置文件所在目录解析**，
   不是 cwd —— 配置跟着制品走，搬目录不会失效。
 - 文件里没有 `presets` 键时，整份文件当作单一预设（一个文件一套模型时不用编名字）。
 - 拼错的键直接报错并列出已知键，不会静默忽略；`--coop` 这类布尔值必须是 JSON 真
   `true`/`false`（`bool("false")` 是 True，会悄悄打开 coopmat 那条有已知数值错误的
   路由，所以字符串只认明确的白名单）。
+- 优先级是**命令行 > preset > 环境变量 > 内置默认**，所以命令行上写的仍然赢。preset
+  压掉了一个已导出的环境变量时会打印 `[serve] preset overrode env: ...`。
+- JSON 没有注释语法，所以 `_comment`（以及 `_comment_1` 等）是被忽略的键，例子里就用它
+  逐条说明。规则只认这一种拼法：`_max-kv` 这种带下划线的拼错照样报错 —— 静默丢一个
+  拼错的键正是上面那条检查要防的事。
+- 制品其实不存在时报 `missing: <path>` 并退出，所以预设可以先写好、制品后转；
+  例子里 `qwen3-vl-2b-fp8kv` 就是这样，它要求额外的 fp8-KV 制品。
 
 ## 客户端怎么指过来
 
