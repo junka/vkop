@@ -25,6 +25,19 @@ that defers":
 Both are pinned here against the in-memory path, which is the reference: same
 payload bytes, same scale values, same MatMul arity. A test of the streamed path
 alone would have agreed with itself.
+
+  3. `finalize` appended the scale to the node that reads the weight, which on
+     this graph is the Transpose -- making a 2-input unary op. onnxoptimizer's
+     IR asserts on that ("ir.h:554: input: Assertion inputs_.size() == 1
+     failed"), and `optimize_model` catches it and skips its whole structural
+     pass set. ConstantFolder alone then folds a different Shape/Slice/Gather
+     chain, leaving attention's Q declared as [-1,-1,-1,256] instead of
+     [-1,24,-1,256]; the runtime derived num_heads = -1 and rejected the 27B
+     artifact with the misleading
+         Attention: head_dim must be even and <= 256
+
+     Like (2) it is invisible in the numbers -- the payload and scale are both
+     right -- so it is pinned structurally, in test_finalize_* below.
 """
 import json
 import os
@@ -206,3 +219,75 @@ def test_the_fold_keeps_a_scale_that_sits_on_the_transpose():
     names = [i["name"] for i in m.nodes["mm"].inputs]
     assert names == ["X", "W", "S"], names
     assert m.nodes["mm"].attributes["transB"] == 1
+
+
+def _finalize_probe(tmp):
+    """Run prepare + finalize on a Transpose-fed model; return the proto.
+
+    Small enough to inspect node by node, shaped like the 27B: the weight sits
+    behind a Transpose, so finalize has a choice of which node to give the scale
+    to -- and only one of them keeps the graph legal.
+    """
+    sys.path.insert(0, PYPI)
+    from onnx2vkop import quant_payload, weight_stream
+
+    mp = _model(tmp)
+    m = onnx.load(mp, load_external_data=False)
+    deferred = weight_stream.prepare(m, tmp, quant="int8", unify=False,
+                                     rgba=False, verbose=False)
+    assert any(e.get("quant") for e in deferred.values()), "nothing deferred"
+    n = quant_payload.finalize(m, deferred, verbose=False)
+    assert n == 1, f"finalize attached {n} scale(s), expected 1"
+    return m
+
+
+def test_finalize_never_makes_a_unary_view_multi_input():
+    """The scale must not land on the Transpose.
+
+    Transpose is unary in the ONNX schema. A 2-input Transpose is an illegal
+    node that onnxoptimizer's IR asserts on, which silently skips every
+    structural pass -- and that is what left the 27B's Q head axis symbolic.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        m = _finalize_probe(tmp)
+        bad = [(n.op_type, n.name, list(n.input)) for n in m.graph.node
+               if n.op_type in ("Transpose", "Reshape", "Squeeze", "Unsqueeze",
+                                "Identity", "Flatten")
+               and len(n.input) != 1]
+        assert not bad, (
+            "finalize appended an operand to a unary view: " + repr(bad))
+
+
+def test_finalize_puts_the_scale_on_the_weight_consumer():
+    """Same artifact, and the MatMul is where the in-memory path puts it.
+
+    The proto still spells B as `Wt` -- folding the Transpose into the MatMul is
+    a DAG-stage rewrite (fuse_transpose_into_matmul) that has not run yet. What
+    matters here is only WHICH node carries the scale.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        m = _finalize_probe(tmp)
+        mm = [n for n in m.graph.node if n.op_type == "MatMul"]
+        assert len(mm) == 1
+        assert list(mm[0].input) == ["X", "Wt", "W_scale"], list(mm[0].input)
+        tr = [n for n in m.graph.node if n.op_type == "Transpose"][0]
+        assert list(tr.input) == ["W"], list(tr.input)
+
+
+def test_the_finalized_proto_survives_the_converter_s_pass_list():
+    """The decisive one: onnxoptimizer must not raise on the proto finalize
+    produced. When it raises, optimize_model falls back to ConstantFolder alone,
+    which is the graph drift that broke attention on the 27B."""
+    onnxoptimizer = pytest.importorskip("onnxoptimizer")
+    sys.path.insert(0, PYPI)
+    from onnx2vkop.optimizer import ONNXOPTIMIZER_PASSES
+
+    with tempfile.TemporaryDirectory() as tmp:
+        m = _finalize_probe(tmp)
+        try:
+            out = onnxoptimizer.optimize(m, ONNXOPTIMIZER_PASSES)
+        except Exception as e:      # noqa: BLE001 -- the assertion is the point
+            raise AssertionError(
+                "onnxoptimizer rejects the finalized graph, so optimize_model "
+                f"would skip every structural pass: {e}") from e
+        assert len(out.graph.node) > 0

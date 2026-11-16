@@ -176,41 +176,84 @@ def finalize(model, deferred, verbose=True) -> int:
     """Attach a scale to every quantizing deferred entry, on the proto.
 
     For each entry carrying `quant`, computes `[name]_scale`, adds it as a
-    FLOAT initializer and appends it to every node that reads the weight --
+    FLOAT initializer and appends it to the node that CONSUMES the weight --
     the same third input `-q int8` appends for an in-memory weight. The tensor
     itself keeps its FLOAT type and its external reference; `write_payload`
     turns the bytes into the payload the entry names.
+
+    The scale goes on the TERMINAL consumer, reached through the weight's pure
+    view chain, not on whatever node happens to read the tensor. With constant
+    folding off a linear arrives as `Transpose(w) -> MatMul(B)`, so the reader
+    is a Transpose -- and Transpose is unary. Appending there makes a 2-input
+    Transpose, which is not a legal ONNX node, and onnxoptimizer's IR asserts
+    on it:
+
+        ir.h:554: input: Assertion `inputs_.size() == 1' failed.
+
+    That exception makes `optimize_model` skip its entire structural pass set,
+    leaving only ConstantFolder -- and measured on the 27B that is enough to
+    change which Shape/Slice/Gather chain folds, leaving Q's head axis symbolic
+    (`[-1,-1,-1,256]` instead of `[-1,24,-1,256]`). The runtime then derived
+    num_heads = -1 and rejected the artifact with the misleading
+    `Attention: head_dim must be even and <= 256`.
+
+    The terminal consumer is also where the in-memory path puts it, and
+    `optimizer.fold_transpose_into_matmul` carries an extra operand from either
+    side, so the two paths still meet at the same `MatMul(A, w, s, transB=1)`.
     """
     quantized = {n: e for n, e in deferred.items() if e.get("quant")}
     if not quantized:
         return 0
+    # Imported here, not at module scope: weight_stream imports this module
+    # lazily inside _write_quantized, and a top-level import would close the
+    # cycle.
+    from .weight_stream import view_chain_to_weight
+
     graph = model.graph
+    uses = {}
+    for node in graph.node:
+        for idx, name in enumerate(node.input):
+            uses.setdefault(name, []).append((node, idx))
+
     existing = {init.name for init in graph.initializer}
     appended = {}
-    for node in graph.node:
-        for idx in range(len(node.input)):
-            name = node.input[idx]
-            entry = quantized.get(name)
-            if entry is None or len(node.input) > 2:
-                # Already carries a scale (or something else in slot 2): the
-                # quantizer's own contract is a three-input MatMul, and this
-                # pass must not manufacture a fourth.
-                continue
-            scale_name = entry.get("scale") or f"{name}_scale"
-            if scale_name not in existing:
-                reader = WeightReader(entry, name)
-                scale = scale_for(entry["quant"], reader,
-                                  bool(entry.get("transposed")))
-                init = numpy_helper.from_array(scale, scale_name)
-                init.data_type = TensorProto.FLOAT
-                graph.initializer.append(init)
-                existing.add(scale_name)
-                # The writer decodes with the same numbers; keeping them on the
-                # entry means it does not have to sweep the source a second time.
-                entry["scale_values"] = scale
-            entry["scale"] = scale_name
-            node.input.append(scale_name)
-            appended[name] = scale_name
+    for name, entry in quantized.items():
+        chain = view_chain_to_weight(uses, name)
+        if chain is None:
+            # prepare's deferral gate only lets a weight out of RAM when a pure
+            # view chain reaches a weight position, so this should be
+            # unreachable -- and it is a hard error rather than a guess because
+            # the alternative is appending a scale to a node that computes on
+            # the weight.
+            raise ValueError(
+                f"'{name}' is quantized on the way out but does not reach a "
+                f"weight consumer through a pure view chain, so no node can "
+                f"take its scale; the runtime would bind no scale and read raw "
+                f"codes")
+        carrier, _operand = chain[-1]
+        if len(carrier.input) > 2:
+            # Already carries a scale (or something else past the weight): the
+            # quantizer's contract is a three-input MatMul, and this pass must
+            # not manufacture a fourth. Record what is there so the missing
+            # check below does not mistake "already done" for "could not".
+            entry["scale"] = carrier.input[2]
+            appended[name] = carrier.input[2]
+            continue
+        scale_name = entry.get("scale") or f"{name}_scale"
+        if scale_name not in existing:
+            reader = WeightReader(entry, name)
+            scale = scale_for(entry["quant"], reader,
+                              bool(entry.get("transposed")))
+            init = numpy_helper.from_array(scale, scale_name)
+            init.data_type = TensorProto.FLOAT
+            graph.initializer.append(init)
+            existing.add(scale_name)
+            # The writer decodes with the same numbers; keeping them on the
+            # entry means it does not have to sweep the source a second time.
+            entry["scale_values"] = scale
+        entry["scale"] = scale_name
+        carrier.input.append(scale_name)
+        appended[name] = scale_name
     missing = sorted(set(quantized) - set(appended))
     if missing:
         raise ValueError(
