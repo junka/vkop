@@ -157,10 +157,16 @@ def fold_zero_centered_norms(module):
     变成 `1 + w`，forward 变成 `out * w`。gated 版(RMSNormGated)不走这条
     路径 —— 它在 `_rmsnorm_gated` 里显式加 1，而且只作用在 linear attention
     内部，不在 HF 自己的层循环里被调用。
+
+    返回 {参数名: 1.0}，键是图上出现的名字（`layers.N....weight`）。流式导出
+    需要它：`weight.data.add_(1)` 对 meta 参数是空操作（meta 没有 storage），
+    所以那边的图是按 `1 + w` 建的、喂进去的却是 checkpoint 原始的 `w`，
+    norm 权重接近 0 时 logits 会全是 0。调用方把这份 map 交给 splice，让它
+    在写出权重字节时补上这个 +1。
     """
     import types
 
-    folded = 0
+    folded_names = {}
 
     def make_forward(m):
         eps = m.eps
@@ -182,22 +188,25 @@ def fold_zero_centered_norms(module):
 
         return types.MethodType(fwd, m)
 
-    def visit(m):
-        nonlocal folded
-        for child in m.children():
-            visit(child)
+    def visit(m, path=""):
+        for name, child in m.named_children():
+            visit(child, f"{path}.{name}" if path else name)
         if type(m).__name__ == "Qwen3_5RMSNorm":
             with torch.no_grad():
                 m.weight.data.add_(1.0)
             m.forward = make_forward(m)
-            folded += 1
+            # The graph names a parameter after the path from the wrapper, and
+            # the wrapper holds `layers` / `norm` at the same level this walk
+            # sees them, so the two agree.
+            folded_names[f"{path}.weight"] = 1.0
 
     visit(module)
-    return folded
+    return folded_names
 
 
-_folded = fold_zero_centered_norms(lm)
-print(f"[norm] pre-folded {_folded} zero-centered RMSNorm weight(s) to (1+w)")
+_folded_norm_addends = fold_zero_centered_norms(lm)
+print(f"[norm] pre-folded {len(_folded_norm_addends)} zero-centered RMSNorm "
+      f"weight(s) to (1+w)")
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +593,14 @@ if STREAM_EXPORT:
             # input (`onnx::MatMul_915`) instead of the named parameter, which
             # the splice cannot resolve. Folding also has nothing to gain here:
             # the weights are meta, so no fold is computable.
-            do_constant_folding=False)
+            do_constant_folding=False,
+            # REQUIRED here, not only on the write below. torch applies
+            # dynamic_axes twice -- once while building the graph (this call)
+            # and once while emitting it -- and skipping the first makes the
+            # meta trace diverge STRUCTURALLY from the eager export (827 vs
+            # 831 nodes: 14 extra Cast, 13 missing Identity, all on the
+            # attention mask's path). See onnx2vkop/stream_export.py.
+            dynamic_axes=dynamic_axes)
         raw, _em, _ext, _nm = graph._export_onnx(
             {}, OPSET, dynamic_axes, False, SX.OperatorExportTypes.ONNX, True,
             False, {}, True, "", {})
@@ -606,7 +622,18 @@ if STREAM_EXPORT:
     resolved = SX.splice_initializers(
         proto, shapes, index,
         weights_file=os.path.basename(EXPORT_PATH).replace(".onnx", ".weights.bin"),
-        target_dtype="F16")
+        target_dtype="F16",
+        # The zero-centred RMSNorm fold above rewrote `weight` on the LIVE
+        # model; on the meta model that write landed nowhere, so the graph here
+        # is built for `1 + w` while the shard still holds `w`. Reproduce the
+        # fold on the payload, or every norm normalises by a near-zero weight
+        # and the logits come out all 0.0.
+        addend=_folded_norm_addends,
+        # The 27B checkpoint carries an `mtp.*` speculative-decoding head whose
+        # parameter names AND shapes repeat the text tower's, so a suffix match
+        # alone cannot tell `layers.0.mlp.gate_proj.weight` from its namesake.
+        # This is the subtree the wrapper was built from.
+        prefix="model.language_model.")
     print(f"[stream] {len(resolved)} weight(s) spliced", flush=True)
 
     # `mrope.M` is a computed BUFFER, not a checkpoint tensor: the exporter's
@@ -643,6 +670,12 @@ if STREAM_EXPORT:
     wfile = EXPORT_PATH.replace(".onnx", ".weights.bin")
     nbytes, offsets = SX.copy_weights(resolved, wfile, target_dtype="F16")
     SX.patch_offsets(proto, offsets)
+
+    # The shape repair deliberately does NOT run here -- it runs after
+    # annotate_custom_ops below, once the Conv1d/LinearAttention output shapes
+    # are declared. Until then a dim that lives behind one of those nodes
+    # cannot be inferred, and those are exactly the state outputs the runtime
+    # reads. See the note at the end of onnx2vkop/stream_export.py.
     onnx.save(proto, EXPORT_PATH)
     print(f"[✓] exported (streamed) -> {EXPORT_PATH} "
           f"({len(resolved)} weights, {nbytes/2**30:.1f} GiB external)")
@@ -717,3 +750,17 @@ def annotate_custom_ops(path):
 
 
 annotate_custom_ops(EXPORT_PATH)
+
+if STREAM_EXPORT:
+    # Last step of the streaming path, and it has to be last: recovering the
+    # dims the meta trace could not prove requires the spliced weights AND the
+    # custom-op shapes annotated just above. `logits` diverges on its vocab
+    # axis (a placeholder where eager has VOCAB) and the state outputs on the
+    # ones that live behind Conv1d/LinearAttention; those are exactly what the
+    # runtime sizes its buffers from. See the note at the end of
+    # onnx2vkop/stream_export.py.
+    _m = onnx.load(EXPORT_PATH, load_external_data=False)
+    _n = SX.resolve_shape_dims(_m, dynamic_axes)
+    if _n:
+        onnx.save(_m, EXPORT_PATH)
+    print(f"[stream] resolved {_n} dim(s) from the spliced weights")
