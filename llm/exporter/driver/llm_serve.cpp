@@ -1153,6 +1153,13 @@ class InferenceServer {
         const int n_chunks = (S + C_max - 1) / C_max;
         int past_len = P;
         double last_run_ms = 0;
+        // Whole-prefill wall clock, host work included. last_run_ms is the
+        // LAST chunk's Run() only, so printing it alone as "the prefill"
+        // understates a multi-chunk prompt by however many chunks there were.
+        // Both are printed because they answer different questions: this one
+        // is what the client waits for before the first token, last_run_ms is
+        // the per-dispatch cost at the end of the context.
+        const auto prefill_t0 = std::chrono::steady_clock::now();
         for (int blk = 0; blk < n_chunks; ++blk) {
             const int A = P + blk * C_max;                     // absolute start
             const int C = std::min(C_max, P + S - A);
@@ -1242,8 +1249,12 @@ class InferenceServer {
         if (!is_stop(static_cast<uint32_t>(next_id)))
             on_token(static_cast<uint32_t>(next_id));
 
-        std::printf("[serve] prefill L=%d (reuse %d, %d chunk(s)) %.0fms -> %d\n",
-                    L, P, n_chunks, last_run_ms, next_id);
+        const double prefill_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prefill_t0).count();
+        std::printf("[serve] prefill L=%d (reuse %d, %d chunk(s)) %.0fms "
+                    "total, last chunk %.0fms -> %d\n",
+                    L, P, n_chunks, prefill_ms, last_run_ms, next_id);
         std::fflush(stdout);
 
         // ---- decode ----

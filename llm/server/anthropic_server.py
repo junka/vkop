@@ -976,15 +976,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, {"input_tokens": n})
 
+    def _log_req(self, msg_id, stream, t0, t_first, input_tokens, out_tokens,
+                 stop_reason, trimmed, error=None):
+        """One line per request: the numbers a client actually feels.
+
+        The backend's own log answers a different question and cannot answer
+        this one: its "prefill ... ms" is the LAST chunk's Run(), so a
+        multi-chunk prompt is under-reported there (see llm_serve.cpp), and it
+        never sees the HTTP round trip or the token counts together. Wall time
+        and time-to-first-token only exist at this layer.
+        """
+        wall = time.time() - t0
+        ttft = (t_first - t0) if t_first is not None else 0.0
+        n_out = out_tokens or 0
+        # The first token is prefill's product, not a decode step, so the
+        # per-token rate is over the tokens after it. With 0 or 1 out there is
+        # no decode span to average and the field is left out.
+        dec = ""
+        if n_out > 1:
+            span = max(1e-6, wall - ttft)
+            dec = f" decode={1000.0 * span / (n_out - 1):.1f}ms/tok"
+        tag = "req" if error is None else "req!"
+        sys.stderr.write(
+            f"[{tag}] {msg_id} {'stream' if stream else 'sync'} "
+            f"in={input_tokens} out={n_out} wall={wall:.3f}s "
+            f"ttft={ttft:.3f}s{dec} stop={stop_reason or 'error'}"
+            f" trim={'yes' if trimmed else 'no'}"
+            + (f" error={error}" if error is not None else "")
+            + "\n")
+        sys.stderr.flush()
+
     def _messages(self, req):
         model = req.get("model") or self.default_model
         max_tokens = int(req.get("max_tokens") or 1024)
         stream = bool(req.get("stream"))
         stop_sequences = req.get("stop_sequences") or []
         msg_id = "msg_" + uuid.uuid4().hex[:24]
+        t0 = time.time()
         try:
             msgs, max_tokens, trimmed = self._prepare(req, max_tokens)
         except Exception as e:
+            self._log_req(msg_id, stream, t0, None, 0, 0, None, False,
+                          error=str(e))
             self._error(400, "invalid_request_error", str(e))
             return
         if trimmed:
@@ -992,7 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if not stream:
             self._messages_sync(req, msgs, model, max_tokens, stop_sequences,
-                                msg_id)
+                                msg_id, t0, trimmed)
             return
 
         self._sse_start()
@@ -1001,8 +1034,11 @@ class Handler(BaseHTTPRequestHandler):
                               self._sse_write,
                               on_over=lambda: self.backend.stop(msg_id))
         out_tokens = 0
+        input_tokens = 0
+        t_first = None
         started = False
         done_reason = "stop"
+        err = None
         try:
             gen = self.backend.generate(msgs, max_tokens, rid=msg_id,
                                         sample=_sampling(req))
@@ -1011,9 +1047,12 @@ class Handler(BaseHTTPRequestHandler):
                     # message_start carries the prompt's token count, so it
                     # waits for the backend's first frame (the count) instead
                     # of announcing a zero.
-                    writer.message_start(frame[1], msg_id)
+                    input_tokens = frame[1]
+                    writer.message_start(input_tokens, msg_id)
                     started = True
                 elif frame[0] == "delta":
+                    if t_first is None:
+                        t_first = time.time()
                     if not started:
                         writer.message_start(0, msg_id)
                         started = True
@@ -1024,8 +1063,10 @@ class Handler(BaseHTTPRequestHandler):
                 writer.message_start(0, msg_id)
             writer.finish(done_reason, out_tokens)
         except BrokenPipeError:
+            err = "client disconnected"
             return
         except Exception as e:
+            err = str(e)
             try:
                 writer.event("error", {"type": "error",
                                        "error": {"type": "api_error",
@@ -1033,13 +1074,15 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         finally:
+            self._log_req(msg_id, stream, t0, t_first, input_tokens,
+                          out_tokens, writer.stop_reason, trimmed, err)
             try:
                 self._sse_close()
             except OSError:
                 pass
 
     def _messages_sync(self, req, msgs, model, max_tokens, stop_sequences,
-                       msg_id):
+                       msg_id, t0, trimmed):
         # The streaming writer with the SSE sink discarded: one parser decides
         # where a tool call ends, so a reply cannot be a usable tool_use over
         # SSE and an unusable raw blob here.
@@ -1049,20 +1092,27 @@ class Handler(BaseHTTPRequestHandler):
         reason = "stop"
         out_tokens = 0
         input_tokens = 0
+        t_first = None
         try:
             for frame in self.backend.generate(msgs, max_tokens, rid=msg_id,
                                                sample=_sampling(req)):
                 if frame[0] == "tokens_in":
                     input_tokens = frame[1]
                 elif frame[0] == "delta":
+                    if t_first is None:
+                        t_first = time.time()
                     writer.feed(frame[1])
                 elif frame[0] == "done":
                     reason, out_tokens = frame[1], frame[2]
         except Exception as e:
+            self._log_req(msg_id, False, t0, t_first, input_tokens, out_tokens,
+                          None, trimmed, error=str(e))
             self._error(500, "api_error", str(e))
             return
 
         writer.finish(reason, out_tokens)
+        self._log_req(msg_id, False, t0, t_first, input_tokens, out_tokens,
+                      writer.stop_reason, trimmed)
         self._json(200, {
             "id": msg_id,
             "type": "message",
@@ -1105,6 +1155,142 @@ def build_backend(args):
     if not args.coop:
         env["VKOP_NO_COOP"] = "1"
     return Backend(argv, env, max_kv=args.max_kv)
+
+
+# Every option a preset may set: long name -> (does it name a file, converter).
+# One table drives the parser defaults, the preset loader and the unknown-key
+# check, so those three cannot drift apart. A key the table does not hold is an
+# error rather than a silent no-op: a typo'd "max_kV" that the server ignores is
+# the failure this whole file exists to make visible.
+_PRESET_OPTIONS = {
+    "host": (False, str),
+    "port": (False, int),
+    "bin": (True, str),
+    "model": (True, str),
+    "embed": (True, str),
+    "tokenizer": (True, str),
+    "model-name": (False, str),
+    "max-kv": (False, int),
+    "kv-kind": (False, str),
+    "prefill-chunk": (False, int),
+    "kv-cache": (True, str),
+    "coop": (False, bool),
+    "repetition-penalty": (False, float),
+    "seed": (False, int),
+    "max-output": (False, int),
+}
+
+# The environment variable each option already honoured, so a preset that takes
+# precedence over one can say which. Absent means the option has no env var
+# (--coop, --model-name) and nothing can be shadowed.
+_PRESET_ENV = {
+    "host": "VKOP_SERVE_HOST", "port": "VKOP_SERVE_PORT",
+    "bin": "VKOP_SERVE_BIN", "model": "VKOP_MODEL", "embed": "VKOP_EMBED",
+    "tokenizer": "VKOP_TOKENIZER", "max-kv": "VKOP_MAX_KV",
+    "kv-kind": "VKOP_KV_KIND", "prefill-chunk": "VKOP_SERVE_CHUNK",
+    "kv-cache": "VKOP_KV_CACHE",
+    "repetition-penalty": "VKOP_REPETITION_PENALTY",
+    "seed": "VKOP_SEED", "max-output": "VKOP_MAX_OUTPUT",
+}
+
+
+def _preset_bool(value, path, name, key):
+    """JSON has real booleans, so anything else here is a typo.
+
+    `bool("false")` is True, which would turn --coop on for a config that asked
+    for it off -- silently, and coopmat is the route with known numeric errors.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in (
+            "true", "false", "yes", "no", "on", "off", "1", "0"):
+        return value.strip().lower() in ("true", "yes", "on", "1")
+    raise SystemExit(f"--config {path}: preset {name!r} key {key!r} wants a "
+                     f"boolean, got {value!r}")
+
+
+def load_preset(path, want=None):
+    """Read one preset out of the config at `path`.
+
+    Schema is ``{"presets": {name: {...}}, "default": name}``. A file with no
+    ``presets`` key is taken as a single unnamed preset: the common case is one
+    file per model setup, and making that file invent a name is friction.
+
+    Relative paths resolve against the config's own directory, not the cwd, so
+    a config that sits beside its artifacts keeps working when it is moved or
+    checked out elsewhere -- which is most of the reason to have the file. (The
+    rest is that the paths stop living in five exported variables.)
+
+    Returns ``(name, {argparse_dest: value})``.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except OSError as e:
+        raise SystemExit(f"--config {path}: {e}")
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--config {path}: not valid JSON: {e}")
+    if not isinstance(doc, dict):
+        raise SystemExit(f"--config {path}: top level must be an object")
+
+    if "presets" in doc:
+        presets = doc["presets"]
+        if not isinstance(presets, dict) or not presets:
+            raise SystemExit(f'--config {path}: "presets" must be a non-empty '
+                             f"object")
+        name = want or doc.get("default")
+        if name is None:
+            if len(presets) == 1:
+                name = next(iter(presets))
+            else:
+                raise SystemExit(
+                    f"--config {path}: {len(presets)} presets and none "
+                    f"selected; pass --preset "
+                    f"{{{','.join(sorted(presets))}}} or set \"default\"")
+        if name not in presets:
+            raise SystemExit(f"--config {path}: no preset {name!r} "
+                             f"(have {', '.join(sorted(presets))})")
+        raw = presets[name]
+        if not isinstance(raw, dict):
+            raise SystemExit(f"--config {path}: preset {name!r} must be an "
+                             f"object")
+    else:
+        if want is not None:
+            raise SystemExit(f"--config {path}: --preset {want!r} given but the "
+                             f'file defines no "presets"')
+        name, raw = "default", doc
+
+    base = os.path.dirname(os.path.abspath(path))
+    out: dict = {}
+    for key, value in raw.items():
+        norm = key.replace("_", "-")
+        if norm not in _PRESET_OPTIONS:
+            raise SystemExit(
+                f"--config {path}: preset {name!r} has unknown key {key!r} "
+                f"(known: {', '.join(sorted(_PRESET_OPTIONS))})")
+        is_path, coerce = _PRESET_OPTIONS[norm]
+        if coerce is bool:
+            value = _preset_bool(value, path, name, key)
+        elif is_path and value == "":
+            # An empty path is how --kv-cache says "disabled"; it must not be
+            # joined into the config's directory.
+            value = ""
+        elif is_path:
+            if not isinstance(value, str):
+                raise SystemExit(
+                    f"--config {path}: preset {name!r} key {key!r} wants a "
+                    f"path string, got {value!r}")
+            value = os.path.normpath(
+                os.path.join(base, os.path.expanduser(value)))
+        else:
+            try:
+                value = coerce(value)
+            except (TypeError, ValueError):
+                raise SystemExit(
+                    f"--config {path}: preset {name!r} key {key!r} wants "
+                    f"{coerce.__name__}, got {value!r}")
+        out[norm.replace("-", "_")] = value
+    return name, out
 
 
 def main():
@@ -1173,11 +1359,57 @@ def main():
                     help="ceiling on generated tokens per reply (the model "
                          "runs at ~5 tok/s on this class of GPU)")
     ap.add_argument("--model-name", default="vkop-qwen3-vl-2b")
+    ap.add_argument("--config", metavar="FILE",
+                    default=os.environ.get("VKOP_SERVE_CONFIG", ""),
+                    help="JSON preset file, so a model setup stops being five "
+                         "exported variables. Schema is {\"presets\": {name: "
+                         "{...}}, \"default\": name}, or a bare object taken as "
+                         "a single preset. Keys are the long option names with "
+                         "- or _ (model, max-kv, prefill-chunk, coop, ...); "
+                         "file paths in the preset resolve against the config's "
+                         "own directory. An unknown key is refused, not ignored")
+    ap.add_argument("--preset", metavar="NAME",
+                    default=os.environ.get("VKOP_SERVE_PRESET", "") or None,
+                    help="which preset in --config to use (default: the file's "
+                         '"default", or the only one it defines)')
+    # Resolve the config BEFORE the real parse and feed it in as argparse
+    # defaults: that is what makes the precedence CLI > preset > env > built-in
+    # fall out for free, without a sentinel on all fifteen options. parse_args
+    # then still lets anything typed on the command line override.
+    pre, _ = ap.parse_known_args()
+    preset_name, preset = None, {}
+    shadowed = []
+    if pre.config:
+        preset_name, preset = load_preset(pre.config, pre.preset)
+        for key in preset:
+            # `key` is the argparse dest (underscores); the tables are keyed by
+            # the option spelling (dashes).
+            env = _PRESET_ENV.get(key.replace("_", "-"))
+            if env and os.environ.get(env):
+                shadowed.append(f"{env}={os.environ[env]}")
+        ap.set_defaults(**preset)
+    elif pre.preset:
+        # Naming a preset with no file to read it from would otherwise be a
+        # silent no-op, which is the shape of mistake this file is meant to stop.
+        raise SystemExit("--preset needs --config (or VKOP_SERVE_CONFIG)")
     args = ap.parse_args()
 
     for path in (args.bin, args.model, args.embed, args.tokenizer):
         if not os.path.exists(path):
             raise SystemExit(f"missing: {path}")
+    if preset_name:
+        src = f"--config {args.config}" + (f" --preset {preset_name}"
+                                           if pre.preset else "")
+        print(f"[serve] preset {preset_name!r} from {src}: "
+              f"{len(preset)} key(s)", file=sys.stderr)
+        for key in sorted(preset):
+            print(f"[serve]   {key.replace('_', '-'):20s} "
+                  f"{preset[key]!r}", file=sys.stderr)
+        if shadowed:
+            # A stale export silently losing to a preset is exactly the kind of
+            # thing that costs an afternoon; say it out loud.
+            print(f"[serve] preset overrode env: {', '.join(shadowed)}",
+                  file=sys.stderr)
 
     backend = build_backend(args)
     print("[serve] waiting for the model to load...", file=sys.stderr)

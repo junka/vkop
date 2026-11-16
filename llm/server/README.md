@@ -38,6 +38,31 @@ python3 -m onnx2vkop.cli -i llm/exporter/llm.onnx -o llm/exporter/llm.vkopbin \
   --extra-shaders TopK --target-backend buffer --master-archive build/vkop_shaders.bin
 ```
 
+### 用配置文件代替一串导出变量
+
+一套模型配置原本是五六个 `VKOP_*` 环境变量加命令行开关。`--config` 把它收进一个
+JSON，`--preset` 在同一份文件里选一套：
+
+```json
+{"presets": {
+   "b3": {"model": "data/llm.vkopbin", "embed": "data/embed_tokens.bin",
+          "tokenizer": "data/qwen3_vl.bin", "bin": "src/build/llm_serve",
+          "max-kv": 16384, "prefill-chunk": 256, "max-output": 512,
+          "kv-cache": "kv_prefix.bin", "port": 8787}},
+ "default": "b3"}
+```
+
+```bash
+python3 llm/server/anthropic_server.py --config ~/vkop_serve/serve.json
+```
+
+- 键名就是长选项名（`max-kv`，下划线也接受）。相对路径**按配置文件所在目录解析**，
+  不是 cwd —— 配置跟着制品走，搬目录不会失效。
+- 文件里没有 `presets` 键时，整份文件当作单一预设（一个文件一套模型时不用编名字）。
+- 拼错的键直接报错并列出已知键，不会静默忽略；`--coop` 这类布尔值必须是 JSON 真
+  `true`/`false`（`bool("false")` 是 True，会悄悄打开 coopmat 那条有已知数值错误的
+  路由，所以字符串只认明确的白名单）。
+
 ## 客户端怎么指过来
 
 `~/.claude/settings.json` 里的 `env` 会覆盖 shell 里的同名变量，所以直接导出
@@ -178,6 +203,77 @@ python3 llm/server/anthropic_server.py --model llm/exporter/llm_fp8_kv.vkopbin \
 两次文件逐字节对比，只有每层 block 0（K 的 head 0）完全相同，head 1..7 和所有 V block
 约 98% 的字节对不上。这半格差别从哪来还没定位，是这条路线上目前唯一的未解项；在此之前
 不要把「文件逐位无损」当成前提，需要严格可复现就用 `--kv-kind fp16`。
+
+## 指标：token 数、延迟、GPU 时间
+
+四层统计，各自回答不同的问题。**不要拿错层**：
+
+| 你要问的 | 看哪里 | 精度 |
+|---|---|---|
+| 这个请求多少 token、多慢、首字多久 | `[req]` 行（stderr） | 最准；token 数是后端 tokenizer 的真实计数 |
+| prompt 单独多少 token | `POST /v1/messages/count_tokens` | 真实计数（不是估算） |
+| 客户端视角 | 响应里的 `usage` | `output_tokens` 含未消费的 stop token |
+| prefill / decode 分相耗时 | `[serve] prefill ...` / `VKOP_SERVE_VERBOSE=1` 的 `r<N>` 行 | 见下面两个坑 |
+| GPU 按算子 | `VKOP_SUBMIT_PROF=1` | 每轮打印一次 op-type 表 + 最慢 op |
+
+`[req]` 是每个请求结束（或失败）时写的一行，直接回答「这个请求花了多少」：
+
+```
+[req] msg_1584a3db... sync   in=15 out=8  wall=0.933s ttft=0.353s decode=82.9ms/tok stop=end_turn trim=no
+[req] msg_cd1e0ecb... stream in=12 out=12 wall=1.185s ttft=0.263s decode=83.8ms/tok stop=end_turn trim=no
+[req!] msg_3c238e34... sync  in=4009 out=0 wall=0.020s ttft=0.000s stop=error trim=no error=context_overflow: ...
+```
+
+（前两行是 560X 本机、`--max-kv 1024 --prefill-chunk 128` 实测；末行是被窗口拒掉的
+请求，`in=` 仍报出了真实计数。）
+
+- `wall` 是 HTTP 层从收到请求到回复写完；`ttft` 到第一个 `delta` 为止（prefill + 首个
+  采样）；`decode` 是 `(n_out-1)` 个 decode step 的平均值（第一个 token 算 prefill 的
+  产物，所以从分母里扣掉），`out<=1` 时不打印。
+- 失败请求打 `[req!]` 并带 `error=`，同样占一行，不会被静默吞掉。
+
+### 两个坑
+
+**`[serve] prefill ...` 两个毫秒数，别拿错。** 这行现在是：
+
+```
+[serve] prefill L=10518 (reuse 0, 42 chunk(s)) 87936ms total, last chunk 600ms -> 15011
+```
+
+`total` 是从进 prefill 到第一个 token 采完的整段墙钟（含所有 chunk 的 host 侧
+embed/bias 填充与上传），`last chunk` 是最后一个 chunk 的 `Run()`。两者差得很开：
+上面这条实测 146 倍（560X 本机，42 个 chunk）。此前这行只打 `last chunk`，读日志的
+人会以为 11k prompt 的 prefill 只要 0.6 秒。
+
+跨 chunk 的成本随上下文增长：`last chunk` 变大是 attention 变长，`total` 大是 chunk
+数量多。想快就加大 `--prefill-chunk`（受另外两道墙限制，见参数表），或者用
+`--kv-cache` 把稳定前缀留下来。
+
+**`[ksel]` 只在 `VKOP_KERNEL_DEBUG=1` 时输出。** 它是 kernel 选路的逐规则 trace，
+每个 MatMul 每次派发都会走一遍；142 个 MatMul × ~20 条规则 = 单个 decode step
+两千多行。曾经无条件打印，`/tmp/serve.log` 涨到 200 万行（64 个请求），真正的
+`[serve]`/`[http]` 行全被埋掉。要看选路就显式开：
+
+```bash
+VKOP_KERNEL_DEBUG=1 python3 llm/server/anthropic_server.py ... 2>&1 | grep '\[ksel\]'
+```
+
+### GPU 侧
+
+`VKOP_SUBMIT_PROF=1` 给每轮一张按 op-type 汇总的 GPU 时间表（`--prefill-chunk` 的每个
+chunk 是一轮，decode 每步一轮），`VKOP_SUBMITPROF_TOPN=N` 控制最慢算子列表长度
+（默认 15；`0` = 全部，截断会少报总量）：
+
+```
+[submitprof] op-type       calls   gpu_ms   avg_ms
+[submitprof] MatMul            142    290.19    2.044     ← prefill chunk
+[submitprof] Attention          28      1.26    0.045
+[submitprof] TOTAL             593    298.08
+```
+
+同一进程里 decode 一步的 MatMul 合计约 11.9ms、TOTAL 约 12.6ms。它和 `[req]` 的
+`decode=21ms/tok` 之差就是 host 侧开销（record + logits 回读做 argmax），不是 GPU 空转。
+`VKOP_OPPROF=1` 是 host 侧的对应物，另外还打 `[rbprof]` 的同步回读计数。
 
 ## 协议细节
 
