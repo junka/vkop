@@ -35,6 +35,7 @@ I/O 契约（llm.onnx）：
 
 import os
 
+import onnx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,13 +55,45 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (  # noqa: E402
     repeat_kv,
 )
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
-    attn_implementation="eager",
-    torch_dtype=torch.float16,
-    local_files_only=os.path.isdir(os.path.expanduser(MODEL_PATH)),
-    trust_remote_code=True,
-)
+# Two ways to get the module tree the exporter traces:
+#
+#   STREAM_EXPORT=1  build it on the META device -- parameters carry shapes and
+#                    dtypes but no storage. The graph is traced from that, and
+#                    the weights are spliced in afterwards straight from the
+#                    safetensors shards (see onnx2vkop.stream_export). Peak is
+#                    the graph, not the checkpoint: a 27B export fits in well
+#                    under a gigabyte instead of ~50 GB.
+#
+#   default          load the real weights. `low_cpu_mem_usage` avoids holding
+#                    two copies during load, which is what pushed 5 GB into
+#                    swap on the 27B model, but the weights are still resident
+#                    for the trace.
+STREAM_EXPORT = os.environ.get("STREAM_EXPORT", "") not in ("", "0")
+
+if STREAM_EXPORT:
+    from transformers import AutoConfig
+    _cfg = AutoConfig.from_pretrained(
+        MODEL_PATH, local_files_only=os.path.isdir(
+            os.path.expanduser(MODEL_PATH)), trust_remote_code=True)
+    with torch.device("meta"):
+        # torch_dtype is REQUIRED, not cosmetic. from_config defaults to fp32,
+        # while the eager path loads the checkpoint at fp16. A fp32 meta model
+        # traces fp32 arithmetic, so the fp16 graph inputs get Cast(1) before
+        # every use: measured 75 Casts against the eager export's 43, and the
+        # added Cast on attention_bias changed its dtype at the Attention
+        # boundary, which the runtime then rejected.
+        model = AutoModelForCausalLM.from_config(
+            _cfg, trust_remote_code=True, torch_dtype=torch.float16)
+    print("[load] model built on the META device (no weight storage)")
+else:
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
+        local_files_only=os.path.isdir(os.path.expanduser(MODEL_PATH)),
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
 model.eval()
 
 # ---------------------------------------------------------------------------
@@ -453,19 +486,28 @@ class Qwen3_5LMOnnx(nn.Module):
 # ---------------------------------------------------------------------------
 B, S = 1, SEQ_LEN
 
-inputs_embeds = torch.randn(B, S, HIDDEN, dtype=torch.float16)
-pos = torch.arange(S, dtype=torch.long).view(1, 1, -1).expand(3, B, -1)
+# Every dummy goes on the model's own device. Under STREAM_EXPORT that is
+# "meta", and a single CPU tensor is enough to break the trace: torch's meta
+# kernels assert all operands share a device, and the first op to touch the
+# stray tensor raises "Tensor on device cpu is not on the expected device meta".
+_dev = torch.device("meta") if STREAM_EXPORT else torch.device("cpu")
+
+inputs_embeds = torch.randn(B, S, HIDDEN, dtype=torch.float16, device=_dev)
+pos = torch.arange(S, dtype=torch.long, device=_dev).view(1, 1, -1).expand(3, B, -1)
 causal = torch.triu(
-    torch.full((S, S), torch.finfo(torch.float16).min, dtype=torch.float16),
+    torch.full((S, S), torch.finfo(torch.float16).min, dtype=torch.float16,
+               device=_dev),
     diagonal=1)
 attention_bias = causal.unsqueeze(0).unsqueeze(0)
 
 past_kvs = tuple(torch.zeros(B, 2, NUM_KV_HEADS, 0, HEAD_DIM,
-                             dtype=torch.float16) for _ in FULL_LAYERS)
-conv_states = tuple(torch.zeros(B, CONV_DIM, CONV_K - 1, dtype=torch.float32)
-                    for _ in LIN_LAYERS)
+                             dtype=torch.float16, device=_dev)
+                 for _ in FULL_LAYERS)
+conv_states = tuple(torch.zeros(B, CONV_DIM, CONV_K - 1, dtype=torch.float32,
+                                device=_dev) for _ in LIN_LAYERS)
 rec_states = tuple(torch.zeros(B, LIN_HEADS_V, LIN_DK, LIN_DV,
-                               dtype=torch.float32) for _ in LIN_LAYERS)
+                               dtype=torch.float32, device=_dev)
+                   for _ in LIN_LAYERS)
 
 inputs = (inputs_embeds, pos, attention_bias,
           *past_kvs, *conv_states, *rec_states)
@@ -524,19 +566,100 @@ self_check()
 
 print(f"[export] {NLAYERS} layers, {len(input_names)} inputs / "
       f"{len(output_names)} outputs, opset={OPSET}, dummy S={S} ...")
-with torch.no_grad():
-    torch.onnx.export(
-        wrapper, inputs, EXPORT_PATH,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=OPSET,
-        do_constant_folding=True,
-        # legacy TorchScript exporter：dynamo 对 RoPE 的 cos/sin 数据依赖会
-        # trigger GuardOnDataDependentSymNode（qwen3vl 的脚本同样如此）。
-        dynamo=False,
-    )
-print(f"[✓] exported -> {EXPORT_PATH}")
+
+if STREAM_EXPORT:
+    # Graph only, then splice the weights in from the shards. See
+    # onnx2vkop/stream_export.py for why export_params=False is the only path
+    # that never reads a payload.
+    from onnx2vkop import stream_export as SX
+
+    with torch.no_grad():
+        graph, params, _ = SX.exporter_utils._model_to_graph(
+            wrapper, inputs, verbose=False,
+            input_names=input_names, output_names=output_names,
+            operator_export_type=SX.OperatorExportTypes.ONNX,
+            # Off on purpose. With folding on, the exporter inlines an
+            # nn.Linear's weight into a MatMul constant -- and under meta it
+            # cannot read that weight, so it surfaces as an ANONYMOUS graph
+            # input (`onnx::MatMul_915`) instead of the named parameter, which
+            # the splice cannot resolve. Folding also has nothing to gain here:
+            # the weights are meta, so no fold is computable.
+            do_constant_folding=False)
+        raw, _em, _ext, _nm = graph._export_onnx(
+            {}, OPSET, dynamic_axes, False, SX.OperatorExportTypes.ONNX, True,
+            False, {}, True, "", {})
+
+    proto = onnx.ModelProto()
+    proto.ParseFromString(raw)
+    print(f"[stream] graph: {len(proto.graph.node)} node(s), "
+          f"{len(proto.graph.initializer)} initializer(s)", flush=True)
+
+    index = SX.SafetensorsIndex(MODEL_PATH)
+    shapes = {k: list(v.shape) for k, v in params.items()}
+    # Keep the real graph inputs (activations, KV/conv/recurrent state) and
+    # splice everything the checkpoint can supply.
+    # The graph is fp16 (that is what the meta model and the dummy inputs are),
+    # so an fp32 checkpoint's payloads must be re-encoded on the way out. The
+    # eager path gets this for free from from_pretrained(torch_dtype=fp16);
+    # skipping it here leaves fp32 weights under fp16 activations and the model
+    # produces all-NaN logits.
+    resolved = SX.splice_initializers(
+        proto, shapes, index,
+        weights_file=os.path.basename(EXPORT_PATH).replace(".onnx", ".weights.bin"),
+        target_dtype="F16")
+    print(f"[stream] {len(resolved)} weight(s) spliced", flush=True)
+
+    # `mrope.M` is a computed BUFFER, not a checkpoint tensor: the exporter's
+    # static interleaved-MRoPE builds it from inv_freq. Under meta it has no
+    # payload, so it surfaced as a graph input. Its value is a few dozen floats
+    # the exporter can compute exactly, so materialize it here rather than
+    # leaving a dangling input.
+    mrope_M = wrapper.mrope.M
+    if mrope_M.device.type == "meta":
+        rotary = (getattr(model.model, "language_model", model.model)
+                  .rotary_emb)
+        inv = rotary.inv_freq.float().cpu()
+        half = inv.shape[0]
+        s1, s2 = list(rotary.mrope_section)[1:3]
+        sel = torch.zeros(half, dtype=torch.long)
+        for j in range(half):
+            if j % 3 == 1 and j < 3 * s1:
+                sel[j] = 1
+            elif j % 3 == 2 and j < 3 * s2:
+                sel[j] = 2
+        M = torch.zeros(3, half, dtype=torch.float32)
+        M[sel, torch.arange(half)] = inv
+        mrope_M = M
+    import numpy as np
+    from onnx import numpy_helper
+    if any(v.name == "mrope.M" for v in proto.graph.input):
+        keep = [v for v in proto.graph.input if v.name != "mrope.M"]
+        del proto.graph.input[:]
+        proto.graph.input.extend(keep)
+        init = proto.graph.initializer.add()
+        np_helper = numpy_helper.from_array(mrope_M.numpy(), "mrope.M")
+        init.CopyFrom(np_helper)
+
+    wfile = EXPORT_PATH.replace(".onnx", ".weights.bin")
+    nbytes, offsets = SX.copy_weights(resolved, wfile, target_dtype="F16")
+    SX.patch_offsets(proto, offsets)
+    onnx.save(proto, EXPORT_PATH)
+    print(f"[✓] exported (streamed) -> {EXPORT_PATH} "
+          f"({len(resolved)} weights, {nbytes/2**30:.1f} GiB external)")
+else:
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper, inputs, EXPORT_PATH,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=OPSET,
+            do_constant_folding=True,
+            # legacy TorchScript exporter：dynamo 对 RoPE 的 cos/sin 数据依赖会
+            # trigger GuardOnDataDependentSymNode（qwen3vl 的脚本同样如此）。
+            dynamo=False,
+        )
+    print(f"[✓] exported -> {EXPORT_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +670,6 @@ print(f"[✓] exported -> {EXPORT_PATH}")
 # 的 dtype 传播、形状推断、fp16 域判定全部落空（实测：Conv1d 的输入被判成
 # fp16，运行时报 "fp32-only"）。这里按算子的语义把形状显式写出来。
 # ---------------------------------------------------------------------------
-import onnx  # noqa: E402
 from onnx import helper, TensorProto  # noqa: E402
 
 
@@ -556,7 +678,12 @@ def _vi(name, dtype, dims):
 
 
 def annotate_custom_ops(path):
-    m = onnx.load(path)
+    # load_external_data=False is REQUIRED, not an optimization. The default
+    # reads every external weight back into RAM -- a second full copy of a
+    # 52 GB model while the checkpoint is still resident, which the OOM killer
+    # ends. This pass only adds value_info entries and never looks at a weight,
+    # so the external_data references can stay opaque.
+    m = onnx.load(path, load_external_data=False)
     g = m.graph
     have = {v.name for v in list(g.value_info) + list(g.input) + list(g.output)}
     added = 0

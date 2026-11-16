@@ -103,6 +103,11 @@ int main(int argc, char **argv) {
                 }
                 if (kv <= 0) kv = q;
                 const int want_bias = q * kv;
+                if (std::getenv("VKOP_PROBE_DEBUG")) {
+                    std::printf("[probe-dbg] inputs_embeds seq=%d kv_past=%d "
+                                "want_bias=%d loaded_bias_elems=%d\n",
+                                q, kv - q, want_bias, ft->num_elements());
+                }
                 if (ft->num_elements() != want_bias) {
                     ft->resize(std::vector<int>{1, 1, q, kv});
                     shape = ft->getShape();
