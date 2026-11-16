@@ -234,6 +234,45 @@ def test_every_literal_resolve_spv_key_is_declared():
     )
 
 
+def test_every_coop_module_key_is_declared():
+    """CoopModule tables in ops/Matmul.hpp name their shader as a struct
+    field, not a resolve_spv("literal"), so
+    test_every_literal_resolve_spv_key_is_declared cannot see them.
+
+    Those tables are the tile menus kFp16Modules / kI8Modules: the loader
+    probes each listed tile and asks the archive for that key. A key missing
+    from shader_map._SECONDARY is never embedded into a converted model, so at
+    load time every MatMul logs "needs the shader variant ..." and silently
+    falls through to the next listed tile. The model still answers correctly,
+    which is what makes it easy to miss: the cost is a failed lookup per op and
+    the loss of the tile the device actually listed.
+
+    buffer_matmul_coop_i8_16x8x32 was exactly this case — CMake built it,
+    kI8Modules probed it, and only the _bda spelling was declared.
+    """
+    txt = open(os.path.join(REPO_ROOT, "ops", "Matmul.hpp")).read()
+    probed = set()
+    for table in re.finditer(
+            r"static constexpr CoopModule (k\w+)\[\] = \{(.*?)\n    \};",
+            txt, re.DOTALL):
+        probed.update(re.findall(r'"([^"]+)"', table.group(2)))
+    assert probed, "could not locate the CoopModule tables in Matmul.hpp"
+    declared = {k for keys in shader_map._SECONDARY.values() for k in keys}
+    missing = sorted(probed - declared)
+    assert not missing, (
+        f"ops/Matmul.hpp probes coopmat tiles {missing} that "
+        "shader_map._SECONDARY does not list, so onnx2vkop never embeds them "
+        "and the loader falls through to the next listed tile on every MatMul"
+    )
+    # The BDA twins are built by the same probe loop (make_coop_bda_pipe
+    # appends "_bda"), so a declared tile without its twin loses the BDA path.
+    missing_bda = sorted(f"{k}_bda" for k in probed if f"{k}_bda" not in declared)
+    assert not missing_bda, (
+        f"coopmat tiles {missing_bda} are probed but their BDA build is not "
+        "declared in shader_map._SECONDARY"
+    )
+
+
 # ------------------------------------------------------------- kernel plan
 # Model.kernel_plans is written into every .vkopbin and read by
 # Runtime::kernel_key_for_node in place of the C++ table, and the per-model

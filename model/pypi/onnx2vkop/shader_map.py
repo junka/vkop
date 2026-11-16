@@ -156,6 +156,15 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # 16x16x32 SINT8 tile (Ada). 4x the per-MMA output area of the 8x8x32
         # default build, and the only int8 shape Ada lists.
         "buffer_matmul_coop_i8_16x16x32",
+        # 16x8x32 SINT8: the half-width tile of the same source (-DCN=8).
+        # ops/Matmul.hpp's kI8Modules probes it and CMake builds it, but it was
+        # only ever listed here in its _bda spelling — a non-BDA device (Ada,
+        # ARL) never asks for that one, so the probe logged "needs the shader
+        # variant" for every MatMul and fell through to the next listed tile.
+        # Output stayed correct (16x16x32 or 8x8x32 caught it), which is why
+        # this survived; the cost was a failed lookup per op and losing the
+        # tile the device does list.
+        "buffer_matmul_coop_i8_16x8x32",
         "buffer_matmul_pack",
         # The int8/fp8 weight-only WIDE GEMV: a second fp16 build of
         # buffer/matmul.comp (-DW8_WIDE), not its own .comp, so nothing derives
