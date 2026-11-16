@@ -222,6 +222,14 @@ struct MatmulAvailability {
     bool coopmat = false;
     int coop_bm = 0;  // built fp16 coop tile's workgroup M (0 = none)
     int coop_bn = 0;
+    // At least one reachable fp16 coop module packs half2 straight into the
+    // output instead of writing flat fp32 to scratch for a following pack
+    // pass (matmul_coop.comp's DEFAULT build vs coop16.comp's). That epilogue
+    // forms each word from (col, col+1) of one row, so it is only correct for
+    // EVEN N: with odd N every other word straddles two rows. The
+    // scratch+pack family has no such constraint (the pack pass sees a flat
+    // element stream). Set by the op from what it actually probed.
+    bool coop_self_pack = false;
     bool coopmat_i8 = false;
     bool ksplit512 = false;
     bool w8_wide = false;

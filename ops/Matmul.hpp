@@ -1178,6 +1178,12 @@ class MatMulBuffer : public BufferFactory {
         sel_av.coopmat = coop_pipeline_ != nullptr;
         sel_av.coop_bm = coop_bm_;
         sel_av.coop_bn = coop_bn_;
+        // Primary module's epilogue family. The smart selector may still pick
+        // an ALT geometry (all of which share this one's source), so the
+        // primary's flag is the right one to publish: mixing families across
+        // the primary/alt split would make odd N mean different things to
+        // selection and dispatch.
+        sel_av.coop_self_pack = coop_no_pack_pass_;
         sel_av.coopmat_i8 = coop_i8_pipeline_ != nullptr;
         sel_av.ksplit512 = true;
         sel_av.w8_wide = true;

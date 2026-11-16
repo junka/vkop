@@ -242,7 +242,7 @@ bool attn_softmax_applies(const Ctx &c) {
 bool coopmat_i8_applies(const Ctx &c) {
     const MatmulFeatures &f = *c.f;
     return c.kn->coop_i8_enabled && f.fp16 && f.weight == WeightKind::kInt8 &&
-           !f.transB && (c.s->n % 8 == 0) && c.av->coopmat_i8;
+           !f.transB && !f.down_act && (c.s->n % 8 == 0) && c.av->coopmat_i8;
 }
 
 bool coopmat_gate(const Ctx &c) {
@@ -268,10 +268,30 @@ bool coopmat_gate(const Ctx &c) {
            up_div(s.n, c.av->coop_bn) * up_div(s.m, c.av->coop_bm) * s.batch >= 96;
 }
 
+// The self-packing coop module (matmul_coop.comp's DEFAULT build, all the
+// 8x8x16 geometry variants) forms each output half2 word from (col, col+1) of
+// ONE row, at word (row*N + col) >> 1. With even N the pair is always
+// flat-adjacent and lands in the right halves. With odd N, row*N alternates
+// parity, so every other row's pair sits one half-word off and clobbers the
+// neighbouring row's element -- silently wrong output, no error. The
+// scratch+pack family (coop16.comp) buffers flat fp32 and lets the pack pass
+// re-pair words, so it is odd-N safe by construction.
+bool coop_n_ok(const Ctx &c) {
+    return (c.s->n & 1) == 0 || !c.av->coop_self_pack;
+}
+
 bool coopmat_applies(const Ctx &c) {
     const MatmulFeatures &f = *c.f;
+    // !down_act: a folded node's MatMul carries Wg/Wu as inputs 2/3 and its
+    // result is silu(x.Wg)*(x.Wu).Wd. No cooperative-matrix module has those
+    // bindings or that epilogue, so routing one here computes a plain down
+    // GEMM over the folded node's inputs -- silently wrong, not merely slow.
+    // The rule table states the same thing by ordering kDownActFold above the
+    // coop rows; this predicate states it in the one place every coop route
+    // (including the smart selector, which runs BEFORE the table) consults.
     return f.fp16 && f.weight == WeightKind::kFp16 && !c.kn->coop_disabled &&
-           c.av->coopmat && !f.epi_bias && coopmat_gate(c);
+           c.av->coopmat && !f.epi_bias && !f.down_act && coop_n_ok(c) &&
+           coopmat_gate(c);
 }
 
 // coopmat + split-K hybrid: only when explicitly opted in via VKOP_COOP_SPLITK
@@ -288,8 +308,13 @@ bool coopmat_splitk_applies(const Ctx &c) {
     if (c.kn->coop_split == 1) return false;
     if (!f.fp16 || f.weight != WeightKind::kFp16) return false;
     if (c.kn->coop_disabled || !c.av->coopmat) return false;
-    if (f.epi_bias) return false;
+    if (f.epi_bias || f.down_act) return false;
     if (s.k < 32) return false;
+    // NOTE: no N-parity guard here. This route's DEPOSIT pass writes flat fp32
+    // to scratch and the FOLD pass reduces it and re-pairs words, so odd N is
+    // safe -- unlike the self-packing DEFAULT build (see coop_n_ok). It also
+    // has no dispatch branch in ops/Matmul.hpp, so the smart selector never
+    // emits it; the guard would be untested either way.
     if (!coopmat_gate(c)) return false;
 
     // Forced depth: must be valid for K.
@@ -402,7 +427,7 @@ bool sk_last_applies(const Ctx &c) {
     if (c.kn->coop_split == 1) return false;
     if (!f.fp16 || f.weight != WeightKind::kFp16) return false;
     if (c.kn->coop_disabled || !c.av->coopmat) return false;
-    if (f.epi_bias) return false;
+    if (f.epi_bias || f.down_act) return false;
     if (!coopmat_gate(c)) return false;
     // N even — scatter_tile_half2 requires it for the HALF2_EPI variant;
     // the fp32 fallback also writes flat fp32 to binding 3 regardless.

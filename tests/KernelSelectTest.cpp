@@ -126,8 +126,14 @@ MatmulShape sh(int batch, int m, int k, int n) {
 }
 
 void test_profiles() {
-    const DeviceProfile &native =
-        device_profile_for(traits_native_discrete());
+    // The traits are bound to named locals: device_profile_for returns a
+    // reference into the static table, and GCC's -Wdangling-reference cannot
+    // tell that from "returning a reference derived from the temporary
+    // argument", so passing a temporary here is a -Werror build break.
+    const DeviceTraits native_traits = traits_native_discrete();
+    const DeviceTraits amd_traits = traits_mvk_amd();
+    const DeviceTraits intel_traits = traits_mvk_intel();
+    const DeviceProfile &native = device_profile_for(native_traits);
     CHECK(native.device_class == DeviceClass::kNativeDiscrete);
     CHECK(native.byte_min_m == 9);
     CHECK(native.fp16_min_m == 9);
@@ -138,7 +144,7 @@ void test_profiles() {
     CHECK(native.wide_threshold_fp16 == 2048);
     CHECK(native.wide_threshold_byte == 896);
 
-    const DeviceProfile &amd = device_profile_for(traits_mvk_amd());
+    const DeviceProfile &amd = device_profile_for(amd_traits);
     CHECK(amd.device_class == DeviceClass::kMoltenVkAmd);
     CHECK(amd.byte_min_m == 9);
     CHECK(amd.fp16_min_m == 4);
@@ -146,7 +152,7 @@ void test_profiles() {
     CHECK(amd.fp16_wide_min_m == 6);
     CHECK(amd.ks_target_blocks == 32);
 
-    const DeviceProfile &intel = device_profile_for(traits_mvk_intel());
+    const DeviceProfile &intel = device_profile_for(intel_traits);
     CHECK(intel.device_class == DeviceClass::kMoltenVkIntel);
     CHECK(intel.byte_min_m == 9);
     CHECK(intel.fp16_min_m == 9);
@@ -327,6 +333,53 @@ void test_coopmat_gate() {
     CHECK_ROUTE(p, kTiledKs);
 }
 
+// Two ways a shape WOULD pass the coop shape gate but must not take the route,
+// because the module cannot express the node: an odd N on a self-packing
+// kernel, and a SwiGLU down fold (which has its own layout and epilogue). Both
+// used to be enforced only by rule-table ORDER, which the smart selector
+// bypasses by running first.
+void test_coopmat_shape_holes() {
+    const DeviceTraits ada = traits_ada();
+    MatmulAvailability av = coop_modules();
+    av.coop_self_pack = true;
+
+    // Even N, self-packing: coop takes it (the control).
+    CHECK_ROUTE(select_matmul(ada, sh(1, 16, 2048, 6144), fp16_w(), av),
+                kCoopmat);
+
+    // Odd N: the self-packing epilogue pairs (col, col+1) within a row, so a
+    // row-major flat word index lands one half-word off on every other row.
+    // Fall through to the odd-N reduce->pack pair, whose scratch pass re-pairs
+    // the words.
+    CHECK_ROUTE(select_matmul(ada, sh(1, 16, 2048, 6143), fp16_w(), av),
+                kReducePack);
+
+    // A module that buffers fp32 in scratch and lets the pack pass form the
+    // words has no such hole, so odd N stays eligible.
+    av.coop_self_pack = false;
+    CHECK_ROUTE(select_matmul(ada, sh(1, 16, 2048, 6143), fp16_w(), av),
+                kCoopmat);
+    av.coop_self_pack = true;
+
+    // SwiGLU down fold at a coop-eligible shape (m=15: the real prefill row
+    // count). The folded node's inputs are [x, Wd, Wg, Wu] and its result is
+    // silu(x.Wg)*(x.Wu).Wd -- no coop module has those bindings, so coop must
+    // lose to the fold row even though M is past the tile minimum.
+    MatmulFeatures f = fp16_w();
+    f.down_act = true;
+    MatmulShape s = sh(1, 15, 2048, 2048);
+    s.n_up = 6144;
+    MatmulAvailability dav = av;
+    dav.down_act = true;
+    CHECK_ROUTE(select_matmul(ada, s, f, dav), kDownActFold);
+
+    // Same node with the fold module missing: the plain routes take it, and
+    // coop is still not one of them (it would compute a bare down GEMM).
+    dav.down_act = false;
+    MatmulPlan p = select_matmul(ada, s, f, dav);
+    CHECK(p.route != MatmulRoute::kCoopmat);
+}
+
 void test_other_routes() {
     const DeviceTraits dev = traits_native_discrete();
     const MatmulAvailability av = fp16_only();
@@ -472,6 +525,7 @@ int main() {
     test_tiled_band_native();
     test_byte_weight_native();
     test_coopmat_gate();
+    test_coopmat_shape_holes();
     test_other_routes();
     test_fallthrough_bits();
     test_mvk_routes();
