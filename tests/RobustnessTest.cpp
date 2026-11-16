@@ -186,9 +186,10 @@ TEST(RobustnessTest, ReluWithInf) {
 // ---- Illegal Axis ----------------------------------------------------------
 
 TEST(RobustnessTest, TransposeIllegalAxis) {
-    // For a rank-2 tensor [2, 3], perm [2, 0] is out of bounds.
-    // Current implementation might segfault or produce garbage. We expect it
-    // to either throw or at least not crash the process.
+    // For a rank-2 tensor [2, 3], perm [2, 0] names axis 2, which does not
+    // exist. This used to reach inshape[2] on a 2-element shape vector, i.e.
+    // UB — garbage output or a crash depending on the run, which is exactly
+    // why this test flaked. Both executors now validate the permutation first.
     auto in = rt_make<float>({2, 3}, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f});
     rt_upload(in);
     auto out = std::make_shared<Tensor<float>>(std::vector<int>{2, 3});
@@ -199,13 +200,26 @@ TEST(RobustnessTest, TransposeIllegalAxis) {
     ASSERT_NE(op, nullptr);
     op->setAttribute({{"perm", "[2, 0]"}});
 
-    // In a robust implementation this should throw. Currently it may just
-    // access OOB memory. We wrap in EXPECT_NO_THROW to document current
-    // behavior, but ideally this should be changed to EXPECT_THROW.
-    EXPECT_NO_THROW({
-        op->onExecute({in}, {out}, 0);
-        rt_run(op.get());
-    });
+    expect_throw_contains([&] { op->onExecute({in}, {out}, 0); },
+                          "axis range");
+}
+
+TEST(RobustnessTest, TransposeDuplicateAxisThrows) {
+    // A permutation may not name the same axis twice: reverse_perms[perm[i]]
+    // would then leave one slot unset and the shader would gather along
+    // whatever that slot held.
+    auto in = rt_make<float>({2, 3}, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f});
+    rt_upload(in);
+    auto out = std::make_shared<Tensor<float>>(std::vector<int>{2, 3});
+    out->as_storage_buffer(rt_dev());
+    out->toGPU();
+
+    auto op = rt_make_op(vkop::ops::OpType::TRANSPOSE);
+    ASSERT_NE(op, nullptr);
+    op->setAttribute({{"perm", "[0, 0]"}});
+
+    expect_throw_contains([&] { op->onExecute({in}, {out}, 0); },
+                          "more than once");
 }
 
 // ---- Scatter: shape contract + out-of-range writes -------------------------

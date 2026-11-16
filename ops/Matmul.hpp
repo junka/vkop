@@ -269,23 +269,21 @@ class MatMulImage : public Operator {
     MatMulImage(MatMulImage &&) = delete;
     MatMulImage &operator=(MatMulImage &&) = delete;
 
-    // use_tensorcore still selects the host-side schedule (method_ below), but
-    // the image backend's SPIR-V arm no longer varies with it: with no shader
-    // symbols linked in, the image MatMul resolves the single "matmul" key
-    // from the archive like every other op. The nv/coop image shaders are only
-    // reachable if the archive names them, which the buffer backend does.
-    explicit MatMulImage(int use_tensorcore = 0)
+    // use_tensorcore is accepted for the factory's uniform signature and then
+    // IGNORED. It used to pick a host-side schedule (method_), but the image
+    // backend has resolved exactly one shader since the archive rework: with no
+    // shader symbols linked in, the image MatMul looks up the folder-derived
+    // "image_matmul" key like every other op, and the nv/coop image modules are
+    // unreachable unless an archive names them (the buffer backend does).
+    // Keeping the schedule while the kernel stopped varying with it was a real
+    // bug: the coop branch dispatched UP_DIV(n,32) into a 16-wide shader and
+    // silently left every column past the first 16 unwritten.
+    explicit MatMulImage(int /*use_tensorcore*/ = 0)
         : Operator(OpType::MATMUL,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(matmul::GpuMatMulParam)) {
-        method_ =
-            use_tensorcore == 2
-                ? matmul::Method::NV_TENSORCORE
-                : (use_tensorcore == 1 ? matmul::Method::VK_COOPERATE_MATRIX
-                                       : matmul::Method::BASIC_ARITHMETIC);
-    };
+                   sizeof(matmul::GpuMatMulParam)) {}
 
   private:
     void execute(
@@ -342,17 +340,18 @@ class MatMulImage : public Operator {
         para_.N = n;
         para_.K = k;
         para_.C = chan;
-        if (method_ == matmul::Method::VK_COOPERATE_MATRIX) {
-            submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
-        } else if (method_ == matmul::Method::NV_TENSORCORE) {
-            submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
-        } else {
-            submit(&para_, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
-        }
+        // Always the 16-wide grid: the image backend resolves exactly one
+        // shader ("image_matmul", from shaders/image/matmul.comp), whose
+        // local_size_x is 16. This used to branch on a tensorcore/coop schedule
+        // and dispatch UP_DIV(n,32) for those, covering only half the columns
+        // the workgroups could write — with N=32 the first 16 columns were
+        // correct and the rest kept whatever the output buffer held. Shapes
+        // with N<=16 were covered by accident, which is why that case alone
+        // failed.
+        submit(&para_, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
     }
 
     matmul::GpuMatMulParam para_;
-    matmul::Method method_ = matmul::Method::BASIC_ARITHMETIC;
 };
 
 // Buffer (SSBO, compact row-major) implementation. fp32: one thread per

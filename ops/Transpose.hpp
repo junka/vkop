@@ -14,6 +14,36 @@ namespace vkop {
 namespace ops {
 
 namespace transpose {
+// `perm` must be a permutation of [0, rank): every index it names has to be a
+// real axis, and no axis may be named twice. Both executors below index
+// inshape[perm[i]] directly, so an out-of-range entry read past the end of the
+// shape vector — UB, which showed up as garbage output or a crash depending on
+// the run — and a duplicate silently dropped an axis. ONNX requires the
+// permutation, so refuse anything else rather than compute something
+// arbitrary. Entries past perm.size() default to the identity, matching the
+// `(i < perm.size()) ? perm[i] : i` convention the buffer path already uses.
+inline void check_perm(const std::vector<int> &perm,
+                       const std::vector<int> &inshape) {
+    const int rank = static_cast<int>(inshape.size());
+    std::vector<bool> seen(static_cast<size_t>(rank), false);
+    for (int i = 0; i < rank; ++i) {
+        const int ax = (i < static_cast<int>(perm.size())) ? perm[i] : i;
+        if (ax < 0 || ax >= rank) {
+            throw std::runtime_error(
+                "Transpose: perm[" + std::to_string(i) + "] = " +
+                std::to_string(ax) + " is outside the input's " +
+                std::to_string(rank) + "-D axis range");
+        }
+        if (seen[static_cast<size_t>(ax)]) {
+            throw std::runtime_error(
+                "Transpose: perm names axis " + std::to_string(ax) +
+                " more than once (perm must be a permutation of 0.." +
+                std::to_string(rank - 1) + ")");
+        }
+        seen[static_cast<size_t>(ax)] = true;
+    }
+}
+
 // True when `perm` merely reorders unit-size dims, so the permuted tensor's
 // flat (row-major) memory is byte-identical to the source's — the Transpose is
 // a pure VIEW on the bytes.
@@ -80,6 +110,14 @@ class TransposeImage : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         auto inshape = inputs[0]->getShape();
+        // This executor indexes a 4-D view: the shader's push constant carries
+        // four dims, and perm_ defaults to {3,2,1,0}. Right-align the input's
+        // real rank into that view (leading 1s) before touching word 4, or a
+        // rank-2 input read past the end of the shape vector.
+        if (inshape.size() < 4) {
+            inshape.insert(inshape.begin(), 4 - inshape.size(), 1);
+        }
+        transpose::check_perm(perm_, inshape);
         std::vector<int> outshape(4);
         for (size_t i = 0; i < 4; ++i) {
             outshape[i] = inshape[perm_[i]];
@@ -216,9 +254,18 @@ class TransposeBuffer : public BufferFactory {
         set_did_host_work_last_round(false);
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
+        transpose::check_perm(perm_, inshape);
+        // A perm shorter than the rank means "the rest keep their place"
+        // (ONNX leaves the permutation implicit for trailing axes); pad it so
+        // the indexing below never reads past perm_. check_perm already
+        // validated the padded form.
+        std::vector<int> perm = perm_;
+        for (int i = static_cast<int>(perm.size()); i < rank; ++i) {
+            perm.push_back(i);
+        }
         std::vector<int> outshape(rank);
         for (int i = 0; i < rank; ++i) {
-            outshape[i] = inshape[perm_[i]];
+            outshape[i] = inshape[perm[i]];
         }
         // Does this round publish a different output shape than the previous
         // one? That is what makes a recorded dispatch unsafe to reuse (see the
@@ -257,7 +304,7 @@ class TransposeBuffer : public BufferFactory {
             for (int i = 0; i < 8 && i < rank; ++i) {
                 pc.inDims[i] = inshape[i];
                 pc.outDims[i] = outshape[i];
-                pc.perm[i] = perm_[i];
+                pc.perm[i] = perm[i];
             }
             ensure_int64_pipeline();
             int64_mode_ = true;
@@ -338,7 +385,7 @@ class TransposeBuffer : public BufferFactory {
         fill_dims(pc.inDims, inshape);
         fill_dims(pc.outDims, outshape);
         for (int i = 0; i < 8; ++i) {
-            pc.perm[i] = (i < rank) ? perm_[i] : i;
+            pc.perm[i] = (i < rank) ? perm[i] : i;
         }
         // fp16 packs two elements per uint word; dispatch one thread per output
         // word (the fp16 shader writes each word once — no RMW race).
