@@ -8651,23 +8651,38 @@ class Quantizer:
                        group_size, via=""):
         """MSE / MAE / relative error of a grouped 4-bit encode, printed once
         per weight. Compared in the grouped view: dequantized carries the
-        [n_groups, group_size, N] shape the scale broadcasts over."""
-        dequantized = Quantizer._dequantize_w3(codes, scale_keepdims, fmt)
-        diff = dequantized - w3
-        mse = np.mean(diff**2)
-        mae = np.mean(np.abs(diff))
-        rel_error = np.abs(diff) / (np.abs(w3) + 1e-8)
+        [n_groups, group_size, N] shape the scale broadcasts over.
+
+        Accumulated one slice of groups at a time. Everything below is
+        elementwise, so holding the whole weight's worth of temporaries buys
+        nothing -- and they are not small. For lm_head ([5120, 248320]) the
+        `rel_error` line alone was three more 4.7 GiB arrays on top of the 4.7
+        GiB `dequantized`, which is how a diagnostic came to set a conversion's
+        peak memory. The stats object is the same one the audit row is built
+        from, and its chunk size is numeric_audit's.
+        """
+        stats = numeric_audit.RoundTrip(fmt)
+        # One slice of groups at a time, sized so the float64 working set stays
+        # inside the audit's chunk budget.
+        per_group = max(1, group_size * n)
+        step = max(1, numeric_audit._CHUNK_ELEMS // per_group)
+        for g0 in range(0, n_groups, step):
+            g1 = min(g0 + step, n_groups)
+            part = Quantizer._dequantize_w3(
+                codes[g0:g1], scale_keepdims[g0:g1], fmt)
+            stats.add(w3[g0:g1], part)
+            del part
         print(f"Quantized '{name}':")
         print(f"  Shape: [{k}, {n}], groups: {n_groups} x {group_size}")
         print(f"  Scale shape: [{n_groups}, {n}]")
-        print(f"  MSE: {mse:.6e}, MAE: {mae:.6e}")
-        print(
-            f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
-            f"Max Rel Error: {np.max(rel_error):.2%}"
-        )
-        numeric_audit.record_roundtrip(
-            name, fmt, w3, dequantized,
-            dead_slices=int(np.count_nonzero(scale_keepdims == 0)), via=via)
+        print(f"  MSE: {stats.mse:.6e}, MAE: {stats.mae:.6e}")
+        print(f"  Mean Rel Error: {stats.mean_rel:.2%}, "
+              f"Max Rel Error: {stats.max_rel:.2%}")
+        numeric_audit.record(name, fmt, stats,
+                             dead_slices=int(np.count_nonzero(
+                                 scale_keepdims == 0)), via=via)
+
+
 
     @staticmethod
     def _pack_4bit_weight(dag_model, name, consumers, dims, codes, scale, fmt):

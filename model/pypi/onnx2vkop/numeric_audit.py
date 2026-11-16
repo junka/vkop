@@ -101,6 +101,131 @@ _REL_L2_WARN: Dict[str, float] = {
 # cannot end the outer audit by accident.
 _STACK: List["NumericAudit"] = []
 
+# Elements per reduction chunk. 1<<23 is 8.4M elements, so a float64 working
+# set of two operands plus their diff is ~200 MB -- bounded, which is the
+# point. Every reduction here used to run on the whole weight at once, and
+# every one of them casts to float64 first: for a [5120, 248320] lm_head that
+# is 3 x 9.5 GiB of temporaries to produce five scalars, on top of the 4.7 GiB
+# fp32 weight the quantizer already holds. It is what pushed the 27B's -q int4
+# conversion to a 54 GiB peak.
+_CHUNK_ELEMS = 1 << 23
+
+
+class RoundTrip:
+    """Every number a quantizer reports about one weight, in one pass.
+
+    The per-weight print (MSE / MAE / relative error) and the audit row are
+    reductions over the same two arrays, so they are accumulated together: a
+    caller decodes one slice at a time and hands each pair to `add`, and both
+    outputs come out of the same accumulator. Splitting them was the original
+    shape of this code, and it charged the conversion two full passes' worth of
+    float64 temporaries for numbers that share every input.
+
+    The relative error is |d| / (|w| + eps) elementwise, and its mean/max are
+    accumulated as signed sums (sum of ratios, and their running max) rather
+    than as arrays -- `np.mean(rel_error)` needs the whole array, a sum does not.
+    """
+
+    __slots__ = ("fmt", "elements", "sum_abs", "sum_sq", "max_abs",
+                 "sum_rel", "max_rel", "sum_sq_src",
+                 "overflow", "subnormals")
+
+    def __init__(self, fmt: str):
+        self.fmt = fmt
+        self.elements = 0
+        self.sum_abs = 0.0          # for MAE
+        # Sum of squared differences: MSE's numerator AND the audit's
+        # ||W - restored||^2. They are the same quantity, so they are the same
+        # accumulator rather than two that must be kept in step.
+        self.sum_sq = 0.0
+        self.max_abs = 0.0
+        self.sum_rel = 0.0          # for Mean Rel Error
+        self.max_rel = 0.0
+        self.sum_sq_src = 0.0       # for the audit's rel_l2 denominator
+        self.overflow = 0
+        self.subnormals = 0
+
+    def add(self, source, restored):
+        """Fold one slice in. `source` is the weight, `restored` what the
+        kernel reads back; both must be the same length."""
+        a = np.asarray(source).reshape(-1)
+        b = np.asarray(restored).reshape(-1)
+        if a.size != b.size:
+            raise ValueError(
+                f"numeric audit: restored {b.size} element(s) from {a.size}")
+        if a.size == 0:
+            return
+        # float64 for the reductions only, and only for this slice.
+        a = a.astype(np.float64)
+        b = b.astype(np.float64)
+        d = b - a
+        ad = np.abs(d)
+        self.elements += d.size
+        self.sum_sq += float(np.dot(d, d))
+        self.sum_abs += float(np.sum(ad))
+        self.sum_sq_src += float(np.dot(a, a))
+        chunk_max = float(np.max(ad))
+        if chunk_max > self.max_abs:
+            self.max_abs = chunk_max
+        # |d| / (|w| + eps), matching the per-tensor print. eps keeps a zero
+        # weight from dividing; a weight the format moves off zero then reads
+        # as a huge but finite error, which is what the print always showed.
+        rel = ad / (np.abs(a) + 1e-8)
+        self.sum_rel += float(np.sum(rel))
+        rel_max = float(np.max(rel))
+        if rel_max > self.max_rel:
+            self.max_rel = rel_max
+        finite_b = np.isfinite(b)
+        self.overflow += int(np.count_nonzero(~finite_b & np.isfinite(a)))
+        min_normal = _MIN_NORMAL.get(self.fmt)
+        if min_normal is not None:
+            self.subnormals += int(np.count_nonzero(
+                (np.abs(b) < min_normal) & (b != 0.0) & finite_b))
+
+    @property
+    def mse(self) -> float:
+        # nan for an empty weight, mirroring the np.mean this replaced (0/0).
+        # Nothing should reach it -- a 0-element initializer is not a weight any
+        # kernel accepts -- but the printed number used to be np.mean's, and a
+        # diagnostic quietly reporting 0.0 where it used to say nan would be a
+        # worse answer than either.
+        return self.sum_sq / self.elements if self.elements else float("nan")
+
+    @property
+    def mae(self) -> float:
+        return self.sum_abs / self.elements if self.elements else float("nan")
+
+    @property
+    def mean_rel(self) -> float:
+        return self.sum_rel / self.elements if self.elements else float("nan")
+
+    @property
+    def rel_l2(self) -> float:
+        """||W - restored|| / ||W||, the loop's formula (vkop_vs_ort.py)."""
+        if self.sum_sq_src == 0.0:
+            # A weight of all zeros (a padding channel) has no relative scale
+            # to be wrong against, but a format that fails to reproduce zero
+            # does.
+            return 0.0 if self.sum_sq == 0.0 else float("inf")
+        return float(np.sqrt(self.sum_sq / self.sum_sq_src))
+
+
+def pair_stats(source, restored, fmt):
+    """A RoundTrip over two whole arrays, for callers that already have both.
+
+    The quantizers stream their slices through `RoundTrip.add` directly; this
+    is for the paths that build the full arrays anyway, and for tests.
+    """
+    rt = RoundTrip(fmt)
+    src = np.asarray(source).reshape(-1)
+    got = np.asarray(restored).reshape(-1)
+    for i in range(0, src.size, _CHUNK_ELEMS):
+        rt.add(src[i:i + _CHUNK_ELEMS], got[i:i + _CHUNK_ELEMS])
+    if src.size == 0:
+        # Preserve the size check for the empty case, which the loop skips.
+        rt.add(src, got)
+    return rt
+
 
 @dataclass
 class WeightRow:
@@ -258,7 +383,10 @@ def record_roundtrip(tensor: str, fmt: str, source: np.ndarray,
     `source` is the weight the quantizer read, `restored` is what the kernel
     will read back: the same float the runtime decodes, not the stored codes.
     Every caller already has both (each -q path computes its own diff for the
-    per-tensor error print), so this adds two reductions and no copies.
+    per-tensor error print), so this adds reductions and no full-size copies --
+    the cast to float64 happens a chunk at a time (see pair_stats), because
+    doing it to the whole weight is three more copies of it, and on a large
+    model that is the conversion's memory peak rather than a diagnostic.
 
     A no-op when nothing is collecting, so a quantizer used outside the
     pipeline (a test, or a caller that imports Optimizer directly) simply does
@@ -266,34 +394,26 @@ def record_roundtrip(tensor: str, fmt: str, source: np.ndarray,
     """
     if not _STACK:
         return
-    src = np.asarray(source, dtype=np.float64).reshape(-1)
-    got = np.asarray(restored, dtype=np.float64).reshape(-1)
-    if src.size != got.size:
-        # A view change (the grouped formats compare in [groups, size, N]) is
-        # fine; a size change means the caller handed over a different tensor.
-        raise ValueError(
-            f"numeric audit: '{tensor}' restored {got.size} element(s) from "
-            f"{src.size}")
-    diff = got - src
-    norm = float(np.linalg.norm(src))
-    if norm == 0.0:
-        # A weight of all zeros (a padding channel) has no relative scale to be
-        # wrong against, but a format that fails to reproduce zero does.
-        rel_l2 = 0.0 if not np.any(diff) else float("inf")
-    else:
-        rel_l2 = float(np.linalg.norm(diff)) / norm
-    finite_in = np.isfinite(got)
-    overflow = int(np.count_nonzero(~finite_in & np.isfinite(src)))
-    subnormals = 0
-    min_normal = _MIN_NORMAL.get(fmt)
-    if min_normal is not None:
-        subnormals = int(np.count_nonzero(
-            (np.abs(got) < min_normal) & (got != 0.0) & finite_in))
+    record(tensor, fmt, pair_stats(source, restored, fmt),
+           dead_slices=dead_slices, via=via)
+
+
+def record(tensor: str, fmt: str, stats: "RoundTrip", dead_slices: int = 0,
+           via: str = "") -> None:
+    """Append the row for a RoundTrip the caller already accumulated.
+
+    The streaming counterpart of record_roundtrip: a quantizer that decodes one
+    slice at a time (the 4-bit path, whose weights are large enough that the
+    whole-tensor version was the conversion's memory peak) folds each pair into
+    a RoundTrip and hands that over, so the arrays are never all live at once.
+    """
+    if not _STACK:
+        return
     _STACK[-1].rows.append(WeightRow(
-        tensor=tensor, fmt=fmt, elements=int(src.size), rel_l2=rel_l2,
-        max_abs=float(np.max(np.abs(diff))) if diff.size else 0.0,
-        overflow=overflow, subnormals=subnormals, dead_slices=dead_slices,
-        via=via))
+        tensor=tensor, fmt=fmt, elements=stats.elements,
+        rel_l2=stats.rel_l2, max_abs=stats.max_abs,
+        overflow=stats.overflow, subnormals=stats.subnormals,
+        dead_slices=dead_slices, via=via))
 
 
 def report(audit: NumericAudit, mode: Optional[str] = None) -> NumericAudit:
