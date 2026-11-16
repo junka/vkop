@@ -16,7 +16,7 @@ try:
 except ImportError:  # onnxsim 可选；缺失则退回 ConstantFolder
     _onnxsim_simplify = None
 
-from .dag import Node
+from .dag import Node, _init_byte_len
 from . import numeric_audit
 
 
@@ -399,14 +399,25 @@ def _demote_large_initializers(model):
     synthesize, so _reattach_initializers can put everything back exactly.
     Initializers whose values live in the typed fields instead of raw_data are
     left in place -- we can only restore what we can byte-copy.
+
+    The size test reads dims and dtype, never the payload: `len(init.raw_data)`
+    would copy the weight to measure it, and on a model whose weights are in RAM
+    (rather than an external file) that is a full pass over the model -- done
+    twice, since the selection and the deletion were separate scans. One pass,
+    collecting indices, replaces both.
     """
     graph = model.graph
     demoted = []
-    for init in graph.initializer:
-        if len(init.raw_data) >= _VIEW_DEMOTE_CAP:
+    big = []
+    for idx, init in enumerate(graph.initializer):
+        if not init.HasField("raw_data"):
+            # Typed-field storage (float_data / int64_data): not byte-copyable,
+            # so it is never demoted, whatever its size.
+            continue
+        if _init_byte_len(init) >= _VIEW_DEMOTE_CAP:
             demoted.append((init.name, init.data_type, tuple(init.dims)))
-    for idx in reversed([i for i, init in enumerate(graph.initializer)
-                         if len(init.raw_data) >= _VIEW_DEMOTE_CAP]):
+            big.append(idx)
+    for idx in reversed(big):
         del graph.initializer[idx]
 
     existing = {inp.name for inp in graph.input}
@@ -423,6 +434,37 @@ def _demote_large_initializers(model):
     return demoted, added
 
 
+def _raw_payload_of(src):
+    """The payload bytes of a raw_map entry, or b"" when it has none.
+
+    Accepts a TensorProto (the cheap form) or bytes (what callers passed
+    before). This is the one place a weight-sized Python object is created, so
+    it is only called for an initializer that actually needs restoring -- after
+    fold() has emptied it, never as a guard.
+    """
+    if src is None:
+        return b""
+    if isinstance(src, (bytes, bytearray)):
+        return bytes(src)
+    return bytes(src.raw_data) if src.HasField("raw_data") else b""
+
+
+def _has_raw_payload(src) -> bool:
+    """Does a raw_map entry carry bytes, without copying them?
+
+    The entry is either a TensorProto (the cheap form -- protobuf's bytes
+    accessor returns a COPY, so holding messages instead of payloads is what
+    keeps a hydrated 4-bit model from being doubled) or a plain bytes object
+    (what every caller passed before, and what the small-tensor path still
+    uses). `HasField` is a flag read; `len(src.raw_data)` would copy the weight.
+    """
+    if src is None:
+        return False
+    if isinstance(src, (bytes, bytearray)):
+        return len(src) > 0
+    return src.HasField("raw_data") and src.ByteSize() > 0
+
+
 def _reattach_initializers(model, demoted, added_inputs, raw_map):
     """Undo _demote_large_initializers on the optimized graph.
 
@@ -430,20 +472,32 @@ def _reattach_initializers(model, demoted, added_inputs, raw_map):
     eliminate_unused_initializer may legitimately have dropped the rest), and
     the synthetic inputs are removed so the graph contract the converter sees
     is unchanged.
+
+    `raw_map` values are TensorProto messages when the caller held them (see
+    optimize_model) and bytes otherwise; both are accepted. Reattaching from a
+    message is a CopyFrom, which is the whole point: no Python bytes object the
+    size of the weight is ever created.
     """
     graph = model.graph
     used = {inp for node in graph.node for inp in node.input}
     have = {init.name for init in graph.initializer}
     for name, dtype, dims in demoted:
-        data = raw_map.get(name)
-        if not data or name in have or name not in used:
+        src = raw_map.get(name)
+        if src is None or name in have or name not in used:
             continue
-        init = graph.initializer.add()
-        init.name = name
-        init.data_type = dtype
-        for d in dims:
-            init.dims.append(d)
-        init.raw_data = data
+        if not _has_raw_payload(src):
+            # Nothing to restore: fold already emptied it, or the bytes live in
+            # a typed field (which the demote gate never selects).
+            continue
+        if isinstance(src, (bytes, bytearray)):
+            init = graph.initializer.add()
+            init.name = name
+            init.data_type = dtype
+            for d in dims:
+                init.dims.append(d)
+            init.raw_data = bytes(src)
+        else:
+            graph.initializer.add().CopyFrom(src)
         del raw_map[name]
 
     if added_inputs:
@@ -774,8 +828,21 @@ class ONNXOptimizer:
 
         # raw_map is the byte source for everything fold() strips; build it
         # before the view demotes initializers out of the graph.
-        raw_map = {init.name: init.raw_data for init in onnx_model.graph.initializer}
-        total_init_bytes = sum(len(b) for b in raw_map.values())
+        #
+        # It holds the TensorProto MESSAGES, not their bytes. `init.raw_data`
+        # returns a copy -- protobuf cannot hand out a view of a bytes field --
+        # so the obvious `{init.name: init.raw_data}` doubles every weight held
+        # in the proto. On a streamed model that is free (the bytes are in the
+        # external file and raw_data is empty), which is why it went unnoticed;
+        # under `-q int4` every weight is hydrated first, and the copy turned
+        # 47.7 GiB into 95 GiB on a 62 GB machine. A message reference costs
+        # nothing (measured: +0.000 GiB for 2 GiB of weights), and the bytes are
+        # reached through `.raw_data` at the few points that need them.
+        raw_map = {init.name: init for init in onnx_model.graph.initializer}
+        # From dims and dtype, not by summing the payloads: this only needs the
+        # total, and reading raw_data here would copy every weight again.
+        total_init_bytes = sum(_init_byte_len(init)
+                               for init in onnx_model.graph.initializer)
 
         demoted: List = []
         added_inputs: List = []
@@ -834,9 +901,14 @@ class ONNXOptimizer:
             _reattach_initializers(optimized_model, demoted, added_inputs, raw_map)
             # fold() strips raw_data from anything above its own 1 MiB cap; the
             # demoted weights are back, the survivors just need their bytes.
+            # _raw_payload_of is read only for an initializer that is actually
+            # empty, so the copy is bounded by what fold stripped.
             for init in optimized_model.graph.initializer:
-                if not init.raw_data and raw_map.get(init.name):
-                    init.raw_data = raw_map[init.name]
+                if init.raw_data:
+                    continue
+                data = _raw_payload_of(raw_map.get(init.name))
+                if data:
+                    init.raw_data = data
 
         else:
             try:
@@ -866,10 +938,27 @@ class ONNXOptimizer:
             # Sin/Cos/Reshape/Concat 等输入全常量的算子整段折叠成 initializer。
             # fold() 内部会剥离 initializer 的 raw_data 以绕开 proto 2GB 上限，
             # 这里在折叠后按名字把权重字节还原，保证返回的 model 权重完整可用。
+            #
+            # fold() clears raw_data IN PLACE, and on these paths it may be
+            # running on the very object raw_map points at (both fallbacks below
+            # assign `optimized_model = onnx_model`). Clearing a message clears
+            # every reference to it, so the bytes must be taken before fold --
+            # but only then. When onnxoptimizer succeeded it handed back a
+            # rebuilt model, fold clears that copy's messages, and raw_map's
+            # still hold theirs.
+            pre_fold: Dict[str, bytes] = {}
+            if optimized_model is onnx_model:
+                for init in optimized_model.graph.initializer:
+                    # Size from dims/dtype first: reading raw_data to measure it
+                    # would copy the weight, which is the thing being avoided.
+                    if _init_byte_len(init) > (1 << 20):
+                        pre_fold[init.name] = init.raw_data
             optimized_model = ConstantFolder.fold(optimized_model, verbose=True)
             for init in optimized_model.graph.initializer:
-                if init.name in raw_map and raw_map[init.name]:
-                    init.raw_data = raw_map[init.name]
+                data = pre_fold.get(init.name) or _raw_payload_of(
+                    raw_map.get(init.name))
+                if data and not init.raw_data:
+                    init.raw_data = data
 
         # 若装了 onnxsim，再跑一遍作为增强（兜底 ConstantFolder 未覆盖的算子，
         # 如更复杂的 data-dependent 折叠）。失败则忽略——ConstantFolder 已覆盖主路径。
