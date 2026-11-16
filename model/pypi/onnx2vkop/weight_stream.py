@@ -411,6 +411,11 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 entry["src_dtype"] = init.data_type
                 entry["data_type"] = _BYTE_PAYLOAD_DTYPES[quant]
                 entry["quant"] = quant
+                # Which stored axis holds the output columns, decided by the
+                # consumer chain -- see is_transposed_weight. Read here because
+                # this is the only point that still has the graph: by the time
+                # the scale is computed the Transpose may have been folded away.
+                entry["transposed"] = is_transposed_weight(uses, init.name)
             deferred[init.name] = entry
 
     # A declared slot the gates above turned down anyway -- a name the graph
@@ -486,6 +491,85 @@ def _only_weight_consumers(ops: Optional[Counter]) -> bool:
     return set(ops) <= _WEIGHT_ONLY_CONSUMERS
 
 
+def view_chain_to_weight(uses: Dict[str, list], name):
+    """The pure-view chain from `name` to a weight position, or None.
+
+    Shared by `_reachable_as_weight` (does such a chain exist?) and
+    `is_transposed_weight` (does it flip the matrix?), because the two ask
+    about the same walk and computing it twice invites them to disagree.
+
+    Returns the list of (node, operand_index) hops, ending at the weight
+    consumer, or None when no chain qualifies -- see `_reachable_as_weight`
+    for the rule and why each part of it is there.
+    """
+    chain = []
+    cur = name
+    for _ in range(_VIEW_CHAIN_MAX):
+        consumers = uses.get(cur, [])
+        if len(consumers) != 1:
+            # Nobody reads it (a dead initializer: the writer prunes it anyway,
+            # so deferring gives nothing back), or several do (a branch).
+            return None
+        node, operand = consumers[0]
+        op = node.op_type
+        if op in _WEIGHT_ONLY_CONSUMERS:
+            # Reached a consumer. It must be reading this in a weight position;
+            # a weight in an activation slot would mean the op computes on it.
+            if operand < 1:
+                return None
+            chain.append((node, operand))
+            return chain
+        if op not in _VIEW_OPS:
+            return None
+        # A view with several outputs (Split) would not be a view of the same
+        # tensor; `_VIEW_OPS` holds none, but the check keeps that honest if
+        # the set grows.
+        if len(node.output) != 1:
+            return None
+        chain.append((node, operand))
+        cur = node.output[0]
+    return None
+
+
+def _last_two_swap(node) -> bool:
+    """Is this node a Transpose that swaps the last two dims?
+
+    The only view that changes which axis a matrix's rows are -- and therefore
+    the only one that moves the per-output-column scale. `Transpose` with any
+    other perm is not a matrix transpose of a 2-D weight.
+    """
+    if node.op_type != "Transpose":
+        return False
+    perm = next((list(a.ints) for a in node.attribute if a.name == "perm"), None)
+    if not perm or len(perm) < 2:
+        return False
+    r = len(perm)
+    return (all(perm[i] == i for i in range(r - 2))
+            and perm[r - 2] == r - 1 and perm[r - 1] == r - 2)
+
+
+def is_transposed_weight(uses: Dict[str, list], name) -> bool:
+    """Does this weight reach its consumer through a matrix transpose?
+
+    Decides the AXIS of the per-output-column scale, and it is not cosmetic:
+    the stored bytes of a checkpoint-layout weight are [N, K], because that is
+    how nn.Linear keeps them and the exporter emits the transpose as a node.
+    A scale is always per OUTPUT COLUMN (N entries), but which STORED axis
+    holds the columns depends on whether that Transpose is still in the chain:
+
+        direct   [K, N]  -> columns are axis 1 -> reduce axis 0
+        Transpose[N, K]  -> columns are axis 0 -> reduce axis 1
+
+    Getting this wrong is silent in the worst way: the payload still has the
+    right size and the artifact still loads, so the only symptom is a model
+    that computes wrong answers.
+    """
+    chain = view_chain_to_weight(uses, name)
+    if chain is None:
+        return False
+    return any(_last_two_swap(node) for node, _ in chain)
+
+
 def _reachable_as_weight(uses: Dict[str, list], name) -> bool:
     """Is every path from `name` to a live consumer a pure view chain?
 
@@ -511,28 +595,7 @@ def _reachable_as_weight(uses: Dict[str, list], name) -> bool:
     than rebuilt per weight. Returns True only for a chain that ENDS at a
     weight position.
     """
-    cur = name
-    for _ in range(_VIEW_CHAIN_MAX):
-        consumers = uses.get(cur, [])
-        if len(consumers) != 1:
-            # Nobody reads it (a dead initializer: the writer prunes it anyway,
-            # so deferring gives nothing back), or several do (a branch).
-            return False
-        node, operand = consumers[0]
-        op = node.op_type
-        if op in _WEIGHT_ONLY_CONSUMERS:
-            # Reached a consumer. It must be reading this in a weight position;
-            # a weight in an activation slot would mean the op computes on it.
-            return operand >= 1
-        if op not in _VIEW_OPS:
-            return False
-        # A view with several outputs (Split) would not be a view of the same
-        # tensor; `_VIEW_OPS` holds none, but the check keeps that honest if
-        # the set grows.
-        if len(node.output) != 1:
-            return False
-        cur = node.output[0]
-    return False
+    return view_chain_to_weight(uses, name) is not None
 
 
 def slot_sources(model, base_dir: str, slot_names) -> Dict[str, tuple]:
@@ -789,16 +852,20 @@ def _write_quantized(entry: dict, out_f, base_dir: str) -> int:
     from . import quant_payload
 
     reader = quant_payload.WeightReader(entry, entry["name"])
+    # Which stored axis holds the output columns -- recorded by prepare while
+    # the Transpose was still in the graph, because it decides both the scale's
+    # axis and how the scale broadcasts over a band.
+    transposed = bool(entry.get("transposed"))
     # `entry["scale"]` is the initializer's NAME. The values are what the
     # encoder needs, and finalize stashed them when it built that initializer;
     # recomputing here would mean a second full pass over the source.
     scale = entry.get("scale_values")
     if scale is None:
-        scale = quant_payload.scale_for(entry["quant"], reader)
-    codes = quant_payload.code_byte(entry["quant"], reader, scale)
+        scale = quant_payload.scale_for(entry["quant"], reader, transposed)
+    codes = quant_payload.code_byte(entry["quant"], reader, scale, transposed)
     written = 0
-    for _, band in reader.bands():
-        blob = codes(band)
+    for offset, band in reader.bands():
+        blob = codes(offset, band)
         out_f.write(blob.tobytes())
         written += blob.size
     return written

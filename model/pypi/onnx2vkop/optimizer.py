@@ -5590,7 +5590,18 @@ class FusionOptimizer:
         mm = match["matmul_node"]
         t = match["transpose_node"]
         # Replace MatMul's B input with the Transpose's input, set transB=1.
-        new_inputs = [mm.inputs[0], match["new_b_input"]]
+        # Anything the two nodes carried past their first two inputs rides
+        # along: a weight-only quantized MatMul is [A, B, scale], and
+        # quant_payload.finalize appends that scale to whoever READS the weight.
+        # On a streamed graph the weight is wired through a Transpose, so the
+        # scale sits on the Transpose (t.inputs[1:]) and the MatMul is still
+        # [A, B]. Rebuilding as [A, B] alone stranded 401 scales on nodes that
+        # then no longer existed, and the runtime rejected every weight with
+        # "MatMul with a int8 weight needs exactly [A, B, scale], got 2 inputs".
+        # On the in-memory path the fold has already run by quantization time,
+        # so the scale is in mm.inputs[2:] instead -- one of the two is empty.
+        extra = list(t.inputs[1:]) + list(mm.inputs[2:])
+        new_inputs = [mm.inputs[0], match["new_b_input"]] + extra
         fused = Node(
             op_type="MatMul",
             name=mm.name,  # keep MatMul's name (its output tensor stays)

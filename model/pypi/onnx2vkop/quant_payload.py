@@ -81,47 +81,92 @@ class WeightReader:
                 remaining -= rows * row_bytes
 
 
-def _column_amax(reader):
+def _amax(reader, transposed: bool):
+    """Per-output-column absmax, along whichever STORED axis holds the columns.
+
+    A scale always has one entry per output column (the kernel indexes it by
+    output channel / N), but which axis of the stored bytes that is depends on
+    the consumer chain:
+
+        direct    MatMul(X, W[K, N])            columns are axis 1 -> reduce axis 0
+        Transpose MatMul(X, Transpose(W[N, K])) columns are axis 0 -> reduce axis 1
+
+    `transposed` comes from weight_stream.is_transposed_weight, which reads it
+    off the graph while the Transpose is still there. Reducing the wrong axis
+    does not fail loudly -- the payload keeps its size and the artifact loads --
+    it just decodes every weight with a scale from the wrong direction.
+
+    Note the two cases differ in more than the axis: reducing axis 0 is
+    position-independent (every row of a band contributes to the same N
+    columns), while reducing axis 1 gives one value PER BAND ROW, which has to
+    land at that row's offset. So the transposed branch places its result
+    rather than broadcasting it.
+    """
+    if transposed:
+        # Stored [N, K] (reader.k == N == dims[0]): one scale per stored row,
+        # so band row `offset + i` is output column `offset + i`.
+        amax = np.zeros(reader.k, dtype=np.float32)
+        for offset, band in reader.bands():
+            rows = band.shape[0]
+            np.maximum(amax[offset:offset + rows],
+                       np.max(np.abs(band), axis=1),
+                       out=amax[offset:offset + rows])
+        return amax
     amax = np.zeros(reader.n, dtype=np.float32)
     for _, band in reader.bands():
         np.maximum(amax, np.max(np.abs(band), axis=0), out=amax)
     return amax
 
 
-def scale_for(fmt, reader):
+def scale_for(fmt, reader, transposed: bool = False):
     """The per-output-column fp32 scale an int8 / fp8 payload is decoded with."""
     from .optimizer import Quantizer
 
-    amax = _column_amax(reader)
+    amax = _amax(reader, transposed)
     if fmt == "int8":
         return np.where(amax == 0, 1.0, amax / 127.0).astype(np.float32)
     max_finite = Quantizer._FP8_FORMATS[fmt][0]
     return np.where(amax == 0, 1.0, amax / max_finite).astype(np.float32)
 
 
-def code_byte(fmt, reader, scale):
-    """A function band -> one uint8 per value, the byte the kernel decodes.
+def code_byte(fmt, reader, scale, transposed: bool = False):
+    """A function (row_offset, band) -> one uint8 per value, the byte the kernel
+    decodes.
 
     int8's code is a signed value; the payload stores it as two's complement,
     so `& 0xFF` is spelled out rather than left to numpy's int8 storage. fp8's
     `_fp8_encode` already returns the finished byte (sign in bit 7).
+
+    `row_offset` is the band's first stored row, and the transposed case needs
+    it: there the rows ARE the output columns, so the scale for a band is the
+    slice that band covers, not the whole table. Passing the whole table would
+    broadcast against the wrong rows and decode every band but the first with
+    the wrong scales.
     """
     from .optimizer import Quantizer
 
-    if fmt == "int8":
-        s = np.asarray(scale, dtype=np.float32)[None, :]
+    scale = np.asarray(scale, dtype=np.float32)
 
-        def codes(band):
-            q = np.round(band / s).astype(np.int8)
+    def slice_for(row_offset, band):
+        rows = band.shape[0]
+        if transposed:
+            # One scale per stored row -> per band row, at that row's offset.
+            return scale[row_offset:row_offset + rows].reshape(-1, 1)
+        # One scale per column -> same for every band.
+        return scale.reshape(1, -1)
+
+    if fmt == "int8":
+        def codes(row_offset, band):
+            q = np.round(band / slice_for(row_offset, band)).astype(np.int8)
             return q.astype(np.uint8)
 
         return codes
 
     max_finite, exp_bits, mant_bits = Quantizer._FP8_FORMATS[fmt]
-    s = np.asarray(scale, dtype=np.float32)[None, :]
 
-    def codes(band):
-        clipped = np.clip(band / s, -max_finite, max_finite)
+    def codes(row_offset, band):
+        clipped = np.clip(band / slice_for(row_offset, band),
+                          -max_finite, max_finite)
         return Quantizer._fp8_encode(clipped, exp_bits, mant_bits)
 
     return codes
@@ -154,7 +199,8 @@ def finalize(model, deferred, verbose=True) -> int:
             scale_name = entry.get("scale") or f"{name}_scale"
             if scale_name not in existing:
                 reader = WeightReader(entry, name)
-                scale = scale_for(entry["quant"], reader)
+                scale = scale_for(entry["quant"], reader,
+                                  bool(entry.get("transposed")))
                 init = numpy_helper.from_array(scale, scale_name)
                 init.data_type = TensorProto.FLOAT
                 graph.initializer.append(init)
