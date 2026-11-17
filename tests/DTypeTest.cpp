@@ -4,6 +4,7 @@
 #include "setup.hpp"
 #include "core/DType.hpp"
 #include "core/Tensor.hpp"
+#include <cmath>
 #include <gtest/gtest.h>
 
 using vkop::core::ElemKind;
@@ -355,6 +356,22 @@ TEST(DTypeTest, RequirePlainByteElem) {
             EXPECT_NE(what.find("never decodes"), std::string::npos) << what;
         }
     }
+}
+
+// fp32 -> fp16 must round to nearest-even across the whole range, including the
+// carry out of the mantissa: a value just under a power of two rounds up to it,
+// and on an odd fp16 exponent that carry lands on an exponent bit that is
+// already set. Combining the fields with OR dropped the carry there and stored
+// half the value, which showed up as fp16 kernels drifting on Windows (MSVC
+// takes this portable branch; x86-64 GCC/Clang use _cvtss_sh).
+TEST(DTypeTest, Fp16ConversionKeepsMantissaCarry) {
+    const float above_half = std::nextafter(0.5F, 0.0F);
+    const float above_two = std::nextafter(2.0F, 0.0F);
+    EXPECT_EQ(vkop::core::ITensor::fp32_to_fp16(above_half), 0x3800);  // 0.5
+    EXPECT_EQ(vkop::core::ITensor::fp32_to_fp16(-above_half), 0xB800); // -0.5
+    EXPECT_EQ(vkop::core::ITensor::fp32_to_fp16(above_two), 0x4000);   // 2.0
+    EXPECT_EQ(vkop::core::ITensor::fp16_to_fp32(0x3800), 0.5F);
+    EXPECT_EQ(vkop::core::ITensor::fp16_to_fp32(0xB800), -0.5F);
 }
 
 } // namespace

@@ -494,8 +494,10 @@ Those measurements surfaced three silent defects:
    `cos_decode`, where half the table is negative, 72 192 come out low and 10 368 high —
    truncation is toward zero, so the sign decides the direction, which is exactly why the
    raw dump looked like noise rather than a bias). Adding the guard+sticky RNE bias
-   (`(mantissa + 0x0FFF + lsb) >> 13`, which also carries into the exponent correctly) made
-   three of the four tables bit-identical and left 4 entries differing in `sin_prefill`.
+   (`(mantissa + 0x0FFF + lsb) >> 13`, which must be *added* to the shifted exponent field,
+   not OR'ed: a carry out of the mantissa is 0x400, the exponent's low bit, so OR halves the
+   value whenever that bit is already set) made three of the four tables bit-identical and
+   left 4 entries differing in `sin_prefill`.
    Those 4 are one row (38) repeated across the duplicated `cat(ang, ang)` halves, and they
    are a `sinf`-vs-torch-`sin` last-bit difference landing on an fp16 tie: torch's fp32 value
    is 0.8518067002 while the midpoint of the two fp16 neighbours is 0.8518066406 — a margin

@@ -479,11 +479,14 @@ class ITensor {
         // Normal number. A bare `mantissa >> 13` truncates (round-toward-zero),
         // while IEEE fp32->fp16 defaults to round-to-nearest-even, so every
         // host-side conversion would sit up to 1 fp16 ulp (relative ~5e-4)
-        // below the true value. The guard+sticky bias below gives RNE, and the
-        // carry into the exponent falls out of the shift for free.
+        // below the true value. The guard+sticky bias below gives RNE; when it
+        // carries out of the mantissa (a value just under a power of two),
+        // `rounded` becomes 0x400, which is the exponent's low bit, so the two
+        // fields must be ADDED - OR'ing them drops the carry whenever the
+        // exponent's low bit is already set and halves the result.
         const uint32_t lsb = (mantissa >> 13) & 1u;
         const uint32_t rounded = (mantissa + 0x0FFFu + lsb) >> 13;
-        return (uint16_t)(sign | (exponent << 10) | rounded);
+        return static_cast<uint16_t>(sign | ((exponent << 10) + rounded));
 #endif
     }
 
