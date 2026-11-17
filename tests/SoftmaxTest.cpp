@@ -117,13 +117,8 @@ private:
 
         torch::manual_seed(42);
         torch::Tensor torch_input;
-        if (input_shape_.size() == 2) {
-            torch_input = torch::randn({input_shape_[0], input_shape_[1]}, this->getTorchConf());
-        } else if (input_shape_.size() == 1) {
-            torch_input = torch::randn({input_shape_[0]}, this->getTorchConf());
-        } else {
-            torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, this->getTorchConf());
-        }
+        std::vector<int64_t> ishape(input_shape_.begin(), input_shape_.end());
+        torch_input = torch::randn(ishape, this->getTorchConf());
 
         int axis = 0;
         if (dim.count("axis") > 0) {
@@ -200,6 +195,10 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
         {{1, 16, 5, 5}, 1},
         {{4, 1000}, 1},
         {{1, 1000}, 1},
+        // H/W degenerate shapes: 4-D layout, effectively 3-D math.
+        {{1, 8, 64, 1}, 1},
+        {{2, 6, 1, 32}, 2},
+        {{2, 4, 8, 8}, 0},
     };
     for (const auto &test_case: test_cases) {
         auto [input_shape, axis] = test_case;

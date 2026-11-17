@@ -28,5 +28,8 @@ TEST(MulTest, MulComprehensiveTest) {
     for (const auto& t : test_cases) {
         MulTest<float> multest(t);
         EXPECT_TRUE(multest.run_test());
+
+        MulTest<uint16_t> multest16(t);
+        EXPECT_TRUE(multest16.run_test());
     }
 }

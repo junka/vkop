@@ -43,6 +43,8 @@ static void run_cast(const std::string &to,
         upload(vkop::core::as_tensor<float>(input));
     } else if (input->dtype() == typeid(uint16_t)) {
         upload(vkop::core::as_tensor<uint16_t>(input));
+    } else if (input->dtype() == typeid(int64_t)) {
+        upload(vkop::core::as_tensor<int64_t>(input));
     }
 
     op->onExecute({input}, {output}, 0);
@@ -121,6 +123,30 @@ TEST(CastTest, OddTotal) {
     for (int i = 0; i < n; ++i) {
         EXPECT_EQ((*tout)[i], expected[i])
             << "mismatch at " << i << " (raw fp16 bits)";
+    }
+}
+
+TEST(CastTest, Int64ToF32) {
+    // The rotary position-id Cast: int64 in, fp32 out. Goes through
+    // buffer_cast_int64 when the device has shaderInt64, and through the CPU
+    // fallback otherwise; both must produce torch's conversion, including
+    // values that exceed 2^24 and negative values that need the high word.
+    auto torch_a = torch::tensor({{0LL, 1LL, -1LL},
+                                  {3000000000LL, -4000000000LL, 123456789LL}},
+                                 torch::kLong);
+    auto ref = torch_a.to(torch::kFloat32);
+    int n = static_cast<int>(torch_a.numel());
+
+    auto tin = std::make_shared<Tensor<int64_t>>(std::vector<int>{2, 3});
+    tin->fillToCPU(std::vector<int64_t>(torch_a.data_ptr<int64_t>(),
+                                        torch_a.data_ptr<int64_t>() + n));
+    auto tout = std::make_shared<Tensor<float>>(std::vector<int>{2, 3}, true);
+
+    run_cast("1", tin, tout);
+
+    for (int i = 0; i < n; ++i) {
+        EXPECT_FLOAT_EQ((*tout)[i], ref.flatten()[i].item<float>())
+            << "mismatch at " << i;
     }
 }
 

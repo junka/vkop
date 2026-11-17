@@ -103,16 +103,9 @@ TEST(AveragePoolTest, AveragePoolComprehensiveTest) {
             }
             ap_op->setAttribute(aptest.attributes);
         }));
-        LOG_INFO("Tesing fp16");
-        AveragePoolTest<float> aptest1(input_shape, kernel_shape, strides, pads, count_include_pad);
-        EXPECT_TRUE (aptest1.run_test({aptest1.input}, {aptest1.output},
-            [&aptest1](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *ap_op = dynamic_cast<AveragePool *>(op.get());
-            if (!ap_op) {
-                LOG_ERROR("Failed to cast operator to AveragePool");
-                return;
-            }
-            ap_op->setAttribute(aptest1.attributes);
-        }));
+        // AveragePool has no fp16 kernel: its constructor ignores the fp16 flag
+        // and always builds the fp32 shader, so an fp16 case cannot be run
+        // until the op grows one. The old block here was labelled fp16 but
+        // instantiated AveragePoolTest<float>, i.e. it re-ran fp32.
     }
 }

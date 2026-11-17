@@ -75,16 +75,17 @@ public:
     int kernel_size_ = 3;
     int stride_ = 2;
     int pad_ = 1;
+    int ceil_mode_ = 0;
 
     std::unordered_map<std::string, std::string> attributes;
 
-    MaxpoolTest(const std::vector<int>& input_shape, int kernel_size, int stride, int pad) : TestCase<T>("MaxPool"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), pad_(pad) {
+    MaxpoolTest(const std::vector<int>& input_shape, int kernel_size, int stride, int pad, int ceil_mode = 0) : TestCase<T>("MaxPool"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), pad_(pad), ceil_mode_(ceil_mode) {
         attributes = {
             {"kernel_shape", std::to_string(kernel_size_)},
             {"strides", std::to_string(stride_)},
             {"pads", std::to_string(pad_)},
             {"dilations", "1"},
-            {"ceil_mode", "0"},
+            {"ceil_mode", std::to_string(ceil_mode_)},
             {"storage_order", "1"}
         };
         initTestdata();
@@ -96,12 +97,12 @@ private:
 
         int H = input_shape_[2], W = input_shape_[3];
         int kh = kernel_size_, kw = kernel_size_, sh = stride_, sw = stride_, ph = pad_, pw = pad_;
-        int out_h = ((H - (kh - 1) + 2 * ph - 1) / sh) + 1;   // ceil_mode=0
-        int out_w = ((W - (kw - 1) + 2 * pw - 1) / sw) + 1;
+        int out_h = ((H - (kh - 1) + 2 * ph - 1 + (ceil_mode_ ? sh - 1 : 0)) / sh) + 1;
+        int out_w = ((W - (kw - 1) + 2 * pw - 1 + (ceil_mode_ ? sw - 1 : 0)) / sw) + 1;
         output = std::make_shared<Tensor<T>>(std::vector<int>{input_shape_[0], input_shape_[1], out_h, out_w});
         torch::manual_seed(42);
         auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, this->getTorchConf());
-        auto torch_output = torch::max_pool2d(torch_input, {kernel_size_, kernel_size_}, {stride_, stride_}, {pad_, pad_}, 1, false);
+        auto torch_output = torch::max_pool2d(torch_input, {kernel_size_, kernel_size_}, {stride_, stride_}, {pad_, pad_}, 1, ceil_mode_ != 0);
         printf("=======output tensor=======");
         std::cout << torch_output << std::endl;
         this->fillTensorFromTorch(input, torch_input);
@@ -112,17 +113,19 @@ private:
 
 
 TEST(MaxPoolTest, MaxPoolComprehensiveTest) {
-    const std::vector<std::tuple<std::vector<int>, int, int, int>> test_cases = {
-        {{1, 3, 224, 224}, 3, 2, 1},
-        {{1, 3, 16, 16}, 4, 2, 1},
+    const std::vector<std::tuple<std::vector<int>, int, int, int, int>> test_cases = {
+        {{1, 3, 224, 224}, 3, 2, 1, 0},
+        {{1, 3, 16, 16}, 4, 2, 1, 0},
+        // ceil_mode=1: the last window starts at index 15 of 16.
+        {{1, 3, 16, 16}, 3, 2, 1, 1},
     };
 
     for (const auto &test_case : test_cases) {
-        auto [input_shape, kernel_size, stride, pad] = test_case;
-        LOG_INFO("Testing Maxpool2d with input shape: [%d, %d, %d, %d], kernel_size: %d, stride: %d, pad: %d",
-                input_shape[0], input_shape[1], input_shape[2], input_shape[3], kernel_size, stride, pad);
+        auto [input_shape, kernel_size, stride, pad, ceil_mode] = test_case;
+        LOG_INFO("Testing Maxpool2d with input shape: [%d, %d, %d, %d], kernel_size: %d, stride: %d, pad: %d, ceil_mode: %d",
+                input_shape[0], input_shape[1], input_shape[2], input_shape[3], kernel_size, stride, pad, ceil_mode);
         LOG_INFO("Running test for fp32 ...");
-        MaxpoolTest<float> maxtest(input_shape, kernel_size, stride, pad);
+        MaxpoolTest<float> maxtest(input_shape, kernel_size, stride, pad, ceil_mode);
         EXPECT_TRUE(maxtest.run_test({maxtest.input}, {maxtest.output},
             [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
@@ -134,7 +137,7 @@ TEST(MaxPoolTest, MaxPoolComprehensiveTest) {
             }));
 
         LOG_INFO("Running test for fp16 ...");
-        MaxpoolTest<uint16_t> maxtest2(input_shape, kernel_size, stride, pad);
+        MaxpoolTest<uint16_t> maxtest2(input_shape, kernel_size, stride, pad, ceil_mode);
         EXPECT_TRUE(maxtest2.run_test({maxtest2.input}, {maxtest2.output},
             [&maxtest2](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());

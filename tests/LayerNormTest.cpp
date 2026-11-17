@@ -111,11 +111,21 @@ private:
         std::vector<int64_t> ishape(input_shape_.begin(), input_shape_.end());
         std::vector<int64_t> nshape(normalized_shape_.begin(),
                                     normalized_shape_.end());
-        auto torch_input = torch::randn(ishape);
-        auto torch_weight = torch::randn(nshape);
-        auto torch_bias = torch::randn(nshape);
+        auto torch_input = torch::randn(ishape, this->getTorchConf());
+        auto torch_weight = torch::randn(nshape, this->getTorchConf());
+        auto torch_bias = torch::randn(nshape, this->getTorchConf());
 
-        auto torch_output = torch::layer_norm(torch_input, nshape, torch_weight, torch_bias, 1e-5);
+        // fp16 reference: accumulate in fp32, then round to half. The CPU
+        // half layer_norm accumulates in half and drifts past the 2% check.
+        torch::Tensor torch_output;
+        if (this->getTorchConf().dtype() == torch::kFloat16) {
+            torch_output = torch::layer_norm(torch_input.to(torch::kFloat32), nshape,
+                                             torch_weight.to(torch::kFloat32),
+                                             torch_bias.to(torch::kFloat32), 1e-5)
+                               .to(torch::kFloat16);
+        } else {
+            torch_output = torch::layer_norm(torch_input, nshape, torch_weight, torch_bias, 1e-5);
+        }
 
         std::vector<int> output_shape = {};
         output_shape.reserve(torch_output.dim());
@@ -182,5 +192,33 @@ TEST(LayerNormTest, LayerNormComprehensiveTest) {
             [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
                 op->setAttribute(lntest.param);
             })) << "normalized_shape rank " << c.norm.size();
+
+        LayerNormTest<uint16_t> lntest16(c.input, c.norm);
+        {
+            // LayerNorm's image kernel only has an fp32 path; fp16 lives in the
+            // SSBO implementation, so this case has to force the buffer backend
+            // instead of inheriting the image default.
+            vkop::tests::ScopedBufferBackend buffer_backend;
+            EXPECT_TRUE(lntest16.run_test({lntest16.input, lntest16.weight, lntest16.bias},
+                                          {lntest16.output},
+                [&lntest16](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(lntest16.param);
+                })) << "fp16 normalized_shape rank " << c.norm.size();
+        }
     }
+}
+
+// normalizedDim 3 (the CHW kernel) is a known image-path bug: the shader runs
+// and writes normalized values, but the readback does not line up with the
+// torch reference's NCHW order (measured first element 1.9269 — the raw input
+// — vs 5.2607). It reproduces with the base and the -DSUBGROUP build, so it is
+// not a subgroup regression. Keeping the case as a DISABLED test makes the gap
+// visible in --gtest_list_tests instead of leaving it only in a comment.
+TEST(LayerNormTest, DISABLED_ChwNormalizedDim) {
+    LayerNormTest<float> lntest({2, 5, 4, 4}, {4, 4, 4});
+    EXPECT_TRUE(lntest.run_test({lntest.input, lntest.weight, lntest.bias},
+                                {lntest.output},
+        [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
+            op->setAttribute(lntest.param);
+        })) << "normalized_shape rank 3 (CHW)";
 }

@@ -26,5 +26,8 @@ TEST(ErfTest, ErfComprehensiveTest) {
         auto [shape] = test_case;
         ErfTest<float> erftest(shape);
         EXPECT_TRUE(erftest.run_test());
+
+        ErfTest<uint16_t> erftest16(shape);
+        EXPECT_TRUE(erftest16.run_test());
     }
 }

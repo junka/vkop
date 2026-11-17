@@ -169,9 +169,19 @@ private:
 TEST(SliceTest, SliceComprehensiveTest) {
     std::vector<std::tuple<std::vector<int>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>>> test_cases = {
         {{6, 4, 4}, {0, 2}, {2, 3}, {1, 2}, {0, 2}},
+        // negative axes
+        {{6, 4, 4}, {0, 0}, {4, 4}, {2, 2}, {-2, -1}},
     };
-    for (const auto& test_case : test_cases) {
+    for (size_t case_idx = 0; case_idx < test_cases.size(); ++case_idx) {
+        const auto& test_case = test_cases[case_idx];
         auto [input_shape, starts, ends, steps, axes] = test_case;
+        std::string shape_str = "[";
+        for (size_t d = 0; d < input_shape.size(); ++d) {
+            shape_str += (d ? "," : "") + std::to_string(input_shape[d]);
+        }
+        shape_str += "]";
+        SCOPED_TRACE(::testing::Message() << "case " << case_idx
+                     << " shape=" << shape_str);
         for (size_t i = 0; i < starts.size(); ++i) {
             LOG_INFO("range %d - %d, step %d, axes %d", starts[i], ends[i], steps[i], axes[i]);
         }

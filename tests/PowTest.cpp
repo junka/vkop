@@ -30,5 +30,8 @@ TEST(PowTest, PowComprehensiveTest) {
     for (const auto& t : test_cases) {
         PowTest<float> powtest(t);
         EXPECT_TRUE(powtest.run_test());
+
+        PowTest<uint16_t> powtest16(t);
+        EXPECT_TRUE(powtest16.run_test());
     }
 }

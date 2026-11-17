@@ -159,8 +159,9 @@ TEST(ResizeTest, ResizeComprehensiveTest) {
         {{1, 2, 4, 4}, {1, 2, 2, 2}, false, "bilinear", false},
         {{1, 3, 8, 8}, {1, 3, 4, 4}, false, "nearest", false},
         {{1, 4, 5, 5}, {1, 4, 10, 10}, false, "nearest", false},
-        // {{1, 2, 3, 3}, {1, 2, 6, 6}, true, "bilinear", true},
-        // {{2, 1, 6, 6}, {2, 1, 12, 12}, true, "bilinear", false},
+        // align_corners=true: both the upsample and the downsample direction.
+        {{1, 2, 4, 4}, {1, 2, 8, 8}, true, "bilinear", false},
+        {{1, 2, 8, 8}, {1, 2, 4, 4}, true, "bilinear", false},
     };
     for (const auto& test_case : test_cases) {
         auto [input_shape, resize, align_corners, mode, antialias] = test_case;

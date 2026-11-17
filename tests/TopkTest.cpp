@@ -69,7 +69,8 @@ private:
         output = std::make_shared<Tensor<T>>(out_shape);
 
         torch::manual_seed(56);
-        auto torch_input = torch::randn({t[0], t[1]}, this->getTorchConf());
+        std::vector<int64_t> ishape(t.begin(), t.end());
+        auto torch_input = torch::randn(ishape, this->getTorchConf());
         auto torch_topk = torch::topk(torch_input, k, axis, true, true);
         auto [value, indices64] = torch_topk;
         auto indices32 = indices64.to(torch::kInt);
@@ -96,6 +97,8 @@ TEST(TopkTest, TopkComprehensiveTest) {
         {{1, 600}, 7, -1},
         {{3, 2000}, 7, -1},
         {{1, 2000}, 6, -1},
+        // k == 1 boundary (single winner per row).
+        {{5, 1024}, 1, -1},
     };
 
     for (const auto &test_case : test_cases) {

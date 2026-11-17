@@ -206,7 +206,9 @@ public:
         {"keepdims", "1"}
     };
 
-    explicit ReduceTest(const std::vector<int> &shape, const std::vector<int> &axes):TestCase<T>("Reduce"), t(shape), axes(axes) {
+    explicit ReduceTest(const std::vector<int> &shape, const std::vector<int> &axes,
+                        bool keepdims = true)
+        : TestCase<T>("Reduce"), t(shape), axes(axes) {
         // The op parses its axes from the attribute map, NOT from the `axes`
         // member the torch reference below uses. The two used to disagree: the
         // map kept the class default [0,1] whatever the caller asked for, so the
@@ -219,6 +221,7 @@ public:
             attributes["axes"] += (i ? ", " : "") + std::to_string(axes[i]);
         }
         attributes["axes"] += "]";
+        attributes["keepdims"] = keepdims ? "1" : "0";
     }
 
     // Variant of initTestdata for a caller-supplied input. The random inputs
@@ -326,13 +329,28 @@ public:
 }
 
 TEST(ReduceTest, ReduceComprehensiveTest) {
-    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> test_cases = {
-        {{1,3, 4, 4}, {0, 1}},
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>, bool>> test_cases = {
+        {{1,3, 4, 4}, {0, 1}, true},
+        {{1,3, 4, 4}, {-1},   true},   // negative axis
+        {{2,4, 8, 8}, {3},    true},   // single axis
     };
     for (const auto &test_case : test_cases) {
-        auto [t, axes] = test_case;
-        ReduceTest<float> reducetest(t, axes);
+        auto [t, axes, keepdims] = test_case;
+        std::string shape_str = "[";
+        for (size_t i = 0; i < t.size(); ++i) {
+            shape_str += (i ? "," : "") + std::to_string(t[i]);
+        }
+        shape_str += "]";
+        std::string axes_str = "[";
+        for (size_t i = 0; i < axes.size(); ++i) {
+            axes_str += (i ? "," : "") + std::to_string(axes[i]);
+        }
+        axes_str += "]";
+        SCOPED_TRACE(::testing::Message() << "shape=" << shape_str
+                     << " axes=" << axes_str << " keepdims=" << keepdims);
+        ReduceTest<float> reducetest(t, axes, keepdims);
         for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
+            SCOPED_TRACE(::testing::Message() << "fp32 op=" << reduceop);
             reducetest.initTestdata(reduceop);
             LOG_INFO("Testing fp32 reduce op: %s", reduceop);
             EXPECT_TRUE(reducetest.run_test({reducetest.input}, {reducetest.output},
@@ -346,8 +364,9 @@ TEST(ReduceTest, ReduceComprehensiveTest) {
             }));
         }
 
-        ReduceTest<uint16_t> reducetest1(t, axes);
+        ReduceTest<uint16_t> reducetest1(t, axes, keepdims);
         for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
+            SCOPED_TRACE(::testing::Message() << "fp16 op=" << reduceop);
             reducetest1.initTestdata(reduceop);
             LOG_INFO("Testing fp16 reduce op: %s", reduceop);
             EXPECT_TRUE(reducetest1.run_test({reducetest1.input}, {reducetest1.output},

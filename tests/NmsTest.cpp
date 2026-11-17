@@ -101,6 +101,11 @@ public:
     }
 private:
     void init_testdata() {
+        // NMS compares exact box indices, so its output is only stable if the
+        // score order is. fp16 quantisation turns close scores into exact ties
+        // whose ordering differs between the CPU reference and the shader; with
+        // unseeded data the fp16 case failed intermittently. Pin the draw.
+        torch::manual_seed(42);
         std::vector<int64_t> boxshape(box_shape_.begin(), box_shape_.end());
         std::vector<int64_t> scoreshape(score_shape_.begin(), score_shape_.end());
 
@@ -258,6 +263,9 @@ TEST(NmsTest, NmsComprehensiveTest) {
         {{1, 10, 4}, {1, 2, 10}, 0, 0.5, 0.5},
         {{1, 200, 4}, {1, 1, 200}, 50, 0.7F, 0.4F},
         {{1, 50, 4}, {1, 7, 50}, 0, 0.3F, 0.2F},
+        // batch > 1: the per-(batch, class) cap and the output slot packing
+        // used to be exercised with N=1 only.
+        {{2, 16, 4}, {2, 3, 16}, 2, 0.5F, 0.1F},
     };
 
     for (const auto &test_case : test_cases) {
