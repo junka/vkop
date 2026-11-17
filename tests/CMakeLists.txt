@@ -851,3 +851,18 @@ foreach(ada_case sklast acc2x1 acc2x2)
         ENVIRONMENT
         "MATMUL_ADA_CASE=${ada_case};MATMUL_ADA_BDA_DESC_ONLY=1")
 endforeach()
+
+if(MSVC)
+    # The probes are POSIX programs (setenv/unsetenv, posix_memalign). MSVC
+    # has none of them, so every probe gets probe_compat.hpp prepended. The
+    # gtest suite is excluded because setup.hpp already defines the same
+    # shims -- force-including both would redefine them.
+    get_property(vkop_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(t IN LISTS vkop_test_targets)
+        get_target_property(ttype ${t} TYPE)
+        if(ttype STREQUAL "EXECUTABLE" AND NOT t STREQUAL "all_tests")
+            target_compile_options(
+                ${t} PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/probe_compat.hpp")
+        endif()
+    endforeach()
+endif()

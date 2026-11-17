@@ -242,9 +242,17 @@ int main() {
     run_case(dev, pool, 16, 256, 256, /*expect_bda=*/true, desc_only);
     // Coop-sized shape (forced primary coop in the test harness). Its route is
     // pinned only when the caller wants to validate a specific coop geometry
-    // (VKOP_FORCE_BM/BN + MATMUL_BDA_COOP_ROUTE).
-    run_case(dev, pool, 64, 1024, 1024, /*expect_bda=*/true, desc_only,
-             std::getenv("MATMUL_BDA_COOP_ROUTE"));
+    // (VKOP_FORCE_BM/BN + MATMUL_BDA_COOP_ROUTE), which only exists on devices
+    // with cooperative matrix; elsewhere the selector legally stays on the
+    // non-coop route and the pin cannot hold.
+    const char *coop_route = std::getenv("MATMUL_BDA_COOP_ROUTE");
+    if (coop_route != nullptr && !dev->is_support_cooperate_matrix()) {
+        std::printf("SKIP: coop route '%s' needs cooperative matrix\n",
+                    coop_route);
+    } else {
+        run_case(dev, pool, 64, 1024, 1024, /*expect_bda=*/true, desc_only,
+                 coop_route);
+    }
     // Byte weight, large N, M=1: W8-WIDE GEMV and its 512-lane build.
     run_i8_wide_case(dev, pool, 1, 2048, 256,
                      ks512 ? "ksplit_w8wide512" : "ksplit_w8wide", desc_only);

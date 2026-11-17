@@ -11,8 +11,6 @@
 //   MATMUL_ADA_CASE=acc2x2   -> VKOP_COOP_ACC=2x2
 // MATMUL_ADA_BDA_DESC_ONLY=1 pins the descriptor modules.
 
-#include <unistd.h>
-
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

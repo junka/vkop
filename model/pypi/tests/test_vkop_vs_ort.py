@@ -19,6 +19,7 @@ numbers on real models come from running the tool (see the resnet18 and
 add_conv fixtures in docs/ and the manual runs it was written against).
 """
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -457,6 +458,14 @@ STUB = textwrap.dedent("""
 
 @pytest.fixture
 def bench(tmp_path):
+    if os.name == "nt":
+        # No shebang on Windows: CreateProcess only starts real executables, so
+        # the stub sits behind a .cmd shim that hands it to this interpreter.
+        script = tmp_path / "stub-bench.py"
+        script.write_text(STUB)
+        path = tmp_path / "stub-bench.cmd"
+        path.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        return path
     path = tmp_path / "stub-bench"
     path.write_text(f"#!{sys.executable}\n{STUB}")
     path.chmod(0o755)
@@ -512,7 +521,7 @@ def test_an_explicit_bench_that_is_not_runnable_stops_the_run(bench,
 
 def test_the_default_bench_is_the_repo_build(bench):
     found = loop.find_bench(None)
-    assert found.name == "vkop-bench" and found.is_file()
+    assert found.stem == "vkop-bench" and found.is_file()
 
 
 # ------------------------------------------------------------ the whole loop

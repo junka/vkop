@@ -7,8 +7,6 @@
 // vkCmdDispatch. DEAD_BDA_DESC_ONLY=1 runs the same shaders through the
 // descriptor builds (N storage bindings) as the A/B baseline.
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

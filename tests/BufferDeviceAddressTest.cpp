@@ -117,7 +117,7 @@ int main() {
                             e.what());
                 failures++;
             }
-            std::free(host);
+            aligned_free_host(host);
         }
     } else {
         std::printf(

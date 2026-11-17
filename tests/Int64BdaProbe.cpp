@@ -4,8 +4,6 @@
 // created. Each op checks exact int64 results and that the BDA module
 // dispatched. INT64_BDA_DESC_ONLY=1 pins the descriptor modules.
 
-#include <unistd.h>
-
 #include <cstdio>
 #include <cstdlib>
 #include <memory>

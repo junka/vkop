@@ -418,6 +418,12 @@ def find_bench(explicit):
         return p
     cands = [str(_REPO / "build" / "benchmark" / "vkop-bench"),
              "build/benchmark/vkop-bench"]
+    # Multi-config generators (Visual Studio, Xcode) put the binary one level
+    # down, and Windows adds .exe, so the flat name is only one build shape.
+    name = "vkop-bench.exe" if os.name == "nt" else "vkop-bench"
+    roots = [_REPO / "build" / "benchmark", Path("build/benchmark")]
+    cands += [str(r / cfg / name)
+              for r in roots for cfg in ("Release", "RelWithDebInfo", "Debug")]
     for c in cands:
         p = Path(c)
         if p.is_file() and os.access(p, os.X_OK):

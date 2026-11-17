@@ -84,16 +84,19 @@ check("sole preset needs no default", m.load_preset(p) == ("only", {"max_kv": 10
 # its artifacts must work from any cwd. Run from "/" to prove cwd is unused.
 sub = os.path.join(tmp, "modelA")
 os.makedirs(sub, exist_ok=True)
+# Absolute on whichever platform runs the test: "/abs/tok.bin" is not an
+# absolute path on Windows and would be joined into the config's directory.
+abs_tok = os.path.join(tmp, "abs", "tok.bin")
 p = write("modelA/cfg.json", {"model": "llm.vkopbin",
                               "kv-cache": "kv.bin",
-                              "tokenizer": "/abs/tok.bin",
+                              "tokenizer": abs_tok,
                               "embed": ""})
 _, got = m.load_preset(p)
 check("relative path -> config's directory",
       got["model"] == os.path.join(sub, "llm.vkopbin"), repr(got.get("model")))
 check("relative kv-cache -> config's directory",
       got["kv_cache"] == os.path.join(sub, "kv.bin"), repr(got.get("kv_cache")))
-check("absolute path left alone", got["tokenizer"] == "/abs/tok.bin",
+check("absolute path left alone", got["tokenizer"] == abs_tok,
       repr(got.get("tokenizer")))
 check("empty path stays empty (how --kv-cache disables itself)",
       got["embed"] == "", repr(got.get("embed")))

@@ -20,8 +20,6 @@
 
 #include <vulkan/vulkan.h>
 
-#include <unistd.h>
-
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -330,7 +328,7 @@ int main() {
     std::printf("bind buffer + set offsets  : %8.1f ns/cmd\n",
                 double(rebind_ns) / kCmdIter);
 
-    std::free(desc_mem);
+    aligned_free_host(desc_mem);
     std::printf("%s\n", failures ? "RESULT: FAIL" : "RESULT: OK");
     std::fflush(nullptr);
     // b3's NVIDIA EGL atexit handler SIGSEGVs after main; _exit reports the
