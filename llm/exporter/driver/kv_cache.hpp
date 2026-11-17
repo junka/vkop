@@ -368,6 +368,13 @@ public:
             auto from = core::as_tensor<float>(p.out);
             from->copyToCPU(cmdpool_);
             auto to = core::as_tensor<float>(p.in);
+            // toCPU() first: copyToGPU returns immediately when the tensor is
+            // already resident, and `p.in` has been resident since the first
+            // round. Without this the state never reached the graph at all --
+            // decode ran every round against whatever in held, and only prefill
+            // looked right, because a chunk's whole recurrence happens inside
+            // one Run() along seq.
+            to->toCPU();
             to->fillToCPU(from->data().data());
             to->copyToGPU(cmdpool_);
             // The readback left the graph output host-resident; next round's
@@ -447,6 +454,13 @@ private:
 
     void zero_(const std::shared_ptr<core::ITensor>& t) {
         auto f = core::as_tensor<float>(t);
+        // toCPU() before the upload is load-bearing: copyToGPU returns
+        // immediately when the tensor is already resident, so without it this
+        // is a NO-OP from the second round onward -- the host vector is zeroed
+        // and never sent. Measured: the first request answered correctly and
+        // every later one inherited the previous request's state, because
+        // reset() had stopped doing anything.
+        f->toCPU();
         std::vector<float> zeros(f->num_elements(), 0.0f);
         f->fillToCPU(zeros.data());
         f->copyToGPU(cmdpool_);
