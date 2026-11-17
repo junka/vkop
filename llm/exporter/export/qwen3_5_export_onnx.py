@@ -730,11 +730,23 @@ def annotate_custom_ops(path):
             s_dim = x_vi.type.tensor_type.shape.dim[1] if x_vi else None
             c = c_dim.dim_value if (c_dim and c_dim.HasField("dim_value")) else None
             s = s_dim.dim_value if (s_dim and s_dim.HasField("dim_value")) else None
-            for out, dims in ((n.output[0], [c if c else "C", "seq"]),
-                              (n.output[1], [c if c else "C", CONV_K - 1])):
-                if out in have:
-                    continue
-                g.value_info.append(_vi(out, TensorProto.FLOAT, dims))
+            # out0 is the convolution result and follows x's dtype; out1 is the
+            # conv state, which is fp32 in every build (conv1d.comp: "the conv
+            # STATE is fp32 in every build: it is carried across rounds").
+            #
+            # Marking both FLOAT is what broke the 27B. x is fp16 here, so a
+            # float32 declaration made the op build the fp32 shader and read the
+            # half-typed input as floats: measured, its output came back with
+            # max 1.47e10 instead of the ~±40 a 4-tap convolution of that input
+            # can produce, and every layer downstream inherited the garbage.
+            x_dtype = (x_vi.type.tensor_type.elem_type if x_vi else
+                       TensorProto.FLOAT)
+            g.value_info.append(_vi(n.output[0], x_dtype,
+                                    [c if c else "C", "seq"]))
+            added += 1
+            if n.output[1] not in have:
+                g.value_info.append(_vi(n.output[1], TensorProto.FLOAT,
+                                        [c if c else "C", CONV_K - 1]))
                 added += 1
         elif n.op_type == "LinearAttention":
             # out [Hv, S, Dv] and state_out [Hv, Dk, Dv]
