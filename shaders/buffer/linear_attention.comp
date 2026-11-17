@@ -239,7 +239,18 @@ void main() {
         // is skipped with a branch, never a `continue` (a divergent barrier
         // operand is undefined).
         if (col_ok) {
-            const uint gt = uint(h) * uint(seq) + uint(t);
+            // `g` and `beta` are [B, S, Hv] in the exporter's layout and
+            // [Hv, S] in the tests' -- the SAME seq_major split the q/k/v and
+            // output bases above already make. This was the one index in the
+            // kernel that ignored it, so on the real graph the gate and the
+            // step size were read from another token's slot.
+            //
+            // The unit test pins [Hv, S] only (seq_major == 0), which is why
+            // the missing branch survived: with head-major inputs the two
+            // spellings coincide and every case passes.
+            const uint gt = uLinAttn.seq_major != 0
+                                ? uint(t) * uint(uLinAttn.heads) + uint(h)
+                                : uint(h) * uint(seq) + uint(t);
             const float decay = exp(ACC_LOAD(uG.data, gt));
             const float beta = ACC_LOAD(uBeta.data, gt);
 
