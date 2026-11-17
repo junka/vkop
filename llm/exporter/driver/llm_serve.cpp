@@ -1239,8 +1239,32 @@ class InferenceServer {
                 std::fflush(stderr);
             }
         }
+        // A hybrid decoder's conv/recurrent state is a lossy accumulator: after
+        // a round it corresponds to the END of covered_ids_, not to any position
+        // inside it. So reusing P rows of KV while the state sits elsewhere
+        // makes the linear layers see a different history from the attention
+        // layers. When the reuse is only partial the state has to be rebuilt,
+        // which means recomputing from 0.
+        //
+        // VKOP_NO_PREFIX_REUSE=1 forces it unconditionally, for A/B runs.
+        if ((lin_state_->present() && match < covered_ids_.size()) ||
+            std::getenv("VKOP_NO_PREFIX_REUSE")) {
+            match = 0;
+        }
         const int P = static_cast<int>(match);
         const int S = L - P;
+        // VKOP_PREFIX_TRACE: the reuse decision, AFTER any override, with the
+        // numbers the round will actually use. The per-id dump above runs
+        // before the override and so cannot answer "did disabling reuse take".
+        if (std::getenv("VKOP_PREFIX_TRACE")) {
+            std::fprintf(stderr,
+                         "[ptrace] covered=%zu incoming=%zu -> P=%d S=%d "
+                         "state=%d reuse_off=%d\n",
+                         covered_ids_.size(), ids.size(), P, S,
+                         lin_state_->present() ? 1 : 0,
+                         std::getenv("VKOP_NO_PREFIX_REUSE") ? 1 : 0);
+            std::fflush(stderr);
+        }
         // Reusing less than the whole covered stream means this round's
         // prefill writes over rows covered_ids_ still claims. Until the round
         // finishes, that claim is not trustworthy (see invalidate_prefix_state).
@@ -1322,6 +1346,8 @@ class InferenceServer {
                 if (lin_state_->present()) {
                     lin_state_->reset();
                     lin_state_->upload();
+                    if (std::getenv("VKOP_STATE_DUMP"))
+                        lin_state_->dump_debug("after reset");
                 }
             }
             if (lin_state_->present()) lin_state_->bind_for_round();
