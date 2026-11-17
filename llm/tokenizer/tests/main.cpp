@@ -7,7 +7,11 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 // 测试数据文件名。实际路径由 main 里解析（优先环境变量，其次可执行文件旁），
 // 让 `make test` / ctest 不依赖 cwd。
@@ -24,18 +28,22 @@ namespace {
 std::string find_data_file(const char* name) {
     std::vector<std::string> dirs;
     if (const char* env = std::getenv("QWEN_TEST_DATA")) dirs.emplace_back(env);
-    // 可执行文件所在目录：/proc/self/exe（Linux）
-    char exe[4096];
+    // 可执行文件所在目录：/proc/self/exe（Linux）或 GetModuleFileNameA（Windows）
+    char exe[4096] = {};
+#ifdef _WIN32
+    DWORD n = ::GetModuleFileNameA(nullptr, exe, sizeof(exe) - 1);
+#else
     ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+#endif
     if (n > 0) {
         exe[n] = '\0';
         std::string exedir = std::string(exe);
-        auto slash = exedir.find_last_of('/');
+        auto slash = exedir.find_last_of("/\\");
         if (slash != std::string::npos) {
             std::string d = exedir.substr(0, slash);
             dirs.push_back(d);
             // 上一级（源码根）及其 tests 子目录：源码内构建时数据在 tests/
-            auto slash2 = d.find_last_of('/');
+            auto slash2 = d.find_last_of("/\\");
             if (slash2 != std::string::npos) {
                 std::string parent = d.substr(0, slash2);
                 dirs.push_back(parent);
