@@ -85,6 +85,7 @@ using vkop::core::as_tensor;
 using vkop::core::ElemKind;
 using vkop::core::elem_name;
 using vkop::export_::KVCache;
+using vkop::export_::LinearState;
 using qwen::Tokenizer;
 
 namespace {
@@ -253,22 +254,62 @@ struct ModelArch {
     int hidden = LEGACY_HIDDEN;
     int nkv = 8;
     int hd = 128;
+    // Number of layers that carry a KV cache. Equal to the model's layer count
+    // for a dense graph (Qwen3-VL-2B: 28), and smaller for a hybrid one:
+    // Qwen3.5-27B has 64 layers of which only every 4th is full attention, so
+    // 16. Everything that walks "one cache per layer" uses this, and the layer
+    // NUMBERS live in kv_layers -- the graph does not name them 0..n-1.
     int nlayers = 28;
+    // The layer index of each KV cache, in ascending order. The graph input is
+    // `past_key_values_<layer>`, and for a hybrid model those numbers are
+    // sparse (Qwen3.5-27B: 3, 7, 11, ... 63). A dense model leaves this as
+    // 0..nlayers-1, which is also what an older artifact carries, so nothing
+    // about the existing path changes.
+    std::vector<int> kv_layers;
     int position_ids_dims = 2;
     bool has_deepstack = false;
     bool has_image_pad_mask = false;
     ElemKind cache_kind = ElemKind::kFloat16;
+
+    // The graph input/output name for cache slot `i` (0-based position in
+    // kv_layers, NOT the layer index).
+    std::string kv_in(int i) const {
+        return "past_key_values_" + std::to_string(kv_layers[i]);
+    }
+    std::string kv_out(int i) const {
+        return "present_key_values_" + std::to_string(kv_layers[i]);
+    }
 };
 
 inline float fp16_to_f32(uint16_t h) { return ITensor::fp16_to_fp32(h); }
 
 ModelArch infer_arch(const std::shared_ptr<Runtime> &rt) {
     ModelArch a;
-    int n = 0;
-    while (rt->GetInput("past_key_values_" + std::to_string(n))) ++n;
-    if (n == 0) throw std::runtime_error("model has no past_key_values_* inputs");
-    a.nlayers = n;
-    auto pk0 = rt->GetInput("past_key_values_0");
+    // Enumerate the model's own input names rather than probing 0, 1, 2, ...
+    // A dense export numbers its caches consecutively and both agree, but a
+    // hybrid decoder only caches the full-attention layers: Qwen3.5-27B has
+    // past_key_values_3, _7, ... _63 and nothing at _0, so counting upward
+    // stops at the first gap and reported "no past_key_values_* inputs".
+    const std::string kv_prefix = "past_key_values_";
+    for (const auto &name : rt->ListInputNames()) {
+        if (name.rfind(kv_prefix, 0) != 0) continue;
+        const std::string digits = name.substr(kv_prefix.size());
+        if (digits.empty()) continue;
+        // The suffix must be a plain layer index: a name like
+        // `past_key_values_3_scale` belongs to a quantized-cache variant and is
+        // not a cache tensor.
+        if (digits.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        a.kv_layers.push_back(std::atoi(digits.c_str()));
+    }
+    std::sort(a.kv_layers.begin(), a.kv_layers.end());
+    if (a.kv_layers.empty())
+        throw std::runtime_error("model has no past_key_values_* inputs");
+    a.nlayers = static_cast<int>(a.kv_layers.size());
+    auto pk0 = rt->GetInput(a.kv_in(0));
+    if (!pk0)
+        throw std::runtime_error("model declares " + a.kv_in(0) +
+                                 " but the runtime has no such input");
     auto s = pk0->getShape();
     if (s.size() >= 3) a.nkv = static_cast<int>(s[2]);
     if (s.size() >= 5) a.hd = static_cast<int>(s[4]);
@@ -485,6 +526,27 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
         q = vocab > 0 ? total / vocab : 1;
     }
     const uint16_t *row = p + static_cast<std::ptrdiff_t>(q - 1) * vocab;
+    // VKOP_LOGIT_TOP: print the head of the distribution. A model that is
+    // producing plausible text has a broad top-5; one whose state or mask is
+    // wrong tends to pin a single token (often EOS) far above the rest, and
+    // that is indistinguishable from "the model chose to stop" without it.
+    // Printed before the greedy early-return below, which is the path a
+    // benchmark run takes.
+    if (std::getenv("VKOP_LOGIT_TOP")) {
+        std::vector<std::pair<float, int>> top;
+        for (int i = 0; i < vocab; ++i) {
+            const float v = fp16_to_f32(row[i]);
+            if (top.size() == 5 && v <= top.back().first) continue;
+            top.emplace_back(v, i);
+            std::sort(top.begin(), top.end(),
+                      [](const auto &a, const auto &b) { return a.first > b.first; });
+            if (top.size() > 5) top.pop_back();
+        }
+        std::printf("[logit] q=%d vocab=%d top:", q, vocab);
+        for (const auto &e : top) std::printf(" %d(%.3f)", e.second, e.first);
+        std::printf("\n");
+        std::fflush(stdout);
+    }
     return sampler.pick(row, vocab, history, sp);
 }
 
@@ -554,7 +616,19 @@ class InferenceServer {
         std::printf("[serve] embed vocab=%d hidden=%d\n", vocab_, arch_.hidden);
 
         kv_ = std::make_unique<KVCache>(rt_, cmdpool_, arch_.nlayers, arch_.nkv,
-                                        arch_.hd, max_kv_, arch_.cache_kind);
+                                        arch_.hd, max_kv_, arch_.cache_kind,
+                                        arch_.kv_layers);
+        // Hybrid decoders (Qwen3.5) also carry per-layer conv/recurrent state
+        // for their linear-attention layers. Dense ones have none and this
+        // stays empty.
+        lin_state_ = std::make_unique<LinearState>(rt_, cmdpool_);
+        if (lin_state_->present()) {
+            lin_state_->reset();
+            lin_state_->upload();
+            std::printf("[serve] linear-attention state: %zu pair(s)\n",
+                        lin_state_->pair_count());
+            std::fflush(stdout);
+        }
         for (int32_t id : tok_.stop_token_ids())
             stop_ids_.push_back(static_cast<uint32_t>(id));
         ds_zero_.assign(static_cast<size_t>(arch_.hidden), 0);
@@ -736,7 +810,7 @@ class InferenceServer {
     // head 0's first rows and nothing else, i.e. noise. pack_rows_ /
     // unpack_rows_ walk the 2 * nkv blocks against the real pitch.
     int kv_pitch_(int layer) {
-        const std::string name = "past_key_values_" + std::to_string(layer);
+        const std::string name = arch_.kv_in(layer);
         auto t = rt_->GetInput(name);
         if (!t) throw std::runtime_error("--kv-cache: no " + name);
         size_t bytes = 0;
@@ -766,7 +840,7 @@ class InferenceServer {
     // kv_->resume_from().
     template <typename C>
     void pack_layer_(int layer, uint32_t rows, int pitch, char *out) {
-        const std::string name = "past_key_values_" + std::to_string(layer);
+        const std::string name = arch_.kv_in(layer);
         rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(arch_.nkv),
                                 static_cast<uint32_t>(pitch),
                                 static_cast<uint32_t>(arch_.hd)});
@@ -814,7 +888,7 @@ class InferenceServer {
     template <typename C>
     void unpack_layer_(int layer, uint32_t rows, int pitch, const char *in,
                        std::vector<C> &scratch) {
-        const std::string name = "past_key_values_" + std::to_string(layer);
+        const std::string name = arch_.kv_in(layer);
         rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(arch_.nkv),
                                 static_cast<uint32_t>(pitch),
                                 static_cast<uint32_t>(arch_.hd)});
@@ -1241,7 +1315,16 @@ class InferenceServer {
             } else {
                 kv_->reset_for_prefill();
                 kv_->upload();
+                // A fresh conversation starts from a zero linear-attention
+                // state, exactly as it starts from an empty KV cache. Reusing
+                // a prefix (past_len > 0) keeps whatever the earlier rounds
+                // left, which is the point of the reuse.
+                if (lin_state_->present()) {
+                    lin_state_->reset();
+                    lin_state_->upload();
+                }
             }
+            if (lin_state_->present()) lin_state_->bind_for_round();
 
             upload_input(cmdpool_, rt_->GetInput("inputs_embeds"));
             upload_input(cmdpool_, rt_->GetInput("position_ids"));
@@ -1258,7 +1341,12 @@ class InferenceServer {
             rt_->invalidate_replay();
             dev_->wait_all_done();
             past_len = kv_->feedback();
+            // The state swap must wait for the GPU: the buffer this round read
+            // is the one the NEXT round writes over.
+            if (lin_state_->present()) lin_state_->advance();
         }
+        if (lin_state_->present() && std::getenv("VKOP_STATE_DUMP"))
+            lin_state_->dump_debug("after prefill");
 
         out_ids.clear();
         // Unique generated ids, in first-seen order, for the repetition
@@ -1347,12 +1435,16 @@ class InferenceServer {
                 if (arch_.has_image_pad_mask)
                     upload_input(cmdpool_, rt_->GetInput("image_pad_mask"));
 
+                if (lin_state_->present()) lin_state_->bind_for_round();
                 const double ms = rt_->Run();
                 next_id = sample_last_token(rt_, cmdpool_, vocab_, sampler_,
                                             penalised, sp);
                 out_ids.push_back(static_cast<uint32_t>(next_id));
                 note(static_cast<uint32_t>(next_id));
                 past_len = kv_->feedback();
+                // sample_last_token reads logits back, which is a host
+                // round-trip, so the GPU is idle here and the swap is safe.
+                if (lin_state_->present()) lin_state_->advance();
                 if (std::getenv("VKOP_SERVE_VERBOSE")) {
                     std::printf("[serve] r%d %.0fms past=%d -> %d\n", step, ms,
                                 past_len, next_id);
@@ -1458,6 +1550,9 @@ class InferenceServer {
     uint64_t seed_ = 0;
     SampleParams defaults_;
     std::unique_ptr<KVCache> kv_;
+    // Conv/recurrent state of a hybrid decoder's linear-attention layers. Null
+    // for a dense model -- nothing in the dense path touches it.
+    std::unique_ptr<LinearState> lin_state_;
     std::vector<uint32_t> stop_ids_;
     std::vector<uint32_t> covered_ids_;
     // False while a round is overwriting rows covered_ids_ still claims.

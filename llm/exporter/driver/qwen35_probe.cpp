@@ -162,8 +162,43 @@ int main(int argc, char **argv) {
     }
     std::printf("[probe] filled %d input(s)\n", filled);
 
-    const double ms = rt->Run();
-    std::printf("[probe] Run() = %.1f ms\n", ms);
+    // Rounds. One is the correctness check this driver was written for;
+    // VKOP_PROBE_ROUNDS>1 repeats the SAME shapes, which is what turns it into
+    // a weight-residency measurement: a dense decoder reads every weight every
+    // round, so if part of the model sits in system memory each extra round
+    // pays for it over PCIe -- visible as a round time that does not fall to
+    // the compute-only floor. Shapes are deliberately not advanced: this
+    // measures "what does one full weight sweep cost", not decode semantics,
+    // and keeping past/present fixed leaves the graph in a single state.
+    int rounds = 1;
+    if (const char *e = std::getenv("VKOP_PROBE_ROUNDS")) {
+        rounds = std::atoi(e);
+        if (rounds < 1) rounds = 1;
+    }
+    std::printf("[probe] rounds = %d\n", rounds);
+    std::vector<double> times;
+    times.reserve(static_cast<size_t>(rounds));
+    for (int r = 0; r < rounds; ++r) {
+        const double ms = rt->Run();
+        times.push_back(ms);
+        if (rounds > 1) {
+            std::printf("[probe] round %d/%d = %.1f ms\n", r + 1, rounds, ms);
+            std::fflush(nullptr);
+        } else {
+            std::printf("[probe] Run() = %.1f ms\n", ms);
+        }
+    }
+    if (rounds > 1) {
+        // min is the steady-state number: round 1 still carries pipeline/plan
+        // cost, and any round that got preempted by the peer session is higher.
+        double best = times[0], sum = 0.0;
+        for (double t : times) {
+            if (t < best) best = t;
+            sum += t;
+        }
+        std::printf("[probe] %d rounds: min=%.1f mean=%.1f ms\n", rounds, best,
+                    sum / rounds);
+    }
 
     int bad = 0;
     for (const auto &name : out_names) {

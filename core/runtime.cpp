@@ -10,6 +10,7 @@
 #include <map>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 
@@ -308,6 +309,58 @@ const char *onnx_type_name(int t) {
         return nullptr;
     }
 }
+
+// VKOP_DUMP_NODE=<substr>: print one line per bound tensor whose name contains
+// the substring, immediately after that node executes.
+//
+// This exists because a post-Run walk of the tensor pool is NOT a valid way to
+// read an intermediate: the shape pool recycles tensor objects, so by the time
+// Run returns a name may map to a buffer some later node has already written.
+// Measured on the 27B, the post-Run dump reported a Sigmoid whose values were
+// outside [0,1] and a Reshape peaking at 8e7 -- those were recycled buffers,
+// not that node's output. Dumping from inside the level loop is the only point
+// where the bytes still belong to the op that just wrote them.
+void dump_node_tensors(
+    const std::string &node_name,
+    const std::vector<std::shared_ptr<core::ITensor>> &outs,
+    const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+    for (const auto &t : outs) {
+        if (!t || !t->gpu_resource()) continue;
+        if (t->elem_kind() == core::ElemKind::kFloat16 ||
+            t->dtype() == typeid(uint16_t)) {
+            auto g = core::as_tensor<uint16_t>(t);
+            if (!g) continue;
+            g->copyToCPU(cmdpool);
+            const auto &d = g->data();
+            double s = 0.0;
+            float mn = 1e30f, mx = -1e30f;
+            for (auto raw : d) {
+                const float v = core::ITensor::fp16_to_fp32(raw);
+                s += v;
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            std::printf("[node] %-34s fp16 n=%zu min=%.5g max=%.5g mean=%.5g\n",
+                        node_name.c_str(), d.size(), mn, mx,
+                        d.empty() ? 0.0 : s / d.size());
+        } else if (t->dtype() == typeid(float)) {
+            auto g = core::as_tensor<float>(t);
+            if (!g) continue;
+            g->copyToCPU(cmdpool);
+            const auto &d = g->data();
+            double s = 0.0;
+            float mn = 1e30f, mx = -1e30f;
+            for (float v : d) {
+                s += v;
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            std::printf("[node] %-34s fp32 n=%zu min=%.5g max=%.5g mean=%.5g\n",
+                        node_name.c_str(), d.size(), mn, mx,
+                        d.empty() ? 0.0 : s / d.size());
+        }
+    }
+}
 } // namespace
 
 // The *_sg build of a primary key. Norm/softmax/attention compile a second
@@ -356,6 +409,15 @@ Runtime::kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
 }
 
 void Runtime::LoadModel() {
+    // Comma-separated: one dump pass per name, so a whole chain can be
+    // captured in a single run instead of one 45 s round each.
+    if (const char *dm = std::getenv("VKOP_DUMP_NODE")) {
+        std::string all(dm), one;
+        std::stringstream ss(all);
+        while (std::getline(ss, one, ',')) {
+            if (!one.empty()) dump_matches_.push_back(one);
+        }
+    }
     const bool pprof = pipeline_prof_enabled();
     const auto load_t0 = std::chrono::steady_clock::now();
     pipeline_prof_set_phase("load");
@@ -4011,6 +4073,25 @@ double Runtime::Run() {
             }
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
+            // VKOP_DUMP_NODE: per-node stats, taken while this node's output
+            // bytes are still its own. See dump_node_tensors for why a
+            // post-Run walk cannot answer the same question.
+            const std::string &nd_name = node_ops_[node_idx]->get_name();
+            bool want_dump = false;
+            for (const auto &pat : dump_matches_) {
+                if (nd_name.find(pat) != std::string::npos) { want_dump = true; break; }
+            }
+            if (want_dump) {
+                // Inputs as well as outputs: for an op whose result is wrong,
+                // "the producer ran" and "the consumer received it" are
+                // different claims, and a view op folded away upstream makes
+                // the second one false while the first stays true.
+                dump_node_tensors(nd_name + " IN",
+                                  node_input_tensors_[node_idx], m_cmdpool_);
+                dump_node_tensors(nd_name + " OUT",
+                                  node_output_tensors_[node_idx], m_cmdpool_);
+                std::fflush(stdout);
+            }
             // Re-ask AFTER execute: an op like Transpose decides per round.
             if (op_writes_output()) {
                 for (const auto &o : node_output_tensors_[node_idx]) {

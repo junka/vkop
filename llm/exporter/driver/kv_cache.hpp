@@ -46,6 +46,7 @@
 
 #pragma once
 
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -69,12 +70,29 @@ public:
     KVCache(const std::shared_ptr<core::Runtime>& rt,
             const std::shared_ptr<VulkanCommandPool>& cmdpool, int nlayers,
             int nkv, int hd, int max_kv,
-            core::ElemKind cache_kind = core::ElemKind::kFloat16)
+            core::ElemKind cache_kind = core::ElemKind::kFloat16,
+            std::vector<int> layers = {})
         : rt_(rt), cmdpool_(cmdpool), nlayers_(nlayers), nkv_(nkv), hd_(hd),
           max_kv_(max_kv), cache_kind_(cache_kind) {
         if (nlayers <= 0 || nkv <= 0 || hd <= 0 || max_kv <= 0) {
             throw std::runtime_error("KVCache: invalid arch parameters");
         }
+        // Which layer number each cache slot belongs to. A dense decoder's
+        // inputs are past_key_values_0 .. _n-1, so the default numbering is
+        // indistinguishable from the real one. A hybrid decoder caches only
+        // its full-attention layers and names them by their position in the
+        // whole stack (Qwen3.5-27B: 3, 7, ... 63), which no arithmetic
+        // recovers -- it has to be passed in.
+        if (layers.empty()) {
+            for (int i = 0; i < nlayers; ++i) layers.push_back(i);
+        }
+        if (static_cast<int>(layers.size()) != nlayers) {
+            throw std::runtime_error(
+                "KVCache: " + std::to_string(layers.size()) +
+                " layer number(s) for " + std::to_string(nlayers) +
+                " cache slot(s)");
+        }
+        layers_ = std::move(layers);
         if (cache_kind != core::ElemKind::kFloat16 &&
             cache_kind != core::ElemKind::kFloat8E4M3FN &&
             cache_kind != core::ElemKind::kFloat8E5M2 &&
@@ -92,22 +110,32 @@ public:
         const std::size_t kv_elems = static_cast<std::size_t>(2) * nkv * max_kv * hd;
         auto dev = cmdpool->getVulkanDevice();
         for (int i = 0; i < nlayers; ++i) {
-            auto pin = rt_->GetInput("past_key_values_" + std::to_string(i));
-            auto pout = rt_->GetOutput("present_key_values_" + std::to_string(i));
+            auto pin = rt_->GetInput(past_name(i));
+            auto pout = rt_->GetOutput(present_name(i));
             if (!pin || !pout) {
-                throw std::runtime_error("KVCache: missing KV tensor layer " +
-                                         std::to_string(i));
+                throw std::runtime_error("KVCache: missing KV tensor for layer " +
+                                         std::to_string(layers_[i]));
             }
             preallocate_kv_(pin, dev, kv_elems);
             share_kv_(pout, pin);
         }
     }
 
+    // Graph names for cache slot `i` (0-based SLOT index, not the layer
+    // number). Named rather than inlined so the three places that build these
+    // strings cannot drift apart.
+    std::string past_name(int i) const {
+        return "past_key_values_" + std::to_string(layers_[i]);
+    }
+    std::string present_name(int i) const {
+        return "present_key_values_" + std::to_string(layers_[i]);
+    }
+
     // 每层 past 的逻辑形状成 kv_len=0（buffer 复用，不重新分配）。必须在填其它
     // 输入之前调用，且之后要 upload()。
     void reset_for_prefill() {
         for (int i = 0; i < nlayers_; ++i) {
-            rt_->ResizeInput("past_key_values_" + std::to_string(i),
+            rt_->ResizeInput(past_name(i),
                              {1u, 2u, static_cast<uint32_t>(nkv_), 0u,
                               static_cast<uint32_t>(hd_)});
         }
@@ -116,7 +144,7 @@ public:
     // reset_for_prefill() 之后把空 past 传上 GPU。
     void upload() {
         for (int i = 0; i < nlayers_; ++i) {
-            auto t = rt_->GetInput("past_key_values_" + std::to_string(i));
+            auto t = rt_->GetInput(past_name(i));
             upload_kv_(t);
         }
     }
@@ -146,7 +174,7 @@ public:
     int feedback() {
         int past_len = 0;
         for (int i = 0; i < nlayers_; ++i) {
-            auto pres = rt_->GetOutput("present_key_values_" + std::to_string(i));
+            auto pres = rt_->GetOutput(present_name(i));
             const int kv_len = num_kv_elems_(pres) / (2 * nkv_ * hd_);
             set_past_len_(i, kv_len);
             past_len = kv_len;
@@ -163,13 +191,15 @@ private:
     std::shared_ptr<core::Runtime> rt_;
     std::shared_ptr<VulkanCommandPool> cmdpool_;
     int nlayers_, nkv_, hd_, max_kv_;
+    // Layer number per cache slot; 0..nlayers-1 unless the model is hybrid.
+    std::vector<int> layers_;
     core::ElemKind cache_kind_;
 
     // past 的逻辑长度跟上写出的历史。ResizeInput 会把 converted_ 置回 false
     // （buffer 走 prealloc_keep_ 复用，不重分配），所以最后要把 past 标回「数据
     // 在 GPU 上」——那块 buffer 里装的正是本轮的历史，不需要任何上传。
     void set_past_len_(int layer, int kv_len) {
-        const std::string name = "past_key_values_" + std::to_string(layer);
+        const std::string name = past_name(layer);
         rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(nkv_),
                                 static_cast<uint32_t>(kv_len),
                                 static_cast<uint32_t>(hd_)});
@@ -238,6 +268,195 @@ private:
             core::as_tensor<int8_t>(t)->toGPU();
         }
     }
+};
+
+// LinearState — the conv/recurrent state of a hybrid decoder's linear-attention
+// layers, held the same way KVCache holds past/present.
+//
+// Qwen3.5-27B is 48 linear + 16 full-attention layers. Each linear layer owns
+// two fixed-shape fp32 tensors that ride the whole conversation:
+//
+//   conv_state_<L>       [1, conv_dim(=10240), conv_k(=3)]
+//   recurrent_state_<L>  [1, v_heads(=48), dk(=128), dv(=128)]
+//
+// The graph takes them as inputs and returns `conv_state_out_<L>` /
+// `recurrent_state_out_<L>`. Unlike the KV cache these are NOT the same bytes
+// in and out: the operator reads the whole state and writes a new one, so the
+// output cannot alias the input -- one dispatch would read and clobber the same
+// buffer. Two buffers per pair, swapped each round, is what gives a disjoint
+// read and write.
+//
+// Two tensor objects per pair (`a`, `b`), each carrying its own VkBuffer. The
+// graph's input and output names re-point at whichever pair of buffers the
+// round needs:
+//
+//   round k:  conv_state_<L> -> cur ,  conv_state_out_<L> -> other
+//   then swap cur/other
+//
+// so the output of one round is the input of the next without a device copy.
+// Sizes are fixed, so the four buffers are allocated once at load and nothing
+// here depends on the context length.
+class LinearState {
+public:
+    // Discover the linear-attention layers from the graph's own input names.
+    // A hybrid decoder numbers them by their position in the whole stack
+    // (Qwen3.5-27B: 0,1,2, 4,5,6, 8,... -- every 4th layer is full
+    // attention), so the set cannot be derived arithmetically; it is read.
+    // A dense model has no `conv_state_*` inputs at all, which is how this
+    // reports "nothing to do" without the caller having to classify the model.
+    LinearState(const std::shared_ptr<core::Runtime>& rt,
+                const std::shared_ptr<VulkanCommandPool>& cmdpool)
+        : rt_(rt), cmdpool_(cmdpool) {
+        const std::string prefix = "conv_state_";
+        for (const auto& name : rt_->ListInputNames()) {
+            if (name.rfind(prefix, 0) != 0) continue;
+            const std::string digits = name.substr(prefix.size());
+            if (digits.empty() ||
+                digits.find_first_not_of("0123456789") != std::string::npos)
+                continue;
+            layers_.push_back(std::atoi(digits.c_str()));
+        }
+        if (layers_.empty()) return;  // a dense decoder has no linear layers
+        auto dev = cmdpool->getVulkanDevice();
+        for (int layer : layers_) {
+            add_pair_("conv_state_", "conv_state_out_", layer, dev);
+            add_pair_("recurrent_state_", "recurrent_state_out_", layer, dev);
+        }
+    }
+
+    // True when this model has linear-attention state at all.
+    bool present() const { return !pairs_.empty(); }
+    size_t pair_count() const { return pairs_.size(); }
+
+    // Zero every state, in preparation for a fresh conversation.
+    void reset() {
+        for (auto &p : pairs_) zero_(p.in);
+    }
+
+    // reset() already uploaded the zeros; kept so the driver's startup sequence
+    // reads the same as the KV cache's.
+    void upload() {}
+
+    // Nothing to do before Run: the graph reads `conv_state_<L>` /
+    // `recurrent_state_<L>` as ordinary inputs, and those tensors ARE the state.
+    // Kept as an explicit no-op so the driver's round shape stays visible.
+    void bind_for_round() {}
+
+    // After Run (and after the GPU is done reading): make this round's output
+    // next round's input.
+    //
+    // This copies INTO the graph-input tensor's own buffer. Two cheaper designs
+    // were tried and both failed, which is why the obvious ones are not here:
+    //
+    //  * alias the input onto a private slot  -- the state never reached the
+    //    graph. The logits came back BIT-IDENTICAL to a run with a zero state,
+    //    and only the private slot showed the value, i.e. the graph kept reading
+    //    its own buffer while the copy went elsewhere.
+    //  * alias the output onto that slot    -- the producer of
+    //    `conv_state_out_<L>` is an Unsqueeze, a pure view, which re-aliases its
+    //    output onto Conv1d's buffer at execute time and discards the alias.
+    //    Measured: the state stayed exactly zero (nonzero 0, mean|v| 0) round
+    //    after round.
+    //
+    // Copying leaves every buffer identity alone: the input tensor keeps the
+    // buffer the runtime allocated for it, so whatever descriptor the op binds
+    // is still the right one. Cost is ~153 MB per round across 96 pairs (48 x
+    // 120 KB conv + 48 x 3 MB recurrent), about 13 ms of PCIe against a ~1.7 s
+    // round.
+    void advance() {
+        for (auto &p : pairs_) {
+            auto from = core::as_tensor<float>(p.out);
+            from->copyToCPU(cmdpool_);
+            auto to = core::as_tensor<float>(p.in);
+            to->fillToCPU(from->data().data());
+            to->copyToGPU(cmdpool_);
+            // The readback left the graph output host-resident; next round's
+            // producer expects to write a device-resident tensor.
+            from->toGPU();
+        }
+    }
+
+    // Diagnostic: is the state non-zero, i.e. did the last round actually
+    // produce something the next one will read?
+    void dump_debug(const char *label) {
+        if (pairs_.empty()) {
+            std::printf("[state] %s: no linear-attention state\n", label);
+            std::fflush(stdout);
+            return;
+        }
+        for (const auto &named : {
+                 std::pair<const char *, std::shared_ptr<core::ITensor>>{
+                     "in", pairs_[0].in},
+                 {"out", pairs_[0].out}}) {
+            auto f = core::as_tensor<float>(named.second);
+            if (!f) continue;
+            f->copyToCPU(cmdpool_);
+            const auto &d = f->data();
+            double sum = 0.0;
+            size_t nz = 0;
+            for (float v : d) {
+                sum += v < 0 ? -static_cast<double>(v) : static_cast<double>(v);
+                if (v != 0.0f) ++nz;
+            }
+            std::printf("[state] %-22s %-3s %zu elem(s), nonzero %zu, "
+                        "mean|v| %.6g\n",
+                        label, named.first, d.size(), nz,
+                        d.empty() ? 0.0 : sum / d.size());
+            std::fflush(stdout);
+            f->toGPU();
+        }
+    }
+
+private:
+    struct Pair {
+        std::shared_ptr<core::ITensor> in;   // graph input:  the state the graph reads
+        std::shared_ptr<core::ITensor> out;  // graph output: the state it produced
+    };
+
+    void add_pair_(const char *in_prefix, const char *out_prefix, int layer,
+                   std::shared_ptr<VulkanDevice>& dev) {
+        const std::string in_name = in_prefix + std::to_string(layer);
+        const std::string out_name = out_prefix + std::to_string(layer);
+        auto tin = rt_->GetInput(in_name);
+        auto tout = rt_->GetOutput(out_name);
+        if (!tin) {
+            throw std::runtime_error("LinearState: no graph input " + in_name);
+        }
+        if (!tout) {
+            throw std::runtime_error("LinearState: no graph output " + out_name);
+        }
+        if (tin->elem_kind() != core::ElemKind::kFloat32) {
+            throw std::runtime_error(
+                "LinearState: " + in_name + " must be float32, got " +
+                std::string(core::elem_name(tin->elem_kind())));
+        }
+        size_t elems = 1;
+        for (auto d : tin->getShape()) elems *= static_cast<size_t>(d);
+        if (elems == 0) {
+            throw std::runtime_error("LinearState: " + in_name + " is empty");
+        }
+        // The graph's own tensors ARE the state; nothing extra is allocated.
+        // `elems` is kept only for the emptiness check above.
+        (void)elems;
+        (void)dev;
+        Pair p;
+        p.in = tin;
+        p.out = tout;
+        pairs_.push_back(std::move(p));
+    }
+
+    void zero_(const std::shared_ptr<core::ITensor>& t) {
+        auto f = core::as_tensor<float>(t);
+        std::vector<float> zeros(f->num_elements(), 0.0f);
+        f->fillToCPU(zeros.data());
+        f->copyToGPU(cmdpool_);
+    }
+
+
+    std::shared_ptr<core::Runtime> rt_;
+    std::shared_ptr<VulkanCommandPool> cmdpool_;
+    std::vector<int> layers_;
+    std::vector<Pair> pairs_;
 };
 
 } // namespace export_

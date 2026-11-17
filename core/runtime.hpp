@@ -47,6 +47,10 @@ class Runtime {
     bool backend_buffer_ = false;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
+    // VKOP_DUMP_NODE=<substr>[,<substr>...], read once at LoadModel. Empty
+    // means the per-node stats are off and the level loop pays nothing.
+    std::vector<std::string> dump_matches_;
+
     std::vector<std::vector<size_t>> level_node_indices_;
 
     // Per-level "contains a synchronous readback" flag, learned on round 0
