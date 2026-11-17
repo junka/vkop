@@ -38,6 +38,11 @@ class SplitImage : public Operator {
         if (attributes.find("num_outputs") != attributes.end()) {
             num_outputs_ = std::stoi(attributes.at("num_outputs"));
         }
+        // ONNX's `split` attribute; see SplitBuffer::setAttribute for why
+        // ignoring it is a silent wrong answer (the even-division fallback).
+        if (attributes.find("split") != attributes.end()) {
+            split_attr_ = parse_attr_list<int>(attributes.at("split"));
+        }
     }
 
   private:
@@ -64,6 +69,17 @@ class SplitImage : public Operator {
             for (size_t i = 0; i < split_vec.size(); i++) {
                 split_vec[i] = (*split)[i];
             }
+        } else if (!split_attr_.empty()) {
+            int64_t sum = 0;
+            for (int v : split_attr_) sum += v;
+            if (sum != tosplit) {
+                throw std::runtime_error(
+                    "Split: the `split` attribute sums to " +
+                    std::to_string(sum) + " but axis " +
+                    std::to_string(para_.axis) + " is " +
+                    std::to_string(tosplit));
+            }
+            split_vec.assign(split_attr_.begin(), split_attr_.end());
         } else {
             split_vec.resize(num_outputs_);
             int base = tosplit / num_outputs_;
@@ -123,6 +139,8 @@ class SplitImage : public Operator {
     }
 
     int num_outputs_ = 0;
+    // ONNX's `split` attribute (empty when the extents arrive as inputs[1]).
+    std::vector<int> split_attr_;
     split::GpuSplitParam para_;
 };
 // Split buffer op (fp32). Per-output submit: bind the shared input + this
@@ -147,6 +165,16 @@ class SplitBuffer : public BufferFactory {
         }
         if (attributes.find("num_outputs") != attributes.end()) {
             num_outputs_ = std::stoi(attributes.at("num_outputs"));
+        }
+        // ONNX's `split` attribute: the per-output extents along `axis`, as a
+        // constant. Dropping it did not fail -- the else branch below divides
+        // the axis evenly -- so an uneven split (q/k/v at 2048/2048/6144 out of
+        // 10240) silently became 44374/44373/44373. Measured on Qwen3.5-27B,
+        // whose 48 Split nodes are ALL attribute-form with a single input:
+        // LinearAttention then read q/k/v from the wrong offsets and its output
+        // came back exactly zero.
+        if (attributes.find("split") != attributes.end()) {
+            split_attr_ = parse_attr_list<int>(attributes.at("split"));
         }
     }
     bool has_host_side_effects() const override { return true; }
@@ -175,6 +203,20 @@ class SplitBuffer : public BufferFactory {
             for (size_t i = 0; i < split_vec.size(); ++i) {
                 split_vec[i] = (*split)[i];
             }
+        } else if (!split_attr_.empty()) {
+            // The attribute form carries the same numbers as the input form;
+            // only one of the three sources is ever populated. Its extents must
+            // still add up to the axis, or the pieces would address past the
+            // input.
+            int64_t sum = 0;
+            for (int v : split_attr_) sum += v;
+            if (sum != tosplit) {
+                throw std::runtime_error(
+                    "Split: the `split` attribute sums to " +
+                    std::to_string(sum) + " but axis " +
+                    std::to_string(axis_) + " is " + std::to_string(tosplit));
+            }
+            split_vec.assign(split_attr_.begin(), split_attr_.end());
         } else {
             split_vec.resize(num_outputs_);
             int base = tosplit / num_outputs_;
@@ -310,6 +352,10 @@ class SplitBuffer : public BufferFactory {
 
     int axis_ = 1;
     int num_outputs_ = 0;
+    // The ONNX `split` attribute, empty when the graph passes the extents as a
+    // second input instead. Checked before the even-division fallback, which is
+    // only correct for an equal split.
+    std::vector<int> split_attr_;
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
