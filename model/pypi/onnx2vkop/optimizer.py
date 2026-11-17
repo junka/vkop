@@ -6621,6 +6621,20 @@ class FusionOptimizer:
 
         program = []  # flat int list, 4 per op
         collapsible = None  # (sigmoid_op_name, dst) or None
+        # Sigmoid ops already folded into an OP_SILU word. Their dst was
+        # returned to the free list at the fold, and the SILU word immediately
+        # re-allocated it -- so the sigmoid must NOT be freed again by the
+        # generic "last consumer" sweep below. Double-freeing it hands the
+        # SILU's own output register to the next op, which overwrites the gate
+        # before anything reads it: measured on Qwen3.5-27B layer 0, the
+        # norm-gated fuse emitted
+        #     SILU r6, r0      ; r6 = silu(z)   <- the gate
+        #     ADD  r6, r1, eps ; r6 clobbered
+        #     ...
+        #     MUL  r7, r6, r6  ; self-multiply instead of r6 * gate
+        # so the output was (normed*(1+w))^2 -- all-non-negative, max 456.75
+        # where HF gives [-5.66, 3.69].
+        folded_sigmoids = set()
         chain_sigmoid_input = {}  # sigmoid op name -> its input tensor name
         # sigmoid op name -> its OUTPUT TENSOR name. The collapse below must
         # find the MUL operand that carries the sigmoid's RESULT; that operand
@@ -6669,6 +6683,7 @@ class FusionOptimizer:
                                 and program[-3] == op_out_reg[sig_name]):
                             program = program[:-4]
                             free_regs.append(op_out_reg[sig_name])
+                            folded_sigmoids.add(sig_name)
                         dst = alloc_reg()
                         op_out_reg[op.name] = dst
                         program.extend([FusionOptimizer._FUSED_OP_CODES_SILU, dst,
@@ -6676,6 +6691,8 @@ class FusionOptimizer:
                         for inp in op.inputs:
                             pred = producer.get(inp["name"])
                             if pred is not None and pred.name in chain_names:
+                                if pred.name in folded_sigmoids:
+                                    continue  # already freed at the fold
                                 consumed_so_far[pred.name] += 1
                                 if consumed_so_far[pred.name] >= use_count[pred.name]:
                                     r = op_out_reg.get(pred.name)

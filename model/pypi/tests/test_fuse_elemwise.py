@@ -255,3 +255,171 @@ def test_one_non_float_leaf_blocks_the_chain():
     fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
     assert not fused, f"one int64 leaf must block the chain; got {[f.name for f in fused]}"
     print("  PASS (one int64 leaf blocks the chain)")
+
+
+# ---------------------------------------------------------------------------
+# The register-allocator's SILU fold.
+#
+# A SIGMOID+MUL(x, sigmoid) pair collapses into one OP_SILU word. The fold
+# frees the SIGMOID's dst and the SILU word immediately re-allocates it, so the
+# sigmoid is ALREADY freed -- and the generic "last consumer" sweep then freed
+# it a second time, handing the SILU's own output register to a later op. On
+# Qwen3.5-27B's norm-gated fuse that produced
+#
+#     SILU r6, r0       ; r6 = silu(gate)
+#     ADD  r6, r1, eps  ; r6 clobbered
+#     SQRT r7, r6
+#     DIV  r6, 1, r7
+#     MUL  r7, r4, r6   ; core * rsqrt
+#     MUL  r6, r7, r5   ; normed * (1+w)
+#     MUL  r7, r6, r6   ; SELF-multiply -- the gate was gone
+#
+# i.e. the layer emitted (normed*(1+w))^2 instead of normed*(1+w)*silu(gate):
+# all-non-negative out, max 456.75 where HF gives [-5.66, 3.69].
+#
+# These tests execute the emitted program rather than only inspecting it,
+# because every op in it is individually plausible.
+SILU, SIGMOID = 14, 7
+
+
+def _make_gated_chain():
+    """The Qwen3.5 gated-RMSNorm chain, in the shape that triggered it:
+
+        gate = Silu(Z)                      <- consumed LAST, six ops later
+        s    = Add(var, eps)
+        r    = Div(1, Sqrt(s))
+        n    = Mul(core, r)
+        m    = Mul(n, w1)
+        out  = Mul(m, gate)
+    """
+    import numpy as np
+    from onnx import numpy_helper
+
+    m = DAGBasedModel()
+
+    def scalar(name, val):
+        m.initializers[name] = numpy_helper.from_array(
+            np.array(val, dtype=np.float32), name)
+        return tdict(name, [1])
+
+    Z = tdict("Z", [4, 8])
+    var = tdict("var", [4, 1])
+    core = tdict("core", [4, 8])
+    w1 = tdict("w1", [8])
+    eps = scalar("eps", 1e-6)
+    one = scalar("one", 1.0)
+    sig = tdict("sig", [4, 8])
+    gate = tdict("gate", [4, 8])
+    sv = tdict("sum", [4, 1])
+    rv = tdict("root", [4, 1])
+    inv = tdict("inv", [4, 1])
+    n = tdict("n", [4, 8])
+    mm = tdict("mm", [4, 8])
+    out = tdict("out", [4, 8])
+
+    for nd in (
+        Node("Sigmoid", "Sigmoid_0", {}, [Z], [sig]),
+        Node("Mul", "Mul_gate", {}, [Z, sig], [gate]),
+        Node("Add", "Add_0", {}, [var, eps], [sv]),
+        Node("Sqrt", "Sqrt_0", {}, [sv], [rv]),
+        Node("Div", "Div_0", {}, [one, rv], [inv]),
+        Node("Mul", "Mul_0", {}, [core, inv], [n]),
+        Node("Mul", "Mul_1", {}, [n, w1], [mm]),
+        Node("Mul", "Mul_2", {}, [mm, gate], [out]),
+    ):
+        m.nodes[nd.name] = nd
+    m.inputs = [Z, var, core, w1]
+    m.outputs = [out]
+    m.build_dependencies()
+    return m
+
+
+def _fused_program(m):
+    m = run_fusion(m)
+    fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
+    assert len(fused) == 1, f"expected one fused node, got {len(fused)}"
+    return [int(x) for x in fused[0].attributes["ops"]]
+
+
+def _run_program(prog, seeds, scalars):
+    """Execute a [oc, dst, a, b] program. Operands >= 100 are scalars."""
+    import math
+
+    regs = dict(seeds)
+    for i in range(0, len(prog), 4):
+        oc, dst, a, b = prog[i:i + 4]
+        av = scalars[a - 100] if a >= 100 else regs.get(a, 0.0)
+        bv = scalars[b - 100] if b >= 100 else regs.get(b, 0.0)
+        if oc == 3:
+            r = av * bv
+        elif oc == 1:
+            r = av + bv
+        elif oc == 4:
+            r = av / bv if bv else 0.0
+        elif oc == 6:
+            r = math.sqrt(av)
+        elif oc == 14:
+            r = av / (1.0 + math.exp(-av)) if av < 700 else av
+        else:
+            raise AssertionError(f"unhandled opcode {oc} in {prog}")
+        regs[dst] = r
+    return regs
+
+
+def test_the_silu_gate_is_not_clobbered_before_it_is_read():
+    """Structural: nothing may write the SILU's dst register until it is read.
+
+    This is the property the double-free broke, and unlike a numeric check it
+    cannot be satisfied by an accidentally-cancelling expression. Measured on
+    the 27B the sequence was SILU r6 / ADD r6,.. -- the gate was dead on
+    arrival and the last MUL became r6*r6.
+    """
+    prog = _fused_program(_make_gated_chain())
+    silu_dst = None
+    for i in range(0, len(prog), 4):
+        if prog[i] == SILU:
+            assert silu_dst is None, "more than one SILU in this chain"
+            silu_dst = prog[i + 1]
+    assert silu_dst is not None, f"the SIGMOID+MUL pair did not fold: {prog}"
+
+    read_at = None
+    for i in range(0, len(prog), 4):
+        if silu_dst in (prog[i + 2], prog[i + 3]):
+            read_at = i
+    assert read_at is not None, f"the gate register is never read: {prog}"
+
+    for i in range(0, len(prog), 4):
+        if i <= read_at and prog[i + 1] == silu_dst:
+            # The SILU word itself writes it; anything after does too.
+            pass
+    writers = [i for i in range(0, len(prog), 4)
+               if prog[i + 1] == silu_dst]
+    assert len(writers) == 1, (
+        f"register r{silu_dst} holding silu(gate) is written by "
+        f"{len(writers)} ops ({writers}); the gate is clobbered before its "
+        f"consumer at word {read_at}. program={prog}")
+
+
+def test_the_fused_chain_evaluates_the_gated_formula():
+    """Numeric: the program must compute normed * (1+w) * silu(gate)."""
+    import math
+
+    prog = _fused_program(_make_gated_chain())
+    # Leaf register order is the allocator's (first appearance); assert the
+    # mapping this test seeds so a reordering fails loudly instead of passing
+    # on wrong numbers. r0/r1 are Z/var and the SILU reads r0.
+    Z, var, core, w1 = 0.7, 0.25, 1.5, 1.9
+    eps, one = 1e-6, 1.0
+    seeds = {0: Z, 1: var, 4: core, 5: w1}
+    regs = _run_program(prog, seeds, [eps, one])
+
+    gate = Z / (1.0 + math.exp(-Z))
+    want = (core / math.sqrt(var + eps)) * w1 * gate
+    got = regs.get(0)
+    print(f"  program={prog}")
+    print(f"  got={got:.6f} want={want:.6f} (squared form would be "
+          f"{((core / math.sqrt(var + eps)) * w1) ** 2:.6f})")
+    assert abs(got - want) < 1e-5, (
+        f"fused chain gave {got}, expected {want}. A value matching "
+        f"{((core / math.sqrt(var + eps)) * w1) ** 2:.6f} means the gate was "
+        f"dropped and the last MUL self-multiplied.")
