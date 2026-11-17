@@ -1757,12 +1757,25 @@ template <typename T> class Tensor : public ITensor {
         // about to write (see the view-writer check there).
         if (vkobj_) {
             auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-            // A borrowed sub-range view must NEVER be reallocated: its size is
-            // the view's byte range, not a pool slot, and dropping it here
-            // would silently turn the view back into a private (empty) buffer
-            // and lose the aliasing. Keep it as-is.
+            // A borrowed sub-range view is kept only while its window still
+            // COVERS this round's payload. "Must NEVER be reallocated" held
+            // only while the same op re-took the same view every round (the
+            // static decode loop these views were built for); the 27B breaks
+            // that: its Split runs the zero-copy alias at q_len=1 (prefix==1)
+            // and the real dispatch at q_len=17, and the dispatch round then
+            // wrote its 69/69/208 KB outputs into the previous decode's
+            // 4/4/12 KB view windows -- shaders kept splitting into a dead
+            // buffer, every later request in the process read stale bytes
+            // (three slices sharing one max was the tell), and the write
+            // itself ran past the window. A view that has become too small
+            // drops back to a private allocation; the zero-copy path rebuilds
+            // the alias next time it fires.
             if (buff && buff->is_view_range()) {
-                return;
+                if (buff->getSize() >= aligned) {
+                    return;
+                }
+                vkobj_.reset();
+                view_range_.reset();
             }
             if (buff) {
                 if (prealloc_keep_ ? (buff->getSize() >= aligned)
