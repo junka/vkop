@@ -217,6 +217,18 @@ GPT2_BRANCHES = [
     r"\s+",
 ]
 GPT2_DIGITS = {r"\p{N}": False, r"\p{N}{1,3}": True}   # 值 = bit2（数字段切 1~3 个）
+#   Qwen3.5：与 GPT-2 逐分支相同，只有字母类从 \p{L} 放宽成 \p{L}\p{M}（多认组合
+#   记号）。数字段仍是 \p{N}（单字符，和 Qwen3-VL 一致）。这是 bit3 而不是一个新的
+#   扫描器：切分逻辑完全一样，只是"哪些码点算字母"这张表多了三个类别。
+QWEN35_BRANCHES = [
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+",
+    r"\p{N}",
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*",
+    r"\s*[\r\n]+",
+    r"\s+(?!\S)",
+    r"\s+",
+]
 #   Phi-4 / o200k 家族：字母按大小写「形状」切两段，数字固定 \p{N}{1,3}（扫描器
 #   内部就切 1~3 个，bit2 对它没有意义），标点尾巴多一个 '/'。
 PHI_BRANCHES = [
@@ -236,6 +248,7 @@ PHI_BRANCHES = [
 PRE_TOKENIZER_FAMILIES = {
     "gpt2": (GPT2_BRANCHES, ("Isolated", False)),
     "phi": (PHI_BRANCHES, ("Removed", True)),
+    "qwen35": (QWEN35_BRANCHES, ("Isolated", False)),
 }
 
 
@@ -334,7 +347,7 @@ def derive_flags(data):
 
     digit3 = family == "gpt2" and GPT2_DIGITS[branches[2]]
     flags = (1 if family == "phi" else 0) | (2 if no_normalizer else 0) \
-        | (4 if digit3 else 0)
+        | (4 if digit3 else 0) | (8 if family == "qwen35" else 0)
     print(f"[+] pre_tokenizer={family} digits={'1-3' if digit3 else '1'} "
           f"normalizer={'none' if no_normalizer else 'present'} -> flags={flags}")
     return flags

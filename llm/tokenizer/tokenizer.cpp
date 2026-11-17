@@ -39,6 +39,12 @@ constexpr uint32_t kFlagNoNormalizer = 1u << 1;
 // GLM-Edge / Llama-3 那一族是 GPT-2 扫描器 + \p{N}{1,3}：只有数字段切成 1~3 个，
 // 字母仍按 \p{L}+ 整段切（Phi 的 UL/LL 大小写形状切分不适用于它们）。
 constexpr uint32_t kFlagDigitRun3 = 1u << 2;
+// Qwen3.5 是 GPT-2 扫描器 + 字母类含 \p{M}：它的字母分支写成
+// [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+，其余六个分支与 GPT-2 逐字符相同，数字段
+// 仍是 \p{N}（单字符）。\p{M}（组合记号）在 GPT-2 的 \p{L} 之外，所以带重音
+// 的分解序列会被切成一个 span 而不是两个——切错了不报错，只会产出不同的 token
+// 串，因此必须由 flag 显式区分，不能默认放宽。
+constexpr uint32_t kFlagLetterIncludesMarks = 1u << 3;
 
 // GPT-2/BBPE byte<->unicode 映射。68 个不可打印/特殊字节被映射到 U+0100..U+017F
 // 区间（UTF-8 编码为 0xC4 0x80..0xC4 0xBF），其余字节一对一映射到自身码点。
@@ -97,6 +103,14 @@ inline bool is_letter(uint32_t cp) {
     return c == UTF8PROC_CATEGORY_LU || c == UTF8PROC_CATEGORY_LL
         || c == UTF8PROC_CATEGORY_LT || c == UTF8PROC_CATEGORY_LM
         || c == UTF8PROC_CATEGORY_LO;
+}
+
+// \p{M} = Mn/Mc/Me (marks). Only Qwen3.5's pre_tokenizer folds these into its
+// letter class (see kFlagLetterIncludesMarks); plain GPT-2 keeps them out.
+inline bool is_mark(uint32_t cp) {
+    auto c = utf8proc_category(cp);
+    return c == UTF8PROC_CATEGORY_MN || c == UTF8PROC_CATEGORY_MC
+        || c == UTF8PROC_CATEGORY_ME;
 }
 
 inline bool is_number(uint32_t cp) {
@@ -243,12 +257,19 @@ std::size_t match_ws_run(const std::vector<uint32_t>& cps, std::size_t i) {
 }
 
 void pre_tokenize(const std::string& s, std::vector<std::string>& out,
-                  std::size_t digit_max) {
+                  std::size_t digit_max, bool letter_includes_marks = false) {
     CpStream st = decode_to_cps(s);
     const auto& cps = st.cps;
     const auto& off = st.offsets;
     std::size_t n = cps.size();
     std::size_t i = 0;
+
+    // The regex's \p{L} class. Qwen3.5 writes \p{L}\p{M} instead, which only
+    // changes which codepoints continue a word (see kFlagLetterIncludesMarks);
+    // binding it once keeps every branch below reading the same class.
+    auto in_letter_class = [letter_includes_marks](uint32_t cp) {
+        return is_letter(cp) || (letter_includes_marks && is_mark(cp));
+    };
 
     auto emit = [&](std::size_t a, std::size_t b) {
         // codepoint 区间 [a,b) -> 原字节子串
@@ -267,12 +288,12 @@ void pre_tokenize(const std::string& s, std::vector<std::string>& out,
         // alt2: [^\r\n\p{L}\p{N}]? \p{L}+
         //   无前缀：cp 是字母
         //   有前缀：cp 不是 CR/NL/L/N，且下一个是字母
-        bool cp_letter = is_letter(cp);
+        bool cp_letter = in_letter_class(cp);
         if (cp_letter
-            || (cp != 0x0D && cp != 0x0A && !is_letter(cp) && !is_number(cp)
-                && i + 1 < n && is_letter(cps[i + 1]))) {
+            || (cp != 0x0D && cp != 0x0A && !in_letter_class(cp) && !is_number(cp)
+                && i + 1 < n && in_letter_class(cps[i + 1]))) {
             std::size_t j = cp_letter ? i : i + 1; // 前缀消费 0 或 1 个
-            while (j < n && is_letter(cps[j])) ++j;
+            while (j < n && in_letter_class(cps[j])) ++j;
             emit(i, j); i = j; continue;
         }
 
@@ -284,11 +305,11 @@ void pre_tokenize(const std::string& s, std::vector<std::string>& out,
         }
 
         // alt4: ' ?[^\s\p{L}\p{N}]+ [\r\n]*  （前缀仅字面空格 0x20）
-        bool cp_nonsln = !is_ws(cp) && !is_letter(cp) && !is_number(cp);
-        if ((cp == 0x20 && i + 1 < n && !is_ws(cps[i + 1]) && !is_letter(cps[i + 1]) && !is_number(cps[i + 1]))
+        bool cp_nonsln = !is_ws(cp) && !in_letter_class(cp) && !is_number(cp);
+        if ((cp == 0x20 && i + 1 < n && !is_ws(cps[i + 1]) && !in_letter_class(cps[i + 1]) && !is_number(cps[i + 1]))
             || cp_nonsln) {
             std::size_t j = (cp == 0x20) ? i + 1 : i;
-            while (j < n && !is_ws(cps[j]) && !is_letter(cps[j]) && !is_number(cps[j])) ++j; // [^\s\p{L}\p{N}]+
+            while (j < n && !is_ws(cps[j]) && !in_letter_class(cps[j]) && !is_number(cps[j])) ++j; // [^\s\p{L}\p{N}]+
             while (j < n && (cps[j] == 0x0D || cps[j] == 0x0A)) ++j;                          // [\r\n]*
             emit(i, j); i = j; continue;
         }
@@ -513,7 +534,7 @@ void Tokenizer::load(const std::string& bin_path) {
     // 未定义的位一律拒绝：分词口径错了不会崩，只会静默切错 token，GPU 上跑完也
     // 看不出来，所以写端加了新 bit 而读端不认识时必须当场报错，不能当 0 处理。
     constexpr uint32_t kKnownFlags = kFlagPhiPreTokenizer | kFlagNoNormalizer
-                                   | kFlagDigitRun3;
+                                   | kFlagDigitRun3 | kFlagLetterIncludesMarks;
     if (flags_ & ~kKnownFlags)
         throw std::runtime_error("tokenizer.bin has unknown flag bits: "
                                  + std::to_string(flags_));
@@ -523,6 +544,7 @@ void Tokenizer::load(const std::string& bin_path) {
               << ", Flags: " << flags_
               << ((flags_ & kFlagPhiPreTokenizer) ? " (phi pre_tokenizer)" : "")
               << ((flags_ & kFlagDigitRun3) ? " (digits 1-3)" : "")
+              << ((flags_ & kFlagLetterIncludesMarks) ? " (letters +marks)" : "")
               << ((flags_ & kFlagNoNormalizer) ? " (no NFC)" : "") << "\n";
 
     // 解析 Vocab Section
@@ -693,7 +715,8 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
         std::string seg(input, i, seg_end - i);
         std::vector<std::string> pieces;
         if (flags_ & kFlagPhiPreTokenizer) pre_tokenize_phi(seg, pieces);
-        else pre_tokenize(seg, pieces, (flags_ & kFlagDigitRun3) ? 3 : 1);
+        else pre_tokenize(seg, pieces, (flags_ & kFlagDigitRun3) ? 3 : 1,
+                          (flags_ & kFlagLetterIncludesMarks) != 0);
         for (const auto& piece : pieces) {
             encode_segment(piece, tokens);
         }
