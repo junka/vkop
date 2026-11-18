@@ -460,6 +460,14 @@ void test_other_routes() {
     // Past the split-K window only the four-column quad kernel can read a
     // packed 4-bit word.
     CHECK_ROUTE(select_matmul(dev, sh(1, 9, 512, 512), f, av), kQuad4);
+    // A wide N must NOT promote a 4-bit weight to kKsplitWide. That route
+    // builds from a separate -DW8_WIDE module whose main() has no uPC.w4
+    // branch, so it reads packed nibbles with unpackHalf2x16: right byte
+    // count, garbage values, no error. This is the decode path that made the
+    // first int4 27B run emit ",,,,," -- the narrow case above passed while
+    // every real shape (n >= 10240) went wide.
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 10240, 5120), f, av), kKsplit);
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 248320, 5120), f, av), kKsplit);
 }
 
 void test_fallthrough_bits() {

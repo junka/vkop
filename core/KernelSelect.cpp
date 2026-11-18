@@ -538,8 +538,20 @@ bool ksplit_w8_wide_applies(const Ctx &c) {
 }
 
 bool fp16_wide_ok(const Ctx &c) {
-    return c.ksplit_ok && !c.wide_disabled && !c.weight_byte &&
-           (c.s->n % 8 == 0) &&
+    // A 4-bit weight must not reach this route. The WIDE entry builds from the
+    // same source but as a separate -DW8_WIDE module whose main() has no
+    // uPC.w4 branch: it calls matmul16_ksplit_wide directly, which reads B with
+    // unpackHalf2x16. Handed packed nibbles it reads the right number of bytes
+    // into the wrong shape of value, so nothing fails and the output is
+    // garbage. The plain ksplit entry is the safe one (its main() tests
+    // uPC.w4 first and calls matmul16_w4_ksplit), which is why the exclusion
+    // lives here and not on ksplit_ok.
+    //
+    // This surfaced on the first int4 decode: prefill's batch*m > 8 kept
+    // ksplit_ok false and the shape landed on quad4, so only decode took this
+    // route -- and the model emitted ",,,,,".
+    return c.ksplit_ok && !c.weight_4bit && !c.wide_disabled &&
+           !c.weight_byte && (c.s->n % 8 == 0) &&
            (c.wide_forced || c.s->n >= c.wide_thr_fp16);
 }
 
