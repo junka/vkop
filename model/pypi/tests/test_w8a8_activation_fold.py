@@ -118,6 +118,89 @@ def test_looks_through_fp16_cast():
     assert "dq" not in mx.nodes
 
 
+def test_moves_the_pair_in_front_of_a_shape_view():
+    """A Reshape between the pair and the MatMul is a storage alias, so the
+    quantization moves to its input and the view copies bytes."""
+    mx = build(with_cast=True)
+    mx.nodes["view"] = Node(
+        "Reshape", "view", {},
+        [ref("a", (1, 512)), ref("newshape", (2,))],
+        [ref("a_v", (1, 512), TensorProto.FLOAT16)],
+    )
+    mx.nodes["mm"].inputs[0] = ref("a_v", (1, 512))
+    mx.build_dependencies()
+
+    assert fold(mx) == 1
+    assert mx.nodes["mm"].inputs[0]["name"] == "a_v"
+    assert mx.nodes["mm"].inputs[0]["dtype"] == TensorProto.INT8
+    view = mx.nodes["view"]
+    assert view.inputs[0]["name"] == "q"
+    assert view.inputs[0]["dtype"] == TensorProto.INT8
+    assert view.outputs[0]["dtype"] == TensorProto.INT8
+    assert float(mx.nodes["mm"].attributes["a_scale"]) == pytest.approx(A_SCALE)
+    assert "cast" not in mx.nodes
+    assert "dq" not in mx.nodes
+
+
+def test_moves_the_pair_in_front_of_a_three_dim_squeeze():
+    # [1,1,K] -> Squeeze -> [1,K], the row the MatMul wants.
+    mx = build(with_cast=True)
+    mx.nodes["q"].inputs[0] = ref("x", (1, 1, 512), TensorProto.FLOAT16)
+    mx.nodes["q"].outputs[0] = ref("q", (1, 1, 512), TensorProto.INT8)
+    mx.nodes["dq"].inputs[0] = ref("q", (1, 1, 512))
+    mx.nodes["dq"].outputs[0] = ref("dq", (1, 1, 512), TensorProto.FLOAT)
+    mx.nodes["cast"].inputs[0] = ref("dq", (1, 1, 512))
+    mx.nodes["cast"].outputs[0] = ref("a", (1, 1, 512), TensorProto.FLOAT16)
+    mx.nodes["view"] = Node(
+        "Squeeze", "view", {},
+        [ref("a", (1, 1, 512))],
+        [ref("a_v", (1, 512), TensorProto.FLOAT16)],
+    )
+    mx.nodes["mm"].inputs[0] = ref("a_v", (1, 512))
+    mx.build_dependencies()
+
+    assert fold(mx) == 1
+    assert mx.nodes["mm"].inputs[0]["name"] == "a_v"
+    view = mx.nodes["view"]
+    assert view.inputs[0]["name"] == "q"
+    # The view keeps reading the shape the pair quantized, not the squeezed one.
+    assert view.inputs[0]["shape"] == [1, 1, 512]
+    assert view.outputs[0]["dtype"] == TensorProto.INT8
+
+
+def test_refuses_a_view_that_another_node_reads():
+    mx = build(with_cast=True)
+    mx.nodes["view"] = Node(
+        "Reshape", "view", {}, [ref("a", (1, 512))], [ref("a_v", (1, 512))]
+    )
+    mx.nodes["mm"].inputs[0] = ref("a_v", (1, 512))
+    mx.nodes["relu"] = Node(
+        "Relu", "relu", {}, [ref("a_v", (1, 512))], [ref("r", (1, 512))]
+    )
+    mx.build_dependencies()
+
+    assert fold(mx) == 0
+    # The float view still has a reader, so the pair must stay intact.
+    assert "dq" in mx.nodes and "cast" in mx.nodes
+    assert "a_scale" not in mx.nodes["mm"].attributes
+
+
+def test_refuses_a_word_mover_between_the_pair_and_the_matmul():
+    """Transpose copies elements word-wise and rejects 1-byte elements, so an
+    int8 A through it would throw at execute."""
+    mx = build(with_cast=True)
+    mx.nodes["view"] = Node(
+        "Transpose", "view", {"perm": [0, 1]},
+        [ref("a", (1, 512))], [ref("a_v", (1, 512))],
+    )
+    mx.nodes["mm"].inputs[0] = ref("a_v", (1, 512))
+    mx.build_dependencies()
+
+    assert fold(mx) == 0
+    assert "dq" in mx.nodes
+    assert "a_scale" not in mx.nodes["mm"].attributes
+
+
 def test_keeps_dq_with_another_consumer():
     mx = build(extra_dq_consumer=True)
     assert fold(mx) == 1
@@ -161,6 +244,28 @@ def test_refuses_fused_epi_bias():
     # drop the bias, not just change the route.
     mx = build()
     mx.nodes["mm"].attributes["epi_bias"] = 1
+    assert fold(mx) == 0
+    assert_unchanged(mx)
+
+
+def test_refuses_a_swiglu_down_act_node():
+    """The down_act row sits above the DP4A row in KernelSelect's table and
+    its kernel reads a float A, so folding here leaves a model that loads and
+    then throws."""
+    mx = build()
+    mm = mx.nodes["mm"]
+    mm.inputs.append(ref("Wg", (256, 512)))
+    mm.inputs.append(ref("Wu", (256, 512)))
+    mm.attributes["down_act"] = [1]
+    mx.build_dependencies()
+    assert fold(mx) == 0
+    assert_unchanged(mx)
+
+
+def test_refuses_an_attention_softmax_node():
+    """attn_softmax pre-empts every other route, DP4A included."""
+    mx = build()
+    mx.nodes["mm"].attributes["attn_softmax"] = 1
     assert fold(mx) == 0
     assert_unchanged(mx)
 

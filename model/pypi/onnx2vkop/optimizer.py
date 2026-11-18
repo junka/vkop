@@ -10527,10 +10527,19 @@ class W8A8ActivationFold:
     travels as the ``a_scale`` attribute and Matmul.hpp folds it into the
     epilogue. A symmetric grid (zero point == 0) is required: the kernel has
     no zero-point correction term.
+
+    Pure shape views (Reshape / Squeeze / Unsqueeze) may sit between the pair
+    and the MatMul: they are buffer aliases with no element math, so the pair
+    moves in front of them and they run on the int8 bytes instead.
     """
 
     MAX_M = 8
     MIN_K = 256
+    # Storage aliases, not element movers: ops/Reshape.hpp's int8 branch is a
+    # byte-preserving view. Everything else that moves elements (Transpose /
+    # Slice / Concat / Gather / Split / Expand) calls
+    # core::require_word_movable_elem, which rejects a 1-byte element.
+    SHAPE_VIEWS = frozenset(("Reshape", "Squeeze", "Unsqueeze"))
 
     @staticmethod
     def fold(dag_model) -> int:
@@ -10543,7 +10552,17 @@ class W8A8ActivationFold:
         folded = []
         dead_dq = []
         for node in list(dag_model.nodes.values()):
-            if node.op_type != "MatMul" or len(node.inputs) < 3:
+            # A plain quantized MatMul is [A, W, weight_scale]; anything else
+            # was claimed by an earlier fusion. The SwiGLU down fold keeps its
+            # Wg/Wu at inputs 2 and 3, and core/KernelSelect.cpp's table puts
+            # both the down_act row and the attn_softmax row ABOVE the DP4A
+            # row -- an int8 A on either one selects a float kernel and
+            # ops/Matmul.hpp throws. So the fold only ever touches the
+            # three-input form.
+            if node.op_type != "MatMul" or len(node.inputs) != 3:
+                continue
+            if (node.attributes.get("down_act")
+                    or node.attributes.get("attn_softmax")):
                 continue
             if "a_scale" in node.attributes:
                 continue
@@ -10552,18 +10571,28 @@ class W8A8ActivationFold:
                 continue
 
             a = node.inputs[0]
-            # ONNX puts the DQ back in the model's float dtype, so a graph whose
-            # activations are fp16 has Cast(fp16) between it and the MatMul
-            # (the DQ's output dtype follows its scale). Look through that Cast
-            # when it exists only to cross that boundary.
+            # Two kinds of glue can sit between the pair and the MatMul: the
+            # fp16 Cast ONNX needs because the DQ returns the model's float
+            # dtype (which follows the scale), and pure shape views. Both are
+            # absorbed while they are the sole reader of their input and are
+            # not a graph output -- the rewrite re-dtypes the views to int8,
+            # which would corrupt any other consumer or a declared output.
+            absorbed = []  # nearest to the MatMul first
             upstream = producer.get(a.get("name"))
-            bypass = []
-            if upstream is not None and upstream.op_type == "Cast":
-                if int(upstream.attributes.get("to", -1)) != TensorProto.FLOAT16:
-                    continue
-                if len(upstream.dependents) != 1:
-                    continue
-                bypass.append(upstream)
+            while upstream is not None and len(upstream.dependents) == 1:
+                if len(upstream.outputs) != 1 or not upstream.inputs:
+                    break
+                if upstream.outputs[0].get("name") in graph_outputs:
+                    break
+                if upstream.op_type in W8A8ActivationFold.SHAPE_VIEWS:
+                    absorbed.append(upstream)
+                elif upstream.op_type == "Cast":
+                    if (int(upstream.attributes.get("to", -1))
+                            != TensorProto.FLOAT16):
+                        break
+                    absorbed.append(upstream)
+                else:
+                    break
                 upstream = producer.get(upstream.inputs[0].get("name"))
             dq = upstream
             if dq is None or dq.op_type != "DequantizeLinear" or len(dq.inputs) < 2:
@@ -10644,8 +10673,25 @@ class W8A8ActivationFold:
             if int(node.outputs[0].get("dtype", -1)) != TensorProto.FLOAT16:
                 continue
 
-            node.inputs[0] = {
+            # Re-chain the shape views straight onto the Q output. The Casts
+            # were only the fp16 crossing and go away with the DQ.
+            views = [n for n in absorbed
+                     if n.op_type in W8A8ActivationFold.SHAPE_VIEWS]
+            casts = [n for n in absorbed if n.op_type == "Cast"]
+            feed = {
                 "name": q_out["name"],
+                "shape": list(q_out.get("shape") or a_shape),
+                "dtype": TensorProto.INT8,
+                "value_dynamic": a.get("value_dynamic", False),
+            }
+            for i, view in enumerate(views):
+                src = views[i + 1].outputs[0] if i + 1 < len(views) else feed
+                view.inputs[0] = dict(src)
+                view.inputs[0]["dtype"] = TensorProto.INT8
+                view.outputs[0]["dtype"] = TensorProto.INT8
+            node.inputs[0] = {
+                "name": (views[0].outputs[0]["name"] if views
+                         else q_out["name"]),
                 "shape": list(a_shape),
                 "dtype": TensorProto.INT8,
                 "value_dynamic": a.get("value_dynamic", False),
@@ -10653,7 +10699,7 @@ class W8A8ActivationFold:
             node.attributes["a_scale"] = format(a_scale, ".9g")
             folded.append((node.name, m, k, n, a_scale))
             dead_dq.append((dq, graph_outputs))
-            dead_dq.extend((n, graph_outputs) for n in bypass)
+            dead_dq.extend((cast, graph_outputs) for cast in casts)
 
         if not folded:
             print("[w8a8] no MatMul satisfied the DP4A gates (static batch*m<=8, "
