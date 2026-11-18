@@ -1,9 +1,13 @@
 // Standalone MatMul GEMV microbenchmark (decode-shape fp16, buffer backend).
 //
 // Drives the real MatMul op through ops::create_from_type, records once via
-// the replay cache (two onExecute rounds -> CACHED), then re-submits the kept
-// SIMULTANEOUS_USE cmd buffer R times and waits once, so the measurement is
-// pure GPU time without per-call sync overhead.
+// the replay cache (two onExecute rounds -> CACHED) with a GPU timestamp pair
+// inside the recording, then re-submits the kept SIMULTANEOUS_USE cmd buffer R
+// times and waits once. Two rows come out of that loop: `gpu` (the last replay's
+// own timestamp span = one dispatch's kernel time) and `wall` (the same submits
+// as seen by the host, so it also contains R vkQueueSubmit calls). Only the gpu
+// row is a bandwidth measurement: on a 560X behind MoltenVK the 4 MB decode
+// shapes are submit-bound, with wall 1.7-2.4x the kernel span.
 //
 // Build (mirrors the tests link line: libvkop + libvload; libvkop carries no
 // SPIR-V, so -DVKOP_DEV_SHADER_ARCHIVE must point at build/vkop_shaders.bin):
@@ -27,6 +31,10 @@
 //      BENCH_INT8=1 swaps B for a byte int8 weight + a per-column fp32 scale,
 //      which is the only way to exercise the byte WIDE (16 cols/lane) GEMV
 //      without a whole quantized model on disk.
+//      BENCH_PATTERN=1 times the column-ramp weight instead of refilling it
+//      with incompressible bytes after the correctness probe. The A/B against
+//      the default; on a part that does not compress storage-buffer reads the
+//      two agree (measured on the 560X).
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -76,6 +84,53 @@ void fill_ones(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
 // offset. A remap or a scale phase error makes out[j] come out as K*wpat(j')
 // for the wrong j', which the all-ones probe cannot see.
 inline int wpat(int j) { return (j % 7) - 3; }
+
+// The timed weight is incompressible by default. The ramp is seven repeated
+// values per column, which is not a bandwidth stimulus on a part that compresses
+// memory: it does not cost its size in DRAM traffic. So the probe runs on the
+// ramp (where K*wpat(j) is an exact reference) and the weight is then refilled
+// from an LCG and re-uploaded into the SAME buffer the recorded cmd binds,
+// before anything is timed.
+//
+// Measured on the 560X: the refill made NO difference outside run-to-run
+// variance (4 MB int8: 0.230/0.217 ms random vs 0.237/0.232 ms ramp; 33.5 MB:
+// 0.825/0.510 vs 0.923/0.843). GCN's DCC compresses images, not storage-buffer
+// reads, so this card was never compressing the ramp. The earlier "104 GB/s
+// with the ramp vs 27.5 GB/s random" reading was NOT a compression effect -- it
+// came from the broken bracketing timestamp pair described at the timing loop.
+// The default stands because it removes the assumption, not because a local
+// artifact was measured.
+//
+// Variance caveat: incompressible bytes did not remove the run-to-run spread at
+// 500 MB-1 GB either, so take the min over several runs rather than attributing
+// all of it to data content.
+void fill_random_i8(const std::shared_ptr<core::Tensor<int8_t>> &t) {
+    // copyToGPU clears AND shrinks the host vector once the upload is done, so
+    // the probe's upload left data_ empty: without this resize the refill writes
+    // nothing and the second upload memcpys from a null pointer.
+    t->data().resize(static_cast<size_t>(t->num_elements()));
+    uint32_t st = 0x12345678u;
+    int8_t *p = t->data().data();
+    for (size_t i = 0; i < t->data().size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        p[i] = static_cast<int8_t>((st >> 16) & 0xFF);
+    }
+}
+
+// fp16 gets random mantissas under a FIXED normal exponent, not random bits:
+// random halfwords are mostly NaN/Inf/denormal, and a denormal or NaN operand
+// can cost different ALU time than the normal values a real weight holds.
+// 0x3C00 is exponent 15 (bias 15), so every value is normal in [1,2) or [-2,-1).
+void fill_random_f16(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
+    t->data().resize(static_cast<size_t>(t->num_elements())); // see fill_random_i8
+    uint32_t st = 0x12345678u;
+    uint16_t *p = t->data().data();
+    for (size_t i = 0; i < t->data().size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        p[i] = static_cast<uint16_t>(0x3C00 | ((st >> 16) & 0x03FF) |
+                                     ((st >> 31) << 15));
+    }
+}
 
 } // namespace
 
@@ -148,6 +203,10 @@ int main(int argc, char **argv) {
     if (int8_mode) {
         printf("weight: int8 (byte WIDE path)\n");
     }
+    printf("weight fill: %s\n",
+           std::getenv("BENCH_PATTERN") != nullptr
+               ? "column ramp (compressible; probe reference)"
+               : "LCG random (incompressible; refilled after the probe)");
 
     // DRAM ceiling probe: vkCmdCopyBuffer of a 256MB region, same submit
     // batch as the GEMV measurements. Read+write so effective bandwidth is
@@ -250,31 +309,11 @@ int main(int argc, char **argv) {
             // whole weight cycles through seven byte values. That is exactly
             // right for the correctness probe it was written for -- it pins
             // the column indexing, and a remap or a scale-phase error shows up
-            // as K*wpat(j') -- but on a part with memory compression it is not
-            // a bandwidth measurement: a weight of one repeated byte does not
-            // cost its size in DRAM traffic.
-            //
-            // BENCH_RANDOM=1 fills from an LCG instead, and the correctness
-            // probe is skipped because K*wpat(j) no longer describes the
-            // expected output. Measured caveat: incompressible bytes did NOT
-            // remove the run-to-run variance at 500 MB-1 GB (the same random
-            // shape still came out anywhere from 68 to 287 GB/s), so treat
-            // that variance as real and take the min over several runs rather
-            // than attributing all of it to data compressibility.
-            const bool random_w = std::getenv("BENCH_RANDOM") != nullptr;
-            if (random_w) {
-                uint32_t st = 0x12345678u;
-                int8_t *p = B8->data().data();
-                for (size_t i = 0; i < static_cast<size_t>(s.K) * s.N; ++i) {
-                    st = st * 1664525u + 1013904223u;
-                    p[i] = static_cast<int8_t>((st >> 16) & 0xFF);
-                }
-            } else {
-                for (int j = 0; j < s.N; ++j) {
-                    for (int k = 0; k < s.K; ++k) {
-                        B8->data()[k * s.N + j] =
-                            static_cast<int8_t>(wpat(j));
-                    }
+            // as K*wpat(j'). It is NOT what gets timed: fill_random_i8 replaces
+            // it after the probe (see the refill below the probe).
+            for (int j = 0; j < s.N; ++j) {
+                for (int k = 0; k < s.K; ++k) {
+                    B8->data()[k * s.N + j] = static_cast<int8_t>(wpat(j));
                 }
             }
             auto S = std::make_shared<core::Tensor<float>>(
@@ -311,6 +350,16 @@ int main(int argc, char **argv) {
         op->set_name(s.name);
         op->set_runtime_device(dev, cmdpool);
         op->enable_replay(true);
+        // GPU time comes from a timestamp pair recorded INSIDE the op's own
+        // command buffer (Operator::set_prof_query -- the VKOP_SUBMIT_PROF
+        // mechanism), set before recording so the CACHED replay carries it.
+        // A pair of empty command buffers bracketing the submit loop does NOT
+        // work here: on MoltenVK/560X it returned 1-10 us spans for a 4 MB
+        // weight read (7654 GB/s on a card whose copy ceiling is 72 GB/s) and
+        // varied 34x between identical runs, because the samples never land on
+        // the work being timed.
+        VulkanQueryPool ts(dev->getLogicalDevice(), 2);
+        op->set_prof_query(ts.get(), 0);
         op->onExecute(in, out, 0); // round 0: record + store fingerprint
         op->onExecute(in, out, 0); // round 1: match -> CACHED (cmd kept)
         auto cmd = op->get_record();
@@ -342,21 +391,16 @@ int main(int argc, char **argv) {
                core::ITensor::fp16_to_fp32(O->data()[1]),
                core::ITensor::fp16_to_fp32(O->data()[s.N - 1]));
         bool ok = true;
-        // K*wpat(j) only describes the output when the weight actually holds
-        // the column ramp; BENCH_RANDOM replaced it with incompressible bytes
-        // for the bandwidth measurement, so there is nothing to compare to.
-        if (std::getenv("BENCH_RANDOM") == nullptr) {
-            for (int j = 0; j < s.N; ++j) {
-                uint16_t v = O->data()[j];
-                float f = vkop::core::ITensor::fp16_to_fp32(v);
-                float want =
-                    static_cast<float>(s.K) * static_cast<float>(wpat(j));
-                if (f != want) {
-                    ok = false;
-                    printf("  MISMATCH at col %d: got %f, want %f (K*wpat(%d))\n",
-                           j, f, want, j);
-                    break;
-                }
+        for (int j = 0; j < s.N; ++j) {
+            uint16_t v = O->data()[j];
+            float f = vkop::core::ITensor::fp16_to_fp32(v);
+            float want =
+                static_cast<float>(s.K) * static_cast<float>(wpat(j));
+            if (f != want) {
+                ok = false;
+                printf("  MISMATCH at col %d: got %f, want %f (K*wpat(%d))\n",
+                       j, f, want, j);
+                break;
             }
         }
         if (!ok) {
@@ -365,56 +409,68 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        // The probe is done, so the weight can stop being compressible. Refill
+        // the host copy and re-upload into the buffer the recorded cmd already
+        // binds -- toCPU() clears the on-GPU flag, without which copyToGPU is a
+        // no-op and the timed loop would still read the ramp.
+        if (std::getenv("BENCH_PATTERN") == nullptr) {
+            if (int8_mode) {
+                auto b8 = std::dynamic_pointer_cast<core::Tensor<int8_t>>(b_keep);
+                fill_random_i8(b8);
+                b8->toCPU();
+                b8->copyToGPU(cmdpool);
+            } else {
+                auto b16 =
+                    std::dynamic_pointer_cast<core::Tensor<uint16_t>>(b_keep);
+                fill_random_f16(b16);
+                b16->toCPU();
+                b16->copyToGPU(cmdpool);
+            }
+            dev->wait_all_done();
+        }
+
+        // Every replay re-emits the same timestamp pair, so after the loop the
+        // queries hold the LAST replay's span: TOP_OF_PIPE (this cmd reaches the
+        // front of the queue) to BOTTOM_OF_PIPE (its work is done), which is the
+        // dispatch's own execution and excludes any idle gap before it. Whether
+        // the queue was actually saturated is what wall/gpu below answers -- the
+        // 4 MB decode shapes on this 560X are submit-bound, so the GPU idles
+        // between replays and wall is 1.3-2.5x the kernel span. wall GB/s is
+        // therefore labelled wall, not presented as bandwidth. A device that
+        // returns no usable timestamps gets the wall row alone, labelled.
+        ts.reset();
         auto t0 = std::chrono::steady_clock::now();
         for (int r = 0; r < reps; ++r) {
             cmd->submit(queue);
         }
         dev->wait_all_done();
         auto t1 = std::chrono::steady_clock::now();
-        double ms =
+        double wall_ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+        auto ticks = ts.getResults();
+        double gpu_ms = static_cast<double>(ticks[1] - ticks[0]) *
+                        static_cast<double>(dev->getTimestampPeriod()) * 1e-6;
         double bytes = static_cast<double>(s.K) * s.N *
                        (int8_mode ? 1 : 2); // weight bytes
-        printf("%-9s K=%-6d N=%-6d : %8.3f ms  %7.1f GB/s\n", s.name, s.K, s.N,
-               ms, bytes / ms / 1e6);
-
-        // GPU-side attribution (BENCH_GPU_TS=1): one timestamp pair around the
-        // whole replay loop, on the same queue. The wall number above also
-        // contains the host's vkQueueSubmit calls; the span below is what the
-        // GPU held the queue from first to last replay, so wall - span is
-        // host-side submit and span covers kernel time plus any queue bubble
-        // between rounds. A single-rep run (reps=1) shows the bubble-free
-        // kernel time.
-        if (std::getenv("BENCH_GPU_TS") != nullptr) {
-            VulkanQueryPool ts(dev->getLogicalDevice(), 2);
-            auto ts_begin = std::make_shared<VulkanCommandBuffer>(cmdpool, 0);
-            auto ts_end = std::make_shared<VulkanCommandBuffer>(cmdpool, 0);
-            // VulkanQueryPool::begin() resets both queries and writes index 0;
-            // end() writes index 1. Both buffers are resubmitted once only, so
-            // they can stay ONE_TIME_SUBMIT.
-            ts_begin->begin();
-            ts.begin(ts_begin->get());
-            ts_begin->end();
-            ts_end->begin();
-            ts.end(ts_end->get());
-            ts_end->end();
-
-            ts_begin->submit(queue);
-            for (int r = 0; r < reps; ++r) {
-                cmd->submit(queue);
-            }
-            ts_end->submit(queue);
-            dev->wait_all_done();
-            auto ticks = ts.getResults();
-            double gpu_ms =
-                static_cast<double>(ticks[1] - ticks[0]) *
-                static_cast<double>(dev->getTimestampPeriod()) * 1e-6 / reps;
-            if (gpu_ms > 0.0) {
-                printf("%-9s gpu       : %8.3f ms  %7.1f GB/s  (host %.3f ms)\n",
-                       s.name, gpu_ms, bytes / gpu_ms / 1e6, ms - gpu_ms);
-            } else {
-                printf("%-9s gpu       : timestamps unsupported\n", s.name);
-            }
+        // ticks[1] > ticks[0] is part of the test, not decoration: the unsigned
+        // subtraction wraps to ~1.8e19 if a driver ever writes them out of
+        // order, which would print a near-zero GB/s as if it were a measurement.
+        if (gpu_ms > 0.0 && ticks[1] > ticks[0]) {
+            printf("%-9s K=%-6d N=%-6d : %8.3f ms  %7.1f GB/s  (gpu)\n",
+                   s.name, s.K, s.N, gpu_ms, bytes / gpu_ms / 1e6);
+            // wall/gpu, not wall-gpu: gpu is ONE replay's span while wall is the
+            // average over all reps, so the difference goes negative on a
+            // gpu-bound shape (measured: lm_head wall 5.606 vs gpu 5.719). The
+            // ratio says which side is the bottleneck -- above 1 the host cannot
+            // submit fast enough to keep the queue full, at 1 the kernel is the
+            // limit and wall GB/s is finally a bandwidth number.
+            printf("%-9s wall      : %8.3f ms  %7.1f GB/s  (%.2fx gpu, %s)\n",
+                   s.name, wall_ms, bytes / wall_ms / 1e6, wall_ms / gpu_ms,
+                   wall_ms > gpu_ms * 1.05 ? "submit-bound" : "gpu-bound");
+        } else {
+            printf("%-9s K=%-6d N=%-6d : %8.3f ms  %7.1f GB/s  "
+                   "(wall, no GPU timestamps)\n",
+                   s.name, s.K, s.N, wall_ms, bytes / wall_ms / 1e6);
         }
 
         // Staging D2H readback probe: the same copyToCPU path the runtime
@@ -422,7 +478,7 @@ int main(int argc, char **argv) {
         // MAPPED STAGING POINTER). The GEMV number above never touches host
         // memory, so this row is the one that moves when the staging pool's
         // memory type changes (HOST_CACHED vs write-combined BAR). Min over
-        // reps; O holds a verified fp16 row of N elements.
+        // reps; O holds an fp16 row of N elements.
         double rb_ms = 1e9;
         for (int r = 0; r < reps; ++r) {
             auto rb0 = std::chrono::steady_clock::now();

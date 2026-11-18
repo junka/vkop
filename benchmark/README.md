@@ -70,19 +70,29 @@ Shader 只从模型内嵌归档来，**运行期没有替换 shader 的开关**�
 
 ## bench_matmul — MatMul GEMV 微基准
 
-decode 形状 fp16 buffer 后端（Qwen3-2B 投影权重形状），走真实 MatMul op + replay cache，纯 GPU 计时；附带 256MB memcpy 带宽上限和空提交开销两个参照。
+decode 形状 fp16 buffer 后端（Qwen3-2B 投影权重形状），走真实 MatMul op + replay cache。
+每个形状打两行：`gpu`（op 自己 recording 里的时间戳跨度 = 一次 dispatch 的 kernel 时间）
+和 `wall`（同一批 submit 的宿主墙钟平均，含 R 次 `vkQueueSubmit`）。**只有 gpu 行是带宽
+测量**；wall/gpu 比值 >1 说明宿主喂不满队列（submit-bound），≈1 才是 kernel 受限。
+附带 memcpy 带宽上限（默认 256MB，`BENCH_MEMPROBE_MB` 可调）和空提交开销两个参照。
+
+权重默认在 correctness probe 之后换成 LCG 随机字节再重新上传（`BENCH_PATTERN=1` 保留
+列斜坡用于 A/B）；probe 本身始终跑，不再像旧 `BENCH_RANDOM=1` 那样被跳过。
 
 ```bash
 # 构建：x86_64 g++-14，链 libvkop + libvload，-DVKOP_DEV_SHADER_ARCHIVE 指向
 # build/vkop_shaders.bin（libvkop 不带 SPIR-V），完整命令见源码头注释
+# CMake 目标产物在 build/benchmark/bench_matmul；仓库根的 build/bench_matmul 是
+# 手工 g++ 命令的产物，不随 cmake --build 更新（拿旧二进制测过一轮，见下）
 #
 # 运行（x86_64 二进制用 /usr/local 的 Vulkan SDK 栈，不是 /opt/homebrew）：
 DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib \
 VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json \
-VKOP_NO_COOP=1 ./build/bench_matmul          # 或 ./build/bench_matmul K N [reps] 自定义形状
+VKOP_NO_COOP=1 ./build/benchmark/bench_matmul   # 或 ... K N [reps] 自定义形状
 ```
 
-2026-10-21 实测（AMD Radeon Pro 560X，MoltenVK x86_64，reps=30，correctness probe 全过）：
+2026-10-21 实测（AMD Radeon Pro 560X，MoltenVK x86_64，reps=30，correctness probe 全过）
+**旧口径：下表全是 wall 平均，含 host submit，不是 GPU 带宽**（见「计时口径修正」）：
 
 | 项 | 耗时 | 带宽 |
 |---|---|---|
@@ -92,6 +102,53 @@ VKOP_NO_COOP=1 ./build/bench_matmul          # 或 ./build/bench_matmul K N [rep
 | gate/up K=2048 N=6144 | 0.842 ms | 29.9 GB/s |
 | down K=6144 N=2048 | 0.940 ms | 26.8 GB/s |
 | lm_head K=2048 N=151936 | 19.50 ms | 31.9 GB/s |
+
+### 计时口径修正（2026-11-18，560X）
+
+三件事，按发现顺序：
+
+**1. 旧的 `BENCH_GPU_TS=1` 括号式时间戳在这台机器上是坏的。** 它把一对空 command
+buffer（只含 reset+timestamp）提交在 replay 循环前后，量「队列跨度」。实测同一形状
+（int8 K=2048 N=2048，4.19MB）：reps=1 → 0.005ms、reps=10 → 0.001ms（**7654 GB/s**，
+本机拷贝上限 71 GB/s）、reps=100 三次独立跑 → 0.010 / 0.168 / 0.340ms（34x 散布）。
+采样点根本没落在被量的工作上。**此前基于它得到的「q/o GPU≈0.16ms、host≈0.13ms、
+~0.10ms 固定 GPU 启动成本、对 q 不敏感」全部作废，需要用新口径重测。**
+
+改成 runtime 自己在用的机制：`Operator::set_prof_query(pool, base)`，时间戳写在 op
+recording 内部（`VKOP_SUBMIT_PROF` 同一条路径），CACHED replay 每次重新发射同一对
+query，循环结束后读到的是**最后一次 replay** 的跨度。新口径稳定且物理：
+
+| 形状（权重字节） | gpu | GB/s | wall | wall/gpu |
+|---|---|---|---|---|
+| int8 K=2048 N=2048（4.19MB） | 0.217–0.249 ms | 17–19 | 0.39–0.57 ms | 1.7–2.4x（submit-bound） |
+| fp16 K=2048 N=2048（8.39MB） | 0.335 ms | 25.0 | 0.581 ms | 1.73x |
+| int8 K=2048 N=16384（33.5MB） | 0.510–0.825 ms | 40–66 | 0.68–0.76 ms | 0.74–1.48x |
+| int8 K=2048 N=151936（311MB） | 5.719 ms | 54.4 | 5.606 ms | 0.98x（gpu-bound） |
+| fp16 K=2048 N=151936（622MB） | 13.511 ms | 46.1 | 10.750 ms | 0.80x |
+
+参照：1GB memcpy 30.273ms = **70.9 GB/s**（读+写口径，另一次 71.9），空提交 0.0158ms。
+311MB 的 int8 lm_head 拿到上限的 77%，量级对了。
+
+注意 gpu 是**单次采样**（最后一次 replay），wall 是 reps 平均，所以大形状上 wall/gpu
+会 <1（fp16 lm_head 0.80x）——那是方差，不是负 host。沿用本 README 的 min-of-3 口径。
+
+**2. wall 当 GB/s 打印是错的。** 小 decode 形状上 host submit 占 wall 的 40–60%
+（4.19MB int8：wall 0.39–0.57ms vs gpu 0.22–0.25ms）。现在 wall 行显式标 `wall`，
+并给 wall/gpu 比值而不是差值（差值在 gpu-bound 形状上会是负数）。
+
+**3. 可压缩权重：默认换成随机，但本机没测出差异。** 旧默认权重是列斜坡
+（每列 7 个重复字节值），在会压缩内存的部件上不是带宽激励。现在 probe 跑完再换随机
+字节重传（`copyToGPU` 上传后会 clear+shrink 宿主 vector，refill 前必须 resize，否则
+第二次上传 memcpy 空指针 → SIGSEGV，踩过）。但 560X 上 A/B 落在方差内：
+
+| 形状 | 随机 | 斜坡（`BENCH_PATTERN=1`） |
+|---|---|---|
+| int8 4.19MB | 0.230 / 0.217 ms | 0.237 / 0.232 ms |
+| int8 33.5MB | 0.825 / 0.510 ms | 0.923 / 0.843 ms |
+
+GCN 的 DCC 压的是 image，不是 storage buffer 读，所以这张卡从来没压过斜坡。
+**此前「104 GB/s 超物理读数是可压缩权重造成的」归因错误**——那是第 1 条的坏时间戳。
+默认保留随机填充是为了去掉这个假设，不是为了修一个本机测到的伪影。
 
 ## bench_matmul_fp8 — fp8 weight-only 解码 A/B
 

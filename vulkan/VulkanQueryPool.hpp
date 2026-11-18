@@ -14,6 +14,8 @@ class VulkanQueryPool {
 
     ~VulkanQueryPool();
 
+    VkQueryPool get() const { return m_queryPool_; }
+
     VulkanQueryPool(const VulkanQueryPool &) = delete;
     VulkanQueryPool &operator=(const VulkanQueryPool &) = delete;
     VulkanQueryPool &operator=(VulkanQueryPool &&other) = delete;
