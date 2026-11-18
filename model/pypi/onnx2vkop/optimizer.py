@@ -10506,6 +10506,184 @@ class PreQuantizedWeights:
             return f"elem_type {data_type}"
 
 
+class W8A8ActivationFold:
+    """Fold an int8 activation Q/DQ pair into a MatMul's A operand.
+
+    The DP4A kernel (shaders/buffer/matmul.comp, VKOP_DP4A) reads A as int8
+    bytes and computes ``acc * a_scale * weight_scale``. Every other route
+    needs a float A, so this rewrite is what makes an int8 x int8 MatMul
+    reachable from a converted model at all: ``-q int8`` alone only turns the
+    weight into a byte payload.
+
+    The pass is deliberately conservative, because the runtime does NOT fall
+    back for an int8 A: ops/Matmul.hpp throws when the DP4A route is not
+    selected. It therefore rewrites a MatMul only when the *conversion-time*
+    shape already satisfies every gate in core/KernelSelect.cpp — static
+    batch*m <= 8, K >= 256, K % 4 == 0, N % 4 == 0, transB == 0, int8 weight,
+    fp16 output. Anything else keeps its Q/DQ pair and runs the float route.
+
+    The A operand is re-pointed at the QuantizeLinear output, so the runtime
+    still does the float -> int8 quantization on the GPU. The activation scale
+    travels as the ``a_scale`` attribute and Matmul.hpp folds it into the
+    epilogue. A symmetric grid (zero point == 0) is required: the kernel has
+    no zero-point correction term.
+    """
+
+    MAX_M = 8
+    MIN_K = 256
+
+    @staticmethod
+    def fold(dag_model) -> int:
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+        graph_outputs = {o.get("name") for o in getattr(dag_model, "outputs", [])}
+
+        folded = []
+        dead_dq = []
+        for node in list(dag_model.nodes.values()):
+            if node.op_type != "MatMul" or len(node.inputs) < 3:
+                continue
+            if "a_scale" in node.attributes:
+                continue
+            weight = dag_model.initializers.get(node.inputs[1].get("name"))
+            if weight is None or weight.data_type != TensorProto.INT8:
+                continue
+
+            a = node.inputs[0]
+            # ONNX puts the DQ back in the model's float dtype, so a graph whose
+            # activations are fp16 has Cast(fp16) between it and the MatMul
+            # (the DQ's output dtype follows its scale). Look through that Cast
+            # when it exists only to cross that boundary.
+            upstream = producer.get(a.get("name"))
+            bypass = []
+            if upstream is not None and upstream.op_type == "Cast":
+                if int(upstream.attributes.get("to", -1)) != TensorProto.FLOAT16:
+                    continue
+                if len(upstream.dependents) != 1:
+                    continue
+                bypass.append(upstream)
+                upstream = producer.get(upstream.inputs[0].get("name"))
+            dq = upstream
+            if dq is None or dq.op_type != "DequantizeLinear" or len(dq.inputs) < 2:
+                continue
+            q = producer.get(dq.inputs[0].get("name"))
+            if q is None or q.op_type != "QuantizeLinear" or len(q.inputs) < 2:
+                continue
+            if not q.outputs:
+                continue
+            q_out = q.outputs[0]
+            q_elem = int(q_out.get("dtype", -1))
+            if q_elem not in (-1, TensorProto.INT8):
+                continue
+            if q_elem == -1:
+                # No declaration: the zero point's element type is the only
+                # remaining proof that this pair produced an int8 tensor.
+                zp = (dag_model.initializers.get(q.inputs[2].get("name"))
+                      if len(q.inputs) > 2 else None)
+                if zp is None or zp.data_type != TensorProto.INT8:
+                    continue
+
+            # Symmetric grid only, on BOTH halves of the pair.
+            # `_is_all_zero` reads the proto fields, so it also handles a
+            # payload numpy cannot decode.
+            if len(q.inputs) > 2:
+                q_zp = dag_model.initializers.get(q.inputs[2].get("name"))
+                if q_zp is None or not PreQuantizedWeights._is_all_zero(q_zp):
+                    continue
+            if len(dq.inputs) > 2:
+                dq_zp = dag_model.initializers.get(dq.inputs[2].get("name"))
+                if dq_zp is None or not PreQuantizedWeights._is_all_zero(dq_zp):
+                    continue
+
+            scale_init = dag_model.initializers.get(q.inputs[1].get("name"))
+            if scale_init is None or scale_init.data_type != TensorProto.FLOAT:
+                continue
+            scale_arr = numpy_helper.to_array(scale_init).astype(np.float64).reshape(-1)
+            if scale_arr.size != 1 or not np.all(np.isfinite(scale_arr)):
+                continue
+            a_scale = float(scale_arr[0])
+            if a_scale <= 0.0:
+                continue
+            # The pair must agree; folding a mismatched DQ would silently
+            # change the value the graph used to produce.
+            dq_scale = dag_model.initializers.get(dq.inputs[1].get("name"))
+            if dq_scale is None or dq_scale.data_type != TensorProto.FLOAT:
+                continue
+            dq_scale_arr = numpy_helper.to_array(dq_scale).astype(np.float64).reshape(-1)
+            if dq_scale_arr.size != 1 or dq_scale_arr[0] != a_scale:
+                continue
+
+            a_shape = [int(d) for d in (a.get("shape") or [])]
+            out_shape = [int(d) for d in (node.outputs[0].get("shape") or [])]
+            if len(a_shape) < 2 or len(out_shape) < 2:
+                continue
+            k = a_shape[-1]
+            n = out_shape[-1]
+            if k <= 0 or n <= 0:
+                continue
+            m = 1
+            for d in a_shape[:-1]:
+                if d <= 0:
+                    m = -1
+                    break
+                m *= d
+            if m <= 0 or m > W8A8ActivationFold.MAX_M:
+                continue
+            if k < W8A8ActivationFold.MIN_K or k % 4 or n % 4:
+                continue
+            if int(node.attributes.get("transB", 0)) != 0:
+                continue
+            # The split-K DP4A epilogue applies the weight scale and writes;
+            # it has no bias slot. A fused epi_bias would be silently dropped,
+            # so leave such a MatMul on the float route.
+            if int(node.attributes.get("epi_bias", 0)) != 0:
+                continue
+            # The DP4A route is the fp16 "fused" form of the split-K GEMV.
+            if int(node.outputs[0].get("dtype", -1)) != TensorProto.FLOAT16:
+                continue
+
+            node.inputs[0] = {
+                "name": q_out["name"],
+                "shape": list(a_shape),
+                "dtype": TensorProto.INT8,
+                "value_dynamic": a.get("value_dynamic", False),
+            }
+            node.attributes["a_scale"] = format(a_scale, ".9g")
+            folded.append((node.name, m, k, n, a_scale))
+            dead_dq.append((dq, graph_outputs))
+            dead_dq.extend((n, graph_outputs) for n in bypass)
+
+        if not folded:
+            print("[w8a8] no MatMul satisfied the DP4A gates (static batch*m<=8, "
+                  "K>=256, K%4==0, N%4==0, transB=0, int8 weight, fp16 output); "
+                  "the graph is unchanged")
+            return 0
+
+        dag_model.build_dependencies()
+        # The DQ only fed the MatMul we just rewired in the common case. Drop
+        # it when nothing else reads it and it is not a graph output; the
+        # remaining Q keeps quantizing once, now straight into the kernel.
+        # Repeat until stable so a bypassed Cast (which depends on the DQ)
+        # cannot keep the DQ alive just by being visited first.
+        for _ in range(4):
+            dag_model.build_dependencies()
+            removed = False
+            for dead, outputs in dead_dq:
+                if (dead.name in dag_model.nodes and not dead.dependents
+                        and dead.outputs[0].get("name") not in outputs):
+                    dag_model.nodes.pop(dead.name, None)
+                    removed = True
+            if not removed:
+                break
+
+        print(f"[w8a8] folded {len(folded)} MatMul activation Q/DQ pair(s) to int8 A:")
+        for name, m, k, n, s in folded:
+            print(f"[w8a8]   {name}: A[{m},{k}] x W[{k},{n}]  a_scale={s:.9g}")
+        return len(folded)
+
+
 class Unifier:
     """Collapse eligible initializers into a single 64-byte-aligned sub-region
     of the model's initializer blob, described by a UnifiedMeta side table.

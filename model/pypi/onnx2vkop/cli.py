@@ -330,6 +330,16 @@ Examples:
              "are available (default: 20).",
     )
     parser.add_argument(
+        "--w8a8", action="store_true",
+        help="Fold a QuantizeLinear/DequantizeLinear pair on a MatMul's A input "
+             "into an int8 A operand for the DP4A route (VKOP_DP4A at run "
+             "time). Only MatMuls that already satisfy the kernel's gates are "
+             "rewritten: int8 weight, fp16 output, transB=0, static batch*m<=8, "
+             "K>=256, K%%4==0, N%%4==0, int8 scale with zero point 0. "
+             "Everything else keeps its Q/DQ pair and runs the float route, "
+             "since the runtime has no int8-A fallback.",
+    )
+    parser.add_argument(
         "-u", "--unify", action="store_true", help="Convert initializers to a single memory block"
     )
     parser.add_argument(
@@ -586,7 +596,7 @@ def main():
         class Args:
             def __init__(self, quant, unify, rgba, group_size, awq_format,
                          awq_stats, awq_alpha, awq_grid, exclude_nodes,
-                         exclude_scopes, exclude_downstream_of):
+                         exclude_scopes, exclude_downstream_of, w8a8):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
@@ -598,13 +608,14 @@ def main():
                 self.exclude_nodes = exclude_nodes
                 self.exclude_scopes = exclude_scopes
                 self.exclude_downstream_of = exclude_downstream_of
+                self.w8a8 = w8a8
 
         converter.apply_optimizations(
             dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
                             args.awq_format, args.awq_stats, args.awq_alpha,
                             args.awq_grid, args.exclude_nodes,
                             args.exclude_scopes,
-                            args.exclude_downstream_of))
+                            args.exclude_downstream_of, args.w8a8))
 
         # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can
         # neither create nor remove them: the extra census is set after the

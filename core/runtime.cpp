@@ -38,6 +38,15 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
         return precision;
     }
     switch (type) {
+    case ops::OpType::MATMUL:
+        // The int8 x int8 DP4A route reads a byte A but writes a float result,
+        // so the kernel build (and the plan's f.fp16 gate) follows the OUTPUT
+        // for that one combination. Every float-A MatMul keeps following the
+        // data input.
+        if (data_input->dtype() == typeid(int8_t) && output != nullptr) {
+            return output->dtype() == typeid(uint16_t) ? 1 : 0;
+        }
+        return data_input->dtype() == typeid(uint16_t) ? 1 : 0;
     case ops::OpType::ADD:
     case ops::OpType::SUB:
     case ops::OpType::MUL:
@@ -57,7 +66,6 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     case ops::OpType::ERF:
     case ops::OpType::FLOOR:
     case ops::OpType::RELU:
-    case ops::OpType::MATMUL:
     case ops::OpType::TRANSPOSE:
     case ops::OpType::CONCAT:
     case ops::OpType::CONV2D:
@@ -1405,6 +1413,19 @@ void Runtime::LoadModel() {
                         // Div/Gather/Concat/Equal/Where/Mul/Neg/Add/Slice/
                         // Reshape/Transpose/Expand)
                         dtype_marker = "_i64_";
+                    } else if (type == vkop::ops::OpType::MATMUL &&
+                               !node_inputs.empty() &&
+                               node_inputs[0] != nullptr &&
+                               node_inputs[0]->dtype() == typeid(int8_t)) {
+                        // int8 x int8 DP4A: A is a byte tensor but the route
+                        // still writes a float result (acc * a_scale *
+                        // weight_scale). The input0-follows rule below would
+                        // hand this node an int8 output and Matmul.hpp's
+                        // require_float_elem would throw. The converter records
+                        // the real output dtype; honor it.
+                        dtype_marker = (out_shape.dtype == "float32")
+                                           ? "_f32_"
+                                           : "_f16_";
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(int8_t)) {

@@ -33,6 +33,7 @@ try:
         Quantizer,
         RGBAConverter,
         Unifier,
+        W8A8ActivationFold,
         _disabled_passes,
         _position_paging_slots,
     )
@@ -60,6 +61,7 @@ except ImportError:
         Quantizer,
         RGBAConverter,
         Unifier,
+        W8A8ActivationFold,
         _disabled_passes,
         _position_paging_slots,
     )
@@ -1029,6 +1031,15 @@ class ModelConverter:
         # one remaining pass that rewrites a 4-D initializer's dims (into its
         # packed form), and an audit needs the logical rank.
         self._audit_weight_layouts(dag_model)
+
+        # int8 x int8 DP4A (opt-in): re-point eligible MatMul A inputs from
+        # their DequantizeLinear to the QuantizeLinear that produced the int8
+        # tensor, and record the activation scale. Runs after the weight
+        # quantization so "int8 weight" is a settled fact, and before RGBA /
+        # Unifier, which renumber initializers. See W8A8ActivationFold for the
+        # gates; a graph that matches nothing is left exactly as it was.
+        if getattr(args, "w8a8", False):
+            W8A8ActivationFold.fold(dag_model)
 
         if getattr(args, "rgba", False):
             RGBAConverter.convert(dag_model)

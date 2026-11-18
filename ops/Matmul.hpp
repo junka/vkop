@@ -641,6 +641,12 @@ class MatMulBuffer : public BufferFactory {
         if (attributes.find("epi_scale") != attributes.end()) {
             epi_scale_ = std::stof(attributes.at("epi_scale"));
         }
+        // Activation scale for the int8 x int8 DP4A route. The kernel folds it
+        // into the epilogue (acc * a_scale * weight_scale); this is the only
+        // consumer of the attribute, so it never touches a float route.
+        if (attributes.find("a_scale") != attributes.end()) {
+            a_scale_ = std::stof(attributes.at("a_scale"));
+        }
         if (attributes.find("epi_bias") != attributes.end()) {
             epi_bias_ = std::stol(attributes.at("epi_bias")) != 0;
         }
@@ -1623,7 +1629,9 @@ class MatMulBuffer : public BufferFactory {
         // collapses the push_constant block to a 4-byte range and zeroes EVERY
         // constant after it -- including K, on which the tiled K window
         // depends.
-        para_.epi_scale = epi_scale_;
+        // The DP4A kernel computes acc * a_scale * weight_scale: its epilogue
+        // slot carries the activation scale, not the attention QK^T scale.
+        para_.epi_scale = dp4a ? a_scale_ : epi_scale_;
         para_.epi_bias = epi_bias_ ? 1 : 0;
         // The bias is [B,1,q,kv] broadcast over the head axis, so its element
         // count is B*M*N while the output's is batch*M*N (batch = B*heads).
@@ -3731,6 +3739,9 @@ class MatMulBuffer : public BufferFactory {
     // tensor is appended as inputs[2] and bound at binding 6.
     float epi_scale_ = 1.0f;
     bool epi_bias_ = false;
+    // Per-tensor activation scale of the int8 A tensor consumed by the DP4A
+    // route (converter-set "a_scale"; 1.0 for every other route).
+    float a_scale_ = 1.0f;
     // Plan B: fuse the trailing Softmax into this MatMul (online softmax in the
     // kernel). Set by the converter via the "attn_softmax" attribute.
     bool attn_softmax_ = false;
