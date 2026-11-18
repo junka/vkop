@@ -55,7 +55,10 @@
 #include "core/DType.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
+#include "vulkan/VulkanBuffer.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDevice.hpp"
 
 namespace vkop {
 namespace export_ {
@@ -360,27 +363,108 @@ public:
     //
     // Copying leaves every buffer identity alone: the input tensor keeps the
     // buffer the runtime allocated for it, so whatever descriptor the op binds
-    // is still the right one. Cost is ~153 MB per round across 96 pairs (48 x
-    // 120 KB conv + 48 x 3 MB recurrent), about 13 ms of PCIe against a ~1.7 s
-    // round.
+    // is still the right one.
+    //
+    // DEVICE-TO-DEVICE, ONE SUBMIT. The earlier form round-tripped every pair
+    // through the host: 96 x (blocking D2H, host memcpy, blocking H2D), which
+    // measured 968 ms of a 2221 ms decode round -- 44% of it. The byte count
+    // was never the problem (~150 MB, ~13 ms of PCIe); the 96 serialized
+    // submit+wait pairs were, and each copyToCPU also forces a graph segment
+    // boundary (VulkanCommandBuffer::pre_readback_hook), which dragged Run()
+    // down by a further ~310 ms by breaking the round into 96 synchronized
+    // pieces. Recording all 96 copies into ONE command buffer and submitting
+    // once removes both: no host traffic, and no readback boundary.
+    //
+    // Ordering: Run() has finished and the GPU is idle when this is called
+    // (the driver waits before sampling), so an explicit barrier on each
+    // buffer is enough -- there is no in-flight work to race with. The
+    // barriers are still required: the producer left `out` in SHADER_WRITE
+    // (or TRANSFER_WRITE for the view case) and the next round reads `in` as
+    // an SSBO.
     void advance() {
+        if (pairs_.empty()) return;
+        auto dev = cmdpool_->getVulkanDevice();
+        VulkanCommandBuffer cmd(cmdpool_);
+        cmd.begin();
+        size_t recorded = 0;
         for (auto &p : pairs_) {
             auto from = core::as_tensor<float>(p.out);
-            from->copyToCPU(cmdpool_);
             auto to = core::as_tensor<float>(p.in);
-            // toCPU() first: copyToGPU returns immediately when the tensor is
-            // already resident, and `p.in` has been resident since the first
-            // round. Without this the state never reached the graph at all --
-            // decode ran every round against whatever in held, and only prefill
-            // looked right, because a chunk's whole recurrence happens inside
-            // one Run() along seq.
-            to->toCPU();
-            to->fillToCPU(from->data().data());
-            to->copyToGPU(cmdpool_);
-            // The readback left the graph output host-resident; next round's
-            // producer expects to write a device-resident tensor.
-            from->toGPU();
+            auto [src, src_off] = resolve_buffer_(from, "advance src");
+            auto [dst, dst_off] = resolve_buffer_(to, "advance dst");
+            const VkDeviceSize bytes = static_cast<VkDeviceSize>(
+                from->num_elements()) * sizeof(float);
+            if (bytes == 0) {
+                throw std::runtime_error(
+                    "LinearState::advance: zero-element state tensor");
+            }
+            // Barrier the whole touched window, offsets included: a borrowed
+            // sub-range forwards the barrier to its parent, and passing the
+            // region's own offset keeps a shared parent from being
+            // transitioned for ranges this copy never touches.
+            src->transferReadBarrier(cmd.get(), bytes, src_off);
+            dst->transferWriteBarrier(cmd.get(), bytes, dst_off);
+            VkBufferCopy region{};
+            region.srcOffset = src_off;
+            region.dstOffset = dst_off;
+            region.size = bytes;
+            vkCmdCopyBuffer(cmd.get(), src->getBuffer(), dst->getBuffer(),
+                            1, &region);
+            dst->readBarrier(cmd.get(), bytes, dst_off);
+            src->readBarrier(cmd.get(), bytes, src_off);
+            ++recorded;
         }
+        cmd.end();
+        // Every pair is either copied or the loop threw; a silent skip here is
+        // exactly the failure the two alias attempts had, so the count is
+        // checked rather than trusted.
+        if (recorded != pairs_.size()) {
+            throw std::runtime_error(
+                "LinearState::advance: recorded " + std::to_string(recorded) +
+                " of " + std::to_string(pairs_.size()) + " state copies");
+        }
+        cmd.submit(dev->getComputeQueue());
+        cmd.wait();
+        // The graph's output tensors were never host-resident on this path, so
+        // they stay on-GPU. The inputs stay on-GPU too -- copyToGPU's staging
+        // path is not used here at all.
+        for (auto &p : pairs_) {
+            core::as_tensor<float>(p.in)->toGPU();
+            core::as_tensor<float>(p.out)->toGPU();
+        }
+    }
+
+    // Resolve a tensor's GPU storage to (root buffer, byte offset).
+    //
+    // Two resource shapes reach this: an owning VulkanBuffer (offset 0, or its
+    // own range_offset for a borrowed view) and a VulkanBufferView (a
+    // texel/buffer view over a parent buffer at m_offset_). The old code
+    // dynamic_cast straight to VulkanBuffer, which returns null for the view
+    // case; skipping on null is precisely how "the copy looked like it ran but
+    // the state never reached the graph" happened twice before (see the two
+    // failed alias designs above). Anything we cannot address is an error, not
+    // a skip.
+    //
+    // getBuffer() on a borrowed VulkanBuffer already recurses to the ROOT
+    // VkBuffer, so pairing it with abs_offset() (root-relative) is consistent.
+    static std::pair<std::shared_ptr<VulkanBuffer>, VkDeviceSize>
+    resolve_buffer_(const std::shared_ptr<core::Tensor<float>> &t,
+                    const char *what) {
+        auto res = t->gpu_buffer();
+        if (!res) {
+            throw std::runtime_error(
+                std::string("LinearState::advance: ") + what +
+                " has no GPU buffer");
+        }
+        if (auto b = std::dynamic_pointer_cast<VulkanBuffer>(res)) {
+            return {b, b->abs_offset()};
+        }
+        if (auto v = std::dynamic_pointer_cast<VulkanBufferView>(res)) {
+            return {v->getBuffer(), v->getOffset()};
+        }
+        throw std::runtime_error(
+            std::string("LinearState::advance: ") + what +
+            " is neither a buffer nor a buffer view");
     }
 
     // Diagnostic: is the state non-zero, i.e. did the last round actually
