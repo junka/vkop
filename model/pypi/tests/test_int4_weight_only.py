@@ -230,7 +230,13 @@ def test_fp16_source_quantizes_like_its_fp32_twin():
 
 def test_gates_preserve_the_float_weight():
     """Every layout the nibble kernel cannot address stays float: no payload
-    rewrite, no scale initializer, no third input."""
+    rewrite, no scale initializer, no third input.
+
+    `transB=1` is deliberately NOT in this list any more: a 4-bit weight behind
+    a Transpose is re-laid as [K, N] and encoded (see
+    test_a_transpose_fed_weight_is_re_laid_and_encoded), which is what makes
+    the in-memory and streamed paths agree on the 27B's graph.
+    """
     numpy.random.seed(4)
     cases = [
         ("Gemm transB=1 has no nibble kernel",
@@ -241,10 +247,6 @@ def test_gates_preserve_the_float_weight():
          build("W", numpy.random.randn(4, 4, 8, 8).astype(numpy.float32),
                [("Conv", "c", {}, ["x", "W"])]),
          {}, 4, "Conv"),
-        ("transB=1 MatMul stores [N, K]",
-         build("W", numpy.random.randn(8, 4).astype(numpy.float32),
-               [("MatMul", "mm", {"transB": 1}, ["x", "W"])]),
-         {"transB": 1}, 4, "MatMul"),
         ("rank-3 batched weight",
          build("W", numpy.random.randn(2, 8, 8).astype(numpy.float32),
                [("MatMul", "mm", {"transB": 0}, ["x", "W"])]),
@@ -260,6 +262,14 @@ def test_gates_preserve_the_float_weight():
         ("K % group_size != 0 cuts a group mid-row",
          build("W", numpy.random.randn(6, 8).astype(numpy.float32),
                [("MatMul", "mm", {"transB": 0}, ["x", "W"])]),
+         {"transB": 0}, 4, "MatMul"),
+        # The SwiGLU fold's kernel ABI is `down_act_ && weight_byte`, so a
+        # 4-bit member of the fold produces a node the runtime rejects after
+        # the conversion has already reported success. It has to stay float.
+        ("the SwiGLU down fold has no 4-bit scale table ABI",
+         build("W", numpy.random.randn(8, 16).astype(numpy.float32),
+               [("MatMul", "mm", {"transB": 0, "down_act": [1]},
+                 ["x", "W"])]),
          {"transB": 0}, 4, "MatMul"),
         ("non-float source arrives already quantized",
          build("W", numpy.arange(64, dtype=numpy.int8).reshape(8, 8),
@@ -331,3 +341,47 @@ def test_writer_records_the_packed_size_and_name():
     assert _init_byte_len(f32) == 48 and _init_dtype_name(f32) == "float32"
     assert _init_bytes(f32) == numpy.arange(12, dtype=numpy.float32).tobytes()
     print("  PASS (writer: packed size, dtype name, raw bytes, mismatch raises)")
+
+
+def test_a_transpose_fed_weight_is_re_laid_and_encoded():
+    """A [N, K] weight behind a Transpose becomes a packed [K, N] payload.
+
+    This is the 27B's shape and the reason the format is reachable at all on
+    that graph: the nibble kernel reads [K, N] and the runtime refuses transB
+    for 4-bit. The reference is quantize(source) then transpose -- which for a
+    symmetric per-group grid is the same numbers as transpose then quantize,
+    and is exactly what weight_stream._write_int4 produces from the file.
+    """
+    import contextlib
+    import io
+
+    n, k = 16, 8                     # N % 8 == 0, K % group == 0
+    numpy.random.seed(7)
+    w_nk = numpy.random.randn(n, k).astype(numpy.float32)   # [N, K] on disk
+    # The state the DAG is in when this pass runs: fold_transpose_into_matmul
+    # has already consumed the Transpose and turned it into transB=1.
+    m = build("W", w_nk,
+              [("MatMul", "mm", {"transB": 1}, ["x", "W"])])
+    with contextlib.redirect_stdout(io.StringIO()):
+        Quantizer.quantize_to_4bit_weight_only(m, 4, "int4")
+
+    init = m.initializers["W"]
+    assert init.data_type == TensorProto.INT4
+    assert tuple(init.dims) == (k, n), "the payload must be [K, N]"
+    assert "transB" not in m.nodes["mm"].attributes
+
+    # The reference: groups cut the LOGICAL K, which is the source's axis 1.
+    # So the stored weight is [N, K/g, g] and each (column, group) reduces its
+    # own g values -- the same locality the streaming path relies on.
+    w3 = w_nk.reshape(n, k // 4, 4)
+    amax = numpy.maximum(numpy.max(numpy.abs(w3), axis=2), 0.0)
+    scale = numpy.where(amax == 0, 1.0, amax / 7.0).astype(numpy.float32)
+    kn_codes = numpy.clip(numpy.round(w3 / scale[:, :, None]),
+                          -8, 7).astype(numpy.int8)
+    want = numpy.ascontiguousarray(kn_codes.reshape(n, k).T).reshape(k, n)
+    nib = want.reshape(-1).astype(numpy.uint8) & 0xF
+    want_packed = (nib[0::2] | (nib[1::2] << 4)).astype(numpy.uint8)
+    assert init.raw_data == want_packed.tobytes()
+
+    got_scale = numpy_helper.to_array(m.initializers["W_scale"])
+    assert numpy.array_equal(got_scale, numpy.ascontiguousarray(scale.T))

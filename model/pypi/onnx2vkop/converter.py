@@ -16,6 +16,7 @@ try:
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
         _VKOP_LOGITS_LAST_ROW_META_PREFIX,
+        _init_byte_len,
     )
     from . import shader_map
     from . import weight_stream
@@ -44,6 +45,7 @@ except ImportError:
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
         _VKOP_LOGITS_LAST_ROW_META_PREFIX,
+        _init_byte_len,
     )
     import shader_map
     import weight_stream
@@ -193,8 +195,16 @@ class ModelConverter:
 
     def parse_onnx_model(self, onnx_path: str, batch_size: int = 1, *,
                          quant: str = None, unify: bool = False,
-                         rgba: bool = False) -> DAGBasedModel:
-        """Parse and convert ONNX model to DAG format."""
+                         rgba: bool = False,
+                         group_size: int = 0) -> DAGBasedModel:
+        """Parse and convert ONNX model to DAG format.
+
+        `group_size` is the 4-bit K group (`-q int4`'s knob). It is needed
+        before any quantization runs, because a deferred int4 weight's scale
+        table is `[K / group, N]` and the row records the grouping so the
+        writer and the runtime can derive the same table length. The other
+        formats ignore it.
+        """
         model = onnx.load(onnx_path, load_external_data=False)
         # Load external weights (llm.weights.bin) so the optimized model can be
         # processed without a 2GB+ single-file protobuf save -- but not
@@ -240,7 +250,7 @@ class ModelConverter:
 
         deferred_weights = weight_stream.prepare(
             model, base_dir, quant=quant, unify=unify, rgba=rgba,
-            keep_in_file=moe_slots)
+            group_size=group_size, keep_in_file=moe_slots)
 
         # A float32 weight left in its file under a byte format is quantized on
         # the way into the trailer, so its scale has to exist in the graph: this
@@ -384,13 +394,26 @@ class ModelConverter:
             )
 
         graph = model.graph
-        try:
-            # 大模型（>2GB 权重）full_check 内部会 SerializeToString 整个 model
-            # 触发 proto 上限，只能退化为逐节点形状检查（结构性校验放后面 DAG 构建做）。
-            onnx.checker.check_model(model, full_check=True)
-            print("ONNX model passed full validation.")
-        except Exception:
-            print("ONNX model full validation skipped (model too large for full_check).")
+        # `full_check` serializes the whole model to a byte string before the
+        # checker sees it, and that copy is sized by the RESIDENT initializers.
+        # A deferred weight has no bytes here, but a quantizing conversion's
+        # SCALE TABLES do: `-q int4` on the 27B puts 1.5 GiB of group scales in
+        # the proto, so the serialization added 3 GiB of transient RSS --
+        # measured, and it then raised anyway ("model too large"). The size is
+        # known from dtype and dims without touching a payload, so the doomed
+        # call is skipped rather than paid for. Under the proto's 2 GB limit the
+        # copy is bounded and the full check still runs.
+        resident = sum(_init_byte_len(init) for init in graph.initializer)
+        if resident > (1 << 30):
+            print("ONNX model full validation skipped (model too large for "
+                  "full_check).")
+        else:
+            try:
+                onnx.checker.check_model(model, full_check=True)
+                print("ONNX model passed full validation.")
+            except Exception:
+                print("ONNX model full validation skipped (model too large for "
+                      "full_check).")
 
         if not self.optimizer.is_topologically_sortable(graph):
             print("Graph is not topologically sorted. Please sort it before proceeding.")

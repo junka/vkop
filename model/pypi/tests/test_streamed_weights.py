@@ -327,10 +327,11 @@ def test_a_view_chain_over_a_float32_weight_hydrates(tmp_path, monkeypatch):
 
 def test_deferral_is_refused_when_a_payload_would_be_rewritten(monkeypatch):
     monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
-    # 4-bit and AWQ need the weight's magnitudes in hand to pick their scale
-    # (a group and a channel both span K), so their payloads cannot be built
-    # from a streamed band and the deferral stays refused.
-    for rewritten in ("int4", "nf4", "nvfp4", "awq"):
+    # nf4/nvfp4 and AWQ cannot be built from a streamed band: nvfp4 has a
+    # per-TENSOR factor (a genuinely global reduction) and AWQ is a real-valued
+    # rescale of the whole weight. nf4's scale is local like int4's but its
+    # codebook encode has not been validated on this path, so it stays refused.
+    for rewritten in ("nf4", "nvfp4", "awq"):
         assert ws.deferral_refusal(rewritten, False, False) is not None, rewritten
     assert ws.deferral_refusal("fp16", True, False) is not None
     assert ws.deferral_refusal("fp16", False, True) is not None
@@ -340,20 +341,25 @@ def test_deferral_is_refused_when_a_payload_would_be_rewritten(monkeypatch):
 
 
 def test_a_byte_format_may_stream_and_quantize_on_the_way_out(monkeypatch):
-    """int8 / fp8 keep their scale in one pass over the file.
+    """int8 / fp8 / int4 keep their scale in one pass over the file.
 
-    Their scale is the weight's per-column absmax and their payload overwrites
-    the values, so a deferred float32 weight can be quantized as it is copied
-    into the trailer instead of being inflated into an array first. That is why
-    these three are the only quantizations deferral still allows.
+    int8 and fp8 reduce to one absmax per output column and overwrite the
+    values, so a deferred weight can be quantized as it is copied into the
+    trailer instead of being inflated into an array first.
+
+    int4 is allowed for a reason that is easy to get backwards: its scale table
+    is [K/group, N], which *looks* like a reduction spanning K. It is not --
+    each entry is an absmax over its own `group` values of K -- so a
+    band-at-a-time sweep accumulates exactly the same table. That is what makes
+    a 27B model convertible in 62 GB of RAM at all.
     """
     monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
-    for value_free in ("int8", "fp8e4m3", "fp8e5m2"):
+    for value_free in ("int8", "fp8e4m3", "fp8e5m2", "int4"):
         assert ws.deferral_refusal(value_free, False, False) is None
         assert ws.exports_weight_values(value_free, False, False) is False
     assert ws.exports_weight_values("int8", True, False) is True
     assert ws.exports_weight_values("int8", False, True) is True
-    for needs_values in ("int4", "nf4", "nvfp4", "awq", "fp16", None):
+    for needs_values in ("nf4", "nvfp4", "awq", "fp16", None):
         assert ws.exports_weight_values(needs_values, False, False) is True
 
 

@@ -426,8 +426,13 @@ MatMul/Gemm/Conv 读，转换器就没法按值看它（这些算子有激活输
 
 三条必须知道的边界：
 
-- 只延「直通」的那部分。`-q int8/fp8/int4/nf4/nvfp4`、`-u`、`-r` 要重写权重字节，一律不延
-  （日志会打 `weights not streamed (<原因>)`）；`VKOP_STREAM_WEIGHTS=0` 是同一个开关的另一侧。
+- 只延「直通」的那部分和**值无关**的量化：`-q fp16`、`int8`、`fp8e4m3/e5m2`、`int4` 都走流式；
+  `-q nf4/nvfp4`、`-q awq`、`-u`、`-r` 一律不延（日志会打 `weights not streamed (<原因>)`）。
+  `VKOP_STREAM_WEIGHTS=0` 是同一个开关的另一侧。
+  - int8/fp8 的 scale 是「每个输出列一个 absmax」；**int4 的 scale 虽然形状是 `[K/group, N]`，
+    但每个元素只对自己那 `group` 个 K 值取 absmax**，所以也能按 band 累加——这就是 27B 能在
+    62 GB 机器上转出 4-bit 产物的原因（`quant_payload.grouped_amax`）。band 边界与 group 边界
+    不必对齐：跨界的 band 用 `np.maximum.reduceat` 在 group 边界处切段，头尾段是部分 group 也精确。
 - 被延迟的张量**没有内容可比**，所以 `eliminate_duplicate_initializer` 会把它们看成同一个
   （text_encoder_tiny 上 14 个不同权重被并成 4 个）。做法是把带外部载荷的 initializer 临时降级成
   图输入跑完 pass 再原样挂回引用（`optimizer.py` 的 `_demote_external_initializers`），小常量的去重照旧。

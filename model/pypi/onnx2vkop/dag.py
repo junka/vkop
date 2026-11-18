@@ -1395,7 +1395,7 @@ class DAGBasedModel:
                                 f"{data_size} bytes, the source says "
                                 f"{entry['length']}")
                         written = weight_stream.write_payload(
-                            entry, f, self.weight_base_dir)
+                            entry, f, self.weight_base_dir, self)
                         if written != data_size:
                             raise weight_stream.DeferredWeightError(
                                 f"deferred weight '{_name}': wrote {written} "

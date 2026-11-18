@@ -19,9 +19,11 @@ if _osp.isdir(_TOOLS) and _TOOLS not in sys.path:
 try:
     from .converter import ModelConverter
     from . import shader_map
+    from . import weight_stream
 except ImportError:
     from converter import ModelConverter
     import shader_map
+    import weight_stream
 
 # filter_shaders may or may not be on sys.path yet (the block above appends
 # tools/ when it exists); import lazily so a conversion still works, with a
@@ -526,28 +528,30 @@ def _any_exclusion(args) -> bool:
 def _force_payloads_for_exclusion(args) -> None:
     """Make --stream-weights and the exclusion flags agree, or refuse.
 
-    A weight left in its ONNX data file under -q int8/fp8 is quantized on the
-    way into the trailer (weight_stream/quant_payload), and that code has no
-    notion of a node exclusion -- it would produce the byte weight this run is
-    asking not to produce, and report a clean conversion doing it. The payloads
-    have to be in memory for the exclusion to have anything to skip.
+    A weight left in its ONNX data file under a value-free format (int8, fp8,
+    int4) is quantized on the way into the trailer (weight_stream/quant_payload),
+    and that code has no notion of a node exclusion -- it would produce the
+    quantized weight this run is asking not to produce, and report a clean
+    conversion doing it. The payloads have to be in memory for the exclusion to
+    have anything to skip.
 
-    Only -q int8/fp8e4m3/fp8e5m2 reach that path: 4-bit, nvfp4 and AWQ already
-    refuse deferral because their scales span K, so for those this changes
-    nothing. It is still the memory of the whole model, so the switch is
-    announced rather than silent, and an explicit --stream-weights on is an
-    error rather than a contradiction the run resolves on its own.
+    Only the value-free formats reach that path: nvfp4, nf4 and AWQ still refuse
+    deferral, so for those this changes nothing. It is still the memory of the
+    whole model, so the switch is announced rather than silent, and an explicit
+    --stream-weights on is an error rather than a contradiction the run resolves
+    on its own.
     """
     if not _any_exclusion(args):
         return
+    value_free = tuple(weight_stream._VALUE_FREE_FORMATS)
     if args.stream_weights == "on":
         sys.exit(
             "Error: --stream-weights on cannot be combined with --exclude-*: "
-            "a streamed weight under -q int8/fp8 is quantized at trailer time, "
-            "where the exclusion has no say, so the flag would be ignored. "
-            "Drop --stream-weights (the exclusion forces it off) or drop the "
-            "exclusion.")
-    if args.quant in ("int8", "fp8e4m3", "fp8e5m2"):
+            f"a streamed weight under -q {'/'.join(value_free)} is quantized at "
+            "trailer time, where the exclusion has no say, so the flag would be "
+            "ignored. Drop --stream-weights (the exclusion forces it off) or "
+            "drop the exclusion.")
+    if args.quant in value_free:
         args.stream_weights = "off"
         print(
             "[exclude] --stream-weights off: the excluded payloads must be in "
@@ -590,7 +594,8 @@ def main():
         # payloads, and a tensor they touch must be in memory.
         dag_model = converter.parse_onnx_model(
             str(input_path), args.batch, quant=args.quant,
-            unify=args.unify, rgba=args.rgba)
+            unify=args.unify, rgba=args.rgba,
+            group_size=getattr(args, "group_size", 0))
 
         # Create a simple args object for apply_optimizations
         class Args:

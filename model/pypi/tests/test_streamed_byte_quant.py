@@ -79,15 +79,45 @@ def _model(tmp, perm=(1, 0)):
     return path
 
 
-def _convert(model_path, tmp, stream, quant="int8"):
-    out = os.path.join(tmp, "o_%s_%s.vkopbin" % (quant, stream))
+def _convert_forced_trailer(model_path, tmp, stream, quant, group,
+                            tag=""):
+    """Convert with the blob forced into the trailer.
+
+    `--external-blob-mb 1` is enough for the streamed arm (a deferred weight
+    costs the SOURCE's bytes) but not for an in-memory one: the hydrated
+    int4 payload is half the fp16 source, which lands under the gate and
+    inlines into the FlatBuffer, where there is no trailer offset to read.
+    """
+    out = os.path.join(tmp, "f_%s_%s%s.vkopbin" % (quant, stream, tag))
+    p = subprocess.run(
+        [sys.executable, "-m", "onnx2vkop.cli", "-i", model_path, "-o", out,
+         "-q", quant, "--group-size", str(group),
+         "--target-backend", "buffer", "--external-blob-mb", "0",
+         "--stream-weights", stream],
+        capture_output=True, text=True, cwd=PYPI)
+    assert p.returncode == 0, f"convert failed ({stream}): {p.stderr[-800:]}"
+    return out
+
+
+def _model_weight_nk():
+    """The exact [N, K] fp16 array `_model` writes, so a test can compute the
+    reference from the same numbers the converter read."""
+    rng = np.random.RandomState(7)
+    w = (rng.randn(N, K) * 0.05).astype(np.float16)
+    w[0, 0] = 2.0
+    return w
+
+
+def _convert(model_path, tmp, stream, quant="int8", extra=()):
+    out = os.path.join(tmp, "o_%s_%s%s.vkopbin" % (quant, stream,
+                                                   "".join(extra)))
     p = subprocess.run(
         [sys.executable, "-m", "onnx2vkop.cli", "-i", model_path, "-o", out,
          "-q", quant, "--target-backend", "buffer",
          # Force the trailer: a 2 MiB blob otherwise trips dag.py's
          # "fits a FlatBuffer vector" gate and never defers at all.
          "--external-blob-mb", "1",
-         "--stream-weights", stream],
+         "--stream-weights", stream, *extra],
         capture_output=True, text=True, cwd=PYPI)
     assert p.returncode == 0, f"convert failed ({stream}): {p.stderr[-800:]}"
     return out
@@ -291,3 +321,187 @@ def test_the_finalized_proto_survives_the_converter_s_pass_list():
                 "onnxoptimizer rejects the finalized graph, so optimize_model "
                 f"would skip every structural pass: {e}") from e
         assert len(out.graph.node) > 0
+
+
+# --------------------------------------------------------------------------
+# int4: a grouped scale that is local to a band, so it streams too
+# --------------------------------------------------------------------------
+#
+# The scale of a 4-bit weight is [K/group, N] — one absmax per (group of K,
+# output column). That table LOOKS like a whole-matrix reduction, and the
+# deferral gate refused it for as long as it was read that way. It is local:
+# each entry depends only on its own `group` rows, so a band-at-a-time sweep
+# adds to the same accumulator and lands on the same table. These cases pin the
+# three things that make the streamed payload usable at all:
+#
+#   * the payload and the table are bit-identical to the in-memory quantizer's;
+#   * the band boundary may fall INSIDE a group (ROW_BLOCK is 2048 and `group`
+#     is a CLI knob, so nothing guarantees they line up);
+#   * a [N, K] source behind a Transpose is re-laid as [K, N] and packed two
+#     columns per byte, which is the only layout `unpack_w4` can read.
+
+import numpy as np  # noqa: E402  (already imported above; kept explicit here)
+
+GROUP = 32
+
+
+def _int4_reference(kn, group=GROUP):
+    """(packed nibbles, [n_groups, N] scale) the in-memory quantizer writes.
+
+    Uses Quantizer._quantize_w3 directly -- the one encoder the -q path, the
+    AWQ path and this streaming path are all supposed to agree with -- rather
+    than restating the arithmetic here, which would only prove the test can
+    copy itself.
+    """
+    sys.path.insert(0, PYPI)
+    from onnx2vkop.optimizer import Quantizer
+
+    k, n = kn.shape
+    codes, scale_keep = Quantizer._quantize_w3(
+        kn.reshape(k // group, group, n), "int4")
+    nib = codes.reshape(-1).astype(np.uint8) & 0xF
+    packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
+    return packed, scale_keep.reshape(k // group, n).astype(np.float32)
+
+
+def _int4_row_and_bytes(binpath, name):
+    summ = _section(binpath, "summary")["summary"]
+    rows = {e["name"]: e for e in _section(binpath, "initializers")["initializers"]}
+    row = rows[name]
+    with open(binpath, "rb") as f:
+        f.seek(summ["external_blob_trailer_offset"] + row["offset"])
+        return row, f.read(row["size"])
+
+
+def test_int4_streams_the_transpose_fed_weight_byte_for_byte():
+    """The 27B's shape: [N, K] behind a Transpose, packed as [K, N].
+
+    A source band is a run of output COLUMNS, so the writer has to transpose
+    and pack on the way out. Two nibbles per byte means the unit it can write
+    per k is half the band -- which is why an odd band start would silently
+    corrupt a byte, and why the writer checks for it.
+    """
+    w_nk = _model_weight_nk()
+    with tempfile.TemporaryDirectory() as tmp:
+        st = _convert(_model(tmp), tmp, "on", quant="int4",
+                      extra=("--group-size", str(GROUP)))
+        row, payload = _int4_row_and_bytes(st, "W")
+        srow, scale_raw = _int4_row_and_bytes(st, "W_scale")
+        assert row["dtype"] == "int4", row
+        assert tuple(row["dims"]) == (K, N), (
+            f"payload dims {row['dims']}; the nibble kernel reads [K, N]")
+        assert srow["dims"] == [K // GROUP, N], (
+            f"scale table is {srow['dims']}, wants [K/group, N]")
+
+        want_pay, want_scale = _int4_reference(
+            np.ascontiguousarray(w_nk.T).astype(np.float32))
+        assert payload == want_pay.tobytes(), (
+            "streamed nibbles differ from the in-memory quantizer's")
+        got_scale = np.frombuffer(scale_raw, dtype=np.float32)
+        assert np.array_equal(got_scale, want_scale.reshape(-1)), (
+            "streamed group scales differ from the in-memory quantizer's")
+
+
+def test_int4_streams_a_direct_kn_weight_byte_for_byte():
+    """The already-[K, N] layout: bands are K rows and no reordering happens."""
+    w_kn = np.ascontiguousarray(_model_weight_nk().T)
+    with tempfile.TemporaryDirectory() as tmp:
+        st = _convert(_model(tmp, perm=None), tmp, "on", quant="int4",
+                      extra=("--group-size", str(GROUP)))
+        row, payload = _int4_row_and_bytes(st, "W")
+        assert row["dtype"] == "int4" and tuple(row["dims"]) == (K, N)
+        want_pay, _ = _int4_reference(w_kn.astype(np.float32))
+        assert payload == want_pay.tobytes()
+
+
+def test_int4_streamed_and_hydrated_payloads_agree():
+    """Same artifact either way, for BOTH source layouts.
+
+    The streamed path reorders packed nibbles in the writer
+    (`weight_stream._write_int4`); the hydrated one transposes the VALUES first
+    (`Quantizer._flip_transposed_4bit_weights`) and then packs. Those are
+    different code paths reaching the same bytes, and only one of them can be
+    right -- on the 27B a disagreement here would have been silently wrong
+    weights in whichever arm took the other branch.
+
+    Byte equality is the claim, not "close enough": the group absmax covers the
+    same set of values in either layout, so the codes and the [K/group, N]
+    table have to come out identical.
+    """
+    for perm in ((1, 0), None):
+        tag = "transposed" if perm else "direct"
+        with tempfile.TemporaryDirectory() as tmp:
+            mp = _model(tmp, perm=perm)
+            # `--external-blob-mb 0` on BOTH arms: the hydrated int4 artifact
+            # inlines its blob (a 2 MiB fp16 source becomes a 1 MiB payload,
+            # under the 1 MiB gate), and the inline layout has no trailer to
+            # read a payload back from. The streamed arm always needs the
+            # trailer. Forcing it keeps the two comparable.
+            st = _convert(mp, tmp, "on", quant="int4",
+                          extra=("--group-size", str(GROUP)))
+            hy = _convert_forced_trailer(mp, tmp, "off", "int4", GROUP)
+            srow, spay = _int4_row_and_bytes(st, "W")
+            hrow, hpay = _int4_row_and_bytes(hy, "W")
+            assert srow["dtype"] == hrow["dtype"] == "int4", (tag, srow, hrow)
+            assert tuple(srow["dims"]) == tuple(hrow["dims"]) == (K, N), tag
+            assert spay == hpay, f"{tag}: streamed payload differs from hydrated"
+
+            _, sscale = _int4_row_and_bytes(st, "W_scale")
+            _, hscale = _int4_row_and_bytes(hy, "W_scale")
+            assert sscale == hscale, f"{tag}: scale tables differ"
+
+
+def test_int4_group_scale_is_local_to_a_band(monkeypatch):
+    """A band boundary inside a group must not lose or gain an absmax.
+
+    ROW_BLOCK is 2048 and `group` is a CLI knob, so the two are not required to
+    line up — and a band that starts mid-group is exactly the case a
+    "ROW_BLOCK % group_size == 0" assumption would get wrong. Sweeping with
+    ROW_BLOCK=7 (a prime) over a K of 512 puts a boundary inside nearly every
+    group.
+    """
+    sys.path.insert(0, PYPI)
+    from onnx2vkop import quant_payload
+    from onnx2vkop.weight_stream import DeferredWeightError
+
+    rng = np.random.RandomState(13)
+    w_kn = (rng.randn(K, N) * 0.05).astype(np.float16)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "src.bin")
+        w_kn.tofile(path)
+        entry = {"name": "W", "location": path, "base_dir": tmp, "offset": 0,
+                 "length": w_kn.nbytes, "data_type": TensorProto.FLOAT16,
+                 "src_dtype": TensorProto.FLOAT16,
+                 "dims": tuple(w_kn.shape), "transposed": False}
+        reader = quant_payload.WeightReader(entry, "W")
+        want = _int4_reference(w_kn.astype(np.float32))[1]
+
+        seen = set()
+
+        orig = quant_payload.WeightReader.bands
+        try:
+            for block in (7, 31, 64, 2048):
+                def patched(self, _block=block):
+                    return orig(self, block=_block)
+                quant_payload.WeightReader.bands = patched
+                got = quant_payload.grouped_amax(
+                    quant_payload.WeightReader(entry, "W"), GROUP, False)
+                assert np.array_equal(got / 7.0, want) or np.array_equal(
+                    got, want * 7.0), (
+                    f"block={block} disagrees with the whole-matrix grouping")
+                seen.add(block)
+        finally:
+            quant_payload.WeightReader.bands = orig
+        assert seen == {7, 31, 64, 2048}
+
+
+def test_int4_refuses_a_group_that_does_not_divide_k():
+    """A partial last group is a payload no kernel can walk, so it is a skip."""
+    rng = np.random.RandomState(14)
+    with tempfile.TemporaryDirectory() as tmp:
+        # K=512 with group 48: 512 % 48 == 32.
+        out = _convert(_model(tmp), tmp, "on", quant="int4",
+                       extra=("--group-size", "48"))
+        row, _ = _int4_row_and_bytes(out, "W")
+        assert row["dtype"] == "float16", (
+            "an ungroupable K must leave the weight wide, not ship nibbles")

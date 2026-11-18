@@ -1,4 +1,4 @@
-"""Finalize the deferred-table entries for a byte-format quantization.
+"""Finalize the deferred-table entries for a byte-format or int4 quantization.
 
 The scale of an int8 / fp8 weight is its per-column absmax and its payload
 overwrites the values, so the conversion neither needs nor wants the weight in
@@ -7,6 +7,18 @@ what the payload will be; this module computes the one thing the writer cannot
 derive on its own -- the scale -- and puts it into the graph as an ordinary
 initializer, appended to each consumer the way every other weight-only format
 appends its scale.
+
+int4 is deferrable for a different reason. Its scale is grouped along K -- one
+entry per (`group_size` values of K, output column) -- which sounds like it
+needs the whole matrix. It does not: each group's scale is an absmax over its
+OWN `group_size` rows and nothing else, so a band-at-a-time sweep can accumulate
+`amax[n_groups, N]` exactly (`_grouped_amax`). The band boundary and the group
+boundary need not coincide; the reduceat slice below is computed from
+`offset % group_size` rather than assumed. That is what makes `-q int4`
+convertible on a machine that cannot hold the model, and it is the only 4-bit
+format here: nf4's codebook lookup is per-element but its *scale* is the group
+absmax, so it would stream too -- it is refused for a different reason (the
+nibble grid it writes is not what this module was validated against).
 
 It runs on the **onnx proto**, right after `weight_stream.prepare`, because no
 DAGBasedModel exists at that point. Adding the scale here (rather than later)
@@ -124,15 +136,134 @@ def _amax(reader, transposed: bool):
     return amax
 
 
-def scale_for(fmt, reader, transposed: bool = False):
-    """The per-output-column fp32 scale an int8 / fp8 payload is decoded with."""
+def scale_for(fmt, reader, transposed: bool = False, group: int = 0):
+    """The fp32 scale a streamed payload is decoded with.
+
+    Two shapes, because the formats ask for two different things:
+
+      * int8 / fp8 -- one entry per output column, `[N]`;
+      * int4       -- one entry per (`group` values of K, output column),
+                      `[n_groups, N]`, row-major, the layout the nibble
+                      kernels read with `scale4(g * uPC.N + ja)`.
+
+    The 4-bit branch is `Quantizer._quantize_w3`'s arithmetic on a table this
+    module accumulated band by band, not on a materialized weight: same absmax
+    per group, same `/7`, same fp32 rounding, so the payload and the table are
+    bit-identical to the in-memory quantizer's.
+    """
     from .optimizer import Quantizer
 
+    if fmt == "int4":
+        amax = grouped_amax(reader, group, transposed)
+        return np.where(amax == 0, 1.0, amax / 7.0).astype(np.float32)
     amax = _amax(reader, transposed)
     if fmt == "int8":
         return np.where(amax == 0, 1.0, amax / 127.0).astype(np.float32)
     max_finite = Quantizer._FP8_FORMATS[fmt][0]
     return np.where(amax == 0, 1.0, amax / max_finite).astype(np.float32)
+
+
+def grouped_amax(reader, group: int, transposed: bool = False):
+    """Per-(K group, output column) absmax, accumulated one band at a time.
+
+    This is the function that makes int4 streamable, and the reason it is not
+    obvious is worth spelling out. A 4-bit weight's scale table is `[K/g, N]`,
+    which looks like "the scale spans K, so the whole matrix must be in hand".
+    But each entry is an absmax over its OWN `group` values of K and nothing
+    else -- a group's scale never sees another group's rows. So a band of rows
+    can reduce into the groups it overlaps and later bands add to the same
+    accumulator, exactly as `_amax` does for the per-column formats.
+
+    The two stored layouts put the group axis in different places, and neither
+    is allowed to assume the band size is a multiple of `group`:
+
+      * stored [K, N] (a direct MatMul weight): groups are ROWS. A band of
+        ROW_BLOCK rows usually contains whole groups, but a smaller band or a
+        larger `group` straddles boundaries -- handled by `np.maximum.reduceat`
+        on the group boundaries that fall INSIDE the band, so the first and
+        last segments are partial and still exact.
+      * stored [N, K] (a Transpose-fed weight, KnWeightLayout's [K, N] source):
+        groups are COLUMNS of the stored row, i.e. one stored row is one whole
+        output column's K axis. A band is then complete per group by
+        construction, and `amax[g, column]` is just the band's row reshaped to
+        [`n_groups`, `group`] and reduced.
+
+    Returns a `[n_groups, n_columns]` float32 table, which is what the writer
+    emits and what the kernel indexes.
+    """
+    if group <= 0 or group % 2:
+        raise ValueError(
+            f"'{reader.name}': a 4-bit group must be a positive even number of "
+            f"K values, got group={group}")
+    if transposed:
+        # Stored [N, K]: reader.n is K, and every stored row is one output
+        # column whose whole K axis sits inside the band it arrives in.
+        if reader.n % group:
+            raise ValueError(
+                f"'{reader.name}': stored K={reader.n} is not a multiple of "
+                f"group={group}, so a group would straddle an output column")
+        n_groups = reader.n // group
+        amax = np.zeros((n_groups, reader.k), dtype=np.float32)
+        for offset, band in reader.bands():
+            rows = band.shape[0]
+            # [rows, K] -> [rows, n_groups, group] -> [rows, n_groups]
+            per_group = np.abs(band).reshape(rows, n_groups, group).max(axis=2)
+            np.maximum(amax[:, offset:offset + rows], per_group.T,
+                       out=amax[:, offset:offset + rows])
+        return amax
+
+    if reader.k % group:
+        raise ValueError(
+            f"'{reader.name}': K={reader.k} is not a multiple of group={group}, "
+            f"so the last group would be partial")
+    n_groups = reader.k // group
+    amax = np.zeros((n_groups, reader.n), dtype=np.float32)
+    for offset, band in reader.bands():
+        rows = band.shape[0]
+        first = offset // group
+        last = (offset + rows - 1) // group
+        # Segment starts INSIDE the band: 0 and every group boundary after it.
+        # The first and last segments are partial whenever a band does not
+        # begin/end on a group boundary, which is exactly the case a "ROW_BLOCK
+        # is a multiple of group_size" assumption would get wrong.
+        bounds = [0] + [g * group - offset for g in range(first + 1, last + 1)]
+        seg = np.maximum.reduceat(np.abs(band), bounds, axis=0)
+        np.maximum(amax[first:last + 1], seg, out=amax[first:last + 1])
+    return amax
+
+
+def code_nibble(fmt, reader, scale, group: int, transposed: bool = False):
+    """A function (row_offset, band) -> int8 codes in [-8, 7], band-shaped.
+
+    `scale` is the table `scale_for` produced: `[n_groups, N]` for int4. The
+    grouping is applied by indexing it with the K index's group, so a band that
+    starts mid-group still divides every row by the scale of the group that row
+    belongs to.
+
+    The division is the in-memory quantizer's, element for element:
+    `Quantizer._quantize_w3` divides the [n_groups, group, N] operand by a
+    [n_groups, 1, N] table, which for a row inside group g is exactly
+    `band[row] / scale[g]`. Same operands, same fp32 rounding, so the codes are
+    bit-identical -- the packed bytes only ever differ in how they are laid
+    down, never in what they say.
+    """
+    if fmt != "int4":
+        raise ValueError(f"code_nibble is the 4-bit encoder; got {fmt!r}")
+    scale = np.asarray(scale, dtype=np.float32)
+
+    if transposed:
+        def codes(offset, band):
+            rows = band.shape[0]
+            # [rows, n_groups] -> [rows, K], one scale per K value of the row.
+            s = np.repeat(scale[:, offset:offset + rows].T, group, axis=1)
+            return np.clip(np.round(band / s), -8, 7).astype(np.int8)
+        return codes
+
+    def codes(offset, band):
+        rows = band.shape[0]
+        idx = np.arange(offset, offset + rows) // group
+        return np.clip(np.round(band / scale[idx]), -8, 7).astype(np.int8)
+    return codes
 
 
 def code_byte(fmt, reader, scale, transposed: bool = False):
@@ -249,15 +380,25 @@ def finalize(model, deferred, verbose=True) -> int:
         if scale_name not in existing:
             reader = WeightReader(entry, name)
             scale = scale_for(entry["quant"], reader,
-                              bool(entry.get("transposed")))
+                              bool(entry.get("transposed")),
+                              int(entry.get("group") or 0))
             init = numpy_helper.from_array(scale, scale_name)
             init.data_type = TensorProto.FLOAT
             graph.initializer.append(init)
             existing.add(scale_name)
-            # The writer decodes with the same numbers; keeping them on the
-            # entry means it does not have to sweep the source a second time.
-            entry["scale_values"] = scale
+            # The values are now in the proto, and the writer reads them back
+            # from there (weight_stream.scale_values_for). Keeping a second
+            # numpy copy on the entry was the peak of a `-q int4` conversion:
+            # the group tables are 1.5 GiB for the 27B, so both copies together
+            # are 3 GiB of RSS that nothing needs at the same time -- measured
+            # on a 10-layer slice, finalize alone accounted for 2.1 GiB of a
+            # 5.2 GiB peak.
+            del scale
         entry["scale"] = scale_name
+        # A 4-bit scale is a [n_groups, N] TABLE, so the shape the consumer
+        # records has to be the table's, not a per-column vector: the runtime
+        # allocates the scale input from what the node declares and a [N]
+        # declaration would truncate it to a quarter of its entries.
         carrier.input.append(scale_name)
         appended[name] = scale_name
     missing = sorted(set(quantized) - set(appended))

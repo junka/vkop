@@ -8474,6 +8474,16 @@ class Quantizer:
             # the row's minor axis.
             if transb_flags != {0}:
                 reasons.append("transB != 0 (only the [K, N] layout unpacks)")
+            # The SwiGLU down fold reads THREE weights through one MatMul with
+            # a single concatenated per-column scale table, and ops/Matmul.hpp
+            # builds that shape only for one-byte weights (down_act_byte is
+            # `down_act_ && weight_byte`). A 4-bit Wd would make a folded node
+            # the kernel rejects at load -- after the conversion has already
+            # reported success. Its group scales cannot express the fold's
+            # [Sd | Sg | Su] table anyway.
+            if any(node.attributes.get("down_act") for node in per_column):
+                reasons.append("weight of a SwiGLU down fold (its scale table "
+                               "ABI is one concatenated per-column vector)")
             k, n = dims
             if n % 8 != 0:
                 reasons.append(f"N={n} is not a multiple of 8 (a packed row "
@@ -8843,6 +8853,87 @@ class Quantizer:
         return scale_name
 
     @staticmethod
+    def _flip_transposed_4bit_weights(dag_model, group_size: int,
+                                      exclude=None):
+        """Re-lay every Transpose-fed 4-bit candidate as [K, N] with transB=0.
+
+        The nibble kernels unpack only a [K, N] payload and ops/Matmul.hpp
+        refuses transB for them, so a weight the exporter left in the
+        checkpoint's [N, K] behind a Transpose has to be flipped before it can
+        be quantized at all. Doing it here, on the hydrated bytes, is what makes
+        the in-memory path agree with the streamed one (which reorders in
+        `weight_stream._write_int4`): the flip is applied to the *matrix*, and
+        because a group's absmax covers the same set of values either way, the
+        codes and the `[n_groups, N]` scale table come out identical.
+
+        This is deliberately not left to KnWeightLayout: that pass runs after
+        quantization and re-lays a PACKED payload, which for 4-bit would mean
+        unpacking, transposing and repacking — and, more importantly, would
+        reduce the group absmax over the wrong axis if the flip happened first.
+        The order here is transpose-then-quantize on values, which for a
+        symmetric per-group grid is the same arithmetic as
+        quantize-then-transpose on codes.
+
+        Only a weight that this pass is about to ENCODE is flipped -- the exact
+        shape the gate will accept (a plain 2-D B operand of a MatMul with
+        transB=1, read by nothing else, N % 8, K % group), and not one the
+        --exclude-* set holds. A weight that is flipped and then rejected for
+        some other reason would still compute correctly (B[k][n] is the same
+        number in either layout), but it would churn the artifact for nothing
+        and, for an excluded weight, contradict what the flag asked for.
+        """
+        uses = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for i, inp in enumerate(n.inputs):
+                uses[inp["name"]].append((n, i))
+
+        flipped = 0
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
+        for name, init in list(dag_model.initializers.items()):
+            if name in deferred:
+                # No bytes in this process, and the streamed path flips the
+                # PACKED payload in weight_stream._write_int4 (from the
+                # `transposed`/`transpose_payload` fields prepare recorded).
+                # Reading the values here would raise.
+                continue
+            if exclude is not None and name in exclude:
+                continue
+            if init.data_type not in (onnx.TensorProto.FLOAT,
+                                      onnx.TensorProto.FLOAT16):
+                continue
+            readers = uses.get(name, [])
+            if len(readers) != 1 or readers[0][1] != 1:
+                continue
+            node = readers[0][0]
+            if node.op_type != "MatMul":
+                continue
+            if node.attributes.get("down_act"):
+                continue
+            if int(node.attributes.get("transB", 0) or 0) != 1:
+                continue
+            if len(init.dims) != 2:
+                continue
+            # Post-flip [K, N]. Check the remaining gates here so a weight the
+            # encoder would refuse keeps the layout it was exported in.
+            n_dim, k_dim = (int(d) for d in init.dims)
+            if n_dim % 8 or k_dim % group_size or group_size % 2:
+                continue
+            arr = numpy_helper.to_array(init)
+            if arr.ndim != 2:
+                continue
+            new_dims = [int(arr.shape[1]), int(arr.shape[0])]
+            new_init = numpy_helper.from_array(
+                np.ascontiguousarray(arr.T), name)
+            new_init.data_type = init.data_type
+            dag_model.initializers[name] = new_init
+            node.attributes.pop("transB", None)
+            for inp in node.inputs:
+                if inp["name"] == name:
+                    inp["shape"] = list(new_dims)
+            flipped += 1
+        return flipped
+
+    @staticmethod
     def quantize_to_4bit_weight_only(dag_model, group_size: int = 64,
                                      fmt: str = "int4", exclude=None):
         """
@@ -8860,12 +8951,23 @@ class Quantizer:
           consuming node's third input.
 
         Unlike INT8 this covers only the buffer MatMul kernel, and only for a
-        plain [K, N] weight: the nibble unpack and the four-columns-per-word
-        addressing both fall apart for a transposed layout, an odd N (a row that
-        does not start on a 32-bit word), or a group that is not a whole number
-        of rows. Every one of those is a gate below rather than a kernel
+        [K, N] payload: the nibble unpack and the four-columns-per-word
+        addressing both fall apart for a transposed layout, an odd N (a row
+        that does not start on a 32-bit word), or a group that is not a whole
+        number of rows. Every one of those is a gate here rather than a kernel
         fallback — a graph the runtime cannot read correctly has to fail here,
         where the reason is nameable, instead of computing plausible numbers.
+
+        A weight behind a Transpose (the checkpoint's [N, K], which is what an
+        exporter with folding off emits for every linear) is NOT skipped: this
+        pass reaches through the view chain, quantizes the source's own shape
+        where the output columns are ROWS, and then re-lays the packed grid as
+        [K, N] with the consumer's transB cleared. That is the same
+        "quantize first, transpose second" order KnWeightLayout uses for the
+        byte formats and for the same reason: the group absmax is over the
+        stored rows, so quantizing before the flip keeps every code on its own
+        output column. The streamed path lands on the identical bytes
+        (weight_stream._write_int4), which is the invariant a test compares.
 
         `exclude` is the --exclude-* weight set: a name in it is neither gated
         nor encoded, so it keeps the dtype it arrived with and its MatMul runs
@@ -8880,6 +8982,12 @@ class Quantizer:
 
         print(f"Applying weight-only {fmt} quantization (group_size={group_size})...")
 
+        flipped = Quantizer._flip_transposed_4bit_weights(
+            dag_model, group_size, exclude)
+        if flipped:
+            print(f"[{fmt}] {flipped} weight(s) behind a Transpose re-laid as "
+                  f"[K, N] with transB=0 before encoding")
+
         converted_count = 0
         skipped_count = 0
 
@@ -8891,6 +8999,14 @@ class Quantizer:
         for name in list(dag_model.initializers.keys()):
             if Quantizer._is_excluded(name, exclude):
                 skipped_count += 1
+                continue
+            if name in getattr(dag_model, "deferred_weights", {}):
+                # Left in its source file: the nibbles and the scale table are
+                # built by weight_stream on the way into the trailer, and this
+                # pass could not produce them anyway -- the tensor has no
+                # bytes. Deferral is only granted to a weight this gate would
+                # have accepted (weight_stream._int4_layout_ok), so skipping is
+                # the same set of weights, reached from the other side.
                 continue
             initializer = dag_model.initializers[name]
             consumers = initializer_consumers.get(name, [])
@@ -9557,9 +9673,17 @@ class KnWeightLayout:
     """
 
     # The element types whose kernels have a layout preference. Everything else
-    # (fp16, fp32, 4-bit) keeps whatever the export chose.
+    # (fp16, fp32) keeps whatever the export chose.
+    #
+    # int4 IS here, and for the same reason the byte formats are: its kernel
+    # unpacks only a [K, N] payload (`uInputB.data[(b_row + k * uPC.N) >> 3]`
+    # walks columns within a K row) and ops/Matmul.hpp refuses transB for it.
+    # The flip this pass performs is therefore not an optimization for 4-bit,
+    # it is the only layout the format can be read in -- which is why
+    # `_match_weight_only`'s "transB != 0" refusal is satisfiable at all on a
+    # graph whose exporter emits the transpose as a node.
     _BYTE_TYPES = (onnx.TensorProto.INT8, onnx.TensorProto.FLOAT8E4M3FN,
-                   onnx.TensorProto.FLOAT8E5M2)
+                   onnx.TensorProto.FLOAT8E5M2, onnx.TensorProto.INT4)
 
     @staticmethod
     def is_byte_value_type(data_type) -> bool:
@@ -9713,6 +9837,18 @@ class KnWeightLayout:
                 skipped["deferred pass-through (no quantizer ran)"] += 1
                 continue
             else:
+                if dtype == onnx.TensorProto.INT4:
+                    # An in-memory 4-bit payload is already PACKED nibbles, in
+                    # the [K, N] order the quantizer wrote. `to_array(...).T`
+                    # would transpose decoded values and then be re-packed as
+                    # one byte per value -- a payload of the wrong size that
+                    # the loader would refuse, or worse, a right-sized one full
+                    # of nonsense. The quantizer only packs a weight whose
+                    # consumer says transB=0, so this is unreachable; it is a
+                    # skip rather than an assert so a graph from elsewhere
+                    # degrades to "left as exported" instead of crashing.
+                    skipped["in-memory 4-bit payload (already packed)"] += 1
+                    continue
                 arr = numpy_helper.to_array(init)
                 if arr.ndim != 2 or arr.shape != tuple(src_dims):
                     skipped["payload does not match its declared dims"] += 1
