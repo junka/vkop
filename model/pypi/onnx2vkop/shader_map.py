@@ -199,6 +199,18 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_matmul_w8_wide_bda_fp8_hw_fp16",
         "buffer_matmul_ksplit512_w8_wide_fp8_hw_fp16",
         "buffer_matmul_ksplit512_w8_wide_bda_fp8_hw_fp16",
+        # The packed 4x8 integer-dot-product int8 GEMV (-DDP4A, opt-in
+        # VKOP_DP4A). Same module-level constraint as the fp8 group -- a
+        # device without VK_KHR_shader_integer_dot_product rejects the module
+        # at pipeline creation -- and the same converter-blind gate:
+        # MatMulBuffer::dp4a_pipeline probes it lazily behind
+        # DeviceTraits::integer_dot_product_packed, which the converter cannot
+        # query, so every MatMul carries it and a non-supporting device never
+        # resolves it. CONDITIONAL in the master archive for a reason
+        # unrelated to the device: GL_EXT_integer_dot_product postdates
+        # shaderc 2023.8, so an old glslc has no such key. Handled as a group
+        # -- see DP4A_KEYS.
+        "buffer_matmul_ksplit_w8a8_dp4a",
         # The -DSUBGROUP build of the base module: only matmul16_softmax's row
         # reduce differs (subgroupMax/subgroupAdd instead of the two 8-round
         # shared trees). The host swaps the primary key for this one when the
@@ -604,6 +616,16 @@ FP8_HW_KEYS: tuple = (
     "buffer_conv2d_fp8_hw",
     "buffer_conv2d_fp8_hw_fp16",
 )
+
+# The DP4A int8 GEMV, conditional on a DIFFERENT build gate than the fp8 group
+# above and for a different reason: CMake emits it only when the configure-time
+# glslc accepts GL_EXT_integer_dot_product (VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT),
+# which shaderc before ~2024 does not. It is a one-key group today; it is
+# spelled as a tuple and handled as a group so adding the BDA/512 spelling
+# later does not need a second special case. Unlike FP8_HW_KEYS it is also
+# gated at RUN time on VKOP_DP4A, so a model that carries it and a device that
+# lacks the feature are both harmless: the route simply is not selected.
+DP4A_KEYS: tuple = ("buffer_matmul_ksplit_w8a8_dp4a",)
 
 
 def _primary_keys(op: str, backend: str, emit_fp16: bool) -> Iterable[str]:

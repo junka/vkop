@@ -21,6 +21,29 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #endif
 
+// Packed 4x8 integer dot product (VK_KHR_shader_integer_dot_product), the
+// -DDP4A build only. Exactly the same module-level trap as FP8_HW above
+// (OpCapability DotProduct), only for a different capability: `#extension`
+// alone is not enough, the capability has to reach the SPIR-V, and a device
+// without the feature then rejects the WHOLE module at pipeline creation
+// rather than the one kernel that wanted it. So this is a separate archive
+// key, built only behind a compile-time probe of the shader compiler
+// (VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT) and a device gate on the host
+// (DeviceTraits::integer_dot_product_packed, i.e. enabled AND accelerated).
+//
+// The GLSL spelling is GL_EXT_integer_dot_product (NOT
+// GL_KHR_shader_integer_dot_product and NOT
+// GL_EXT_shader_integer_dot_product -- glslang accepts only this one) and the
+// entry points are dotPacked4x8EXT(int,int) / dotPacked4x8AccSatEXT. There is
+// no unsigned overload on the two-argument form in glslang 11.x beyond the
+// uint/uint one, and the packed signed form is the only one the target device
+// accelerates (integerDotProduct4x8BitPackedSignedAccelerated is true there
+// while 8BitSignedAccelerated is false, so an i8vec4 spelling would be
+// expanded into shifts and adds by the driver).
+#ifdef DP4A
+#extension GL_EXT_integer_dot_product : require
+#endif
+
 #include "../common/subgroup_reduce.comp"
 
 // MatMul SSBO reduce pass (fp32 + fp16). Computes C = A @ B.
@@ -1104,6 +1127,178 @@ void matmul16_w8_ksplit() {
     }
     ks_store_flat(s, row, ja);
 }
+
+// ---- packed 4x8 integer dot product (-DDP4A module) --------------------
+#ifdef DP4A
+// int8 activation x int8 weight split-K GEMV, inner loop = dotPacked4x8EXT.
+//
+// WHY IT IS WORTH A SECOND KERNEL AT ALL. The weight-only byte GEMV reads one
+// 32-bit word (four int8 weights) per k step and spends, per word, four byte
+// extracts, four int->float converts, four subtracts and four FMAs. DP4A
+// replaces that whole sequence with ONE instruction per weight word, plus one
+// for the paired A word amortized over the four columns: eight bytes of weight
+// and four MACs per dot. The per-byte instruction count drops roughly an order
+// of magnitude. That only matters when the kernel is issue-bound rather than
+// bandwidth-bound, which is the regime this route exists for: a model whose
+// weights do not fit VRAM streams them over PCIe, and there the fetch -- not
+// the ALU -- is the wall, so nothing is gained; a model that fits is
+// issue-bound and the reduction is real. Both are plausible deployments, which
+// is why VKOP_DP4A is opt-in and the byte GEMV stays the default.
+//
+// THE BYTE PAIRING DECIDES THE LAYOUT. dotPacked4x8EXT(x, y) is
+//   sum over t in 0..3 of x.byte[t] * y.byte[t]
+// so the four bytes of one operand must be four CONSECUTIVE k of the SAME
+// output column. Whether that is free depends entirely on the weight layout:
+//
+//   [batch, N, K] (transB != 0): column j's K values are contiguous, so a
+//     word at j*K+k IS four consecutive k. One A word pairs with four column
+//     words: four dots, no data movement. This is the layout DP4A wants.
+//
+//   [batch, K, N] (transB == 0): the word at k*N+j holds four ADJACENT
+//     COLUMNS at one k, i.e. exactly the wrong axis. The k values of one
+//     column sit N bytes apart, so no load can pair them. They have to be
+//     gathered in registers: read the four words for k..k+3 and transpose the
+//     4x4 byte block, which costs ~24 integer ops per 16 MACs (see w8_col4
+//     below) against the ~64 the float path spends. Still a clear instruction
+//     win, though half the win the transB form gets.
+//
+// The converter now ships byte weights as [K, N] (KnWeightLayout, commit
+// "store int8 weights as [K, N], dropping transB"), so the transB form below
+// is the rare one -- but it is a third of the kernel and it is the form a
+// [OC, K] checkpoint reaches when the layout pass declines (symbolic K, more
+// than one consumer), so both are here. They share the fold: the lane mapping
+// differs exactly as it does between matmul16_w8_ksplit and its _transb
+// sibling, and ks_store_flat_at already takes (quad, slice) explicitly for
+// that reason.
+//
+// INT32 EXACTNESS (a hard precondition, enforced on the host, not here). The
+// accumulator is 32-bit: every term is at most 128*128 = 16384 (int8 reaches
+// -128, whose magnitude squared is 128^2), so the sum stays inside 2^31 while
+// K < 131071. The host gate fails closed at that bound; a shape that slipped
+// past would wrap silently and return plausible garbage rather than faulting.
+//
+// ACTIVATION SCALE. A is a quantized int8 tensor, so the result needs
+// acc * scale_a * scale_b[col]. scale_b is the existing per-column table at
+// binding 4 and is applied by the fold as usual. scale_a is a per-tensor
+// scalar and rides in uPC.epi_scale (an otherwise unused float in the push
+// constant): the partial is pre-multiplied by it BEFORE the fold, which is
+// algebraically the same as scaling the final sum and needs no extra
+// uniform. uPC.epi_scale defaults to 1.0, so a host that forgets to set it
+// gets a result that is off by exactly scale_a -- it must be set.
+
+// The 4x4 byte transpose [K, N] forces: w0..w3 are the words holding four
+// adjacent columns at k, k+1, k+2, k+3 respectively (low byte first), and
+// c0..c3 come back as those four columns' four CONSECUTIVE k, which is what
+// dotPacked4x8EXT needs. Two interleave steps; masking so each shift lands
+// whole bytes, and the second step joins the low/high halves. 24 integer ops
+// for 16 MACs' worth of weights.
+void w8_col4(uint w0, uint w1, uint w2, uint w3, out int c0, out int c1,
+             out int c2, out int c3) {
+    // Step 1: pair rows (k0,k1) and (k2,k3), splitting even/odd columns.
+    // a0/a2 keep columns 0 and 2, a1/a3 keep columns 1 and 3.
+    uint a0 = (w0 & 0x00FF00FFu) | ((w1 & 0x00FF00FFu) << 8);
+    uint a1 = ((w0 >> 8) & 0x00FF00FFu) | (((w1 >> 8) & 0x00FF00FFu) << 8);
+    uint a2 = (w2 & 0x00FF00FFu) | ((w3 & 0x00FF00FFu) << 8);
+    uint a3 = ((w2 >> 8) & 0x00FF00FFu) | (((w3 >> 8) & 0x00FF00FFu) << 8);
+    // Step 2: join the k pairs into the four whole k of each column.
+    c0 = int((a0 & 0x0000FFFFu) | ((a2 & 0x0000FFFFu) << 16));
+    c1 = int((a1 & 0x0000FFFFu) | ((a3 & 0x0000FFFFu) << 16));
+    c2 = int((a0 >> 16) | (a2 & 0xFFFF0000u));
+    c3 = int((a1 >> 16) | (a3 & 0xFFFF0000u));
+}
+
+// One A word (four consecutive k) dotted against four columns' words. The
+// weight words must already be k-tetrads, which is true by construction in
+// the [N, K] path and after w8_col4 in the [K, N] one. Returns int32, not
+// float: the sum of a lane's dots stays exact in the integer domain and is
+// converted ONCE on the way out, which is both cheaper (no per-dot int->float
+// convert) and the reason the K bound in the header is meaningful.
+ivec4 dp4a_cols(int aw, int c0, int c1, int c2, int c3) {
+    return ivec4(dotPacked4x8EXT(aw, c0), dotPacked4x8EXT(aw, c1),
+                 dotPacked4x8EXT(aw, c2), dotPacked4x8EXT(aw, c3));
+}
+
+void matmul16_w8a8_dp4a() {
+    int row = int(gl_WorkGroupID.y);
+    if (row >= uPC.batch * uPC.M) return;
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+    int q = uPC.ksplit_q;
+    int n_slice = KS_LANES / q;
+    int n = row / uPC.M;
+    // A is int8 too, so its element index is a byte index and four of them are
+    // one word. K % 4 == 0 (host gate) keeps a_off a whole word and every k
+    // tetrad inside one load.
+    int a_off = row * uPC.K;
+    // scale_a, the activation's per-tensor quant scale. See the header: the
+    // host carries it in epi_scale, which is 1.0 unless it is set.
+    float a_mul = uPC.epi_scale;
+
+    // The K slice each lane owns. Rounded up to a whole number of k tetrads so
+    // every lane's range starts and ends on a word boundary: a lane that began
+    // mid-tetrad could not form a packed operand without reading its
+    // neighbour's k. The stride is the rounded chunk, so the slices still tile
+    // [0, K) with no double count; the last one is clipped by kend.
+    int chunk = ((uPC.K + n_slice - 1) / n_slice + 3) & ~3;
+    ivec4 s = ivec4(0);
+
+    if (uPC.transB != 0) {
+        // [N, K]: K-contiguous lane mapping (slice = lane % n_slice,
+        // quad = lane / n_slice). Consecutive lanes walk consecutive k, which
+        // is what the layout packs contiguously -- the same reasoning as
+        // matmul16_w8_ksplit_transb.
+        int quad = lane / n_slice;
+        int slice = lane % n_slice;
+        int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
+        if (ja >= uPC.N) {
+            ks_store_flat_at(vec4(s), row, ja, quad, slice);
+            return;
+        }
+        int b_c0 = bmap(n) * uPC.K * uPC.N + ja * uPC.K;
+        int k0 = slice * chunk;
+        int kend = min(k0 + chunk, uPC.K);
+        for (int k = k0; k < kend; k += 4) {
+            // Four columns x one k tetrad = four words, four dots. No
+            // transposition: [N, K] already stores the tetrad contiguously.
+            int aw = int(uInputA.data[(a_off + k) >> 2]);
+            s += dp4a_cols(
+                aw, int(uInputB.data[(b_c0 + k) >> 2]),
+                int(uInputB.data[(b_c0 + uPC.K + k) >> 2]),
+                int(uInputB.data[(b_c0 + 2 * uPC.K + k) >> 2]),
+                int(uInputB.data[(b_c0 + 3 * uPC.K + k) >> 2]));
+        }
+        ks_store_flat_at(vec4(s) * a_mul, row, ja, quad, slice);
+        return;
+    }
+
+    // [K, N]: quad = lane % q, slice = lane / q -- the column-quad mapping the
+    // non-transB sibling uses, so a warp's lanes read one contiguous
+    // q*4-byte run per k row. Each lane owns four columns and gathers their k
+    // tetrads with w8_col4.
+    int quad = lane % q;
+    int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
+    if (ja >= uPC.N) {
+        ks_store_flat(s, row, ja);
+        return;
+    }
+    int b_row = bmap(n) * uPC.K * uPC.N + ja;
+    int slice = lane / q;
+    int k0 = slice * chunk;
+    int kend = min(k0 + chunk, uPC.K);
+    for (int k = k0; k < kend; k += 4) {
+        // One word per k, four adjacent columns in each: transpose the 4x4
+        // byte block into four per-column k tetrads, then four dots.
+        uint w0 = uInputB.data[(b_row + (k + 0) * uPC.N) >> 2];
+        uint w1 = uInputB.data[(b_row + (k + 1) * uPC.N) >> 2];
+        uint w2 = uInputB.data[(b_row + (k + 2) * uPC.N) >> 2];
+        uint w3 = uInputB.data[(b_row + (k + 3) * uPC.N) >> 2];
+        int c0, c1, c2, c3;
+        w8_col4(w0, w1, w2, w3, c0, c1, c2, c3);
+        int aw = int(uInputA.data[(a_off + k) >> 2]);
+        s += dp4a_cols(aw, c0, c1, c2, c3);
+    }
+    ks_store_flat(vec4(s) * a_mul, row, ja);
+}
+#endif  // DP4A
 
 // 4-bit weight-only, B is [batch, K, N], N % 8 == 0: decode slicing over K, but
 // the units are whole scale GROUPS, not single k steps — a lane that stopped
@@ -2418,6 +2613,22 @@ void matmul32() {
 // in ops/Matmul.hpp. Same bindings, push constants and workgroup as the general
 // module, so only the pipeline it is bound to differs.
 void main() { matmul16_w8_ksplit_wide(); }
+#elif defined(DP4A)
+#if !defined(FP16)
+#error "the DP4A module needs -DFP16 (its epilogue packs half2)"
+#endif
+// The -DDP4A build: the packed-dot-product int8 x int8 split-K GEMV. Its own
+// module for the module-level reason in the header (OpCapability DotProduct):
+// a device without VK_KHR_shader_integer_dot_product rejects the whole module
+// at vkCreateComputePipelines, so it can never ride in the general one. SPIR-V
+// DCE drops every other kernel from this build and `matmul16_w8a8_dp4a`
+// from theirs, which is what keeps the capability out of every other entry.
+//
+// Same bindings, push constants and 256-lane workgroup as the byte WIDE
+// module, and the same launch geometry as the 4-column byte GEMV
+// (grid.x = UP_DIV(N/4, ksplit_q), grid.y = batch*M), so the host's
+// dispatch_on call is a drop-in for that route's.
+void main() { matmul16_w8a8_dp4a(); }
 #elif defined(DOWN_ACT)
 #if !defined(FP16)
 #error "the SwiGLU down-projection module needs -DFP16"

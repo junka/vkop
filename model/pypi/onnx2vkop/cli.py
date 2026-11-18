@@ -68,6 +68,13 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     # is partly present only, since that IS an inconsistency.
     absent_f8 = [k for k in shader_map.FP8_HW_KEYS if k not in master]
     f8_group_absent = len(absent_f8) == len(shader_map.FP8_HW_KEYS)
+    # Same for the DP4A group: its own CMake gate
+    # (VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT), its own all-or-nothing check, and
+    # its own reason an absence is a configuration rather than a gap -- the
+    # route is additionally gated on VKOP_DP4A at run time, so nothing asks
+    # for the key unless the operator opted in.
+    absent_dp4a = [k for k in shader_map.DP4A_KEYS if k not in master]
+    dp4a_group_absent = len(absent_dp4a) == len(shader_map.DP4A_KEYS)
     # The keys above come from the graph's kernel plan, which records the
     # post-fallback spelling per (backend, precision) -- the exact string the
     # runtime will look up. So an absent one is a genuine gap, not a phantom:
@@ -79,7 +86,8 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     # exception, and only when the whole group is absent.
     missing = sorted(k for k in keys
                      if k not in master
-                     and not (f8_group_absent and k in shader_map.FP8_HW_KEYS))
+                     and not (f8_group_absent and k in shader_map.FP8_HW_KEYS)
+                     and not (dp4a_group_absent and k in shader_map.DP4A_KEYS))
     if absent_f8 and not f8_group_absent:
         print(
             f"[shaders] {master_path} carries only part of the fp8 "
@@ -87,6 +95,14 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
             "partial group means the archive is inconsistent, and the model "
             "will use the software fp8 decode for those routes. Rebuild the "
             "archive.",
+            file=sys.stderr,
+        )
+    if absent_dp4a and not dp4a_group_absent:
+        print(
+            f"[shaders] {master_path} carries only part of the DP4A group "
+            f"(missing {', '.join(absent_dp4a)}); a partial group means the "
+            "archive is inconsistent, and VKOP_DP4A will fall back to the "
+            "byte GEMV for those routes. Rebuild the archive.",
             file=sys.stderr,
         )
     return subset, missing, len(master)

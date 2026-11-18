@@ -400,6 +400,72 @@ if(VKOP_ENABLE_FLOAT8)
     endif()
 endif()
 
+# The packed 4x8 integer-dot-product module (-DDP4A on buffer/matmul.comp).
+# Same shape of gate as the float8 one above, for the same reason:
+# OpCapability DotProduct is module-level, so the kernel cannot ride in the
+# general module -- a device that never enabled
+# VK_KHR_shader_integer_dot_product rejects the WHOLE module at
+# vkCreateComputePipelines, which would take every buffer MatMul down with it.
+#
+# Two independent things have to line up and they are checked in different
+# places. The SHADER COMPILER half is here: GLSL_EXT_integer_dot_product (the
+# only spelling glslang accepts -- not GL_KHR_..., not GL_EXT_shader_...) and
+# dotPacked4x8EXT were added to shaderc after 2023.8, so the system glslc on a
+# 1.3.275 SDK rejects the source outright. The DEVICE half is the host gate
+# (DeviceTraits::integer_dot_product_packed, set from
+# integerDotProduct4x8BitPackedSignedAccelerated in VulkanDevice), and the two
+# must agree: the model only carries this key when the archive has it, and the
+# host only builds the pipeline when the device advertises the feature.
+#
+# Probe mechanics copied from the float8 block: glslc exits 0 even when the
+# compile fails, so the .spv's existence is the signal, not the exit code. The
+# probe uses the same two-argument dotPacked4x8EXT the kernel calls, so it
+# cannot pass on an extension that is present but does not expose that form.
+set(VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT FALSE)
+set(_dp4a_probe_src ${CMAKE_CURRENT_BINARY_DIR}/glslc_dp4a_probe.comp)
+set(_dp4a_probe_out ${CMAKE_CURRENT_BINARY_DIR}/glslc_dp4a_probe.spv)
+file(WRITE ${_dp4a_probe_src}
+    "#version 450\n"
+    "#extension GL_EXT_integer_dot_product : require\n"
+    "layout(local_size_x = 32) in;\n"
+    "layout(set = 0, binding = 0) readonly buffer A { uint d[]; } a;\n"
+    "layout(set = 0, binding = 1) buffer B { int d[]; } b;\n"
+    "void main() {\n"
+    "  uint i = gl_GlobalInvocationID.x;\n"
+    "  b.d[i] = dotPacked4x8EXT(int(a.d[i]), int(a.d[i + 1]));\n"
+    "}\n")
+file(REMOVE ${_dp4a_probe_out})
+execute_process(
+    COMMAND ${GLSLC_EXECUTABLE} -c ${_dp4a_probe_src}
+            -fshader-stage=compute -o ${_dp4a_probe_out}
+    OUTPUT_QUIET ERROR_QUIET)
+if(EXISTS ${_dp4a_probe_out})
+    set(VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT TRUE)
+    message(STATUS "glslc accepts GL_EXT_integer_dot_product: building the "
+                   "DP4A int8 GEMV module")
+else()
+    message(STATUS "glslc rejects GL_EXT_integer_dot_product (shaderc too "
+                   "old): the DP4A int8 GEMV module is NOT built and "
+                   "VKOP_DP4A is a no-op. Use a Vulkan SDK >= 1.4.321.")
+endif()
+
+if(VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT)
+    # One module. Both weight layouts are branches inside the same entry
+    # point (uPC.transB), exactly as the byte split-K GEMV does it in the
+    # general module, so one archive key covers both -- the host has one
+    # pipeline and does not have to pick a key per layout.
+    set(SPIRV_FILE_DP4A ${SPIRV_DIR}/buffer_matmul_ksplit_w8a8_dp4a.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_DP4A}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_DP4A} -DFP16 -DDP4A
+        DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling buffer/matmul (DP4A int8 GEMV, fp16) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_DP4A})
+endif()
+
 if(VKOP_GLSLC_HAS_FLOAT8)
     # Two builds, one per entry point the host can select: the general fp16
     # module and the WIDE GEMV one. Same -DW8_WIDE split as the software
@@ -962,6 +1028,17 @@ list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_ksplit512_fp16:${SPIRV_FILE_KS512}
      --spv buffer_matmul_ksplit512_w8_wide_fp16:${SPIRV_FILE_KS512_W8WIDE})
 list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS512} ${SPIRV_FILE_KS512_W8WIDE})
+# The DP4A int8 GEMV, when this glslc could build it. Like the fp8 group an
+# absent key is the NORMAL state on an old shaderc, and the host treats it as
+# "no bytes for this key": MatMulBuffer::dp4a_pipeline resolves to nullptr and
+# an int8-activation MatMul is refused by name rather than run on a float
+# kernel. VKOP_DP4A is opt-in, so a model without the key simply never takes
+# the route.
+if(VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT)
+    list(APPEND ARCHIVE_ARGS
+         --spv buffer_matmul_ksplit_w8a8_dp4a:${SPIRV_FILE_DP4A})
+    list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_DP4A})
+endif()
 # The fp8 hardware-decode modules, when this glslc could build them. Absent
 # keys are the normal state on an old shaderc, and the host falls back to the
 # software decode (MatMulBuffer::f8_hw_pipeline resolves to nullptr).

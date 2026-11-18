@@ -173,9 +173,22 @@ def test_secondary_keys_exist_in_master_archive():
         "stale or hand-edited archive — rebuild it."
     )
     f8_absent_ok = not f8_present
+    # The DP4A key is conditional on a different build gate
+    # (VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT), so it can be absent for the same
+    # class of reason. Checked as a group too, so a partial group still fails.
+    dp4a_present = [k for k in shader_map.DP4A_KEYS if k in master]
+    assert len(dp4a_present) in (0, len(shader_map.DP4A_KEYS)), (
+        "the DP4A group is partly present in "
+        f"{master_path}: found {dp4a_present}. CMake emits those keys under "
+        "one VKOP_GLSLC_HAS_INTEGER_DOT_PRODUCT gate, so a partial group "
+        "means a stale or hand-edited archive — rebuild it."
+    )
+    dp4a_absent_ok = not dp4a_present
     for (op, backend), keys in shader_map._SECONDARY.items():
         for k in keys:
             if f8_absent_ok and k in shader_map.FP8_HW_KEYS:
+                continue
+            if dp4a_absent_ok and k in shader_map.DP4A_KEYS:
                 continue
             assert k in master, (
                 f"secondary key {k!r} declared for ({op}, {backend}) is not "
