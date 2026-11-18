@@ -110,6 +110,33 @@ int main(int argc, char **argv) {
         {6144, 2048, "down"},
         {2048, 151936, "lm_head"},
     };
+    // BENCH_SWEEP=1 replaces the table with a working-set ladder that crosses
+    // the L2 boundary. This matters more than it looks: the default shapes and
+    // any single mid-size run measure a weight that fits (or nearly fits) in
+    // L2 and is replayed reps times, so they report L2 bandwidth and not DRAM.
+    // On a 48 MB-L2 Ada part the same K=5120 GEMV measured 250 GB/s at N=10240
+    // (50 MB) and ~50 GB/s at N=102400 (500 MB) -- a 5x difference that is
+    // entirely working-set, and that made a model running at its real DRAM
+    // rate look 3x slower than "the kernel could do".
+    //
+    // Sizes bracket a 48 MB L2 from half of it to 42x at int8 (fp16 doubles
+    // them): 25 MB, 50 MB, 200 MB, 500 MB, 1 GB, 2 GB. Every entry keeps
+    // N % 16 == 0 so the byte WIDE route stays eligible; the tag names the
+    // working set in L2s, which is the variable that actually changes. Note
+    // the measurements are NOT monotonic in size -- 500 MB and 1 GB have both
+    // come out slower than 2 GB in separate runs -- so read the ladder as
+    // "where does the number stop being L2", not as a curve.
+    if (std::getenv("BENCH_SWEEP") != nullptr) {
+        shapes.clear();
+        const int k = 5120;
+        // int8 weight bytes = K*N; the tag says how many 48 MB L2s that is.
+        static const char *kSweepNames[] = {"L2x0.5", "L2x1", "L2x4",
+                                            "L2x10", "L2x20", "L2x40"};
+        const int kN[] = {5120, 10240, 40960, 102400, 204800, 409600};
+        for (int i = 0; i < 6; ++i) {
+            shapes.push_back({k, kN[i], kSweepNames[i]});
+        }
+    }
     if (argc > 1) {
         // Override: bench_matmul K N [reps]
         shapes.clear();
@@ -134,7 +161,17 @@ int main(int argc, char **argv) {
     // (one un-throttled round). Nothing in the probe is needed for the GEMV
     // A/B, so drop it.
     if (std::getenv("BENCH_SKIP_MEMPROBE") == nullptr) {
-        const size_t bytes = 256u << 20;
+        // 256 MB by default, which is 5x a 48 MB L2 -- enough on this class of
+        // part, but BENCH_MEMPROBE_MB raises it for a clean DRAM number (a
+        // 1 GB copy leaves no doubt that L2 cannot hold the working set).
+        size_t mb = 256;
+        if (const char *e = std::getenv("BENCH_MEMPROBE_MB")) {
+            const int v = std::atoi(e);
+            if (v > 0) {
+                mb = static_cast<size_t>(v);
+            }
+        }
+        const size_t bytes = mb << 20;
         auto src = std::make_shared<VulkanBuffer>(
             dev, bytes,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -209,9 +246,35 @@ int main(int argc, char **argv) {
             auto B8 = std::make_shared<core::Tensor<int8_t>>(
                 std::vector<int>{s.K, s.N});
             B8->reserveOnCPU();
-            for (int j = 0; j < s.N; ++j) {
-                for (int k = 0; k < s.K; ++k) {
-                    B8->data()[k * s.N + j] = static_cast<int8_t>(wpat(j));
+            // wpat(j) is column-only, so every row of B is identical and the
+            // whole weight cycles through seven byte values. That is exactly
+            // right for the correctness probe it was written for -- it pins
+            // the column indexing, and a remap or a scale-phase error shows up
+            // as K*wpat(j') -- but on a part with memory compression it is not
+            // a bandwidth measurement: a weight of one repeated byte does not
+            // cost its size in DRAM traffic.
+            //
+            // BENCH_RANDOM=1 fills from an LCG instead, and the correctness
+            // probe is skipped because K*wpat(j) no longer describes the
+            // expected output. Measured caveat: incompressible bytes did NOT
+            // remove the run-to-run variance at 500 MB-1 GB (the same random
+            // shape still came out anywhere from 68 to 287 GB/s), so treat
+            // that variance as real and take the min over several runs rather
+            // than attributing all of it to data compressibility.
+            const bool random_w = std::getenv("BENCH_RANDOM") != nullptr;
+            if (random_w) {
+                uint32_t st = 0x12345678u;
+                int8_t *p = B8->data().data();
+                for (size_t i = 0; i < static_cast<size_t>(s.K) * s.N; ++i) {
+                    st = st * 1664525u + 1013904223u;
+                    p[i] = static_cast<int8_t>((st >> 16) & 0xFF);
+                }
+            } else {
+                for (int j = 0; j < s.N; ++j) {
+                    for (int k = 0; k < s.K; ++k) {
+                        B8->data()[k * s.N + j] =
+                            static_cast<int8_t>(wpat(j));
+                    }
                 }
             }
             auto S = std::make_shared<core::Tensor<float>>(
@@ -279,15 +342,21 @@ int main(int argc, char **argv) {
                core::ITensor::fp16_to_fp32(O->data()[1]),
                core::ITensor::fp16_to_fp32(O->data()[s.N - 1]));
         bool ok = true;
-        for (int j = 0; j < s.N; ++j) {
-            uint16_t v = O->data()[j];
-            float f = vkop::core::ITensor::fp16_to_fp32(v);
-            float want = static_cast<float>(s.K) * static_cast<float>(wpat(j));
-            if (f != want) {
-                ok = false;
-                printf("  MISMATCH at col %d: got %f, want %f (K*wpat(%d))\n", j,
-                       f, want, j);
-                break;
+        // K*wpat(j) only describes the output when the weight actually holds
+        // the column ramp; BENCH_RANDOM replaced it with incompressible bytes
+        // for the bandwidth measurement, so there is nothing to compare to.
+        if (std::getenv("BENCH_RANDOM") == nullptr) {
+            for (int j = 0; j < s.N; ++j) {
+                uint16_t v = O->data()[j];
+                float f = vkop::core::ITensor::fp16_to_fp32(v);
+                float want =
+                    static_cast<float>(s.K) * static_cast<float>(wpat(j));
+                if (f != want) {
+                    ok = false;
+                    printf("  MISMATCH at col %d: got %f, want %f (K*wpat(%d))\n",
+                           j, f, want, j);
+                    break;
+                }
             }
         }
         if (!ok) {
