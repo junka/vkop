@@ -817,18 +817,33 @@ void ks_store(vec4 s, int row, int ja) {
 // quad; a runtime stride into shared is legal, and it keeps the fold code
 // identical for every q (the array is sized for the KS_LANES-lane block, so
 // the q == 4 case uses it exactly).
+//
+// A transB (weight [batch, N, K]) dispatch runs the SAME slot convention but
+// derives (quad, slice) from the lane the other way round -- slice = lane %
+// n_slice, quad = lane / n_slice -- so that consecutive lanes walk K instead of
+// columns. That is a property of the DEPOSIT's lane math, not of the fold; it
+// enters through ks_store_flat_at below, which takes the pair explicitly.
 shared vec4 ks_flat[KS_LANES];
 
-void ks_store_flat(vec4 s, int row, int ja) {
-    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+// Deposit one lane's partial into slot `slice * q + quad` and let one lane per
+// column quad fold. The (quad, slice) pair is a parameter because the two
+// weight layouts derive it differently (see the transB branch of
+// matmul16_w8_ksplit); the slot convention, the fold order and the epilogue are
+// shared, so both forms reduce identically.
+//
+// The folding lanes are the slice == 0 lanes, which under EITHER mapping are
+// exactly q lanes with q distinct quads: the blocked form (slice = lane / q)
+// picks lanes 0..q-1, the interleaved form (slice = lane % n_slice) picks
+// lanes j * n_slice. Taking the pair from the caller keeps this fold blind to
+// how the deposit laid its lanes out -- the only thing that must agree is the
+// slot formula.
+void ks_store_flat_at(vec4 s, int row, int ja, int quad, int slice) {
     int q = uPC.ksplit_q;
     int n_slice = KS_LANES / q;
-    int quad = lane % q;
-    int slice = lane / q;
     ks_flat[slice * q + quad] = s;
     barrier();
     // One folding lane per column quad; the rest of the block is done.
-    if (lane >= q) return;
+    if (slice != 0) return;
     vec4 v = ks_flat[quad];
     for (int t = 1; t < n_slice; ++t) v += ks_flat[t * q + quad];
     int cja = (int(gl_WorkGroupID.x) * q + quad) * 4;
@@ -844,12 +859,200 @@ void ks_store_flat(vec4 s, int row, int ja) {
     uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
 }
 
+void ks_store_flat(vec4 s, int row, int ja) {
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+    int q = uPC.ksplit_q;
+    ks_store_flat_at(s, row, ja, lane % q, lane / q);
+}
+
+// Split-K GEMV for a byte weight stored [batch, N, K] (uPC.transB != 0).
+//
+// This is the only split-K form an ONNX-exported weight reaches: the exporter
+// keeps the checkpoint's [OC, K] layout and sets transB=1 rather than
+// materializing a transpose, and every gate that used to admit a byte weight
+// demanded !transB -- so the GEMV fell through to matmul16_w8_even_n, whose y
+// grid is UP_DIV(batch*m, 16) and therefore uses 16 of 256 lanes at decode.
+// That 6.25% occupancy is what an earlier 20 GB/s measurement was made of.
+//
+// LANE MAPPING -- K-contiguous instead of column-contiguous.
+//
+//   slice = lane % n_slice    (which interleaved K slice this lane carries)
+//   quad  = lane / n_slice    (which column quad it owns)
+//
+// The [K, N] form maps quad = lane % q, slice = lane / q, which in a 32-lane
+// warp gives q different COLUMNS and one slice. In [N, K] a column's K bytes
+// are contiguous, but a column is K bytes away from its neighbour, so each
+// lane's 4-byte word lands in a different cache line: a warp touches q lines
+// and uses 4 bytes of each. Swapping the roles makes consecutive lanes differ
+// in K instead, and K is the axis [N, K] packs contiguously.
+//
+// INTERLEAVED K. Lane `slice` walks whole words
+//
+//     w_t = slice + n_slice * t,     t = 0, 1, ... ,  w < K/4
+//     byte k = 4 * w_t
+//
+// rather than a blocked [slice*chunk, (slice+1)*chunk). A block's lanes read
+// words 0..n_slice-1 on trip 0, n_slice..2*n_slice-1 on trip 1, ..., so the
+// n_slice consecutive lanes are one contiguous n_slice*4-byte run. At
+// n_slice >= 32 (q <= 8) a full warp covers exactly 128 B: one cache line, all
+// of it used, and the warp's successive trips stream the next lines.
+//
+// COVERAGE. The word indices lane `slice` reads are {slice + n_slice*t}. Every
+// integer w in [0, K/4) has the unique decomposition w = slice + n_slice*t with
+// slice = w mod n_slice, t = w / n_slice, so the union over the block's lanes
+// is exactly [0, K/4): no word is read by two lanes (no double-counting in the
+// fold) and none is skipped. Per-lane trip counts differ by at most one -- the
+// (K/4) mod n_slice lanes with the smallest slice take one extra word -- which
+// is why the loop bound is per-lane (w < kw) rather than per-block.
+//
+// q <= 8: THE MAPPING DOES NOT NEED IT, THE BANDWIDTH DOES.
+// The mapping alone already puts consecutive lanes on consecutive words for
+// every q, so the kernel is correct for any q the host sends and degrades
+// gracefully: n_slice = 16 (q = 16) splits a warp into two 64-byte runs,
+// n_slice = 8 (q = 32) into four 32-byte runs. A 32-byte DRAM sector is the
+// real granularity of a miss, so even q = 32 wastes nothing at DRAM -- what it
+// loses is that one 128-byte line now arrives as four separate segments. q > 32
+// is where runs drop below a sector and the access pattern genuinely
+// disintegrates. The host therefore clamps this route to q <= 8 (see q_plain in
+// core/KernelSelect.cpp): that buys the full line AND the largest block count,
+// and it costs nothing because a smaller q is strictly more blocks -- which is
+// the only reason this kernel splits K at all.
+//
+// q = 8 is the exact value that makes one WARP one QUAD: the 256-lane block is
+// 8 warps, n_slice = 32, so quad = lane / 32 is the warp index and slice =
+// lane % 32 is the lane within it. Every issue of every warp is therefore one
+// 32-word = 128-byte run of one column group -- the cleanest shape this mapping
+// has. (In the 512-lane build the block is 16 warps and q = 8 puts two warps
+// per quad, each still issuing its own 128-byte run.) The run starts at
+// b_c0 + 4*slice, so it is line-aligned only when the column base is; K % 32 ==
+// 0 would guarantee that, and where it does not hold a run straddles two lines
+// -- still one contiguous span, and nothing on the DRAM side is lost.
+//
+// TAIL. K need not be a multiple of n_slice*4: the per-lane bound `w < K/4`
+// gives each lane ceil-or-floor(K/4 / n_slice) words, so the last trip is
+// ragged across lanes by construction and no block-wide padding exists to
+// trim. What it does need is K % 4 == 0, so the last word is whole.
+//
+// HOST PRECONDITIONS: K % 4 == 0 (word loads, and the A half2 alignment: an
+// even K makes a_off even and k = 4w even), N % 4 == 0 (the quad), N even (the
+// half2 store in the fold), K >= 256, batch*m <= 8.
+void matmul16_w8_ksplit_transb(int row, int lane, int q, int n_slice) {
+    int quad = lane / n_slice;
+    int slice = lane % n_slice;
+    int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
+    vec4 s = vec4(0.0);
+    // A quad past the last column reads nothing, but still publishes the zero
+    // the fold expects in its slot.
+    if (ja >= uPC.N) {
+        ks_store_flat_at(s, row, ja, quad, slice);
+        return;
+    }
+    int n = row / uPC.M;
+    int a_off = row * uPC.K;
+    int b_c0 = bmap(n) * uPC.K * uPC.N + ja * uPC.K;
+
+    // Two words per trip: word w and word w + n_slice, i.e. eight k. Eight
+    // weight words -- two per column -- plus the trip's four A words all issue
+    // before any is consumed, the same eight-loads-in-flight budget the [K, N]
+    // form settled on (the two-at-a-time form it replaced stalled on DRAM
+    // latency near 21 GB/s). Within a warp the first word of every lane is one
+    // contiguous n_slice*4-byte run and the second word is the next one, so a
+    // trip touches two adjacent lines rather than one -- still fully coalesced.
+    //
+    // 4-BYTE LOADS ARE ENOUGH, and the measurement says so: the [K, N] sibling
+    // reaches 213 GB/s (memcpy ceiling 259) with the same 4 bytes per lane. A
+    // warp of 32 lanes times 4 B is 128 B -- one full line per issue -- which
+    // is Little's law satisfied at the miss granularity that matters. A uvec4
+    // load (uInputB4, binding 2) would cut the instruction count 4x and widen
+    // the warp's run to 512 B, but 16 B per lane buys no additional bytes in
+    // flight per warp beyond what the issue rate already sustains, while it
+    // quadruples the live weight registers in the FMA loop and raises the
+    // precondition from K % 4 == 0 to K % 16 == 0 plus 16 B column alignment.
+    // Not worth it until something shows the issue rate binding.
+    int kw = uPC.K >> 2;
+    int w = slice;
+    for (; w + n_slice < kw; w += 2 * n_slice) {
+        int k = w << 2;
+        int k2 = (w + n_slice) << 2;
+        uint r0 = uInputB.data[(b_c0 + k) >> 2];          // col ja+0, k..k+3
+        uint r1 = uInputB.data[(b_c0 + k2) >> 2];         // col ja+0, k2..k2+3
+        uint r2 = uInputB.data[(b_c0 + uPC.K + k) >> 2];  // col ja+1
+        uint r3 = uInputB.data[(b_c0 + uPC.K + k2) >> 2];
+        uint r4 = uInputB.data[(b_c0 + 2 * uPC.K + k) >> 2];  // col ja+2
+        uint r5 = uInputB.data[(b_c0 + 2 * uPC.K + k2) >> 2];
+        uint r6 = uInputB.data[(b_c0 + 3 * uPC.K + k) >> 2];  // col ja+3
+        uint r7 = uInputB.data[(b_c0 + 3 * uPC.K + k2) >> 2];
+        uint aw = (a_off + k) >> 1;
+        uint aw2 = (a_off + k2) >> 1;
+        vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
+        vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
+        vec2 a2 = unpackHalf2x16(uInputA.data[aw2]);
+        vec2 a3 = unpackHalf2x16(uInputA.data[aw2 + 1]);
+        // unpack_w8 is low byte first: .x is k, .w is k+3.
+        vec4 w0 = unpack_w8(r0);
+        vec4 w1 = unpack_w8(r1);
+        s.x += a0.x * w0.x + a0.y * w0.y + a1.x * w0.z + a1.y * w0.w +
+               a2.x * w1.x + a2.y * w1.y + a3.x * w1.z + a3.y * w1.w;
+        vec4 w2 = unpack_w8(r2);
+        vec4 w3 = unpack_w8(r3);
+        s.y += a0.x * w2.x + a0.y * w2.y + a1.x * w2.z + a1.y * w2.w +
+               a2.x * w3.x + a2.y * w3.y + a3.x * w3.z + a3.y * w3.w;
+        vec4 w4 = unpack_w8(r4);
+        vec4 w5 = unpack_w8(r5);
+        s.z += a0.x * w4.x + a0.y * w4.y + a1.x * w4.z + a1.y * w4.w +
+               a2.x * w5.x + a2.y * w5.y + a3.x * w5.z + a3.y * w5.w;
+        vec4 w6 = unpack_w8(r6);
+        vec4 w7 = unpack_w8(r7);
+        s.w += a0.x * w6.x + a0.y * w6.y + a1.x * w6.z + a1.y * w6.w +
+               a2.x * w7.x + a2.y * w7.y + a3.x * w7.z + a3.y * w7.w;
+    }
+    // The lanes whose slice < (K/4) mod n_slice have one word left.
+    // This loop runs 0 or 1 times per lane: it consumes the ragged remainder
+    // when K/4 is not a multiple of n_slice. The lanes whose slice <
+    // (K/4) mod n_slice each own exactly one more word.
+    for (; w < kw; w += n_slice) {
+        int k = w << 2;
+        uint r0 = uInputB.data[(b_c0 + k) >> 2];
+        uint r1 = uInputB.data[(b_c0 + uPC.K + k) >> 2];
+        uint r2 = uInputB.data[(b_c0 + 2 * uPC.K + k) >> 2];
+        uint r3 = uInputB.data[(b_c0 + 3 * uPC.K + k) >> 2];
+        uint aw = (a_off + k) >> 1;
+        vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
+        vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
+        vec4 w0 = unpack_w8(r0);
+        s.x += a0.x * w0.x + a0.y * w0.y + a1.x * w0.z + a1.y * w0.w;
+        vec4 w1 = unpack_w8(r1);
+        s.y += a0.x * w1.x + a0.y * w1.y + a1.x * w1.z + a1.y * w1.w;
+        vec4 w2 = unpack_w8(r2);
+        s.z += a0.x * w2.x + a0.y * w2.y + a1.x * w2.z + a1.y * w2.w;
+        vec4 w3 = unpack_w8(r3);
+        s.w += a0.x * w3.x + a0.y * w3.y + a1.x * w3.z + a1.y * w3.w;
+    }
+    // K % 4 == 0 is a HARD host precondition of this route (it is what admits
+    // the shape, see transb_byte_ok in core/KernelSelect.cpp), so the word walk
+    // above covers all of [0, K) and there is no scalar tail. A shape that
+    // slipped through would lose its last (K & 3) k, not corrupt the rest --
+    // and there is nowhere correct to put them anyway: under the interleaved
+    // mapping a lane's k set is not a contiguous range.
+    ks_store_flat_at(s, row, ja, quad, slice);
+}
+
 void matmul16_w8_ksplit() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
     int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
     int n_slice = KS_LANES / q;
+    // A [batch, N, K] weight takes the K-contiguous lane mapping, which is a
+    // different lane decomposition and a different fold lane set. It is a
+    // whole separate body rather than a branch in the loop below: the two
+    // mappings disagree on which of the block's lanes own which column, so
+    // sharing the preamble would mean sharing `ja` too and neither kernel
+    // would be readable.
+    if (uPC.transB != 0) {
+        matmul16_w8_ksplit_transb(row, lane, q, n_slice);
+        return;
+    }
     int quad = lane % q;
     int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
     int n = row / uPC.M;
@@ -864,86 +1067,6 @@ void matmul16_w8_ksplit() {
     // A quad past the last column reads nothing; ks_store_flat still publishes
     // its zero so the reduction never sees an uninitialized slot.
     if (ja < uPC.N) {
-        if (uPC.transB != 0) {
-            // B is [batch, N, K]: the quad's four columns are four CONTIGUOUS
-            // rows of K bytes, so one 32-bit word carries four consecutive k
-            // of ONE column rather than one k of four columns -- four streams
-            // (one per column) instead of one.
-            //
-            // This is the only split-K form an ONNX-exported weight reaches:
-            // the exporter keeps the checkpoint's [OC, K] layout and sets
-            // transB=1 rather than materializing a transpose, and every gate
-            // that used to admit a byte weight demanded !transB -- so the GEMV
-            // fell through to matmul16_w8_even_n, whose y grid is
-            // UP_DIV(batch*m, 16) and therefore uses 16 of 256 lanes at
-            // decode. That 6.25% occupancy is what the 20 GB/s number was made
-            // of.
-            //
-            // Host preconditions for this route: K % 4 == 0 (word loads below
-            // assume it) and N % 4 == 0 (the quad).
-            int b_c0 = bmap(n) * uPC.K * uPC.N + ja * uPC.K;
-            // 4-aligned, NON-OVERLAPPING slices: slice t covers
-            // [t*chunk4, min((t+1)*chunk4, K)). Rounding chunk up to a word
-            // would let two slices share the tail, so the last slice is
-            // clamped instead and the union still covers [0, K) exactly once.
-            int chunk4 = (chunk + 3) & ~3;
-            int k0t = slice * chunk4;
-            int kendt = (slice == n_slice - 1) ? uPC.K
-                                               : min(k0t + chunk4, uPC.K);
-            if (k0t >= uPC.K) kendt = k0t;
-            int k = k0t;
-            for (; k + 7 < kendt; k += 8) {
-                // Column c's k..k+3 and k+4..k+7, one word each.
-                uint r0 = uInputB.data[(b_c0 + k) >> 2];
-                uint r1 = uInputB.data[(b_c0 + k + 4) >> 2];
-                uint r2 = uInputB.data[(b_c0 + uPC.K + k) >> 2];
-                uint r3 = uInputB.data[(b_c0 + uPC.K + k + 4) >> 2];
-                uint r4 = uInputB.data[(b_c0 + 2 * uPC.K + k) >> 2];
-                uint r5 = uInputB.data[(b_c0 + 2 * uPC.K + k + 4) >> 2];
-                uint r6 = uInputB.data[(b_c0 + 3 * uPC.K + k) >> 2];
-                uint r7 = uInputB.data[(b_c0 + 3 * uPC.K + k + 4) >> 2];
-                uint aw = (a_off + k) >> 1;
-                vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
-                vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
-                vec2 a2 = unpackHalf2x16(uInputA.data[aw + 2]);
-                vec2 a3 = unpackHalf2x16(uInputA.data[aw + 3]);
-                // unpack_w8 is low byte first: .x is k, .w is k+3.
-                vec4 w0 = unpack_w8(r0);
-                vec4 w1 = unpack_w8(r1);
-                s.x += a0.x * w0.x + a0.y * w0.y + a1.x * w0.z +
-                       a1.y * w0.w + a2.x * w1.x + a2.y * w1.y +
-                       a3.x * w1.z + a3.y * w1.w;
-                vec4 w2 = unpack_w8(r2);
-                vec4 w3 = unpack_w8(r3);
-                s.y += a0.x * w2.x + a0.y * w2.y + a1.x * w2.z +
-                       a1.y * w2.w + a2.x * w3.x + a2.y * w3.y +
-                       a3.x * w3.z + a3.y * w3.w;
-                vec4 w4 = unpack_w8(r4);
-                vec4 w5 = unpack_w8(r5);
-                s.z += a0.x * w4.x + a0.y * w4.y + a1.x * w4.z +
-                       a1.y * w4.w + a2.x * w5.x + a2.y * w5.y +
-                       a3.x * w5.z + a3.y * w5.w;
-                vec4 w6 = unpack_w8(r6);
-                vec4 w7 = unpack_w8(r7);
-                s.w += a0.x * w6.x + a0.y * w6.y + a1.x * w6.z +
-                       a1.y * w6.w + a2.x * w7.x + a2.y * w7.y +
-                       a3.x * w7.z + a3.y * w7.w;
-            }
-            // Tail: byte-addressed, so it stays correct when k is not a
-            // multiple of 4 (the aligned slice makes that rare, not impossible).
-            for (; k + 1 < kendt; k += 2) {
-                vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
-                s.x += a.x * load_w8(b_c0 + k) + a.y * load_w8(b_c0 + k + 1);
-                s.y += a.x * load_w8(b_c0 + uPC.K + k) +
-                       a.y * load_w8(b_c0 + uPC.K + k + 1);
-                s.z += a.x * load_w8(b_c0 + 2 * uPC.K + k) +
-                       a.y * load_w8(b_c0 + 2 * uPC.K + k + 1);
-                s.w += a.x * load_w8(b_c0 + 3 * uPC.K + k) +
-                       a.y * load_w8(b_c0 + 3 * uPC.K + k + 1);
-            }
-            ks_store_flat(s, row, ja);
-            return;
-        }
         // Eight k's per trip: every weight word (and the trip's A half2 words)
         // is issued before any is consumed, so the trip's loads are all in
         // flight together. The two-at-a-time form kept only two loads in flight

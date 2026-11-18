@@ -291,6 +291,27 @@ void test_byte_weight_native() {
     // transB = 1 is not the layout the byte tile loader reads: stay fused.
     p = select_matmul(dev, sh(1, 9, 2048, 2048), weight8(true), av);
     CHECK_ROUTE(p, kFusedFp16);
+
+    // Decode + transB byte weight: the split-K GEMV's [N, K] form. Its lanes
+    // are mapped K-contiguous (slice = lane % n_slice), so q is capped at 8 to
+    // keep n_slice >= 32 and one warp on one 128-byte line. Uncapped, q_plain
+    // would leave this shape at its default 16 (N/4 = 1280 quads is already
+    // past the 32-block floor); the cap pulls it to 8.
+    p = select_matmul(dev, sh(1, 1, 5120, 5120), weight8(true), av);
+    CHECK_ROUTE(p, kKsplit);
+    CHECK(p.ksplit_q == 8);
+    // A narrow N still walks q down for block count, below the cap.
+    p = select_matmul(dev, sh(1, 1, 5120, 512), weight8(true), av);
+    CHECK_ROUTE(p, kKsplit);
+    CHECK(p.ksplit_q == 4); // 512/4 = 128 quads; 128/4 = 32 blocks
+    // The cap is an upper bound only: a pin may ask for fewer, never more.
+    MatmulKnobs kn2;
+    kn2.ksplit_q = 64;
+    p = select_matmul(dev, sh(1, 1, 5120, 5120), weight8(true), av, kn2);
+    CHECK(p.ksplit_q == 8);
+    kn2.ksplit_q = 4;
+    p = select_matmul(dev, sh(1, 1, 5120, 5120), weight8(true), av, kn2);
+    CHECK(p.ksplit_q == 4);
 }
 
 void test_coopmat_gate() {

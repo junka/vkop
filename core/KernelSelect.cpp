@@ -567,8 +567,22 @@ bool reduce_applies(const Ctx &) { return true; }
 
 // q search: the block floor is the only reason to split K, so take the
 // shallowest split that clears it, starting from the route's natural depth.
+//
+// The transB (weight [N, K]) form additionally caps q at 8. Its lanes are
+// mapped slice = lane % n_slice with n_slice = 256/q, so a warp's 32 lanes span
+// n_slice consecutive K words: q = 8 makes n_slice 32 and one warp reads
+// exactly one 128-byte line per issue. The mapping stays CORRECT for any larger
+// q (consecutive lanes still walk consecutive words) but a warp then splits
+// into 64-byte or 32-byte runs, so the cap buys a full line at no cost -- a
+// smaller q is strictly more blocks, and block count is the only reason this
+// kernel splits K at all. See matmul16_w8_ksplit_transb in
+// shaders/buffer/matmul.comp.
 void q_plain(Ctx &c) {
     int q = c.kn->ksplit_q > 0 ? c.kn->ksplit_q : 16;
+    if (c.ksplit_transb) {
+        // Upper bound only: a pin may still ask for a SMALLER q (more blocks).
+        q = std::min(q, 8);
+    }
     while (q > 4 && up_div(c.s->n / 4, q) < 32) {
         q /= 2;
     }
