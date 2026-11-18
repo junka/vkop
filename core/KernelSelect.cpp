@@ -112,6 +112,10 @@ struct Ctx {
     bool fused = false;
     bool tiled = false;
     bool ksplit_ok = false;
+    // True when the winning shape is a transB=1 byte weight admitted by the
+    // split-K GEMV's [batch, N, K] form. The WIDE variants keep their
+    // [K, N]-only assumption, so w8_wide_ok must exclude this.
+    bool ksplit_transb = false;
     bool w8_quad = false;
     bool w4_quad = false;
     bool l2_resident = false;
@@ -204,9 +208,25 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
         }
     }
 
-    const bool ksplit = c.fused && !f.transB && (s.n % 4 == 0) &&
-                        ((s.k % 2) == 0) && (s.batch * s.m <= 8) && (s.k >= 256);
+    // Split-K GEMV admits transB=1 only for a BYTE weight with K % 4 == 0:
+    // matmul16_w8_ksplit has an explicit [batch, N, K] form, and that is the
+    // layout every ONNX-exported weight arrives in (the exporter keeps the
+    // checkpoint's [OC, K] and sets transB=1 instead of materializing a
+    // transpose). Without this the byte GEMV fell through to fused_fp16's
+    // matmul16_w8_even_n, whose y grid is UP_DIV(batch*m, 16) -- 16 of 256
+    // lanes busy at decode, i.e. 6.25% occupancy, which is where the 27B's
+    // ~20 GB/s and 15x gap to the DRAM floor came from.
+    //
+    // The fp16 ksplit kernels (matmul16_ksplit / _wide) still have only the
+    // [K, N] form: their inner loop steps by N. They stay gated on !transB,
+    // and so do the WIDE byte variants.
+    const bool transb_byte_ok =
+        f.transB && c.weight_byte && (s.k % 4 == 0);
+    const bool ksplit = c.fused && (!f.transB || transb_byte_ok) &&
+                        (s.n % 4 == 0) && ((s.k % 2) == 0) &&
+                        (s.batch * s.m <= 8) && (s.k >= 256);
     c.ksplit_ok = ksplit && !c.tiled;
+    c.ksplit_transb = c.ksplit_ok && f.transB;
 
     c.w8_quad = c.fused && c.weight_byte && !f.transB && (s.n % 4 == 0);
     c.w4_quad = c.fused && c.weight_4bit;
@@ -241,8 +261,20 @@ bool attn_softmax_applies(const Ctx &c) {
 
 bool coopmat_i8_applies(const Ctx &c) {
     const MatmulFeatures &f = *c.f;
+    // transB is allowed now: matmul_coop_i8.comp stages B into a shared
+    // [K_BLOCK][BN] tile either way and only the source address changes, so
+    // the [batch, N, K] layout ONNX exports (keeps the checkpoint's [OC, K])
+    // reaches the MMA without a materialized transpose.
+    //
+    // This matters more than the rule-table comment suggests. That comment
+    // ("the MMA saves no weight bandwidth and loses to the weight-only GEMV at
+    // decode") assumed the GEMV it competed with was efficient; for a transB
+    // byte weight it was matmul16_w8_even_n, whose y grid is
+    // UP_DIV(batch*m, 16) -- 16 of 256 lanes at decode. With transB gated out
+    // here, the earlier "VKOP_COOP_I8 measured no gain" result was a false
+    // negative: this route never ran.
     return c.kn->coop_i8_enabled && f.fp16 && f.weight == WeightKind::kInt8 &&
-           !f.transB && !f.down_act && (c.s->n % 8 == 0) && c.av->coopmat_i8;
+           !f.down_act && (c.s->n % 8 == 0) && c.av->coopmat_i8;
 }
 
 bool coopmat_gate(const Ctx &c) {
@@ -490,8 +522,10 @@ bool tiled_ks_applies(const Ctx &c) {
 bool tiled_applies(const Ctx &c) { return c.tiled; }
 
 bool w8_wide_ok(const Ctx &c) {
-    return c.ksplit_ok && !c.wide_disabled && c.weight_byte &&
-           (c.s->n % 16 == 0) &&
+    // The WIDE (16 columns/lane) kernels read [batch, K, N] only, so a transB
+    // byte weight must not reach them; it takes the 4-column split-K form.
+    return c.ksplit_ok && !c.ksplit_transb && !c.wide_disabled &&
+           c.weight_byte && (c.s->n % 16 == 0) &&
            (c.wide_forced || c.s->n >= c.wide_thr_byte);
 }
 

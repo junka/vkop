@@ -18,6 +18,12 @@ from . import weight_stream
 # blob。schema 无需改动（外部区域对 FlatBuffer 完全透明）。
 _EXTERNAL_BLOB_MAGIC = 8  # 8 字节 offset 尾巴
 
+# Trailing zero bytes reserved after the embedded VKSP archive, so
+# tools/patch_model_shaders.py can replace kernels of a different size in
+# place (see the shader_archive block in save_to_binary). The runtime ignores
+# them: ShaderArchive::parse stops at its own entry table.
+_SHADER_ARCHIVE_SLACK = 4 << 20
+
 from .generated.vkop.model import (
     Attribute,
     ConcurrentLevel,
@@ -996,8 +1002,19 @@ class DAGBasedModel:
         # 本图能 dispatch 的 key，llm 旋转形态 ~933 KB），所以直接放进 FlatBuffer，
         # 不走 initializer blob 那套外置 trailer——那套是为几 GB 权重准备的，而
         # 2 GiB 的向量上限对归档来说完全够用。
+        #
+        # Reserve slack past the archive's own end. ShaderArchive::parse walks
+        # the entry table and ignores anything after the last blob, so trailing
+        # zeros are invisible to the runtime -- but they let a later
+        # `tools/patch_model_shaders.py` swap in recompiled kernels of a
+        # DIFFERENT size without moving a byte of the weights that follow this
+        # vector. Without the slack every recompile that grows a shader (adding
+        # a branch adds SPIR-V) forces a full re-conversion of a multi-GB model.
+        # Cost is this many bytes per file; 4 MiB is ~40% headroom on a 9 MB
+        # archive, which is many recompiles' worth.
         if shader_archive:
-            shader_archive_vec = builder.CreateByteVector(bytes(shader_archive))
+            padded = bytes(shader_archive) + b"\x00" * _SHADER_ARCHIVE_SLACK
+            shader_archive_vec = builder.CreateByteVector(padded)
         else:
             shader_archive_vec = 0
 

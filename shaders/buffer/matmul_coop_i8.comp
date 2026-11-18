@@ -41,11 +41,11 @@
 //      one coopMatMulAdd
 //   3. epilogue: int32 acc * scale_a[row] * scale_b[col] -> FLAT fp32 scratch
 //
-// A is [batch, M, K] row-major (fp16, packed half2). B is [batch, K, N]
-// row-major, one int8 byte per element. Output is [batch, M, N]; the flat fp32
-// result goes to the scratch buffer and the existing pack pass
-// (buffer_matmul_pack.comp) repacks it to packed half2 -- the same
-// odd-N-straddle reason as the fp16 kernel.
+// A is [batch, M, K] row-major (fp16, packed half2). B is one int8 byte per
+// element, either [batch, K, N] (transB == 0) or [batch, N, K] (transB == 1).
+// Output is [batch, M, N]; the flat fp32 result goes to the scratch buffer and
+// the existing pack pass (buffer_matmul_pack.comp) repacks it to packed half2
+// -- the same odd-N-straddle reason as the fp16 kernel.
 
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_shader_subgroup_basic : enable
@@ -94,7 +94,9 @@ layout(push_constant) uniform PC {
     int K;
     int batch;
     int fp32;   // unused (this kernel is fp16-out); kept for PC compat
-    int transB; // unused (the gate requires transB == 0); kept for PC compat
+    int transB; // 1 = B is [batch, N, K] (row-major per column); 0 = [batch, K, N].
+                // Only the staging address differs; the shared tile and the MMA
+                // are identical either way.
     // Tail of the host's GpuMatMulParam, declared so the offsets below match
     // it exactly and only b_shared + the grouped fields (via bmap) are read;
     // see matmul.comp / ops/Matmul.hpp for what each field means.
@@ -341,15 +343,25 @@ void main() {
             int col = idx % BN;               // N dim
             int kk = k_base + row;
             int w = n0 + col;
-            // B is [batch, K, N] row-major; the gate rejects transB.
+            // B is either [batch, K, N] (transB == 0) or [batch, N, K]
+            // (transB == 1, the layout every ONNX-exported weight arrives in:
+            // the exporter keeps the checkpoint's [OC, K] and sets transB
+            // rather than materializing a transpose). Only the ADDRESS
+            // changes -- the shared tile stays [K_BLOCK][BN] row-major, which
+            // is what coopMatLoad below expects. Note the transB form reads
+            // contiguous bytes along K for a fixed column, so a lane's loads
+            // are sequential but adjacent lanes are K bytes apart; the tile
+            // absorbs that into one coalesced staging pass instead of
+            // scattering it across the MMA.
+            int b_idx = (uPC.transB != 0)
+                            ? (b_base + w * K + kk)   // [N, K]: column-major row
+                            : (b_base + kk * N + w);  // [K, N]: row-major
 #if IS_SIGNED
-            shB[idx] = (kk < K && w < N)
-                           ? int8_t(loadB_byte(b_base + kk * N + w))
-                           : int8_t(0);
+            shB[idx] = (kk < K && w < N) ? int8_t(loadB_byte(b_idx))
+                                         : int8_t(0);
 #else
-            shB[idx] = (kk < K && w < N)
-                           ? uint8_t(loadB_byte(b_base + kk * N + w))
-                           : uint8_t(0);
+            shB[idx] = (kk < K && w < N) ? uint8_t(loadB_byte(b_idx))
+                                         : uint8_t(0);
 #endif
         }
 
