@@ -114,6 +114,17 @@ struct ShaderCapabilities {
     // device can decode fp8 without an fp8 MMA.
     DeviceCap shader_float8;
     DeviceCap shader_float8_coopmat;
+    // VK_KHR_shader_integer_dot_product, promoted to Vulkan 1.3 core.
+    // Enabling the bit is what lets a module carry `OpCapability DotProduct`;
+    // without it the driver rejects the whole module at pipeline creation, so
+    // a dot-product kernel must gate on `enabled` and nothing else.
+    //
+    // Whether the *packed* form is accelerated is a PROPERTY, not a feature:
+    // see VulkanDevice::supports_dot_product_packed_signed(). This device
+    // reports integerDotProduct8BitSignedAccelerated = false while the packed
+    // 4x8 signed form is accelerated, so a gate that only asked "is the
+    // feature on" would pick a code path the driver emulates.
+    DeviceCap integer_dot_product;
 };
 
 // Device-scoped VK_EXT_descriptor_buffer state, resolved once in the
@@ -462,6 +473,18 @@ class VulkanDevice {
     bool supportsSubgroupArithmetic() const {
         return m_support_subgroup_arithmetic_;
     }
+    // True when `dot()` on two packed 4x8 int8 vectors is a hardware
+    // instruction (integerDotProduct4x8BitPackedSignedAccelerated). This is
+    // the "is it worth routing to" answer, deliberately separate from the
+    // feature bit: on this device family the feature is on, the 8-bit-per-lane
+    // signed form is NOT accelerated, and only the packed 4x8 form is -- so a
+    // kernel written with the i8vec4 form would be emulated while the packed
+    // one runs on real hardware. Requires the feature to be enabled, because a
+    // property without the feature is unusable.
+    bool supports_dot_product_packed_signed() const {
+        return shader_caps_.integer_dot_product.enabled &&
+               m_dot_product_packed_signed_;
+    }
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -513,6 +536,14 @@ class VulkanDevice {
     VkPhysicalDeviceDescriptorBufferPropertiesEXT m_descriptor_buffer_props_{};
 #endif
     bool m_support_subgroup_arithmetic_ = false;
+    // VK_KHR_shader_integer_dot_product property answers (queried in
+    // getProperties(), gated on the feature being enabled at the getter).
+    // Only the packed 4x8 signed form is cached: it is the one the int8 GEMV
+    // routes on, and 8BitSignedAccelerated is false on this hardware.
+    bool m_dot_product_packed_signed_ = false;
+#ifdef VK_KHR_shader_integer_dot_product
+    VkPhysicalDeviceShaderIntegerDotProductProperties m_dot_product_props_{};
+#endif
 
 #ifdef VK_EXT_subgroup_size_control
     uint32_t minSubgroupSize_ = 0;

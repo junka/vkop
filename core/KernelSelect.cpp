@@ -555,9 +555,55 @@ bool ksplit_512_applies(const Ctx &c) {
 
 bool ksplit_applies(const Ctx &c) { return c.ksplit_ok; }
 
-bool quad4_applies(const Ctx &c) {
-    return c.fused && (c.w8_quad || c.w4_quad);
+// int32 exactness ceiling for the packed dot product. Every product term is at
+// most |a|*|b|, and the accumulator sums K of them, so the bound is
+// K * max|a| * max|b| < 2^31.
+//
+// Two candidate maxima, and the strict one is used because it costs nothing:
+//   - symmetric quantization guarantees |v| <= 127 (127*127 = 16129), which
+//     allows K <= 133144;
+//   - int8 can still ENCODE -128, and one such element makes the term
+//     128*128 = 16384, which allows only K <= 131071.
+// The published "K < 133152" figure is NOT safe: 133151 * 16129 = 2147592479,
+// already past 2^31, so it would admit the last ~7 values of its own interval
+// into a silent signed wrap. This is a HARD constraint -- an overflowing
+// accumulator returns plausible garbage with no error anywhere -- so the gate
+// fails closed at the strict bound. Real models sit far below it (K <= ~20k),
+// so the tighter limit changes no route.
+constexpr int kDp4aMaxK = 131071; // largest K with K * 128 * 128 < 2^31
+
+bool ksplit_w8a8_dp4a_applies(const Ctx &c) {
+    const MatmulShape &s = *c.s;
+    const MatmulFeatures &f = *c.f;
+    return c.kn->dp4a_enabled &&                // opt-in, off by default
+           c.fused &&                           // fp16 out, even N
+           !f.transB &&                         // [K, N] weight rows
+           f.weight == WeightKind::kInt8 &&     // signed 8-bit weights
+           f.a_int8 &&                          // int8 activations
+           s.k <= kDp4aMaxK &&                  // int32 stays exact
+           c.dev->integer_dot_product_packed && // feature + acceleration
+           (s.n % 4 == 0) && (s.k % 4 == 0) &&  // whole dot words
+           (s.batch * s.m <= 8) &&              // decode-shaped launch
+           (s.k >= 256) &&                      // one dot per block
+           c.av->w8a8_dp4a;                     // module built
 }
+
+void q_dp4a(Ctx &c) {
+    // Same block-count reasoning as the byte WIDE kernel: four columns per
+    // lane's dot word, so a block covers 4*q of them and the profile floor is
+    // the only constraint on how far to split K.
+    int q = c.kn->ksplit_q;
+    if (q <= 0) {
+        q = 256;
+        while (q > 4 && up_div(c.s->n / 4, q) < c.kn->ksplit_floor) {
+            q /= 2;
+        }
+    }
+    c.q = q;
+    c.wide = false;
+}
+
+bool quad4_applies(const Ctx &c) { return c.fused && (c.w8_quad || c.w4_quad); }
 
 bool fused_applies(const Ctx &c) { return c.fused; }
 
@@ -658,6 +704,19 @@ const MatmulRule kMatmulRules[] = {
     {MatmulRoute::kTiled, "tiled", tiled_applies, nullptr},
     // 6. Split-K GEMV. The WIDE variants are per-N auto-enabled; a driver that
     //    refused their module falls through to the 4-column kernel below.
+    //
+    //    6a. DP4A (opt-in, VKOP_DP4A): int8 x int8 with the packed 4x8 dot
+    //    product. It sits ABOVE the byte WIDE rows on purpose. Every route
+    //    below it is a superset for this shape class -- WIDE auto-enables at
+    //    n >= 896, so placing DP4A after it would make the flag a no-op on
+    //    every shape the model actually has, and the one measurement it exists
+    //    for (weights spilling out of VRAM) would never run. Its gate is
+    //    narrow enough (batch*m <= 8, both dtypes int8, K < 133152, module
+    //    built) that it cannot reach a tile, coopmat or fp16 shape. Default
+    //    off, so this ordering only decides what happens when an operator asks
+    //    for it by name.
+    {MatmulRoute::kKsplitW8A8Dp4a, "ksplit_w8a8_dp4a", ksplit_w8a8_dp4a_applies,
+     q_dp4a},
     {MatmulRoute::kKsplitW8Wide512, "ksplit_w8wide512",
      ksplit_w8_wide512_applies, q_byte_wide},
     {MatmulRoute::kKsplitW8Wide, "ksplit_w8wide", ksplit_w8_wide_applies,
@@ -968,6 +1027,7 @@ DeviceTraits device_traits_from(VulkanDevice &dev) {
     t.zero_init_wmem = sc.zero_init_wmem.enabled;
     t.shader_float8 = sc.shader_float8.enabled;
     t.shader_float8_coopmat = sc.shader_float8_coopmat.enabled;
+    t.integer_dot_product_packed = dev.supports_dot_product_packed_signed();
     return t;
 }
 
@@ -993,6 +1053,8 @@ const char *matmul_route_tag(MatmulRoute route) {
         return "ksplit_w8wide";
     case MatmulRoute::kKsplitW8Wide512:
         return "ksplit_w8wide512";
+    case MatmulRoute::kKsplitW8A8Dp4a:
+        return "ksplit_w8a8_dp4a";
     case MatmulRoute::kTiled:
         return "tiled";
     case MatmulRoute::kTiledKs:
@@ -1063,6 +1125,9 @@ MatmulKnobs matmul_knobs_from_env() {
     k.tile_disabled = flag("VKOP_NO_TILE");
     k.coop_disabled = flag("VKOP_NO_COOP");
     k.coop_i8_enabled = flag("VKOP_COOP_I8");
+    // Opt-in only: unset parses as false, which is the shipped default. See
+    // MatmulKnobs::dp4a_enabled for why this is not auto-enabled.
+    k.dp4a_enabled = flag("VKOP_DP4A");
     k.force_coop = flag("VKOP_FORCE_COOP");
     if (const char *e = std::getenv("VKOP_COOP_SPLITK_FORCE")) {
         const int v = std::atoi(e);

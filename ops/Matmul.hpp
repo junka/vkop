@@ -736,7 +736,24 @@ class MatMulBuffer : public BufferFactory {
         // separately below rather than folded into the shared ones.
         const bool weight_4bit =
             weight_nf4 || weight_int4 || weight_nvfp4 || weight_uint4;
-        core::require_float_elem(inputs[0]->elem_kind(), "MatMul", "input 0");
+        // The DP4A route (opt-in, VKOP_DP4A) is the ONLY MatMul shape whose A
+        // operand is int8: the kernel consumes both sides as packed bytes and
+        // accumulates in int32. Everything else still requires a float A, and
+        // that guard is deliberately kept -- it is what stops a quantized
+        // operand from reaching a kernel that would read its bytes as
+        // exponents. The relaxation is therefore not "allow int8"; it is
+        // "allow int8 when this node could be the W8A8 route", and the plan is
+        // re-checked below: if selection did not choose kKsplitW8A8Dp4a (the
+        // module is missing, the device lacks the feature, K is past the int32
+        // ceiling, ...), the int8 A is rejected rather than handed to a float
+        // kernel.
+        const bool a_int8 = inputs[0]->elem_kind() == core::ElemKind::kInt8;
+        const bool a_int8_candidate =
+            a_int8 && core::matmul_knobs().dp4a_enabled && weight_int8;
+        if (!a_int8_candidate) {
+            core::require_float_elem(inputs[0]->elem_kind(), "MatMul",
+                                     "input 0");
+        }
         if (!weight_byte && !weight_4bit) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
@@ -1163,6 +1180,11 @@ class MatMulBuffer : public BufferFactory {
         sel_feat.group_size = weight_4bit ? group_size : 0;
         sel_feat.epi_bias = epi_bias_;
         sel_feat.attn_softmax = attn_softmax_;
+        // The DP4A route is the only one that accepts an int8 A; every other
+        // row in the table requires a float activation. Selection is what
+        // decides, and the throw below makes the pair (int8 A, non-DP4A
+        // route) fail loudly instead of running a float kernel over bytes.
+        sel_feat.a_int8 = a_int8;
         // The fold's structural half (the 4-input rewrite and the da_ok
         // geometry) is not expressible as a shape, so fold it into the flag.
         sel_feat.down_act = down_inputs_ok && down_k_out >= 1 && (n % 4 == 0) &&
@@ -1190,6 +1212,11 @@ class MatMulBuffer : public BufferFactory {
         sel_av.tile_ks_split = true;
         sel_av.tile_ks_fold = true;
         sel_av.down_act = true;
+        // Optimistic like the others: a driver refusal or an archive without
+        // the key clears it below and re-runs the table, which drops the shape
+        // onto the byte WIDE / 4-column GEMV instead. Probe lazily -- the
+        // module is only worth resolving when VKOP_DP4A is on.
+        sel_av.w8a8_dp4a = core::matmul_knobs().dp4a_enabled;
 
         // Process-wide: the env knobs are resolved once, by core/KernelSelect.
         const core::MatmulKnobs &sel_knobs = core::matmul_knobs();
@@ -1198,6 +1225,7 @@ class MatMulBuffer : public BufferFactory {
         VulkanPipeline *sel_ks_split = nullptr;
         VulkanPipeline *sel_ks_fold = nullptr;
         VulkanPipeline *sel_down_act = nullptr;
+        VulkanPipeline *sel_dp4a = nullptr;
 
         core::MatmulPlan plan = core::select_matmul(
             m_dev_->device_traits(), sel_shape, sel_feat, sel_av, sel_knobs);
@@ -1285,6 +1313,22 @@ class MatMulBuffer : public BufferFactory {
                     down_act_pipeline(true);
                 }
                 break;
+            case core::MatmulRoute::kKsplitW8A8Dp4a:
+                // Missing key or driver refusal both land here as nullptr;
+                // either way availability is withdrawn and the table re-runs.
+                // It is NOT a silent correctness fallback when A really is
+                // int8: no other module reads a byte A, so the re-run lands on
+                // a float-activation route and the explicit check below turns
+                // that into a loud error instead of a garbage result. For a
+                // float-A graph (the ordinary case -- this route is only
+                // reachable with VKOP_DP4A=1 and an int8 A) the re-run is the
+                // existing GEMV, which is exactly right.
+                sel_dp4a = dp4a_pipeline();
+                if (sel_dp4a == nullptr) {
+                    sel_av.w8a8_dp4a = false;
+                    retry = true;
+                }
+                break;
             case core::MatmulRoute::kCoopmatSkLast:
                 if (sklast_fp32_pipes_.empty()) {
                     sel_av.coopmat = false;
@@ -1317,6 +1361,23 @@ class MatMulBuffer : public BufferFactory {
             plan.route == core::MatmulRoute::kKsplitWide512 ||
             plan.route == core::MatmulRoute::kKsplitW8Wide ||
             plan.route == core::MatmulRoute::kKsplitW8Wide512;
+        const bool dp4a = plan.route == core::MatmulRoute::kKsplitW8A8Dp4a;
+        // The int8-A relaxation above is only an ADMISSION: selection still has
+        // to pick the one route that reads bytes on both sides. Any other route
+        // here would run a float kernel (or a byte-weight/float-activation
+        // kernel) over int8 payload bytes and return plausible garbage, so this
+        // stays a hard error -- it means the gate and the dispatch disagree,
+        // which is a bug, not a slow path.
+        if (a_int8 && !dp4a) {
+            throw std::runtime_error(
+                std::string("vkop: MatMul got an int8 activation but selected "
+                            "route '") +
+                plan.tag + "', which reads a float A (VKOP_DP4A=" +
+                (sel_knobs.dp4a_enabled ? "1" : "0") + ", dot_product=" +
+                (m_dev_->device_traits().integer_dot_product_packed ? "1" : "0") +
+                ", module=" + (sel_av.w8a8_dp4a ? "1" : "0") +
+                ") — no kernel can compute this");
+        }
         const bool coopmat = plan.route == core::MatmulRoute::kCoopmat;
         const bool coopmat_i8 = plan.route == core::MatmulRoute::kCoopmatI8;
         const bool coopmat_sklast =
@@ -1528,7 +1589,10 @@ class MatMulBuffer : public BufferFactory {
         // plain kernels' x stride, the fold route overwrites K with the up
         // width and reads it directly.
         para_.K_act = k;
-        para_.ksplit = (ksplit && !tiled) ? 1 : 0;
+        // The DP4A route is a split-K GEMV like the others, so the shader's
+        // ksplit flag must be up for it too -- otherwise the module takes its
+        // even-N fused branch and never reaches the dot-product loop.
+        para_.ksplit = ((ksplit || dp4a) && !tiled) ? 1 : 0;
         // para_ persists across executes and the down fold raises ks_part for
         // its fold pass without lowering it again, so a later plain split-K
         // dispatch on this module would run the fold entry in place of its
@@ -1537,6 +1601,11 @@ class MatMulBuffer : public BufferFactory {
         para_.ks_part = 0;
         para_.wide = plan.wide ? 1 : 0;
         para_.ksplit_q = plan.ksplit_q;
+        // Mirrored for the route log. set_route runs later, at the dispatch
+        // site, and the split-K launch geometry is exactly what a route line
+        // needs in order to explain an occupancy shortfall.
+        route_q_ = plan.ksplit_q;
+        route_wide_ = plan.wide;
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;
         para_.nvfp4 = weight_nvfp4 ? 1 : 0;
@@ -2522,6 +2591,35 @@ class MatMulBuffer : public BufferFactory {
                 return;
             }
         }
+        if (dp4a) {
+            // int8 x int8 packed-dot-product GEMV. Same launch geometry as the
+            // 4-column byte kernel (grid.x = column quads per block, grid.y =
+            // output rows), because the route is a drop-in replacement for the
+            // inner loop, not a different tiling: q counts 4-column groups and
+            // each lane's dot word produces four output columns.
+            //
+            // Descriptor contract, identical to the byte WIDE kernel's 7-slot
+            // layout (out, A, B, scratch, scale, global, epi bias; unused slots
+            // bound to a dummy). A is bound through the ordinary
+            // dispatch_by_dtype path, which lands an int8_t storage tensor
+            // here; the kernel must read it as signed bytes, NOT dequantize it
+            // with the per-column weight table. There is no dedicated
+            // activation-scale binding and this route adds none -- see the
+            // module header the shader agent writes for how the activation
+            // scale is applied.
+            if (sel_dp4a == nullptr) {
+                // Unreachable: selection only emits this route after the probe
+                // returned a pipeline. Fail loudly rather than dispatch a null
+                // handle.
+                throw std::runtime_error(
+                    "vkop: MatMul selected ksplit_w8a8_dp4a without a built "
+                    "pipeline");
+            }
+            set_route(plan.tag, batch, m, n, k, rep);
+            const int q = plan.ksplit_q;
+            dispatch_on(sel_dp4a, dp4a_ds_[m_id_], UP_DIV(n / 4, q), batch * m);
+            return;
+        }
         if (fused_fp16) {
             // Single pass: x covers output WORDS (column pairs), or DWORDs for
             // the four-column quantized kernels.
@@ -3041,6 +3139,72 @@ class MatMulBuffer : public BufferFactory {
         return w8_wide_pipeline_impl("buffer_matmul_w8_wide_fp8_hw_fp16", true);
     }
 
+    // int8 x int8 packed-dot-product GEMV (VKOP_DP4A). Three independent
+    // failure modes and all of them fall back to the byte GEMV:
+    //   - the device never enabled shaderIntegerDotProduct (module rejected at
+    //     pipeline creation),
+    //   - the archive has no bytes for the key (a model converted before the
+    //     shader landed),
+    //   - the driver refuses the module at vkCreateComputePipelines.
+    // `refused` is device-scoped and lives for the process (the driver's
+    // answer cannot change); `no_bytes` is MODEL-scoped and must not be, or a
+    // graph converted before the shader landed would blacklist the route for
+    // every later model in the same process. Same split as the WIDE GEMV.
+    VulkanPipeline *dp4a_pipeline() {
+        static bool refused = false;
+        if (dp4a_pipeline_) {
+            return dp4a_pipeline_.get();
+        }
+        // The property query answers "accelerated", the feature bit answers
+        // "usable". Both are required; the module is pointless with either.
+        if (!m_dev_->device_traits().integer_dot_product_packed) {
+            return nullptr;
+        }
+        if (refused || dp4a_no_bytes_) {
+            return nullptr;
+        }
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv("buffer_matmul_ksplit_w8a8_dp4a");
+        } catch (const std::exception &e) {
+            dp4a_no_bytes_ = true;
+            if (!dp4a_warned_missing_) {
+                dp4a_warned_missing_ = true;
+                std::fprintf(stderr,
+                             "[vkop] %s\n[vkop] VKOP_DP4A is on but %s is not "
+                             "in this model's archive; int8 activations fall "
+                             "back to the byte GEMV\n",
+                             e.what(), "buffer_matmul_ksplit_w8a8_dp4a");
+            }
+            return nullptr;
+        }
+        try {
+            dp4a_pipeline_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), use_uab, 0);
+            for (int i = 0; i < vkop::kInflight; ++i) {
+                dp4a_ds_[i] = dp4a_pipeline_->allocDescriptorSets();
+            }
+        } catch (const std::exception &e) {
+            refused = true;
+            dp4a_pipeline_.reset();
+            std::fprintf(stderr,
+                         "[vkop] buffer_matmul_ksplit_w8a8_dp4a pipeline "
+                         "rejected (%s); VKOP_DP4A shapes use the byte GEMV\n",
+                         e.what());
+            return nullptr;
+        }
+        return dp4a_pipeline_.get();
+    }
+
     // Shared body. `f8` selects which module slot and which "no bytes" flag to
     // use; everything else -- descriptor layout, push constants, the driver
     // refusal latch -- is identical, and keeping it one function is what stops
@@ -3265,10 +3429,24 @@ class MatMulBuffer : public BufferFactory {
     // recording round's value for Runtime to read back.
     void set_route(const char *tag, int batch, int m, int n, int k, int rep) {
         route_tag_ = tag;
-        char buf[192];
+        char buf[224];
+        // q and wide are what the split-K GEMV's occupancy actually turns on
+        // (grid.x = UP_DIV(n/4|8|16, q)), so a route log without them cannot
+        // answer "did this shape launch enough blocks?". The grid is spelled
+        // out too: it is the number a 48-SM device is judged against, and
+        // recomputing it by hand from q is how a 21%-occupancy launch looked
+        // busy for weeks.
+        const int per_block_cols = route_wide_ ? 16 : 4;
+        const int gx =
+            route_q_ > 0
+                ? UP_DIV((n / per_block_cols) + (n % per_block_cols != 0),
+                         route_q_)
+                : 0;
         snprintf(buf, sizeof(buf),
-                 "%s batch=%d m=%d n=%d k=%d transB=%d rep=%d mid=%d", tag,
-                 batch, m, n, k, transB_ ? 1 : 0, rep, m_id_);
+                 "%s batch=%d m=%d n=%d k=%d transB=%d rep=%d mid=%d q=%d "
+                 "wide=%d gx=%d gy=%d",
+                 tag, batch, m, n, k, transB_ ? 1 : 0, rep, m_id_, route_q_,
+                 route_wide_ ? 1 : 0, gx, batch * m);
         route_info_ = buf;
     }
 
@@ -3477,6 +3655,15 @@ class MatMulBuffer : public BufferFactory {
     // 512-lane fp8 hardware WIDE GEMV (opt-in VKOP_KSPLIT512 route).
     std::unique_ptr<VulkanPipeline> w8_wide512_f8_pipeline_;
     VkDescriptorSet w8_wide512_f8_ds_[vkop::kInflight] = {nullptr};
+    // int8 x int8 packed-dot-product GEMV (opt-in VKOP_DP4A). Its own module,
+    // its own descriptor sets, its own process-wide refusal latch -- a device
+    // that will not create it must keep the byte GEMV, not drop the op.
+    std::unique_ptr<VulkanPipeline> dp4a_pipeline_;
+    VkDescriptorSet dp4a_ds_[vkop::kInflight] = {nullptr};
+    // Model-scoped "this archive has no dp4a key" latch (a reconverted model
+    // in the same process must get the route back) and its one-shot warning.
+    bool dp4a_no_bytes_ = false;
+    bool dp4a_warned_missing_ = false;
     // The 512-lane split-K modules (VKOP_KSPLIT512=1), probed through
     // secondary_pipeline(): the ksplit-only general module and the int8 WIDE
     // module, both -DKSPLIT512 builds of shaders/buffer/matmul.comp.
@@ -3535,6 +3722,10 @@ class MatMulBuffer : public BufferFactory {
     bool down_act_ = false;
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
+    // Split-K GEMV geometry, mirrored from the plan so set_route can report
+    // the launch dimensions (q, wide, and the grid they produce).
+    int route_q_ = 0;
+    bool route_wide_ = false;
     // Attention QK^T epilogue (folded from a FusedElemwise by the converter):
     // epi_scale_ multiplies every output element, epi_bias_ flags that a bias
     // tensor is appended as inputs[2] and bound at binding 6.

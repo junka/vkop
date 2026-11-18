@@ -90,6 +90,14 @@ struct DeviceTraits {
     // a device may decode fp8 without an fp8 cooperative matrix.
     bool shader_float8 = false;
     bool shader_float8_coopmat = false;
+    // VK_KHR_shader_integer_dot_product is ENABLED and the packed 4x8 signed
+    // form is ACCELERATED. Both halves matter: the feature bit is what lets a
+    // module carry `OpCapability DotProduct` (without it vkCreatePipeline
+    // rejects the module), and the property is what says `dotPacked4x8EXT` is
+    // one instruction rather than an emulation. This device has the feature
+    // and only the packed form accelerated (8BitSignedAccelerated is false),
+    // so the i8vec4 spelling must never be assumed from this flag alone.
+    bool integer_dot_product_packed = false;
 };
 
 // Coarse device classes the tables key on. Keep this list about *behaviour*,
@@ -164,6 +172,15 @@ enum class MatmulRoute {
     kKsplitWide512,
     kKsplitW8Wide,
     kKsplitW8Wide512,
+    // int8 x int8 split-K GEMV whose inner loop is the packed 4x8 integer dot
+    // product (`dotPacked4x8EXT`): four weight bytes and four activation bytes
+    // per instruction, accumulated in int32. Opt-in via VKOP_DP4A because the
+    // kernel only pays off when the weight stream is the bottleneck; see the
+    // rule row in core/KernelSelect.cpp. The int32 accumulator is exact only
+    // while K * 128 * 128 < 2^31 (K <= 131071), and the gate refuses past that
+    // -- note the commonly quoted K < 133152 bound is itself wrong, see
+    // kDp4aMaxK.
+    kKsplitW8A8Dp4a,
     kTiled,
     kTiledKs,
     kCoopmat,
@@ -206,6 +223,11 @@ struct MatmulFeatures {
     bool fp16 = true;
     bool transB = false;
     WeightKind weight = WeightKind::kFp16;
+    // True when A is an int8 tensor (the activation is quantized, not the
+    // value the kernel dequantizes). Only the W8A8 DP4A route consumes it;
+    // every other route requires a float A, and core::require_float_elem
+    // still enforces that for them (see ops/Matmul.hpp).
+    bool a_int8 = false;
     int group_size = 0;
     // Attention QK^T epilogue: the converter folded scale/bias into this MatMul.
     bool epi_bias = false;
@@ -234,6 +256,10 @@ struct MatmulAvailability {
     bool ksplit512 = false;
     bool w8_wide = false;
     bool w8_wide512 = false;
+    // The DP4A module probed and built (op side). Its route ALSO needs
+    // DeviceTraits::integer_dot_product_packed, because the pipeline cannot
+    // even be created without the feature.
+    bool w8a8_dp4a = false;
     bool tile_ks_split = false;
     bool tile_ks_fold = false;
     bool down_act = false;
@@ -252,6 +278,14 @@ struct MatmulKnobs {
     int wide_threshold_byte = 0;
     // VKOP_KSPLIT512: opt into the 512-lane split-K builds.
     bool ksplit512_enabled = false;
+    // VKOP_DP4A: opt into the int8 x int8 packed-dot-product GEMV. Default
+    // OFF: the kernel is a bandwidth play, and on a device whose weights fit
+    // VRAM it loses to the weight-only byte GEMV (which reads the same bytes
+    // through a wider per-lane load and needs no activation quantization).
+    // It exists for the regime where a few GB of weights spill out of VRAM:
+    // there the launch is PCIe-limited rather than issue-limited, so halving
+    // the fetched weight stream is what matters.
+    bool dp4a_enabled = false;
     // VKOP_KS_N / VKOP_KS_TARGET: pin tile-split-K depth / saturation target.
     int ks_n_pin = 0;
     int ks_target_pin = 0;

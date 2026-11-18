@@ -276,8 +276,31 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     head = reinterpret_cast<VkBaseOutStructure *>(&db_properties);
 #endif
 
+#ifdef VK_KHR_shader_integer_dot_product
+    // Whether dot() on a packed 4x8 vector is a hardware instruction is a
+    // PROPERTY, not a feature: the feature bit only grants permission to put
+    // `OpCapability DotProduct` in a module, while this says whether the
+    // driver executes `dotPacked4x8EXT` or expands it into shifts and adds.
+    // The standalone struct's sType value is the same number in its 1.3-core
+    // and KHR spellings (both are 1000280001), so chaining it once answers
+    // either way; a driver that does not know it leaves the fields zero, which
+    // reads as "not accelerated" -- the safe answer for a routing gate.
+    VkPhysicalDeviceShaderIntegerDotProductProperties dot_properties = {};
+    dot_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
+    dot_properties.pNext = head;
+    head = reinterpret_cast<VkBaseOutStructure *>(&dot_properties);
+#endif
+
     properties2.pNext = head;
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+
+#ifdef VK_KHR_shader_integer_dot_product
+    m_dot_product_props_ = dot_properties;
+    m_dot_product_packed_signed_ =
+        dot_properties.integerDotProduct4x8BitPackedSignedAccelerated !=
+        VK_FALSE;
+#endif
 
 #ifdef VK_EXT_descriptor_buffer
     m_descriptor_buffer_props_ = db_properties;
@@ -943,9 +966,20 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_KHR_shader_integer_dot_product
+    // Two ways to reach this feature and they are mutually exclusive on the
+    // SPIR-V side: through the KHR extension struct (pre-1.3) or through
+    // VkPhysicalDeviceVulkan13Features. The old `< 1.3` test here meant the
+    // feature was NEVER probed on a 1.3+ device, and the 1.3 core block below
+    // did not ask for it either -- so on a device whose min(instance, device)
+    // came out 1.3 (b3: instance 1.3.275, device 1.4.329) the bit stayed
+    // untaken and any module carrying OpCapability DotProduct was rejected at
+    // pipeline creation. Keep this branch for the pre-1.3 case and add the
+    // core one in the 1.3 block; the availability flag is set by whichever
+    // branch is taken.
     if (supportedExtensions.count(
             VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) > 0 &&
         api_version < VK_API_VERSION_1_3) {
+        shader_caps_.integer_dot_product.available = true;
         descs.push_back(FeatureDescriptor{
             .sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
@@ -962,6 +996,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *queried = static_cast<
                     VkPhysicalDeviceShaderIntegerDotProductFeatures *>(q);
+                recordCap(shader_caps_.integer_dot_product,
+                          queried->shaderIntegerDotProduct);
                 if (!queried->shaderIntegerDotProduct)
                     return nullptr;
 
@@ -1209,6 +1245,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #if VK_VERSION_1_3
     if (api_version >= VK_API_VERSION_1_3) {
         shader_caps_.zero_init_wmem.available = true;
+        // VK_KHR_shader_integer_dot_product is core in 1.3, so on a 1.3 (or
+        // 1.4-capable) device the bit lives in this struct, not in the KHR
+        // one -- and asking for the KHR struct while the instance advertises
+        // 1.3 is the case the extension branch above deliberately excludes.
+        // Set here rather than in an `== 1.3` test, so a 1.4 device whose
+        // instance was created at 1.3 (this box) and a real 1.4 one both land
+        // in the same branch.
+        shader_caps_.integer_dot_product.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
             .extensionName = nullptr, // Core
@@ -1224,9 +1268,12 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 auto *feat = static_cast<VkPhysicalDeviceVulkan13Features *>(q);
                 recordCap(shader_caps_.zero_init_wmem,
                           feat->shaderZeroInitializeWorkgroupMemory);
+                recordCap(shader_caps_.integer_dot_product,
+                          feat->shaderIntegerDotProduct);
                 if (!feat->robustImageAccess && !feat->maintenance4 &&
                     !feat->subgroupSizeControl &&
-                    !feat->shaderZeroInitializeWorkgroupMemory)
+                    !feat->shaderZeroInitializeWorkgroupMemory &&
+                    !feat->shaderIntegerDotProduct)
                     return nullptr;
                 auto e = std::make_unique<VkPhysicalDeviceVulkan13Features>();
                 *e = makeFeatureStruct<
@@ -1240,6 +1287,10 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 // workgroup_memory, 1.3 core).
                 e->shaderZeroInitializeWorkgroupMemory =
                     feat->shaderZeroInitializeWorkgroupMemory;
+                // Only this one bit: the 4x8 forms are what the int8 GEMV
+                // uses, and asking for a bit the engine never issues is a bit
+                // the driver can still refuse.
+                e->shaderIntegerDotProduct = feat->shaderIntegerDotProduct;
                 return std::shared_ptr<void>(std::move(e));
             }});
     }
@@ -1964,6 +2015,27 @@ void VulkanDevice::dumpShaderCapabilities() const {
     pr("descriptor_buffer", c.descriptor_buffer);
     pr("shader_float8", c.shader_float8);
     pr("shader_float8_coopmat", c.shader_float8_coopmat);
+    pr("integer_dot_product", c.integer_dot_product);
+    // The packed 4x8 answer is a property, and it is the one that decides
+    // whether a dot() route is worth taking -- a feature bit alone would say
+    // "yes" to a kernel the driver expands into shifts. Printed on its own
+    // line so "feature on / accuracy false" cannot read as a green light.
+#ifdef VK_KHR_shader_integer_dot_product
+    std::fprintf(
+        stderr,
+        "[devcaps] %-30s packed_signed=%s (8bit_signed=%s) "
+        "feature=%s\n",
+        "dot_product_accel", yes_no(m_dot_product_packed_signed_),
+        yes_no(m_dot_product_props_.integerDotProduct8BitSignedAccelerated !=
+               VK_FALSE),
+        yes_no(c.integer_dot_product.enabled));
+#else
+    // Built against headers without the extension: no property struct exists,
+    // so there is nothing to report beyond the (never-queried) cap above.
+    std::fprintf(stderr, "[devcaps] %-30s packed_signed=no (headers lack "
+                         "VK_KHR_shader_integer_dot_product)\n",
+                 "dot_product_accel");
+#endif
     std::fflush(stderr);
 }
 

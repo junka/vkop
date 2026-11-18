@@ -91,6 +91,20 @@ MatmulAvailability int8_modules() {
     return a;
 }
 
+// DP4A: the int8 W8A8 modules plus the dot-product one, on a device whose
+// packed 4x8 signed form is accelerated.
+MatmulAvailability dp4a_modules() {
+    MatmulAvailability a = int8_modules();
+    a.w8a8_dp4a = true;
+    return a;
+}
+
+DeviceTraits traits_dp4a() {
+    DeviceTraits t = traits_native_discrete();
+    t.integer_dot_product_packed = true;
+    return t;
+}
+
 MatmulAvailability coop_modules() {
     MatmulAvailability a;
     a.coopmat = true;
@@ -113,6 +127,13 @@ MatmulFeatures weight8(bool transB = false) {
     f.fp16 = true;
     f.transB = transB;
     f.weight = WeightKind::kInt8;
+    return f;
+}
+
+// int8 activation + int8 weight: the only combination the DP4A route accepts.
+MatmulFeatures w8a8(bool transB = false) {
+    MatmulFeatures f = weight8(transB);
+    f.a_int8 = true;
     return f;
 }
 
@@ -471,6 +492,117 @@ void test_fallthrough_bits() {
                 kKsplitW8Wide);
 }
 
+// int8 x int8 packed dot product (VKOP_DP4A). Every check here is a boundary
+// that, if it slipped, would either run a float kernel over byte payloads or
+// let a signed 32-bit accumulator wrap.
+void test_dp4a_routes() {
+    const DeviceTraits dev = traits_dp4a();
+    const MatmulAvailability av = dp4a_modules();
+    const MatmulShape decode = sh(1, 1, 2048, 2048);
+
+    MatmulKnobs on;
+    on.dp4a_enabled = true;
+
+    // Default OFF: the same device, availability and shape keep the byte WIDE
+    // GEMV. This is the shipped behaviour and the reason the route is opt-in.
+    MatmulPlan p = select_matmul(dev, decode, w8a8(), av, MatmulKnobs());
+    CHECK_ROUTE(p, kKsplitW8Wide);
+
+    // Opted in on a device with the packed form accelerated: DP4A wins, even
+    // though the byte WIDE row would also apply (n >= 896). That ordering is
+    // deliberate -- see the rule comment.
+    p = select_matmul(dev, decode, w8a8(), av, on);
+    CHECK_ROUTE(p, kKsplitW8A8Dp4a);
+    CHECK(!p.wide);
+    // Same block-floor walk as the byte WIDE kernel, in 4-column groups: n/4 =
+    // 512 groups, and q walks down from 256 while UP_DIV(groups, q) stays under
+    // the floor of 8 (2 -> 4 -> 8), landing on q = 64.
+    CHECK(p.ksplit_q == 64);
+
+    // An fp16 activation is the ordinary case: the DP4A gate must not claim it
+    // even with the knob on.
+    p = select_matmul(dev, decode, weight8(), av, on);
+    CHECK_ROUTE(p, kKsplitW8Wide);
+
+    // The int32 ceiling. The safe bound is K * 128 * 128 < 2^31, i.e.
+    // K <= 131071; every K below is a multiple of 4 so the dot-word gate does
+    // not mask the overflow gate. One -128 element makes a term 16384, and
+    // 131072 of them reach 2^31 exactly.
+    p = select_matmul(dev, sh(1, 1, 131068, 2048), w8a8(), av, on);
+    CHECK_ROUTE(p, kKsplitW8A8Dp4a);
+    p = select_matmul(dev, sh(1, 1, 131072, 2048), w8a8(), av, on);
+    CHECK(p.route != MatmulRoute::kKsplitW8A8Dp4a);
+    // 133148 sits INSIDE the published "K < 133152" window but already
+    // overflows under the symmetric 127*127 bound (133145 is the last K that
+    // fits with 127s), so a gate written to the published figure accepts it.
+    p = select_matmul(dev, sh(1, 1, 133148, 2048), w8a8(), av, on);
+    CHECK(p.route != MatmulRoute::kKsplitW8A8Dp4a);
+
+    // Non-int8 weight (fp8 shares the byte kernels but is not a signed dot
+    // product operand -- its bytes are a float encoding).
+    MatmulFeatures f8 = w8a8();
+    f8.weight = WeightKind::kFp8;
+    CHECK(select_matmul(dev, decode, f8, av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // int8 weight with a float activation (weight-only quantization).
+    CHECK(select_matmul(dev, decode, weight8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // 4-bit weight is not a byte operand at all.
+    MatmulFeatures w4 = w8a8();
+    w4.weight = WeightKind::kInt4;
+    CHECK(select_matmul(dev, decode, w4, av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // Device without the feature (or without the accelerated packed form):
+    // the flag alone must not route. This is the exact failure the old
+    // api_version < 1.3 probe produced -- feature "on" nowhere, kernel
+    // rejected at pipeline creation -- and the gate has to fail closed.
+    DeviceTraits no_dot = traits_native_discrete();
+    CHECK(select_matmul(no_dot, decode, w8a8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // Module missing (archive without the key, or the driver refused it): the
+    // availability bit is what the op clears, and the table must fall through
+    // rather than emit a route with nothing to dispatch.
+    CHECK_ROUTE(select_matmul(dev, decode, w8a8(), int8_modules(), on),
+                kKsplitW8Wide);
+
+    // K and N must be whole dot-words (4 bytes each) -- the kernel reads one
+    // 32-bit word per side.
+    CHECK(select_matmul(dev, sh(1, 1, 2046, 2048), w8a8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+    CHECK(select_matmul(dev, sh(1, 1, 2048, 2046), w8a8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // Decode-shaped only (batch * m <= 8), like every split-K GEMV row: past
+    // it the tile owns the shape and a row-per-block kernel is the wrong
+    // launch.
+    CHECK(select_matmul(dev, sh(1, 9, 2048, 2048), w8a8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+    // batch * m, not m alone: 2 x 3 = 6 is inside the window, 3 x 4 = 12 is
+    // not.
+    CHECK_ROUTE(select_matmul(dev, sh(2, 3, 2048, 2048), w8a8(), av, on),
+                kKsplitW8A8Dp4a);
+    CHECK(select_matmul(dev, sh(3, 4, 2048, 2048), w8a8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // K < 256 is not worth a dot loop (one block would cover the whole row).
+    CHECK(select_matmul(dev, sh(1, 1, 128, 2048), w8a8(), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // transB: the DP4A module walks [K, N] rows like the WIDE kernels, so a
+    // folded-transpose weight must stay on the 4-column split-K form.
+    CHECK(select_matmul(dev, sh(1, 1, 2048, 2048), w8a8(true), av, on).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+
+    // Odd N has no fused epilogue for the byte kernels either.
+    MatmulKnobs on_odd = on;
+    CHECK(select_matmul(dev, sh(1, 1, 2048, 2047), w8a8(), av, on_odd).route !=
+          MatmulRoute::kKsplitW8A8Dp4a);
+}
+
 void test_mvk_routes() {
     const MatmulAvailability av = int8_modules();
 
@@ -549,6 +681,7 @@ int main() {
     test_coopmat_shape_holes();
     test_other_routes();
     test_fallthrough_bits();
+    test_dp4a_routes();
     test_mvk_routes();
     print_native_decode_table();
 
