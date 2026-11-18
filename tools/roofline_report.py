@@ -112,9 +112,11 @@ def dtype_bytes(name):
 # constant this repository already carries, a value from the vulkaninfo
 # profile JSON checked in next to it, or a vendor-published peak.
 #
-# `sm` is taken from core/KernelSelect.cpp's sm_estimate() through the oracle
-# when the oracle is available; the copy here is only the fallback so a report
-# still prints without it (and is then labelled as such).
+# `sm` is the count this preset documents. The oracle is asked for the same
+# count through VKOP_SM_ESTIMATE, because core/KernelSelect.cpp's sm_estimate()
+# only has a per-vendor guess (32 for any AMD part, while the 560X has 16 CUs);
+# without the override the report's occupancy model and its
+# latency-bound classification would disagree about the size of the device.
 #
 # Peak throughput is computed from the SM's own structure
 # (2 flop/clock/lane x lanes-per-SM x clock x SM) so it is internally
@@ -191,6 +193,67 @@ DEVICES = {
                   "maxComputeWorkGroupInvocations 1024, subgroupSize 32) + "
                   "Xe register-file structure (8 threads/EU, 128 GRF x 32 B)",
     },
+    "amd-560x": {
+        # AMD Radeon Pro 560X (Polaris 21, GCN 4) behind MoltenVK, the 2019
+        # 15" MacBook Pro dGPU. 16 CU x 64 FP32 lanes (4 SIMD x 16), 907 MHz
+        # published boost. The CU count is the one this repo's own
+        # kMoltenVkAmd calibration profile already states ("16 CUs saturate
+        # the tile at ~32 blocks", core/KernelSelect.cpp).
+        "name": "AMD Radeon Pro 560X (Polaris 21, MoltenVK)",
+        "vendor_id": 0x1002,
+        "sm": 16,
+        "cores_per_sm": 64,
+        "clock_ghz": 0.907,
+        # Verified on this box with VKOP_DEVCAPS=1: subgroupSize 32,
+        # maxComputeSharedMemorySize 65536, maxComputeWorkGroupInvocations
+        # 1024, coopmat no, shader_float16 yes, storage_buffer_8bit yes,
+        # integer_dot_product feature yes but packed_signed accelerated NO.
+        "subgroup_size": 32,
+        "max_invocations_per_wg": 1024,
+        # GCN LDS is 64 KiB per CU and one workgroup may claim all of it.
+        # This is the field the generic preset got wrong (32 KiB): the byte
+        # WIDE GEMV's 16 KiB fold array then looked like 2 workgroups/CU
+        # instead of 4.
+        "shared_per_sm": 64 * 1024,
+        "shared_per_wg": 64 * 1024,
+        # GCN vector register file: 256 VGPRs x 64 lanes x 4 B = 64 KiB per
+        # SIMD, 4 SIMD per CU. VGPRs are handed out in 4-register granules
+        # PER THREAD (the non-NVIDIA branch of occupancy()). The generic
+        # preset's 256-register granule applied per thread priced a 40-VGPR
+        # kernel at 4096 B/thread, which zeroed the register limit and made
+        # every kernel on this card report 1 workgroup/CU.
+        "reg_file_bytes_per_sm": 4 * 256 * 64 * 4,
+        "reg_granule_regs": 4,
+        # Residency: up to 10 wavefronts per SIMD x 4 SIMD x 64 lanes.
+        # Counted in LANES, so it does not depend on whether the driver
+        # exposes wave32 (MoltenVK does) or the hardware's wave64.
+        "threads_per_sm": 4 * 10 * 64,
+        "eu_per_sm": 0,
+        "threads_per_eu": 0,
+        "grf_bytes": 0,
+        # Measured, not published: bench_matmul BENCH_MEMPROBE_MB=1024 copy
+        # ceiling, counted as read+write traffic (the row's own convention).
+        # Two runs: 70.9 and 71.9 GB/s. A 311 MB int8 lm_head GEMV reaches
+        # 54.4 GB/s of it, so this is the right order of ceiling.
+        "bandwidth_gbs": 71.0,
+        # Polaris 11/21 L2. Not queryable through Vulkan; every weight in the
+        # models this box runs is far above it either way.
+        "l2_bytes": 1024 * 1024,
+        # GCN 4 has no packed-fp16 double-rate math (that arrived with Vega)
+        # and no accelerated int8 dot product (verified above), so all three
+        # peaks are the same fp32 ALUs. The x2/x4 the other presets carry
+        # would overstate this card's ridge point by 2x/4x.
+        "flops_fp32": 2 * 16 * 64 * 0.907e9,
+        "flops_fp16": 2 * 16 * 64 * 0.907e9,
+        "flops_int8": 2 * 16 * 64 * 0.907e9,
+        "source": "VKOP_DEVCAPS=1 on this box (vendor 0x1002 device 0x67ef "
+                  "driver 14, subgroup 32, shared 65536, invocations 1024, "
+                  "no coopmat, dot_product_accel packed_signed=no) + "
+                  "core/KernelSelect.cpp's moltenvk-amd profile (16 CUs) + "
+                  "GCN 4 CU structure (4 SIMD x 16 lanes, 64 KiB VGPR/SIMD, "
+                  "4-VGPR granule, 10 waves/SIMD) + published 907 MHz boost "
+                  "+ measured 1 GB copy ceiling",
+    },
     "nvidia-generic": {
         "name": "Generic native NVIDIA dGPU (no coopmat assumed)",
         "vendor_id": 0x10DE,
@@ -238,8 +301,6 @@ DEVICES = {
         "source": "sm_estimate()'s conservative default",
     },
 }
-
-SM_ESTIMATE_FALLBACK = {0x8086: 8, 0x10DE: 48, 0x1002: 32}
 
 
 # ---------------------------------------------------------------------------
@@ -986,9 +1047,18 @@ class RoutingOracle:
             }
             lines.append(json.dumps(payload))
         try:
+            env = dict(os.environ)
+            # sm_estimate()'s vendor table is a guess -- it returns 32 CUs for
+            # ANY AMD part, while the preset documents the observed count (16
+            # on the 560X). Ask the selector for the preset's count through its
+            # own override knob so the reported SM number, the occupancy model
+            # and the route selection all describe the same device. An explicit
+            # VKOP_SM_ESTIMATE in the environment still wins.
+            env.setdefault("VKOP_SM_ESTIMATE", str(DEVICES[self.device]["sm"]))
             proc = subprocess.run([self.binary],
                                   input="\n".join(lines) + "\n",
-                                  capture_output=True, text=True, timeout=600)
+                                  capture_output=True, text=True, timeout=600,
+                                  env=env)
         except (OSError, subprocess.SubprocessError) as e:
             return [dict(r, route=None, oracle_error=str(e)) for r in requests]
         got = {}
@@ -2219,10 +2289,17 @@ def build_report(analysis, metrics, roofline, args):
     A(f"  SM / lanes      : {roofline.sm} SM x {dev['cores_per_sm']} lanes"
       f" @ {dev['clock_ghz']:.2f} GHz")
     A(f"  peak fp32       : {roofline.peak['fp32'] / 1e12:.2f} TFLOP/s")
+    # A preset whose fp16/int8 peak equals its fp32 peak is a device with no
+    # packed math at that width; saying "packed half2 ALUs" there would claim
+    # hardware the device does not have.
     A(f"  peak fp16       : {roofline.peak['fp16'] / 1e12:.2f} TFLOP/s "
-      f"(packed half2 ALUs; coopmat MMA not modelled separately)")
+      + ("(packed half2 ALUs; coopmat MMA not modelled separately)"
+         if dev["flops_fp16"] > dev["flops_fp32"] else
+         "(same ALUs at the fp32 rate: no packed-fp16 math on this device)"))
     A(f"  peak int8       : {roofline.peak['int8'] / 1e12:.2f} TOP/s "
-      f"(packed int8x4 ALUs)")
+      + ("(packed int8x4 ALUs)"
+         if dev["flops_int8"] > dev["flops_fp32"] else
+         "(same ALUs at the fp32 rate: no accelerated int8 dot product)"))
     A(f"  DRAM bandwidth  : {dev['bandwidth_gbs']:.0f} GB/s")
     A(f"  ridge points    : fp32 {roofline.ridge['fp32']:.1f}  "
       f"fp16 {roofline.ridge['fp16']:.1f}  "
@@ -2883,10 +2960,10 @@ def main(argv=None):
         sm = None
         for k in list(model.archive.keys())[:0]:
             pass
-        # The oracle reports the SM count straight out of sm_estimate(); fall
-        # back to the vendor table only when it is unavailable.
-        sm = SM_ESTIMATE_FALLBACK.get(DEVICES[args.device]["vendor_id"],
-                                      DEVICES[args.device]["sm"])
+        # The preset's documented SM/CU count is authoritative here: the oracle
+        # is asked for the same count through VKOP_SM_ESTIMATE (see
+        # RoutingOracle.query), so this is also what the selector used.
+        sm = DEVICES[args.device]["sm"]
         metrics = analysis.run(args.decode_m)
         attach_occupancy(analysis, metrics)
         # Ask the oracle once for a trivial query so the reported sm is the

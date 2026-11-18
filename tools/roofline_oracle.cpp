@@ -199,6 +199,32 @@ void fill_preset(const std::string &name, DevicePreset &p) {
         p.traits.subgroup_size = 32;
         p.fp16_8x8x16 = true;
         p.i8_8x8x32 = true;
+    } else if (name == "amd-560x") {
+        // This box: AMD Radeon Pro 560X (Polaris 21) behind MoltenVK, from
+        // VKOP_DEVCAPS=1 -- vendor 0x1002, device 0x67ef, driver_id 14
+        // (MOLTENVK), coopmat no (and no fp16/int8 tile listed), subgroup
+        // arithmetic yes at subgroupSize 32, shader_float16 yes,
+        // storage_buffer_8bit yes, fp32 atomic add (global+shared) yes,
+        // subgroup_rotate yes, zero_init_wmem yes, integer_dot_product
+        // feature yes but packed_signed ACCELERATED no. Discrete GDDR5, so
+        // unified_memory is false. driver_id + vendor are what put this on
+        // the kMoltenVkAmd profile (byte_min_m 9, fp16_min_m 4, wide_n 65536,
+        // ks_target_blocks 32) instead of kGeneric.
+        p.name = "amd-560x";
+        p.traits.vendor_id = 0x1002;
+        p.traits.device_id = 0x67EF;
+        p.traits.driver_id = 14;  // VK_DRIVER_ID_MOLTENVK
+        p.traits.unified_memory = false;
+        p.traits.coopmat = false;
+        p.traits.subgroup_arithmetic = true;
+        p.traits.subgroup_size = 32;
+        p.traits.shader_float16 = true;
+        p.traits.storage_buffer_8bit = true;
+        p.traits.f32_global_atomic_add = true;
+        p.traits.f32_shared_atomic_add = true;
+        p.traits.subgroup_rotate = true;
+        p.traits.zero_init_wmem = true;
+        p.traits.integer_dot_product_packed = false;
     } else if (name == "nvidia-generic") {
         // A discrete NVIDIA part whose coopmat listing we do not assert: the
         // report then shows the non-coop routes, which is the conservative
