@@ -167,7 +167,10 @@ const int K_BLOCK = CK; // the device's SINT8 coopmat K
 const int NTHREADS = SG_M * SG_N * 32;
 const int BM = SG_M * M_BLOCK; // workgroup M footprint (one accumulator tile)
 const int BN = SG_N * N_BLOCK; // workgroup N footprint
-const int AMAX_LANES = NTHREADS / BM;
+// (An AMAX_LANES = NTHREADS/BM constant lived here. Phase 1 used to split the
+// block evenly across all BM rows, which at decode -- M = 1 -- handed the one
+// live row only that many threads. It now spreads the block over the rows that
+// actually exist, so the constant no longer describes anything.)
 #if ((SG_M * SG_N) != 8)
 #error "matmul_coop_i8: SG_M * SG_N must be 8 subgroups (256 threads)"
 #endif
@@ -275,17 +278,41 @@ void main() {
     }
     barrier();
     {
-        // AMAX_LANES threads cooperate on each of the BM rows; each walks
-        // every AMAX_LANES-th tap of K.
-        int h = int(tid) % BM;
-        int klane = int(tid) / BM; // 0..AMAX_LANES-1
-        int hg = m0 + h;
-        if (hg < M) {
-            float mx = 0.0;
-            for (int kk = klane; kk < K; kk += AMAX_LANES) {
-                mx = max(mx, abs(loadA_f16(a_base + hg * K + kk)));
+        // The workgroup covers BM rows, but the tensor only has M of them, and
+        // at decode M is 1 -- so distributing threads as (row = tid % BM,
+        // k-lane = tid / BM) left 248 of 256 threads with hg >= M and gave the
+        // single live row just AMAX_LANES = 8 threads, each walking K/8 = 640
+        // taps as one serial max chain.
+        //
+        // Instead, spread ALL threads over the rows that actually exist: every
+        // thread takes a flat index over (live row, k-lane) and walks K with a
+        // stride of that many lanes. At M=1 that is 256 lanes over one row
+        // (20 taps each at K=5120) instead of 8 (640 each) -- a 32x shorter
+        // dependency chain, and it costs nothing: no extra dispatch, no global
+        // memory, no barrier change. At M >= BM it degenerates to the original
+        // distribution.
+        //
+        // The per-row partial maxes still combine through shAmaxU, so the row
+        // index has to be a shAmaxU slot (0..BM-1); the flat split is over
+        // (hg, klane) pairs, not over BM.
+        //
+        // `lanes` rounds DOWN, so a thread's row never exceeds live_rows - 1.
+        // The at-most live_rows-1 surplus threads fall past the guard and
+        // contribute nothing, and no (row, k) pair is lost: klane covers
+        // [0, lanes) for every live row.
+        const int live_rows = min(BM, M - m0);
+        if (live_rows > 0) {
+            const int lanes = max(1, NTHREADS / live_rows);
+            const int h = int(tid) / lanes;
+            const int klane = int(tid) % lanes;
+            if (h < live_rows) {
+                const int hg = m0 + h;
+                float mx = 0.0;
+                for (int kk = klane; kk < K; kk += lanes) {
+                    mx = max(mx, abs(loadA_f16(a_base + hg * K + kk)));
+                }
+                atomicMax(shAmaxU[h], floatBitsToUint(mx));
             }
-            atomicMax(shAmaxU[h], floatBitsToUint(mx));
         }
     }
     barrier();
