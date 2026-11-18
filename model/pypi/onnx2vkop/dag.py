@@ -721,15 +721,20 @@ class DAGBasedModel:
 
         def add_entry(name, arr, offset, size, moe_group=None, moe_expert_id=-1,
                       moe_source=None, moe_source_offset=0, moe_source_size=0,
-                      moe_source_dtype=None, dtype=None):
+                      moe_source_dtype=None, dtype=None, dims=None):
             """One InitializerEntry side-table row for `name` at blob `offset`.
 
             `dtype` overrides the element type the loader is told to expect
             (see _init_dtype_name): a byte-format deferred weight keeps its
-            FLOAT tensor but its blob bytes are a 1-byte-per-value payload."""
+            FLOAT tensor but its blob bytes are a 1-byte-per-value payload.
+            `dims` does the same for the shape: KnWeightLayout stores the
+            payload as [K, N] while the tensor still describes the source file's
+            [N, K], and the loader allocates and addresses by what the ROW says.
+            The element count is identical, which is what keeps the payload
+            extent check meaningful."""
             name_off = builder.CreateString(name)
             dtype_off = builder.CreateString(_init_dtype_name(arr, dtype))
-            dims = list(arr.dims)
+            dims = list(arr.dims) if dims is None else list(dims)
             InitializerEntry.StartDimsVector(builder, len(dims))
             for d in reversed(dims):
                 builder.PrependUint32(int(d))
@@ -821,6 +826,12 @@ class DAGBasedModel:
             # group out to a whole 16-byte word.
             _qe = self.deferred_weights.get(name)
             _qdtype = _qe.get("data_type") if _qe and _qe.get("quant") else None
+            # A transposed payload's logical shape lives on the entry, not on
+            # the tensor (whose dims still describe the source file). The side
+            # table row -- and therefore the runtime's tensor -- takes the
+            # payload's.
+            _qdims = (_qe.get("dims")
+                      if _qe and _qe.get("transpose_payload") else None)
             _lm = _qe.get("lane_major") if _qe else None
             data_size = 0 if slot else _init_byte_len(arr, _qdtype)
             if _lm is not None and not slot:
@@ -850,7 +861,8 @@ class DAGBasedModel:
                           moe_source_size=src[2] if src else 0,
                           moe_source_dtype=_DATA_TYPE_MAP.get(src[3]) if src else None)
             else:
-                add_entry(name, arr, aligned_offset, data_size, dtype=_qdtype)
+                add_entry(name, arr, aligned_offset, data_size, dtype=_qdtype,
+                          dims=_qdims)
             entries.add(name)
 
         # --- Append the unified sub-region (if any) and record its base. ---

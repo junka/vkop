@@ -42,7 +42,13 @@ class WeightReader:
     def __init__(self, entry, name):
         self.entry = entry
         self.name = name
-        dims = list(entry["dims"])
+        # `dims` is the LOGICAL shape the side table records, which is what the
+        # kernel indexes: [N, K] for a transB=1 weight, and [K, N] once
+        # KnWeightLayout has flipped it. `src_dims` is how the SOURCE FILE is
+        # laid out, and it is what this reader seeks by; the two differ exactly
+        # when the payload is transposed on the way out. Defaulting to `dims`
+        # keeps every entry that was never flipped reading what it always did.
+        dims = list(entry.get("src_dims") or entry["dims"])
         if len(dims) != 2:
             raise ValueError(
                 f"'{name}': a byte-format weight must be 2-D, got {dims}")

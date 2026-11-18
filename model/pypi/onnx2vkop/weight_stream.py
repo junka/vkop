@@ -848,8 +848,18 @@ def _write_quantized(entry: dict, out_f, base_dir: str) -> int:
     straight pass: read a band, quantize it, write it. The band length is
     quant_payload.ROW_BLOCK rows, so a wide weight never materializes more than
     a few hundred MiB.
+
+    An entry carrying `transpose_payload` writes the same codes in the other
+    order: the source is the checkpoint's [N, K], the side table promises [K, N]
+    (see KnWeightLayout), and every code keeps its value and its scale index --
+    only the byte it lands on moves. The scale is per OUTPUT COLUMN either way,
+    which is why it is computed from the source (where those columns are rows)
+    and needs no second pass here.
     """
     from . import quant_payload
+
+    if entry.get("transpose_payload"):
+        return _write_quantized_transposed(entry, out_f, base_dir)
 
     reader = quant_payload.WeightReader(entry, entry["name"])
     # Which stored axis holds the output columns -- recorded by prepare while
@@ -869,6 +879,94 @@ def _write_quantized(entry: dict, out_f, base_dir: str) -> int:
         out_f.write(blob.tobytes())
         written += blob.size
     return written
+
+
+def _write_quantized_transposed(entry: dict, out_f, base_dir: str) -> int:
+    """Write a quantized [N, K] source as the [K, N] payload the side table says.
+
+    The source band is [rows, K] with `rows` consecutive output columns, so one
+    band fills a `rows`-byte slice of EVERY output row: for k in [0, K) the
+    codes of column n at row k land at `k * N + n`. Reading stays sequential
+    (one contiguous band), and each write is `rows` bytes -- 2 KiB at the
+    default ROW_BLOCK -- instead of the one byte a naive element write would
+    move.
+
+    The file is positioned by absolute offset rather than by seeking the
+    buffered writer per row: a 248320-column weight is ~10^6 row writes, and
+    alternating `seek`/`write` on a buffered stream flushes the buffer each
+    time. `os.pwrite` on the same descriptor leaves the stream's position where
+    this function puts it at the end, so the writer's next payload still lands
+    where its offsets were computed.
+    """
+    from . import quant_payload
+
+    reader = quant_payload.WeightReader(entry, entry["name"])
+    transposed = bool(entry.get("transposed"))
+    if not transposed:
+        raise DeferredWeightError(
+            f"deferred weight '{entry['name']}' asks for a transposed payload "
+            f"but its source is already [K, N]; only a [N, K] source can be "
+            f"reordered into the other layout")
+
+    scale = entry.get("scale_values")
+    if scale is None:
+        scale = quant_payload.scale_for(entry["quant"], reader, transposed)
+    codes = quant_payload.code_byte(entry["quant"], reader, scale, transposed)
+
+    src_n, src_k = reader.k, reader.n          # file layout: [N, K]
+    dst_k, dst_n = (int(d) for d in entry["dims"])
+    if (dst_k, dst_n) != (src_k, src_n):
+        raise DeferredWeightError(
+            f"deferred weight '{entry['name']}': the side table promises "
+            f"[{dst_k}, {dst_n}] but the source is [{src_n}, {src_k}]; a "
+            f"transposed payload must be the same matrix the other way round")
+
+    out_f.flush()
+    base = out_f.tell()
+    pwrite = _pwrite_for(out_f)
+    left = dst_n                       # output columns still to be written
+    done = 0
+    for offset, band in reader.bands():
+        rows = band.shape[0]
+        q = codes(offset, band)
+        if q.shape != (rows, src_k):
+            raise DeferredWeightError(
+                f"deferred weight '{entry['name']}': band {offset} quantized to "
+                f"{q.shape}, expected {(rows, src_k)}")
+        t = np.ascontiguousarray(q.T)  # [K, rows]
+        for k in range(src_k):
+            pwrite(out_f, t[k].tobytes(), base + k * dst_n + offset)
+        done += rows
+        left -= rows
+    if left:
+        raise DeferredWeightError(
+            f"deferred weight '{entry['name']}': source bands covered {done} of "
+            f"{dst_n} output columns")
+    out_f.seek(base + dst_n * dst_k)
+    return dst_n * dst_k
+
+
+def _pwrite_for(stream):
+    """A write-at-offset callable for `stream`, falling back to seek+write."""
+    fileno = getattr(stream, "fileno", None)
+    if fileno is not None and hasattr(os, "pwrite"):
+        try:
+            fd = fileno()
+        except (OSError, ValueError):
+            fd = None
+        if fd is not None:
+            def _at(stream, data, offset):
+                view = memoryview(data)
+                while view:
+                    n = os.pwrite(fd, view, offset)
+                    view = view[n:]
+                    offset += n
+            return _at
+
+    def _seek_write(stream, data, offset):
+        stream.seek(offset)
+        stream.write(data)
+    return _seek_write
 
 
 def verify_not_sidebar_located(slots, trailer_path: str) -> List[str]:
@@ -948,14 +1046,22 @@ def verify_deferred(deferred: Dict[str, dict], dag_model) -> None:
         # payload is a quarter the size and the two must never be compared.
         # What is checked here is that the source extent still matches what the
         # entry promised; the payload size is derived at write time, not stored.
+        #
+        # A transposed payload (KnWeightLayout) is the one pass allowed to
+        # change an entry's dims: it flips the LOGICAL shape to [K, N] while the
+        # source stays [N, K], and records the file's layout in `src_dims`.
+        # Checking against that is what keeps the promise ("the same bytes,
+        # read in the same order") exact rather than waived -- the element
+        # count it multiplies out to is still the numel `length` was sized for.
         quantized = e.get("quant") is not None
         got = payload_bytes(init, e.get("src_dtype") if quantized else None)
+        want_dims = tuple(e.get("src_dims") or e["dims"])
         if ((not quantized and init.data_type != e["data_type"])
-                or tuple(int(d) for d in init.dims) != e["dims"]
+                or tuple(int(d) for d in init.dims) != want_dims
                 or got != e["length"]):
             problems.append(
                 f"'{name}' changed while deferred: dtype {e['data_type']}->{init.data_type}, "
-                f"dims {list(e['dims'])}->{list(init.dims)}, "
+                f"dims {list(want_dims)}->{list(init.dims)}, "
                 f"bytes {e['length']}->{got if got >= 0 else 'n/a'}")
     if problems:
         raise DeferredWeightError(

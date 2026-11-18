@@ -1,7 +1,7 @@
 """Model optimization utilities."""
 
 import os
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple
 
@@ -9476,6 +9476,279 @@ class Quantizer:
         print(f"Converted {converted_count} tensors to nvfp4 weight-only")
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
+
+
+class KnWeightLayout:
+    """Store every byte-format MatMul weight as [K, N] and clear its transB.
+
+    # Why the runtime wants this
+
+    An ONNX export keeps a Linear's weight in the checkpoint layout, [OC, K],
+    and emits the transpose as a node. `fold_transpose_into_matmul` folds that
+    node into the MatMul as `transB=1` instead of materializing the transpose,
+    which is the right call for fp16 -- the tile stages the weight into shared
+    memory once per (m, n) block, so a transposed read costs little.
+
+    A *byte* weight's GEMV reads it once per output row out of L2/DRAM, so the
+    layout is the whole story. Under transB=1 the split-K kernel has a narrow
+    form: four columns per lane, and consecutive lanes `K` bytes apart, which
+    makes every warp touch 32 separate cache lines. Measaured on the 27B at
+    K=5120/N=10240 that is 33 GB/s on a 360 GB/s card. The same bytes as
+    [K, N] let the WIDE form read 16 consecutive columns per lane: 213 GB/s,
+    same kernel family, same instruction count otherwise.
+
+    So for a byte-format weight (int8 or fp8) whose consumers all ask for
+    transB=1, this pass rewrites the payload to [K, N] and sets transB=0. The
+    product is unchanged -- B[k][n] is the same number either way -- and every
+    scale entry keeps its output column.
+
+    # The decision is about the PRODUCT, not the source shape
+
+    "Does this need transposing?" is answered from the MatMul's own geometry,
+    never from "the first dim looks like OC":
+
+      1. A is [.., M, K]: K is A's last dim, which the runtime reads directly
+         (ops/Matmul.hpp) and which ONNX's own shape rule guarantees. If A's
+         last dim is not known (a symbolic/dynamic graph) the weight is left
+         alone -- there is nothing to check the result against.
+      2. B_operand is [.., N, K] under transB=1 and [.., K, N] under transB=0.
+         Under transB=0 the weight is already what this pass wants; it is
+         checked (B's first matrix dim == K) and left alone.
+      3. Under transB=1 the payload is [N, K] on disk. After the flip it is
+         [K, N], and the check that this is the right orientation is that the
+         *other* dim is the one the MatMul uses as N: `B_dims[-2]` is the
+         output-column count, which must match what the consumer computes.
+
+    That is what keeps the two shapes the 27B exports that look like neither
+    case straight: `(5120, 6144)` and `(5120, 17408)` feed MatMuls whose A is
+    `[.., 6144]` / `[.., 17408]`, so K is the last dim of the *weight* and the
+    graph already asks for transB=0. Rule 2 recognises them as [K, N] and the
+    pass leaves them alone -- a rule based on "transpose anything whose first
+    dim is bigger" would corrupt them.
+
+    # Scope
+
+    Only MatMul weights that reach their consumer as a 2-D B operand with
+    transB=1 -- the same gate `Quantizer._match_weight_only` uses, and for the
+    same reason: one initializer shared by two MatMuls with different transB has
+    no single layout. A weight with a non-constant producer, a batched B, a Conv
+    consumer, or a Gemm that survived lower_gemm_to_matmul is skipped. fp16 and
+    4-bit weights are not touched at all; their kernels have their own layouts
+    and their own gates.
+
+    # Where the bytes move
+
+    A deferred weight (the only way a 25 GB model converts at all) is
+    reordered by weight_stream._write_quantized_transposed on its way into the
+    trailer -- one band in RAM, the file positioned per row, peak RSS
+    unchanged. A hydrated weight is reordered in memory here, which is fine
+    because a model small enough to hold its weights is small enough to
+    transpose one of them.
+
+    Both paths quantize FIRST and transpose SECOND. That order is not a
+    preference: the scale is a per-output-column absmax, and in the source
+    [N, K] those columns are ROWS. Quantizing in the source layout lets the
+    existing `quant_payload._amax` reduce the axis it was already written for,
+    and every code keeps the scale of the column it belongs to. Transposing
+    first would leave the absmax to run over K (a 5120-entry table for a
+    10240-column weight), which is silent: the payload keeps its size, the
+    artifact loads, and every weight decodes with a scale from the wrong
+    direction.
+    """
+
+    # The element types whose kernels have a layout preference. Everything else
+    # (fp16, fp32, 4-bit) keeps whatever the export chose.
+    _BYTE_TYPES = (onnx.TensorProto.INT8, onnx.TensorProto.FLOAT8E4M3FN,
+                   onnx.TensorProto.FLOAT8E5M2)
+
+    @staticmethod
+    def is_byte_value_type(data_type) -> bool:
+        return data_type in KnWeightLayout._BYTE_TYPES
+
+    @staticmethod
+    def _activation_k(dag_model, node, producer):
+        """K as the MatMul sees it: the last dim of its A operand.
+
+        Returns None when A's shape is unknown (a symbolic dim the converter
+        could not resolve) -- the caller skips rather than guesses, because a
+        wrong K here is a silently transposed weight.
+        """
+        if not node.inputs:
+            return None
+        ref = node.inputs[0]
+        dims = list(ref.get("shape") or [])
+        if not dims:
+            # A node input may carry no shape when its producer is a graph
+            # input or an op whose value_info the parser could not find (see
+            # converter's "Input tensor not found" path). The producer's
+            # recorded output shape is the same fact from the other side.
+            src = producer.get(ref["name"])
+            if src is not None:
+                for out in src.outputs:
+                    if out.get("name") == ref["name"]:
+                        dims = list(out.get("shape") or [])
+                        break
+        if len(dims) < 2:
+            return None
+        k = int(dims[-1])
+        return k if k > 0 else None
+
+    @staticmethod
+    def classify(node, weight_name, weight_dims, activation_k):
+        """Should this weight be flipped? Returns (action, reason).
+
+        action is one of
+          "transpose"  -- payload is [N, K] and transB says so; flip it
+          "keep"       -- the weight is already [K, N] and transB agrees
+          "skip"       -- not this pass's business (unknown shape, not a plain
+                          2-D B operand, ...)
+
+        The decision reads the CONSUMER, never the source shape: the question
+        is "what matrix does this MatMul want", and only the MatMul can say.
+        `activation_k` is A's last dim (KnWeightLayout._activation_k), or None
+        when the graph does not pin it.
+        """
+        attrs = node.attributes or {}
+        tb = int(attrs.get("transB", 0) or 0)
+        if node.op_type != "MatMul":
+            # MatMul only. A Gemm that survives lower_gemm_to_matmul carries an
+            # alpha/beta/activation the MatMul lowering cannot express, and
+            # gemm.comp is a different kernel whose transB handling this pass
+            # has no measurement for. Every LLM Linear is a MatMul by this
+            # point, so the restriction costs nothing and keeps an untested
+            # code path untouched.
+            return "skip", "not a MatMul"
+        if len(node.inputs) < 2 or node.inputs[1]["name"] != weight_name:
+            return "skip", "not the B operand"
+        dims = [int(d) for d in weight_dims]
+        if len(dims) != 2:
+            return "skip", f"{dims} is not a plain 2-D matrix"
+        k = activation_k
+        if k is None:
+            return "skip", "A's K is not statically known"
+        if tb == 0:
+            # Already [K, N]; the transB=0 kernels index it that way. Confirm
+            # the orientation instead of trusting it: a [N, K] payload sitting
+            # under transB=0 would compute garbage, and no downstream check
+            # would notice.
+            if dims[0] != k:
+                return "skip", (f"transB=0 but {dims} does not have K={k} "
+                                f"leading; left as exported")
+            return "keep", f"already [K, N] ({dims[0]}x{dims[1]}, K={k})"
+        # transB=1: on disk the payload is [N, K], so its last dim is K.
+        if dims[1] != k:
+            return "skip", (f"transB=1 but {dims} does not have K={k} trailing; "
+                            f"left as exported")
+        return "transpose", f"[N, K]={dims} -> [K, N] with transB=0"
+
+    @staticmethod
+    def apply(dag_model, verbose=True) -> int:
+        """Flip every byte weight whose consumers all ask for transB=1.
+
+        Runs after the -q quantizers have fixed each weight's element type (it
+        keys on the payload dtype, which the quantizer is what sets) and before
+        the writer, which is where a deferred payload's bytes are produced.
+        """
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+        uses = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for i, inp in enumerate(n.inputs):
+                uses[inp["name"]].append((n, i))
+
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
+        flipped = 0
+        kept = 0
+        skipped = Counter()
+        for name, init in list(dag_model.initializers.items()):
+            dtype = init.data_type
+            entry = deferred.get(name)
+            if entry is not None and entry.get("quant"):
+                # A quantizing entry's payload type is the format's, not the
+                # tensor's -- the tensor still spells the float it came from.
+                dtype = entry.get("data_type", dtype)
+            if not KnWeightLayout.is_byte_value_type(dtype):
+                continue
+            readers = uses.get(name, [])
+            if not readers:
+                continue
+            ops = {n.op_type for n, _ in readers}
+            if not ops <= {"MatMul", "Gemm"}:
+                skipped[f"consumed by {sorted(ops - {'MatMul', 'Gemm'})}"] += 1
+                continue
+            if len(readers) != 1 or readers[0][1] != 1:
+                # One initializer read in several places (or from A) has no
+                # single B layout to choose.
+                skipped["shared or not the B operand"] += 1
+                continue
+            node = readers[0][0]
+            if node.attributes.get("down_act"):
+                skipped["SwiGLU fold (its own scale table ABI)"] += 1
+                continue
+            action, reason = KnWeightLayout.classify(
+                node, name, init.dims,
+                KnWeightLayout._activation_k(dag_model, node, producer))
+            if action == "skip":
+                skipped[reason] += 1
+                continue
+            if action == "keep":
+                kept += 1
+                continue
+
+            src_dims = [int(d) for d in init.dims]      # [N, K]
+            new_dims = [src_dims[1], src_dims[0]]       # [K, N]
+            if entry is not None and entry.get("quant"):
+                # Deferred: the bytes are produced by the writer. Record where
+                # the source is laid out and what the payload will be, and
+                # leave the tensor alone -- nothing may read its values.
+                if entry.get("transposed") is not True:
+                    skipped["deferred entry is not a [N, K] source"] += 1
+                    continue
+                entry["src_dims"] = tuple(src_dims)
+                entry["dims"] = tuple(new_dims)
+                entry["transpose_payload"] = True
+            elif entry is not None:
+                skipped["deferred pass-through (no quantizer ran)"] += 1
+                continue
+            else:
+                arr = numpy_helper.to_array(init)
+                if arr.ndim != 2 or arr.shape != tuple(src_dims):
+                    skipped["payload does not match its declared dims"] += 1
+                    continue
+                new_init = numpy_helper.from_array(
+                    np.ascontiguousarray(arr.T), name)
+                new_init.data_type = dtype
+                dag_model.initializers[name] = new_init
+            # transB=0 is the [K, N] form. Deleting the key rather than writing
+            # 0 keeps a weight that never had one (a direct export) identical
+            # to itself across a reconvert.
+            node.attributes.pop("transB", None)
+            KnWeightLayout._retag_input(dag_model, node, name, new_dims)
+            flipped += 1
+
+        if verbose:
+            print(f"[kn] {flipped} byte weight(s) rewritten as [K, N] with "
+                  f"transB=0; {kept} already [K, N]")
+            for reason, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
+                print(f"[kn]   {count} left as exported: {reason}")
+        return flipped
+
+    @staticmethod
+    def _retag_input(dag_model, node, name, dims):
+        """Update the shape the node records for the weight it reads.
+
+        The runtime reshapes each input to the shape its consumer recorded
+        (core/runtime.cpp's per-node reshape_view pre-pass), so a flipped
+        payload must be re-declared as [K, N] on every node that reads it. The
+        element count is unchanged, which is what reshape_view requires, and
+        the alternative -- leaving [N, K] on the node -- is a silent wrong
+        answer, not a cosmetic mismatch.
+        """
+        for inp in node.inputs:
+            if inp["name"] == name:
+                inp["shape"] = list(dims)
 
 
 class PreQuantizedWeights:

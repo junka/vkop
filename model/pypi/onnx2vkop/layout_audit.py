@@ -237,6 +237,26 @@ def _classify(bits: Optional[int], k: int, n: int, transposed: bool,
     return tuple(flags)
 
 
+def _payload_dims(dag_model, name, init):
+    """The dims the KERNEL will see for this weight, not the source's.
+
+    They differ for exactly one case: a deferred byte weight that
+    KnWeightLayout re-laid as [K, N] with transB=0. Its payload is reordered on
+    the way into the trailer, so the tensor still describes the source file
+    ([N, K]) while the runtime allocates and indexes [K, N]. Auditing the
+    source dims would report k and n swapped -- the exact opposite of what this
+    module exists to say -- and in `strict` mode could fail a conversion over a
+    layout the artifact does not actually have.
+
+    The element count is identical either way (it is a transpose), which is why
+    every extent check downstream still holds.
+    """
+    entry = (getattr(dag_model, "deferred_weights", {}) or {}).get(name)
+    if entry is not None and entry.get("transpose_payload"):
+        return tuple(int(d) for d in entry["dims"])
+    return tuple(int(d) for d in init.dims)
+
+
 def audit_layout(dag_model) -> LayoutAudit:
     """Walk every weight position and check the layout its consumer needs.
 
@@ -252,7 +272,7 @@ def audit_layout(dag_model) -> LayoutAudit:
             if init is None:
                 audit.skipped += 1
                 continue
-            dims = tuple(int(d) for d in init.dims)
+            dims = _payload_dims(dag_model, node.inputs[1]["name"], init)
             transposed = int((node.attributes or {}).get("transB", 0) or 0) != 0
             if len(dims) < 2:
                 # A rank-<2 B operand: the runtime rejects it (ops/Matmul.hpp:

@@ -28,6 +28,7 @@ try:
         FusionOptimizer,
         InitializerMerger,
         ONNXOptimizer,
+        KnWeightLayout,
         PreQuantizedWeights,
         Quantizer,
         RGBAConverter,
@@ -54,6 +55,7 @@ except ImportError:
         FusionOptimizer,
         InitializerMerger,
         ONNXOptimizer,
+        KnWeightLayout,
         PreQuantizedWeights,
         Quantizer,
         RGBAConverter,
@@ -1009,10 +1011,21 @@ class ModelConverter:
 
         numeric_audit.finish()
 
+        # Byte weights are re-laid as [K, N] with transB=0 here, so the runtime
+        # reaches the WIDE form of the split-K byte GEMV: 16 consecutive columns
+        # per lane instead of four columns a whole K row apart. Quantization has
+        # already fixed each weight's element type (this pass keys on the
+        # payload dtype), and nothing below reads a weight's values, so the
+        # payload can still be a deferred one whose bytes are produced at write
+        # time. KnWeightLayout explains the decision rule and why the transpose
+        # follows the quantize rather than preceding it.
+        KnWeightLayout.apply(dag_model)
+
         # Every consumer-driven weight layout is settled by now: the fusion
         # passes that fold a Transpose or a Q/DQ pair have re-pointed each
-        # consumer at its real weight, and quantization has fixed that weight's
-        # element size. Run the layout audit in this window -- RGBA below is the
+        # consumer at its real weight, quantization has fixed that weight's
+        # element size, and KnWeightLayout has chosen the byte weights' physical
+        # orientation. Run the layout audit in this window -- RGBA below is the
         # one remaining pass that rewrites a 4-D initializer's dims (into its
         # packed form), and an audit needs the logical rank.
         self._audit_weight_layouts(dag_model)
