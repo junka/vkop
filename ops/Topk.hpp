@@ -69,6 +69,7 @@ class Topk : public Operator {
         } else if (attributes.find("k") != attributes.end()) {
             para_.k = std::stol(attributes.at("k"));
         }
+        attr_k_ = para_.k;
 
         if (attributes.find("largest") != attributes.end()) {
             para_.largest = std::stol(attributes.at("largest"));
@@ -79,6 +80,7 @@ class Topk : public Operator {
         if (attributes.find("axis") != attributes.end()) {
             para_.axis = std::stol(attributes.at("axis"));
         }
+        attr_axis_ = para_.axis;
     }
 
   private:
@@ -99,6 +101,15 @@ class Topk : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
+        // execute() rewrites para_.k (rounded up to even for fp16) and
+        // para_.axis (renumbered for the flattened 2-D view) for the kernel.
+        // Restore the ONNX attribute values first: a registered post-process
+        // runs every Run(), and carrying the rewritten values into the next
+        // round made a rank-3 logits input throw ("rank 3, axis 1") and turned
+        // k=1 into k=2 with no row pad, so the last index read back was the
+        // runner-up of the last row instead of its argmax.
+        para_.k = attr_k_;
+        para_.axis = attr_axis_;
         auto inshape = inputs[0]->getShape();
         int rank = inputs[0]->num_dims();
         // RegisterPostProcess callers hand the op a rank-N tensor whose
@@ -210,10 +221,15 @@ class Topk : public Operator {
             using T = decltype(dummy);
             auto temp1 = core::as_tensor<T>(tempvalue1_);
             auto temp2 = core::as_tensor<T>(tempvalue2_);
-            if (temp1->size() == 0) {
+            // Size the scratch to THIS round's rows. Sizing it once on the
+            // first call let a later, taller input (a longer multi-turn
+            // prefill after a decode) write past the first round's buffers.
+            if (temp1->getShape() != outshape) {
                 temp1->resize(outshape);
                 temp2->resize(outshape);
                 tempindex1_->resize(outshape);
+            }
+            if (tempindex2_->getShape() != inshape) {
                 tempindex2_->resize(inshape);
             }
             tmpvalue1 = temp1->as_storage_buffer(m_dev_);
@@ -324,6 +340,8 @@ class Topk : public Operator {
     }
 
     topk::GpuTopkParam para_;
+    int attr_k_ = 1;
+    int attr_axis_ = -1;
     std::shared_ptr<core::ITensor> tempvalue1_;
     std::shared_ptr<core::ITensor> tempvalue2_;
     std::unique_ptr<core::Tensor<int>> tempindex1_;
