@@ -135,7 +135,7 @@ class PimplFacade : public Operator {
     bool did_alias_output_last_round() const override {
         return impl_->did_alias_output_last_round();
     }
-    void set_did_alias_output_last_round(bool v) {
+    void set_did_alias_output_last_round(bool v) override {
         impl_->set_did_alias_output_last_round(v);
     }
     // Same forwarding trap as recording_changes_per_round: the parameter SSBO
