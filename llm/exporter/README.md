@@ -634,7 +634,9 @@ python3 ../server/embed_table.py \
   --model ~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
   --out text_phi4/embed_tokens.bin            # 200064x3072 fp16
 # 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
-python3 check/phi4_check_onnx.py
+python3 check/check_onnx.py \
+  --model ~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
+  --onnx text_phi4/llm.onnx
 # 3) 转 vkopbin —— 多 GB 图不要加 -u（UnifiedMeta 的偏移是 int32，会溢出）
 python3 -m onnx2vkop.cli -i text_phi4/llm.onnx -o text_phi4/llm.vkopbin
 # 4) tokenizer bin（MODEL_DIR / OUTPUT_BIN 两个环境变量决定输入与产物）
@@ -685,7 +687,7 @@ python3 check/greedy_ref.py "用一个词回答：天空是什么颜色？"   # 
 HF generate = ONNX Runtime = vkop GPU = [72721, 4472, 788, 200020]  →  '蓝色。' + 轮末符
 ```
 
-`check/phi4_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3（fp16+CPU ORT 的
+`check/check_onnx.py`（Phi-4 那次）的数值口径：prefill logits 相对均值差 1.5e-3（fp16+CPU ORT 的
 累积舍入），32 层 present_key_values 全部 < 1.4e-3，decode 单步 argmax 一致，
 每轮 GPU 约 330ms/token。
 
@@ -706,7 +708,9 @@ python3 ../server/embed_table.py \
   --model ~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
   --out text_glm_edge/embed_tokens.bin          # 59264x2048 fp16, 243MB
 # 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
-python3 check/glm_edge_check_onnx.py
+python3 check/check_onnx.py \
+  --model ~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
+  --onnx text_glm_edge/llm.onnx
 # 3) 转 vkopbin —— 权重 2.94GB，同样不能加 -u（UnifiedMeta 偏移是 int32）
 python3 -m onnx2vkop.cli -i text_glm_edge/llm.onnx -o text_glm_edge/llm.vkopbin
 # 4) tokenizer bin
@@ -756,7 +760,7 @@ HF generate (fp16 与 bf16 同解) = ONNX Runtime = vkop GPU
 ```
 
 prompt 侧也逐 token 相同：13 个 id `[59253, 10, 551, …]`（GPU 侧用 `VKOP_CHATDBG=1`
-打印）。`check/glm_edge_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3、argmax
+打印）。`check/check_onnx.py`（GLM-Edge 那次）的数值口径：prefill logits 相对均值差 1.5e-3、argmax
 一致率 1.000，28 层 present_key_values 全部 < 1.7e-3，decode 单步 argmax 相同；
 GPU 上 prefill 约 90ms、decode 约 110ms/token。多轮：第二轮的历史是 37 个 token =
 第一轮 user 13 + assistant 正文 11 + 第二轮 user 13，正好是「丢掉末尾那个 `<|user|>`

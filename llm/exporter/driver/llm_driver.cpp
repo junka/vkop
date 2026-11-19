@@ -2,8 +2,8 @@
 // End-to-end driver for llm.vkopbin (Qwen3-VL-2B LLM, buffer backend).
 //
 // Loads the 3649-node model, fills the 35 prefill inputs from .npy files
-// dumped by llm/exporter/export/dump_llm_inputs.py, runs prefill, and compares the
-// logits output against reference_logits.npy (ONNX Runtime).
+// dumped by llm/exporter/export/dump_llm_decode.py (round0/), runs prefill, and
+// compares the logits output against reference_logits.npy (ONNX Runtime).
 //
 // Usage:
 //   llm_driver <model.vkopbin> <inputs_dump_dir>
@@ -560,7 +560,7 @@ int main(int argc, char** argv) {
 
         // Optional named-intermediate dump (VKOP_DUMP_TENSORS=comma list, or
         // "*" to dump every fp16 tensor). VKOP_DUMP_ROUND=<n> restricts to one
-        // round. Output matches prefill_ort_stats.py for line-by-line diff.
+        // round. Output matches ort_stats.py for line-by-line diff.
         if (const char *d = std::getenv("VKOP_DUMP_TENSORS")) {
             int dump_round = -1;
             if (const char *r = std::getenv("VKOP_DUMP_ROUND")) dump_round = std::atoi(r);

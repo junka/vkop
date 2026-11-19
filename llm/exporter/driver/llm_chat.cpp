@@ -1320,7 +1320,7 @@ int main(int argc, char** argv) {
         if (profile_mode) session_metrics.prefill_ms = prefill_chunk_ms;
 
         // Optional named-intermediate dump (mirrors llm_driver's VKOP_DUMP_TENSORS).
-        // "*" dumps every fp16 tensor. Output matches prefill_ort_stats.py
+        // "*" dumps every fp16 tensor. Output matches ort_stats.py
         // for line-by-line topological diff.
         if (const char *d = std::getenv("VKOP_DUMP_TENSORS")) {
             std::string s(d);
