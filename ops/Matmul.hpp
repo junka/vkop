@@ -2997,7 +2997,7 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
-                static_cast<int>(spv.second), use_uab, 0);
+                static_cast<int>(spv.second), use_uab, 0, pipeline_cache_);
             for (auto &ds : g.ds) {
                 ds = pipe->allocDescriptorSets();
             }
@@ -3090,7 +3090,7 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
-                static_cast<int>(spv.second), use_uab, 0);
+                static_cast<int>(spv.second), use_uab, 0, pipeline_cache_);
             for (auto &ds : coop_alt_.ds) {
                 ds = pipe->allocDescriptorSets();
             }
@@ -3270,7 +3270,7 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
-                static_cast<int>(spv.second), use_uab, 0);
+                static_cast<int>(spv.second), use_uab, 0, pipeline_cache_);
             for (int i = 0; i < vkop::kInflight; ++i) {
                 dp4a_ds_[i] = dp4a_pipeline_->allocDescriptorSets();
             }
@@ -3338,7 +3338,7 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), wide.first,
-                static_cast<int>(wide.second), use_uab, 0);
+                static_cast<int>(wide.second), use_uab, 0, pipeline_cache_);
             for (int i = 0; i < vkop::kInflight; i++) {
                 ds[i] = slot->allocDescriptorSets();
             }
@@ -3414,7 +3414,7 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
-                static_cast<int>(spv.second), use_uab, 0);
+                static_cast<int>(spv.second), use_uab, 0, pipeline_cache_);
             for (int i = 0; i < vkop::kInflight; ++i) {
                 ds[i] = cached->allocDescriptorSets();
             }
@@ -3486,7 +3486,7 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
-                static_cast<int>(spv.second), use_uab, 0);
+                static_cast<int>(spv.second), use_uab, 0, pipeline_cache_);
             for (int i = 0; i < vkop::kInflight; ++i) {
                 ds_slot[i] = slot->allocDescriptorSets();
             }
@@ -3963,7 +3963,7 @@ class MatMulBuffer : public BufferFactory {
                 sizeof(matmul::GpuMatMulParam),
                 reinterpret_cast<const uint32_t *>(spv.first),
                 static_cast<int>(spv.second), /*update_after_bind=*/false,
-                required_subgroup_size_, VK_NULL_HANDLE);
+                required_subgroup_size_, pipeline_cache_);
             v.ds = v.pipe->allocDescriptorSets();
             ensure_bda_table_buf();
             bind_table_descriptor(v.pipe.get(), v.ds);
@@ -4089,7 +4089,7 @@ class MatMulBuffer : public BufferFactory {
                 std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
                 static_cast<int>(spv.second), /*update_after_bind=*/false,
-                required_subgroup_size_, VK_NULL_HANDLE);
+                required_subgroup_size_, pipeline_cache_);
             ds_out = pipe->allocDescriptorSets();
             ensure_coop_bda_table_buf();
             bind_coop_table_descriptor(pipe.get(), ds_out);
@@ -4163,7 +4163,8 @@ class MatMulBuffer : public BufferFactory {
                 m_dev_->getLogicalDevice(),
                 std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv.first,
-                static_cast<int>(spv.second), /*update_after_bind=*/false, 0);
+                static_cast<int>(spv.second), /*update_after_bind=*/false, 0,
+                pipeline_cache_);
             ds_out = pipe->allocDescriptorSets();
             if (!down_act_bda_table_buf_) {
                 down_act_bda_table_buf_ = std::make_shared<VulkanBuffer>(

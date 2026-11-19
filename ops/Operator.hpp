@@ -127,6 +127,13 @@ class Operator {
                        VkPipelineCache cache = VK_NULL_HANDLE) {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
+        // Kept for the pipelines an op builds lazily on its first dispatch of
+        // a new shape (MatMul's split-K / SwiGLU-fold / WIDE modules). Built
+        // without it, every MatMul instance re-ran MoltenVK's SPIR-V -> MSL
+        // conversion for the same module: 317 creates, ~725 ms of the first
+        // prefill on Qwen3-VL-2B. Through the runtime's cache the conversion
+        // is shared by key, and persisted with VK_PIPELINE_CACHE=1.
+        pipeline_cache_ = cache;
         // Nothing supplied this op's shader yet: Runtime swaps archive bytes in
         // via override_spv() before calling this for ops it builds from a model
         // file, and ops built straight through create_from_type() (unit-test
@@ -487,6 +494,7 @@ class Operator {
     }
 
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     static std::shared_ptr<VulkanBufferView> dummy_bufferview_;
     static std::atomic<int> instance_count_;
     static std::atomic<long>

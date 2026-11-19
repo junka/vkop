@@ -166,6 +166,18 @@ size_t g_pcache_initial_bytes = 0;
 void Runtime::LoadPipelineCache() {
     const char *env = std::getenv("VK_PIPELINE_CACHE");
     if (!env || env[0] != '1') {
+        // No on-disk cache, but still hand every op an in-process one: ops
+        // that build the same module many times (each MatMul instance builds
+        // its own split-K / fold pipelines) then share the driver-side
+        // compile instead of repeating it. On MoltenVK that is the SPIR-V ->
+        // MSL conversion + Metal compile, ~2 ms per pipeline. Not saved.
+        auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
+        VkPipelineCacheCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        if (vkCreatePipelineCache(device, &ci, nullptr, &pipeline_cache_) !=
+            VK_SUCCESS) {
+            pipeline_cache_ = VK_NULL_HANDLE;
+        }
         return;
     }
     pipeline_cache_enabled_ = true;
