@@ -654,5 +654,123 @@ TEST(QuantizeLinearTest, PerAxisScaleThrows) {
                           "scale[0]";
 }
 
+// ---- scale/zero_point caching on a read-only leaf ------------------------
+//
+// The op reads its per-tensor scale (and zero_point) through copyToCPU. A
+// read-only leaf's bytes cannot change for the model's lifetime, so the op
+// caches them after the first execute and skips the copy on every later round.
+// That matters far beyond the saved copy: in graph mode copyToCPU fires
+// pre_readback_hook, which CLOSES AND SUBMITS the segment being recorded, so a
+// per-round readback forces a segment boundary and stops segment replay for the
+// rest of the round. Measured on a 40-layer Qwen3.5 int8 artifact carrying 161
+// --w8a8 QuantizeLinear nodes: 322 readback boundaries and 323 segments per
+// round (vs 18 with the cache), 1285 ms of the round's 1601 ms inside this op,
+// decode 300 -> 1700 ms/token.
+//
+// Two things have to hold for that to be correct AND to actually replay:
+//   1. the cached value equals what a fresh read would produce (asserted here
+//      by mutating the source tensor's GPU bytes and expecting the OUTPUT to
+//      ignore them -- while a non-leaf source must honour them);
+//   2. did_host_work_last_round() must be FALSE on the cached rounds, or the
+//      segment is classified dynamic and re-records anyway.
+TEST(QuantizeLinearTest, ReadOnlyLeafScaleIsCachedButNonLeafIsReread) {
+    const int n = 8;
+    auto dev = TestEnv::get_device();
+    auto cmdpool = TestEnv::get_command_pool();
+
+    auto build_op = [&]() {
+        auto op = ops::create_from_type(ops::OpType::QUANTIZE_LINEAR, 0, 0, true);
+        op->set_runtime_device(dev, cmdpool);
+        return op;
+    };
+    auto upload = [&](auto t) {
+        t->as_storage_buffer(dev);
+        t->copyToGPU(cmdpool);
+    };
+    auto run_once = [&](const std::unique_ptr<vkop::ops::Operator> &op,
+                        const std::shared_ptr<vkop::core::ITensor> &scale_t,
+                        const std::shared_ptr<vkop::core::ITensor> &in_t,
+                        const std::shared_ptr<vkop::core::ITensor> &out_t) {
+        op->onExecute({in_t, scale_t, nullptr}, {out_t}, 0);
+        auto cmd = op->get_record();
+        std::vector<VkSubmitInfo> info{cmd->buildSubmitInfo()};
+        vkop::VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
+        cmd->wait();
+        dev->wait_all_done();
+        as_tensor<int8_t>(out_t)->copyToCPU(cmdpool);
+    };
+
+    // Input values chosen so scale=1.0 and scale=0.5 give different bytes.
+    auto vals = torch::tensor({1.0f, 2.0f, 3.0f, 4.0f, -1.0f, -2.0f, -3.0f,
+                               -4.0f})
+                    .to(torch::kFloat16);
+
+    // Scale 1.0, then 0.5. With scale=1.0 an input of 3.0 encodes to byte 3;
+    // with scale=0.5 it encodes to 6. So the two output byte vectors differ,
+    // which is what makes the "did it re-read?" question observable.
+    auto in_t = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    in_t->fillToCPU(ql_fp16_bits(vals));
+    upload(in_t);
+    auto out_t = std::make_shared<Tensor<int8_t>>(std::vector<int>{n}, true);
+    out_t->set_elem_kind(vkop::core::ElemKind::kInt8);
+
+    // The scale tensor is kept by its concrete type: copyToGPU is a Tensor<T>
+    // method, and the op only ever sees the ITensor facade.
+    auto make_scale = [&](float s, bool leaf) {
+        auto t = std::make_shared<Tensor<float>>(std::vector<int>{1});
+        t->fillToCPU(std::vector<float>{s});
+        if (leaf) t->set_read_only_leaf();
+        t->as_storage_buffer(dev);
+        t->copyToGPU(cmdpool);
+        return t;
+    };
+    // Rewrite the scale's GPU bytes behind the op's back, so the next execute
+    // either notices (a re-read) or does not (a cache hit).
+    auto rewrite_scale = [&](const std::shared_ptr<Tensor<float>> &t, float s) {
+        t->fillToCPU(std::vector<float>{s});
+        t->copyToGPU(cmdpool);
+        dev->wait_all_done();
+    };
+
+    // --- leaf: first round reads, every later round must use the cache ------
+    {
+        auto op = build_op();
+        auto scale_t = make_scale(1.0f, /*leaf=*/true);
+        run_once(op, scale_t, in_t, out_t);
+        const int8_t first = (*as_tensor<int8_t>(out_t))[2];  // 3.0 / 1.0 = 3
+        EXPECT_EQ(first, 3);
+        EXPECT_TRUE(op->did_host_work_last_round())
+            << "the first round really does read the scalar";
+
+        // Change the GPU bytes WITHOUT telling the op. A cached leaf must not
+        // notice; a re-reading one would encode 3.0/0.5 = 6.
+        rewrite_scale(scale_t, 0.5f);
+        run_once(op, scale_t, in_t, out_t);
+        EXPECT_EQ((*as_tensor<int8_t>(out_t))[2], 3)
+            << "a read-only leaf's scalar is constant by construction, so the "
+               "cache is correct";
+        EXPECT_FALSE(op->did_host_work_last_round())
+            << "a round that read nothing must report no host work, or the "
+               "segment is classified dynamic and re-records every round -- "
+               "which is the bug this cache exists to fix";
+    }
+
+    // --- non-leaf: a graph-value scale can change, so it must re-read -------
+    {
+        auto op = build_op();
+        auto scale_t = make_scale(1.0f, /*leaf=*/false);
+        run_once(op, scale_t, in_t, out_t);
+        EXPECT_EQ((*as_tensor<int8_t>(out_t))[2], 3);
+
+        rewrite_scale(scale_t, 0.5f);
+        run_once(op, scale_t, in_t, out_t);
+        EXPECT_EQ((*as_tensor<int8_t>(out_t))[2], 6)
+            << "a scale that is a graph value CAN change between rounds; "
+               "caching it would apply a stale scale";
+        EXPECT_TRUE(op->did_host_work_last_round())
+            << "the re-read round must report host work";
+    }
+}
+
 } // namespace
 

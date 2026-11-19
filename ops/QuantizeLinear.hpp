@@ -113,13 +113,18 @@ class QuantizeLinear : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Host work here is the scale/zero-point scalar readback (the LLM's
-        // fp8 KV DQ reads cache_scale every round); the payload copy itself
-        // is a GPU dispatch. Conservative: report true whenever a scalar is
-        // present, regardless of dtype.
-        set_did_host_work_last_round(inputs.size() >= 2);
-        if (inputs.empty() || outputs.empty())
+        // Host work is the scale/zero-point scalar readback the push constant
+        // needs. It happens at most ONCE per scalar when that scalar is a
+        // read-only leaf (a converter-emitted initializer, which is every
+        // use site this op has: the fp8 KV cache's constant scale and the
+        // --w8a8 activation scale); see the caching block below for why a
+        // per-round copy is both wasteful and replay-hostile. Report the flag
+        // from where the read actually happens, not here, so the cached rounds
+        // can be replayed.
+        if (inputs.empty() || outputs.empty()) {
+            set_did_host_work_last_round(false);
             return;
+        }
 
         auto shape = inputs[0]->getShape();
         int total = total_elems(shape);
@@ -187,10 +192,32 @@ class QuantizeLinear : public BufferFactory {
         // scale and silently fall back to scale=1.0 — a latent bug that breaks
         // every weight in an ORT-quantized fp16 model. So read the scalar
         // across float elem kinds.
+        //
+        // CACHE. A read-only leaf's bytes cannot change for the model's
+        // lifetime (see Tensor::is_read_only_leaf — the loader sets it on every
+        // initializer), so the scalar is read once and kept. Without this the
+        // copyToCPU below runs EVERY round, and in graph mode that is not just
+        // one wasted copy: pre_readback_hook closes and submits the segment
+        // being recorded, so each such op forces a segment boundary and
+        // destroys segment replay for the rest of the round. Measured on a
+        // 40-layer Qwen3.5 int8 artifact with 161 --w8a8 QuantizeLinear nodes:
+        // 322 readback boundaries, 323 segments (vs 15 with none), 1285 ms of
+        // the round's 1601 ms inside this op, decode 300 -> 1700 ms/token.
+        //
+        // Only the leaf case is cached. A scale that is a graph value can be
+        // overwritten between rounds, and re-reading it is the correct
+        // behaviour there; the flag is therefore reported per round from what
+        // actually happened, which is also what lets the cached rounds replay.
+        const bool scalar_is_leaf =
+            inputs.size() >= 2 && inputs[1] && inputs[1]->is_read_only_leaf();
+        bool read_scale_this_round = false;
         float scale = 1.0f;
-        if (inputs.size() >= 2 && inputs[1]) {
+        if (scalar_is_leaf && scale_cached_) {
+            scale = scale_cache_;
+        } else if (inputs.size() >= 2 && inputs[1]) {
             const auto s_kind = inputs[1]->elem_kind();
             if (core::is_float_elem(s_kind) && inputs[1]->size() > 0) {
+                read_scale_this_round = true;
                 if (s_kind == core::ElemKind::kFloat32) {
                     auto s = core::as_tensor<float>(inputs[1]);
                     if (s) {
@@ -229,13 +256,26 @@ class QuantizeLinear : public BufferFactory {
         }
         if (scale == 0.0f)
             scale = 1.0f; // a zero scale is meaningless; guard
+        if (scalar_is_leaf && !scale_cached_) {
+            scale_cache_ = scale;
+            scale_cached_ = true;
+        }
 
         // Per-tensor zero_point from inputs[2]. fp8 has none (stays 0);
-        // int8/uint8 read one byte and reinterpret per format.
+        // int8/uint8 read one byte and reinterpret per format. Cached on the
+        // same terms as the scale above (a read-only leaf cannot change), and
+        // it is a byte leaf here so the copyToCPU is the same kind of forced
+        // segment boundary.
+        const bool zp_is_leaf =
+            inputs.size() >= 3 && inputs[2] && inputs[2]->is_read_only_leaf();
+        bool read_zp_this_round = false;
         int zp = 0;
-        if (inputs.size() >= 3 && inputs[2]) {
+        if (zp_is_leaf && zp_cached_) {
+            zp = zp_cache_;
+        } else if (inputs.size() >= 3 && inputs[2]) {
             auto z = core::as_tensor<int8_t>(inputs[2]);
             if (z && z->num_elements() > 0) {
+                read_zp_this_round = true;
                 z->copyToCPU(m_cmdpool_);
                 const int8_t raw = (*z)[0];
                 zp = (q_kind == core::ElemKind::kUint8)
@@ -243,6 +283,17 @@ class QuantizeLinear : public BufferFactory {
                          : int(raw);
             }
         }
+        if (zp_is_leaf && !zp_cached_) {
+            zp_cache_ = zp;
+            zp_cached_ = true;
+        }
+
+        // The push constant is fully determined by these two scalars plus the
+        // tensors' dtypes/shapes, and the shapes are re-viewed by the runtime's
+        // per-level pre-pass, so a round that read neither scalar has nothing
+        // in the recording that went stale -- it can replay.
+        set_did_host_work_last_round(read_scale_this_round ||
+                                     read_zp_this_round);
 
         // The float side's dtype (fp16 vs fp32). For quantize it is the input;
         // for dequant the output. uint16_t container == fp16, float == fp32.
@@ -316,6 +367,14 @@ class QuantizeLinear : public BufferFactory {
         }
         submit(&pc, groups, 1, 1);
     }
+
+    // Cached per-tensor scalars, valid only when the corresponding input is a
+    // read-only leaf (see execute()). One instance per node, so the cache is
+    // per-node and a graph with 161 of these holds 161 floats.
+    bool scale_cached_ = false;
+    bool zp_cached_ = false;
+    float scale_cache_ = 1.0f;
+    int zp_cache_ = 0;
 };
 
 } // namespace ops
