@@ -538,18 +538,16 @@ bool ksplit_w8_wide_applies(const Ctx &c) {
 }
 
 bool fp16_wide_ok(const Ctx &c) {
-    // A 4-bit weight must not reach this route. The WIDE entry builds from the
-    // same source but as a separate -DW8_WIDE module whose main() has no
-    // uPC.w4 branch: it calls matmul16_ksplit_wide directly, which reads B with
-    // unpackHalf2x16. Handed packed nibbles it reads the right number of bytes
-    // into the wrong shape of value, so nothing fails and the output is
-    // garbage. The plain ksplit entry is the safe one (its main() tests
-    // uPC.w4 first and calls matmul16_w4_ksplit), which is why the exclusion
-    // lives here and not on ksplit_ok.
+    // The WIDE route now serves 4-bit as well, through the uPC.w4 branch added
+    // to that module's main(). It is the faster shape for a nibble-packed
+    // weight: one uint32 holds the lane's whole eight-column octet at one k,
+    // where the plain w4 kernel reads 4 columns over 2 k. Measured from
+    // compiled SPIR-V: 4.30 ops/MAC against 8.00.
     //
-    // This surfaced on the first int4 decode: prefill's batch*m > 8 kept
-    // ksplit_ok false and the shape landed on quad4, so only decode took this
-    // route -- and the model emitted ",,,,,".
+    // 4-bit has its own row (kKsplitW4Wide) and its own kernel
+    // (matmul16_w4_ksplit_wide) in the same -DW8_WIDE module. It must not fall
+    // into this one: matmul16_ksplit_wide reads B with unpackHalf2x16, which
+    // turns packed nibbles into plausible-looking garbage.
     return c.ksplit_ok && !c.weight_4bit && !c.wide_disabled &&
            !c.weight_byte && (c.s->n % 8 == 0) &&
            (c.wide_forced || c.s->n >= c.wide_thr_fp16);
@@ -560,6 +558,21 @@ bool ksplit_wide512_applies(const Ctx &c) {
 }
 
 bool ksplit_wide_applies(const Ctx &c) { return fp16_wide_ok(c); }
+
+// The 4-bit WIDE GEMV, split out of fp16_wide_ok above. Three things differ:
+// the weight is nibble-packed, the kernel is matmul16_w4_ksplit_wide in the
+// same -DW8_WIDE module, and its launch is eight columns per lane (so the host
+// dispatches UP_DIV(n/8, q) rather than the int8 WIDE kernels' 16).
+//
+// Group size must be set: the kernel scales once per group boundary, and a
+// zero group would divide by zero in its ngroups computation.
+bool ksplit_w4_wide_applies(const Ctx &c) {
+    const MatmulFeatures &f = *c.f;
+    return c.weight_4bit && c.ksplit_ok && !c.wide_disabled &&
+           !c.weight_byte && (c.s->n % 8) == 0 && f.group_size > 0 &&
+           (c.s->k % f.group_size) == 0 &&
+           (c.wide_forced || c.s->n >= c.wide_thr_fp16);
+}
 
 bool ksplit_512_applies(const Ctx &c) {
     return c.ksplit_ok && c.ks512 && c.av->ksplit512;
@@ -733,6 +746,12 @@ const MatmulRule kMatmulRules[] = {
      ksplit_w8_wide512_applies, q_byte_wide},
     {MatmulRoute::kKsplitW8Wide, "ksplit_w8wide", ksplit_w8_wide_applies,
      q_byte_wide},
+    // 4-bit WIDE, ahead of the fp16 WIDE row: both build from the -DW8_WIDE
+    // module and both use an 8-column launch, so the 4-bit predicate has to be
+    // reached first. fp16_wide_ok excludes weight_4bit, which keeps the two
+    // from overlapping either way.
+    {MatmulRoute::kKsplitW4Wide, "ksplit_w4wide", ksplit_w4_wide_applies,
+     q_fp16_wide},
     {MatmulRoute::kKsplitWide512, "ksplit_wide512", ksplit_wide512_applies,
      q_fp16_wide},
     {MatmulRoute::kKsplitWide, "ksplit_wide", ksplit_wide_applies, q_fp16_wide},
@@ -1059,6 +1078,8 @@ const char *matmul_route_tag(MatmulRoute route) {
         return "ksplit512";
     case MatmulRoute::kKsplitWide:
         return "ksplit_wide";
+    case MatmulRoute::kKsplitW4Wide:
+        return "ksplit_w4wide";
     case MatmulRoute::kKsplitWide512:
         return "ksplit_wide512";
     case MatmulRoute::kKsplitW8Wide:

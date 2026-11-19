@@ -466,8 +466,22 @@ void test_other_routes() {
     // count, garbage values, no error. This is the decode path that made the
     // first int4 27B run emit ",,,,," -- the narrow case above passed while
     // every real shape (n >= 10240) went wide.
-    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 10240, 5120), f, av), kKsplit);
-    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 248320, 5120), f, av), kKsplit);
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 5120, 10240), f, av), kKsplit);
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 5120, 248320), f, av), kKsplit);
+
+    // With a group size recorded (every real int4 weight has one) a wide 4-bit
+    // shape takes kKsplitW4Wide instead: the 8-column nibble kernel in the
+    // -DW8_WIDE module, launched UP_DIV(n/8, q). The cases above stay on
+    // kKsplit only because the fixture leaves group_size at 0, which that
+    // kernel's per-group scale walk cannot use.
+    f.group_size = 64;
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 5120, 10240), f, av),
+                kKsplitW4Wide);
+    // Below the wide threshold the narrow kernel still wins.
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 512, 512), f, av), kKsplit);
+    // A K that is not a whole number of groups would leave the scale walk
+    // scaling a partial group, so the predicate refuses it. 5152 = 80*64 + 32.
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1, 5152, 10240), f, av), kKsplit);
 }
 
 void test_fallthrough_bits() {

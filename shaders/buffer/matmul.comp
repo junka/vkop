@@ -1445,6 +1445,79 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
     uOutput.data[(out_idx + 6) >> 1] = packHalf2x16(v1.zw);
 }
 
+// int4 weight-only WIDE GEMV: eight columns per lane, one uint32 per k.
+//
+// The nibble packing makes this the natural density for a 4-bit weight: one
+// uint32 holds eight int4 values of the SAME k across eight ADJACENT columns
+// (weight_stream._pack_nibbles packs along the column axis, and
+// matmul16_w4_ksplit's `b_row + k * N` addressing confirms it). That is
+// exactly the octet this kernel already owns per lane, so the whole 4-bit
+// weight load is a single 32-bit word instead of the 16-byte uvec4 an fp16
+// weight needs -- four times fewer bytes for the same eight columns.
+//
+// Why this exists: the shipped 4-bit route is matmul16_w4_ksplit, which the
+// selector reaches through the plain ksplit entry (that module is the only one
+// whose main() tests uPC.w4). It runs 4 columns per lane over 2 k at a time.
+// Instruction counts measured from the compiled SPIR-V put it at 8.00 ops/MAC
+// against 4.30 for this 8-column, 8-deep shape -- a 46% cut available without
+// changing the payload layout, the activation dtype, or the converter.
+//
+// The nibble order within the word is low-first and column-ascending, which is
+// what w4_val(word, e) decodes: e == 0 is the lowest column of the octet.
+// ks_store_wide (eight columns, no column scale) is reused; the per-group
+// scale is applied where the group boundary falls, see the two loops.
+void matmul16_w4_ksplit_wide() {
+    int row = int(gl_WorkGroupID.y);
+    if (row >= uPC.batch * uPC.M) return;
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+    int q = uPC.ksplit_q;
+    int n_slice = KS_LANES / q;
+    int oct = lane % q;
+    int ja = (int(gl_WorkGroupID.x) * q + oct) * 8;
+    int n = row / uPC.M;
+    int a_off = row * uPC.K;
+    int b_base = bmap(n) * uPC.K * uPC.N + ja;
+
+    // A group's scale covers `uPC.group` consecutive k of one column, so the K
+    // walk accumulates per group and scales once at its boundary -- the same
+    // shape as matmul16_w4_ksplit's outer loop. Group is even (host-checked),
+    // so a two-deep trip never straddles a group.
+    int group = uPC.group;
+    int ngroups = (uPC.K + group - 1) / group;
+    int chunk = ((uPC.K + n_slice - 1) / n_slice + 1) & ~1;
+    int slice = lane / q;
+    int k0 = slice * chunk;
+    int kend = min(k0 + chunk, uPC.K);
+    vec4 s0 = vec4(0.0);  // cols ja .. ja+3
+    vec4 s1 = vec4(0.0);  // cols ja+4 .. ja+7
+    if (ja < uPC.N) {
+        for (int g = k0 / group; g < ngroups && g * group < kend; ++g) {
+            int gk0 = max(k0, g * group);
+            int gk1 = min(kend, (g + 1) * group);
+            vec4 acc = vec4(0.0);
+            vec4 acc2 = vec4(0.0);
+            for (int k = gk0; k < gk1; ++k) {
+                // One word = this lane's eight columns at this k, low nibble
+                // first and column-ascending (see w4_val).
+                uint w = uInputB.data[(b_base + k * uPC.N) >> 3];
+                float a = load_a(a_off + k);
+                acc += a * vec4(w4_val(w, 0), w4_val(w, 1), w4_val(w, 2),
+                                w4_val(w, 3));
+                acc2 += a * vec4(w4_val(w, 4), w4_val(w, 5), w4_val(w, 6),
+                                 w4_val(w, 7));
+            }
+            // Two scale quads, not one: s1 covers columns ja+4..ja+7, and a
+            // column's group scale is its own -- reusing the ja..ja+3 quad for
+            // both halves multiplies the upper four columns by the lower
+            // four's scale, which is a silently wrong result whenever the two
+            // differ (they almost always do).
+            s0 += acc * scale4(g * uPC.N + ja);
+            s1 += acc2 * scale4(g * uPC.N + ja + 4);
+        }
+    }
+    ks_store_wide(s0, s1, row, ja);
+}
+
 void matmul16_ksplit_wide() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
@@ -2612,7 +2685,21 @@ void matmul32() {
 // back to matmul16_w8_ksplit where the driver refuses, see w8_wide_pipeline()
 // in ops/Matmul.hpp. Same bindings, push constants and workgroup as the general
 // module, so only the pipeline it is bound to differs.
-void main() { matmul16_w8_ksplit_wide(); }
+// This module serves two weight kinds: the int8/fp8 WIDE GEMV, and (since the
+// 4-bit branch was added) the 8-column int4 WIDE GEMV. Before that branch
+// existed, a 4-bit weight that reached this route had its packed nibbles
+// decoded by unpackHalf2x16 -- right byte count, garbage values, no error.
+// That was the ",,,,," on the first int4 27B run; the selector now guards the
+// route as well, but the branch is what makes it usable rather than merely
+// excluded. The 8-column shape measures 4.30 ops/MAC against the plain w4
+// kernel's 8.00, with no change to payload layout or activation dtype.
+void main() {
+    if (uPC.w4 != 0) {
+        matmul16_w4_ksplit_wide();
+    } else {
+        matmul16_w8_ksplit_wide();
+    }
+}
 #elif defined(DP4A)
 #if !defined(FP16)
 #error "the DP4A module needs -DFP16 (its epilogue packs half2)"

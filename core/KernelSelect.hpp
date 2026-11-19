@@ -170,6 +170,15 @@ enum class MatmulRoute {
     kKsplit512,
     kKsplitWide,
     kKsplitWide512,
+    // 4-bit weight, eight columns per lane: one uint32 per k holds the lane's
+    // whole octet, so the weight load is a quarter of the fp16 WIDE form's
+    // bytes for the same column count. A separate route rather than a flag on
+    // kKsplitWide because the launch geometry differs (8 columns per lane vs
+    // the int8 WIDE kernels' 16) and the pipeline must be the -DW8_WIDE
+    // module: the general module has no such kernel, and routing 4-bit there
+    // silently ran the 4-column matmul16_w4_ksplit with a quarter of the
+    // needed grid.
+    kKsplitW4Wide,
     kKsplitW8Wide,
     kKsplitW8Wide512,
     // int8 x int8 split-K GEMV whose inner loop is the packed 4x8 integer dot
@@ -256,6 +265,11 @@ struct MatmulAvailability {
     bool ksplit512 = false;
     bool w8_wide = false;
     bool w8_wide512 = false;
+    // The -DW8_WIDE module built and was accepted by the driver. The 4-bit
+    // WIDE GEMV lives in that same module (its main() dispatches on uPC.w4),
+    // so w8_wide covers it -- kept separate anyway so a future split of the
+    // module does not silently disable one of the two.
+    bool w4_wide = false;
     // The DP4A module probed and built (op side). Its route ALSO needs
     // DeviceTraits::integer_dot_product_packed, because the pipeline cannot
     // even be created without the feature.

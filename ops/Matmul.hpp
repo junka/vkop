@@ -1214,6 +1214,7 @@ class MatMulBuffer : public BufferFactory {
         sel_av.coopmat_i8 = coop_i8_pipeline_ != nullptr;
         sel_av.ksplit512 = true;
         sel_av.w8_wide = true;
+        sel_av.w4_wide = true;
         sel_av.w8_wide512 = true;
         sel_av.tile_ks_split = true;
         sel_av.tile_ks_fold = true;
@@ -1238,6 +1239,20 @@ class MatMulBuffer : public BufferFactory {
         for (int attempt = 0; attempt < 8; ++attempt) {
             bool retry = false;
             switch (plan.route) {
+            case core::MatmulRoute::kKsplitW4Wide:
+                // Same module as the int8 WIDE GEMV; the shader's main()
+                // dispatches on uPC.w4. Resolving it here (rather than at the
+                // dispatch site) keeps the availability withdrawal in one
+                // place: a missing key or a driver refusal drops w4_wide and
+                // re-runs the table, which lands on the plain 4-column w4
+                // kernel rather than this route's 8-column grid.
+                sel_wide = w8_wide_pipeline();
+                if (sel_wide == nullptr) {
+                    sel_av.w4_wide = false;
+                    sel_av.w8_wide = false;
+                    retry = true;
+                }
+                break;
             case core::MatmulRoute::kKsplitW8Wide512:
                 sel_wide = w8_wide_pipeline();
                 if (sel_wide == nullptr) {
@@ -1364,6 +1379,7 @@ class MatMulBuffer : public BufferFactory {
             plan.route == core::MatmulRoute::kKsplit ||
             plan.route == core::MatmulRoute::kKsplit512 ||
             plan.route == core::MatmulRoute::kKsplitWide ||
+            plan.route == core::MatmulRoute::kKsplitW4Wide ||
             plan.route == core::MatmulRoute::kKsplitWide512 ||
             plan.route == core::MatmulRoute::kKsplitW8Wide ||
             plan.route == core::MatmulRoute::kKsplitW8Wide512;
@@ -2582,6 +2598,26 @@ class MatMulBuffer : public BufferFactory {
                 dispatch_on(sel_ks512, ksplit512_ds_[m_id_],
                             UP_DIV(n / 4, q), batch * m);
                 return;
+            case core::MatmulRoute::kKsplitW4Wide: {
+                // 4-bit weight, eight columns per lane. The kernel lives in the
+                // same -DW8_WIDE module as the int8 WIDE GEMV (its main()
+                // dispatches on uPC.w4), so the pipeline and descriptor set are
+                // sel_wide / w8_wide_ds_, resolved in the selection phase
+                // above. What differs is the grid: UP_DIV(n/8, q) with the same
+                // q the fp16 WIDE route computed, because both put eight
+                // columns in a lane -- not the int8 byte form's sixteen.
+                //
+                // Deliberately no BDA arm and no submit() fallback: the wide
+                // module has no _bda entry, and submit() binds the PRIMARY
+                // (general) module, which carries no 4-bit wide kernel. That
+                // fallback is exactly what once ran matmul16_w4_ksplit -- a
+                // 64-column block -- under this route's 8-column grid, leaving
+                // three quarters of the output columns unwritten.
+                set_route(plan.tag, batch, m, n, k, rep);
+                dispatch_on(sel_wide, w8_wide_ds_[m_id_], UP_DIV(n / 8, q),
+                            batch * m);
+                return;
+            }
             case core::MatmulRoute::kKsplitWide:
                 set_route(plan.tag, batch, m, n, k, rep);
                 if (bda_b4_aligned() &&
