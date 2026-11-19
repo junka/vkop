@@ -3398,6 +3398,21 @@ double Runtime::Run() {
         seg_batch = std::atoi(sb);
         if (seg_batch < 1) seg_batch = 1;
     }
+    // ...but a batch also flushes once it holds this many recorded ops
+    // (VKOP_SEG_BATCH_OPS, 0 = count-only). The count cap was sized for
+    // one-level segments (~2 ops each, 384 per decode round). Graph mode's
+    // default segments are coarse -- 7 of ~100 ops on Qwen3-VL-2B -- so a
+    // 32-segment batch held the WHOLE round until recording finished and the
+    // GPU sat idle for the ~2 ms of record. Flushing a coarse segment as soon
+    // as it closes overlaps the rest of the recording with its execution:
+    // decode 16.3 -> 13.9 ms/token on M5 Max, identical tokens. Fine-grained
+    // segments still coalesce (~16 per submit at the default).
+    int seg_batch_ops_cap = 32;
+    if (const char *sbo = std::getenv("VKOP_SEG_BATCH_OPS")) {
+        seg_batch_ops_cap = std::max(0, std::atoi(sbo));
+    }
+    int graph_seg_ops = 0;  // ops recorded into the open segment
+    int seg_batch_ops = 0;  // ops held by the unflushed batch
     std::vector<VkSubmitInfo> seg_batch_sis;
     std::vector<std::shared_ptr<VulkanCommandBuffer>> seg_batch_cmds;
     seg_batch_sis.reserve(static_cast<size_t>(seg_batch));
@@ -3494,6 +3509,7 @@ double Runtime::Run() {
         }
         seg_batch_sis.clear();
         seg_batch_cmds.clear();
+        seg_batch_ops = 0;
     };
 
     // Close + submit the open segment, chaining it onto the previous segment's
@@ -3578,7 +3594,10 @@ double Runtime::Run() {
         graph_prev_sem = graph_seg->getSignalSemaphore();
         graph_seg = nullptr;
         seg_op_indices_curr.push_back({});  // 开下一段的空集合
-        if (static_cast<int>(seg_batch_sis.size()) >= seg_batch) {
+        seg_batch_ops += graph_seg_ops;
+        graph_seg_ops = 0;
+        if (static_cast<int>(seg_batch_sis.size()) >= seg_batch ||
+            (seg_batch_ops_cap > 0 && seg_batch_ops >= seg_batch_ops_cap)) {
             flush_seg_batch();
         }
         if (seg_trace)
@@ -4143,6 +4162,9 @@ double Runtime::Run() {
                 }
             }
             graph_op_idx = -1;
+            if (graph_mode) {
+                ++graph_seg_ops;
+            }
             // segment replay: 记录本 op 属于当前 segment. replay hit 段被 continue
             // 跳过不会走到这里; 只有正常 record 的 miss 段才收集.
             if (graph_mode && seg_replay && graph_next_seg > 0 &&
