@@ -10686,6 +10686,10 @@ class W8A8ActivationFold:
         graph_outputs = {o.get("name") for o in getattr(dag_model, "outputs", [])}
 
         folded = []
+        # Nodes that also carry the pre-quantization fp16 A as a trailing
+        # input, so a round the DP4A gate cannot serve (prefill's batch*m > 8)
+        # still has a float A. See the append site.
+        folded_with_fallback = []
         dead_dq = []
         for node in list(dag_model.nodes.values()):
             # A plain quantized MatMul is [A, W, weight_scale]; anything else
@@ -10832,6 +10836,32 @@ class W8A8ActivationFold:
                 "dtype": TensorProto.INT8,
                 "value_dynamic": a.get("value_dynamic", False),
             }
+            # Carry the fp16 tensor the pair quantized as a TRAILING input.
+            #
+            # The DP4A gate (`batch*m <= 8`) is a shape the runtime decides per
+            # round, and it holds for decode but NOT for prefill: the DP4A GEMV
+            # reads the whole weight once per output row, so a prefill chunk's
+            # row count would multiply the weight traffic by that count. Those
+            # rounds take an ordinary float kernel, and A being int8 would make
+            # ops/Matmul.hpp throw -- a model that loads and then refuses to run
+            # the first prompt. Keeping the pre-quantization tensor lets the
+            # runtime bind it for exactly those rounds.
+            #
+            # Nothing extra is computed or stored: q.inputs[0] is the producer's
+            # output, already live and consumed by this node's own QuantizeLinear
+            # (it is that node's only consumer in every graph the pass fires on).
+            # Its shape is restated as a_shape because the pair may sit behind
+            # shape views, which are metadata-only for an unchanged element
+            # count; the runtime re-views per consumer anyway.
+            pre_dtype = int(q.inputs[0].get("dtype", -1))
+            if pre_dtype in (-1, TensorProto.FLOAT16):
+                node.inputs.append({
+                    "name": q.inputs[0]["name"],
+                    "shape": list(a_shape),
+                    "dtype": TensorProto.FLOAT16,
+                    "value_dynamic": q.inputs[0].get("value_dynamic", False),
+                })
+                folded_with_fallback.append(node.name)
             node.attributes["a_scale"] = format(a_scale, ".9g")
             folded.append((node.name, m, k, n, a_scale))
             dead_dq.append((dq, graph_outputs))
@@ -10863,6 +10893,10 @@ class W8A8ActivationFold:
         print(f"[w8a8] folded {len(folded)} MatMul activation Q/DQ pair(s) to int8 A:")
         for name, m, k, n, s in folded:
             print(f"[w8a8]   {name}: A[{m},{k}] x W[{k},{n}]  a_scale={s:.9g}")
+        if folded_with_fallback:
+            print(f"[w8a8] {len(folded_with_fallback)} of them also carry the "
+                  f"fp16 A as a trailing input, for the rounds the DP4A "
+                  f"gate cannot serve (prefill)")
         return len(folded)
 
 

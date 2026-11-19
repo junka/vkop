@@ -753,11 +753,34 @@ class MatMulBuffer : public BufferFactory {
         // module is missing, the device lacks the feature, K is past the int32
         // ceiling, ...), the int8 A is rejected rather than handed to a float
         // kernel.
-        const bool a_int8 = inputs[0]->elem_kind() == core::ElemKind::kInt8;
+        const bool a_int8_raw =
+            inputs[0]->elem_kind() == core::ElemKind::kInt8;
+        // A --w8a8 node carries the fp16 tensor its QuantizeLinear consumed as
+        // a TRAILING input, so a shape the DP4A gate cannot serve still has a
+        // float A to run the ordinary kernels with. That gate (batch*m <= 8)
+        // is the exact case this exists for: the DP4A GEMV reads the whole
+        // weight once per output row, so a prefill chunk would multiply the
+        // weight traffic by its row count -- prefill must stay on the float
+        // kernels and only decode takes the int8 route. Require the same rank
+        // and element count so the substitution cannot change m/k/n.
+        const bool a_fallback_ok =
+            a_int8_raw && inputs.size() == 4 && inputs[3] != nullptr &&
+            core::is_float_elem(inputs[3]->elem_kind()) &&
+            inputs[3]->getShape() == inputs[0]->getShape();
+        // Which input the kernels bind as A this round. Stays 0 (the int8 one)
+        // while DP4A is reachable; see the fallback switch after selection.
+        int a_index = 0;
+        // DP4A off for this process or this weight: the float fallback is the
+        // only kernel that can run, so take it before the gates read A.
+        if (a_int8_raw && a_fallback_ok &&
+            !(core::matmul_knobs().dp4a_enabled && weight_int8)) {
+            a_index = 3;
+        }
+        const bool a_int8 = a_int8_raw && a_index == 0;
         const bool a_int8_candidate =
             a_int8 && core::matmul_knobs().dp4a_enabled && weight_int8;
         if (!a_int8_candidate) {
-            core::require_float_elem(inputs[0]->elem_kind(), "MatMul",
+            core::require_float_elem(inputs[a_index]->elem_kind(), "MatMul",
                                      "input 0");
         }
         if (!weight_byte && !weight_4bit) {
@@ -791,7 +814,8 @@ class MatMulBuffer : public BufferFactory {
                         core::elem_name(inputs[4]->elem_kind()));
                 }
                 scale_index = 4;
-            } else if (inputs.size() != want) {
+            } else if (inputs.size() != want &&
+                       !(inputs.size() == want + 1 && a_fallback_ok)) {
                 throw std::runtime_error(
                     std::string("vkop: MatMul with a ") + weight_label +
                     " weight needs exactly " +
@@ -835,7 +859,7 @@ class MatMulBuffer : public BufferFactory {
                 scale_index = 2;
             }
         }
-        auto shape_a = inputs[0]->getShape();
+        auto shape_a = inputs[a_index]->getShape();
         auto shape_b = inputs[1]->getShape();
         const int rank_a = static_cast<int>(shape_a.size());
         const int rank_b = static_cast<int>(shape_b.size());
@@ -1090,9 +1114,9 @@ class MatMulBuffer : public BufferFactory {
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
-        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+        dispatch_by_dtype(inputs[a_index]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            bind_ssbo<T>(inputs[a_index], /*is_output=*/false);
         });
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
@@ -1364,6 +1388,18 @@ class MatMulBuffer : public BufferFactory {
             default:
                 break;
             }
+            if (!retry && a_int8 && a_fallback_ok &&
+                plan.route != core::MatmulRoute::kKsplitW8A8Dp4a) {
+                // DP4A did not fire for this round's shape (prefill's
+                // batch*m > 8, K past the int32 bound, no module...). The fold
+                // kept the fp16 A precisely for this, so switch to it and let
+                // the table pick a float route. Clearing sel_feat.a_int8 makes
+                // DP4A unreachable for the next pass, so this settles in one
+                // extra iteration; the 8-attempt guard still bounds it.
+                a_index = 3;
+                sel_feat.a_int8 = false;
+                retry = true;
+            }
             if (!retry) {
                 break;
             }
@@ -1389,7 +1425,8 @@ class MatMulBuffer : public BufferFactory {
         // here would run a float kernel (or a byte-weight/float-activation
         // kernel) over int8 payload bytes and return plausible garbage, so this
         // stays a hard error -- it means the gate and the dispatch disagree,
-        // which is a bug, not a slow path.
+        // which is a bug, not a slow path. `a_int8` is already false once the
+        // fp16 fallback above took over, so a fallback round falls through.
         if (a_int8 && !dp4a) {
             throw std::runtime_error(
                 std::string("vkop: MatMul got an int8 activation but selected "

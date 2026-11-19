@@ -105,9 +105,31 @@ def test_folds_int8_a_and_records_scale():
     # result for this graph.
     assert float(mm.attributes["a_scale"]) == pytest.approx(A_SCALE)
     # The weight contract is untouched: [W_int8, scale] still trailing.
-    assert [i["name"] for i in mm.inputs[1:]] == ["W", "s_w"]
+    assert [i["name"] for i in mm.inputs[1:3]] == ["W", "s_w"]
+    # And the pre-quantization fp16 tensor rides after them as the fallback. The
+    # DP4A gate is a per-round shape the runtime re-checks, and prefill's fails
+    # it, so without this input the model loads and then throws on the first
+    # prompt. See ops/Matmul.hpp's a_index.
+    assert mm.inputs[3]["name"] == "x"
+    assert mm.inputs[3]["dtype"] == TensorProto.FLOAT16
+    assert mm.inputs[3]["shape"] == [1, 512]
     # The pair's DQ only fed this MatMul, so it is gone.
     assert "dq" not in mx.nodes
+
+
+def test_fallback_is_omitted_when_the_pair_quantized_a_non_fp16_tensor():
+    """The fallback input is only valid if it is the fp16 A. A graph whose pair
+    sits on something else keeps the 3-input form, and the runtime's
+    `inputs.size() == 4` guard then never fires for it."""
+    mx = build()
+    # Make the pair's input a fp32 tensor: no fp16 fallback may be appended.
+    mx.nodes["q"].inputs[0] = ref("x", (1, 512), TensorProto.FLOAT)
+    mx.build_dependencies()
+
+    assert fold(mx) == 1
+    mm = mx.nodes["mm"]
+    assert mm.inputs[0]["name"] == "q"
+    assert [i["name"] for i in mm.inputs] == ["q", "W", "s_w"]
 
 
 def test_looks_through_fp16_cast():
