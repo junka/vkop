@@ -84,6 +84,14 @@ def run(step_ids, pos_start):
     }
     for i in range(nl):
         feed[f"past_key_values_{i}"] = past[i]
+    # Qwen3-VL 的多模态输入，纯文本时喂 llm_chat 同款的「空」值：deepstack 一行
+    # 全零 (1, hidden)，image_pad_mask 全 false (B, L) —— 没有位置被 scatter，
+    # 图就退化成纯文本路径。纯文本模型没有这些输入，这里什么也不加。
+    for name in by_name:
+        if name.startswith("deepstack_embeds_"):
+            feed[name] = np.zeros((1, hidden), dtype=np.float16)
+        elif name == "image_pad_mask":
+            feed[name] = np.zeros((1, L), dtype=bool)
     out = sess.run(None, feed)
     past = out[1:]
     return out[0]
