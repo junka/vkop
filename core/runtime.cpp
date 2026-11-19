@@ -2055,7 +2055,16 @@ std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) const {
     }
     auto it = outputs_.find(name);
     if (it == outputs_.end()) {
-        return nullptr;
+        // RegisterPostProcess publishes its outputs ("post_<Op><i>") in
+        // real_outputs_ only. Without this fallback a caller probing for them
+        // always missed: llm_chat's GPU argmax silently fell back to reading
+        // the whole logits row back and scanning it on the CPU every token,
+        // while the TopK post-op still ran on the GPU for nothing.
+        auto rit = real_outputs_.find(name);
+        if (rit == real_outputs_.end()) {
+            return nullptr;
+        }
+        return rit->second;
     }
     return it->second;
 }
