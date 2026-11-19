@@ -99,7 +99,11 @@ if(MSVC)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast /utf-8 /bigobj")
 # /FS: /MP spawns several cl.exe per project that all write the same .pdb;
 # without it every incremental rebuild loses the race (error C1041).
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FS")
+# /MP: MSBuild only parallelises across projects, so a target with many TUs
+# (all_tests is one TU per test file) compiled them one cl.exe at a time --
+# ~35 minutes on a cold all_tests build. /MP forks one cl.exe per core inside
+# the project; the suite is memory-bound, so keep the job count around 6.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FS /MP")
 else()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer ${FP16_CXX_FLAGS}")
 if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
