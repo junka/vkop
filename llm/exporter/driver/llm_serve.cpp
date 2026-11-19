@@ -26,9 +26,11 @@
 //
 // 与 llm_chat 的关系：prefill/decode 的数值路径与它逐位同构（同样的
 // embed 查表、causal bias、KVCache 语义、present→past 只改逻辑长度），但**故意
-// 不带**滑窗环、host-imported 零拷贝输入、GPU argmax 后处理。
+// 不带**滑窗环、host-imported 零拷贝输入。
 // 那些是性能层，任何一个出问题都会静默错答案；服务端先要正确，快的那部分等
-// 行为被验证过再接。跨请求的 KV 前缀复用保留：下一段的 ids 以上一段覆盖的序列
+// 行为被验证过再接。已接入的两项：GPU argmax（TopK k=1 后处理，仅贪心路径；
+// 与 host 扫描逐 token 对拍一致，VKOP_GPU_ARGMAX=0 回退）和 decode 输入的单次
+// batch 上传（与逐个 copyToGPU 同字节，只是一次 submit）。跨请求的 KV 前缀复用保留：下一段的 ids 以上一段覆盖的序列
 // 为前缀时只算新增的 token —— Claude Code 每轮都把整段历史重发，省下的正是
 // 「整个上下文重新 prefill」。
 //
@@ -369,18 +371,22 @@ void fill_i64_input(const std::shared_ptr<Runtime> &rt, const std::string &name,
     if (tg->num_elements() > 0) tg->fillToCPU(data);
 }
 
+// With `batch`, the copy is only recorded into it; the caller ends, submits
+// and waits once for every input and then resets the staging pool.
 void upload_input(const std::shared_ptr<vkop::VulkanCommandPool> &cp,
-                  const std::shared_ptr<ITensor> &t) {
+                  const std::shared_ptr<ITensor> &t,
+                  const std::shared_ptr<vkop::VulkanCommandBuffer> &batch =
+                      nullptr) {
     if (t->dtype() == typeid(int64_t))
-        as_tensor<int64_t>(t)->copyToGPU(cp);
+        as_tensor<int64_t>(t)->copyToGPU(cp, nullptr, nullptr, batch);
     else if (t->dtype() == typeid(int))
-        as_tensor<int>(t)->copyToGPU(cp);
+        as_tensor<int>(t)->copyToGPU(cp, nullptr, nullptr, batch);
     else if (t->dtype() == typeid(int8_t))
-        as_tensor<int8_t>(t)->copyToGPU(cp);
+        as_tensor<int8_t>(t)->copyToGPU(cp, nullptr, nullptr, batch);
     else if (t->dtype() == typeid(float))
-        as_tensor<float>(t)->copyToGPU(cp);
+        as_tensor<float>(t)->copyToGPU(cp, nullptr, nullptr, batch);
     else
-        as_tensor<uint16_t>(t)->copyToGPU(cp);
+        as_tensor<uint16_t>(t)->copyToGPU(cp, nullptr, nullptr, batch);
 }
 
 std::vector<uint16_t> causal_bias(int q, int kv) {
@@ -512,6 +518,21 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
                       int fallback_vocab, Sampler &sampler,
                       const std::vector<uint32_t> &history,
                       const SampleParams &sp) {
+    // Greedy fast path: the TopK(k=1) post-op registered at load already
+    // reduced every logits row on the GPU, so read back one int per row
+    // instead of the 151936-wide fp16 row and its host scan (~2 ms/token on
+    // M5 Max). Same first-maximum answer as Sampler::pick's greedy branch --
+    // llm_chat's two-turn A/B against the CPU scan is token-identical.
+    // Anything that needs the distribution (temperature, repetition
+    // penalty, VKOP_LOGIT_TOP) still takes the full readback below.
+    if (sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f &&
+        !std::getenv("VKOP_LOGIT_TOP")) {
+        if (auto idx_out = rt->GetOutput("post_TopK1")) {
+            auto ti = as_tensor<int>(idx_out);
+            ti->copyToCPU(cp);
+            return ti->at(static_cast<int>(ti->num_elements()) - 1);
+        }
+    }
     auto logits = rt->GetOutput("logits");
     if (!logits) throw std::runtime_error("no 'logits' output");
     auto lg = as_tensor<uint16_t>(logits);
@@ -552,6 +573,30 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
 
 // ------------------------------------------------------------- the server ----
 class InferenceServer {
+  private:
+    // GPU argmax as a TopK(k=1) post-process over 'logits' (the same hook
+    // llm_chat uses). Needs the model archive to carry the TopK kernel
+    // (onnx2vkop --extra-shaders TopK); a model without it throws inside
+    // RegisterPostProcess before the graph is touched, so it just keeps the
+    // host scan. VKOP_GPU_ARGMAX=0 forces the host scan (A/B arm).
+    void register_gpu_argmax() {
+        if (const char *e = std::getenv("VKOP_GPU_ARGMAX"); e && e[0] == '0') {
+            std::printf("[serve] argmax: host scan (VKOP_GPU_ARGMAX=0)\n");
+            return;
+        }
+        auto logits = rt_->GetOutput("logits");
+        if (!logits) return;
+        try {
+            rt_->RegisterPostProcess(
+                vkop::ops::OpType::TOPK, {{"k", "1"}}, {logits},
+                {std::make_shared<vkop::core::Tensor<uint16_t>>(),
+                 std::make_shared<vkop::core::Tensor<int>>()});
+            std::printf("[serve] argmax: GPU TopK(k=1) post-process\n");
+        } catch (const std::exception &e) {
+            std::printf("[serve] argmax: host scan (%s)\n", e.what());
+        }
+    }
+
   public:
     InferenceServer(const std::string &model, const std::string &embed,
                     const std::string &tok_path, int max_kv,
@@ -580,6 +625,7 @@ class InferenceServer {
         std::printf("[serve] === LoadModel ===\n");
         rt_->LoadModel();
         std::printf("[serve] === LoadModel done ===\n");
+        register_gpu_argmax();
         arch_ = infer_arch(rt_);
         if (kv_kind != "auto") {
             // The cache dtype belongs to the artifact: the converter wires
@@ -1449,17 +1495,34 @@ class InferenceServer {
                     if (tg->num_elements() > 0) tg->fillToCPU(&zero);
                 }
 
-                upload_input(cmdpool_, rt_->GetInput("inputs_embeds"));
-                upload_input(cmdpool_, rt_->GetInput("position_ids"));
-                upload_input(cmdpool_, rt_->GetInput("attention_bias"));
-                if (arch_.has_deepstack) {
-                    for (int d = 0; d < 3; ++d)
-                        upload_input(cmdpool_,
-                                     rt_->GetInput("deepstack_embeds_" +
-                                                   std::to_string(d)));
+                // One submit for every per-step input. Each standalone
+                // copyToGPU is its own submit+wait, ~0.3 ms of fixed cost on
+                // MoltenVK, and a Qwen3-VL step has seven of them. Same bytes
+                // and same staging path as before, recorded into one buffer
+                // (llm_chat's batch upload).
+                {
+                    auto batch =
+                        std::make_shared<vkop::VulkanCommandBuffer>(cmdpool_);
+                    batch->begin();
+                    upload_input(cmdpool_, rt_->GetInput("inputs_embeds"), batch);
+                    upload_input(cmdpool_, rt_->GetInput("position_ids"), batch);
+                    upload_input(cmdpool_, rt_->GetInput("attention_bias"),
+                                 batch);
+                    if (arch_.has_deepstack) {
+                        for (int d = 0; d < 3; ++d)
+                            upload_input(cmdpool_,
+                                         rt_->GetInput("deepstack_embeds_" +
+                                                       std::to_string(d)),
+                                         batch);
+                    }
+                    if (arch_.has_image_pad_mask)
+                        upload_input(cmdpool_, rt_->GetInput("image_pad_mask"),
+                                     batch);
+                    batch->end();
+                    batch->submit(dev_->getComputeQueue());
+                    batch->wait();
+                    cmdpool_->getStagingBufferPool()->reset();
                 }
-                if (arch_.has_image_pad_mask)
-                    upload_input(cmdpool_, rt_->GetInput("image_pad_mask"));
 
                 if (lin_state_->present()) lin_state_->bind_for_round();
                 const double ms = rt_->Run();
