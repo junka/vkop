@@ -3,9 +3,10 @@
 
 llm_chat's decode loop looks up token id -> embedding row from a standalone
 [vocab, hidden] fp16 file; the table is not part of the vkop graph. This reads
-just that one tensor out of the checkpoint instead of building the whole model
-(see llm/exporter/export/dump_embed_tokens.py, which does the same by loading
-the full model).
+just that one tensor out of the checkpoint's safetensors instead of building
+the whole model, so it works for any architecture whose checkpoint carries an
+embed_tokens.weight (Qwen3-VL / Qwen3 / Phi-4-mini / GLM-Edge / ...), sharded
+checkpoints included.
 
 Usage:
     python3 llm/server/embed_table.py [--model DIR] [--out FILE]
@@ -88,6 +89,7 @@ def extract(model_dir, out_path):
     if len(blob) != expected:
         raise SystemExit(f"size mismatch: {len(blob)} vs {expected}")
 
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     tmp = out_path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(blob)

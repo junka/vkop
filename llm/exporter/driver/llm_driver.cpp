@@ -560,7 +560,7 @@ int main(int argc, char** argv) {
 
         // Optional named-intermediate dump (VKOP_DUMP_TENSORS=comma list, or
         // "*" to dump every fp16 tensor). VKOP_DUMP_ROUND=<n> restricts to one
-        // round. Output matches dump_ort_intermediates.py for line-by-line diff.
+        // round. Output matches prefill_ort_stats.py for line-by-line diff.
         if (const char *d = std::getenv("VKOP_DUMP_TENSORS")) {
             int dump_round = -1;
             if (const char *r = std::getenv("VKOP_DUMP_ROUND")) dump_round = std::atoi(r);

@@ -546,7 +546,6 @@ else:
 print(f"\ndone. llm.onnx ({os.path.getsize(EXPORT_PATH)/1e6:.1f} MB)")
 
 # embed_tokens 权重表不在 llm.onnx 图里（图输入是 inputs_embeds），需要单独导出：
-#   python3 export/dump_embed_tokens_qwen3.py    (本脚本同目录，自动适配模型路径)
+#   python3 llm/server/embed_table.py --model <checkpoint 目录> --out <embed_tokens.bin>
 print("\n下一步：导出 embed_tokens 权重表")
-print("  MODEL_PATH=", MODEL_PATH)
-print("  python3 llm/exporter/export/dump_embed_tokens_qwen3.py [embed_tokens.bin]")
+print(f"  python3 llm/server/embed_table.py --model {MODEL_PATH} --out embed_tokens.bin")

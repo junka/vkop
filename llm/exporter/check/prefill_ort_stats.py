@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """ORT prefill 中间张量统计，与 llm_chat 的 VKOP_DUMP_TENSORS="*" 输出同格式。
 
-dump_ort_intermediates.py 的精简重写：
   - 不依赖 transformers 的模型类（Qwen3VLForConditionalGeneration 导入链因
     torchvision::nms 损坏不可用），输入由 AutoTokenizer + embed_tokens.bin
     构造，与 check/greedy_ref.py 同一套（ids/因果 bias/mrope position_ids

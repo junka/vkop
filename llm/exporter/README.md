@@ -630,7 +630,9 @@ head_dim 128 / intermediate 8192 / vocab 200064 / `tie_word_embeddings=true`。
 ```bash
 # 1) 导出 ONNX（权重：ModelScope LLM-Research/Phi-4-mini-instruct）
 python3 export/phi4_export_onnx.py            # → text_phi4/llm.onnx + llm.weights.bin
-python3 export/dump_embed_tokens_phi4.py      # → text_phi4/embed_tokens.bin (200064x3072 fp16)
+python3 ../server/embed_table.py \
+  --model ~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
+  --out text_phi4/embed_tokens.bin            # 200064x3072 fp16
 # 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
 python3 check/phi4_check_onnx.py
 # 3) 转 vkopbin —— 多 GB 图不要加 -u（UnifiedMeta 的偏移是 int32，会溢出）
@@ -700,7 +702,9 @@ I/O 名字与形状，`llm_chat` / `kv_cache` 的加载逻辑一行没改；架�
 ```bash
 # 1) 导出 ONNX（朴素 pre-norm decoder，分离 q/k/v 投影 + fused gate_up_proj）
 python3 export/glm_edge_export_onnx.py          # → text_glm_edge/llm.onnx + llm.weights.bin
-python3 export/dump_embed_tokens_glm_edge.py    # → text_glm_edge/embed_tokens.bin (59264x2048 fp16, 243MB)
+python3 ../server/embed_table.py \
+  --model ~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
+  --out text_glm_edge/embed_tokens.bin          # 59264x2048 fp16, 243MB
 # 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
 python3 check/glm_edge_check_onnx.py
 # 3) 转 vkopbin —— 权重 2.94GB，同样不能加 -u（UnifiedMeta 偏移是 int32）

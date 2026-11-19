@@ -282,7 +282,7 @@ n_ext = sum(1 for t in m.graph.initializer
 print(f"[consolidate] initializers={n_init} external={n_ext}")
 
 # lm_head 与 embed_tokens 共享权重（tie_word_embeddings=true），图里只有一份 MatMul
-# 权重；embed_tokens.bin 由 dump_embed_tokens_phi4.py 单独给 C++ 驱动用。
+# 权重；embed_tokens.bin 由 llm/server/embed_table.py 单独给 C++ 驱动用。
 onnx.save_model(
     m, EXPORT_PATH,
     save_as_external_data=True,
@@ -311,6 +311,5 @@ assert locs == {WEIGHTS_BIN}, f"unexpected external locations: {locs}"
 
 print(f"\ndone. {EXPORT_PATH} ({os.path.getsize(EXPORT_PATH)/1e6:.1f} MB)")
 print("下一步：导出 embed_tokens 权重表")
-print("  MODEL_PATH=", MODEL_PATH)
-print("  python3 llm/exporter/export/dump_embed_tokens_phi4.py "
-      f"{os.path.join(out_dir, 'embed_tokens.bin')}")
+print(f"  python3 llm/server/embed_table.py --model {MODEL_PATH} "
+      f"--out {os.path.join(out_dir, 'embed_tokens.bin')}")
