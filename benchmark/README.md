@@ -427,6 +427,71 @@ BENCH_M=8 BENCH_INT8=1 ./build/bench_matmul.exe
 BENCH_M=9 BENCH_INT8=1 ./build/bench_matmul.exe
 ```
 
+## 端到端：LLM 对话与文生图（Apple M5 Max，2026-11-20）
+
+环境：Apple M5 Max、36 GB 统一内存、MoltenVK，`main@cc0314a`，`-O0` Debug 构建（`CMakeLists.txt`
+写死）。所有模型都用当前 shader 归档重转。每次**只跑一个进程**，没有后台负载。本机实测 GPU 读带宽上限约
+**438 GB/s**（Metal 顺序读 1 GiB），decode 是带宽受限的，下表的「带宽」= 权重字节 ÷ 每 token 时间。
+
+### LLM（greedy，prompt "Explain in detail how a transformer language model works."，生成 64 token）
+
+| 模型 | 权重 | prompt | prefill（首轮冷启动） | decode llm_chat | decode llm_serve | 带宽 | 对 ORT |
+|---|---|---|---|---|---|---|---|
+| Qwen3-VL-2B fp16 | 3.46 GB | 19 | 95 ms | **13.8 ms**（72.7 tok/s） | 14.5 ms | 250 GB/s | 48/48 一致 |
+| Qwen3-VL-2B int8 | 1.74 GB | 19 | 72 ms | 17.5 ms（57.0 tok/s） | 18.3 ms | 99 GB/s | 48/48 一致 |
+| Qwen3-VL-2B int4 | 0.98 GB | 19 | 257 ms | **11.2 ms**（88.9 tok/s） | 12.1 ms | 88 GB/s | 第 10 步分叉（量化误差） |
+| GLM-Edge-1.5B fp16 | 2.96 GB | 16 | 57 ms | 12.7 ms（78.6 tok/s） | 13.5 ms | 233 GB/s | 48/48 一致 |
+| Phi-4-mini fp16 | 7.69 GB | 13 | 89 ms | 24.1 ms（41.4 tok/s） | 24.8 ms | 319 GB/s | 32/32 一致 |
+| Qwen3-4B fp16 | 8.06 GB | 19 | 194 ms | 30.9 ms（32.4 tok/s） | 31.8 ms | 261 GB/s | 16/16 一致 |
+| Qwen3-VL-2B 多模态（224² 图） | +0.83 GB 视觉塔 | 65 | 视觉塔 109 ms + prefill 127 ms | 13.9 ms | — | — | 回答 "The image is green." |
+
+- llm_chat 的 decode 是 `VKOP_PROFILE=1` 报的均值（p50 与均值相差 < 0.4 ms）。llm_serve 是客户端经 RPC 管道
+  量到的相邻 `DELTA` 间隔，比 chat 多约 0.6–0.9 ms 的管道开销；两者首轮输出逐字一致。
+- serve 第二轮复用 KV 前缀（例如 2B：97 token 里复用 82 个），prefill 只要 41 ms。
+- 「对 ORT」：`llm/exporter/check/greedy_ref.py`（CPU ORT 逐步 greedy）与 vkop 逐 token 比较。
+- 反常点，留作后续优化：**int8 比 fp16 慢**（字节少一半，decode 反而 17.5 ms vs 13.8 ms，只有 99 GB/s），
+  **int4 的 prefill 是 fp16 的 2.7 倍**。fp16 模型只用到带宽上限的 57–73%：MatMul 本身接近上限
+  （lm_head 435 GB/s），差距在每步约 560 个小 op 的调度。
+
+复现（脚本只是把下面两条包起来串行跑，并比较输出）：
+
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
+       VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+printf 'Explain in detail how a transformer language model works.\n' | VKOP_PROFILE=1 \
+  ./build/llm_chat llm/exporter/llm.vkopbin llm/exporter/embed_tokens.bin llm/tokenizer/qwen3_vl.bin 64
+# 转换（每个模型约 10–30 s，权重流式读取，峰值内存约 0.2 GB）
+cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
+  -o ../../llm/exporter/llm.vkopbin -q fp16 --extra-shaders TopK --master-archive ../../build/vkop_shaders.bin
+```
+
+### 文生图：Qwen-Image-2.1，512×512，40 步
+
+`image_gen dit_prefill_static.vkopbin dit_decode_static.vkopbin "A red fox sitting on a wooden bench in a sunlit park" 40 7`
+
+| 阶段 | 时间 | 说明 |
+|---|---|---|
+| 文本塔 加载 / 前向 | 1.67 s / 0.45 s | 13.9 GB，用完即释放 |
+| DiT prefill 加载 / 前向 | 1.6 s / 0.21 s | 13.8 GB，32 层 KV |
+| DiT decode 加载 | 1.6 s | 14.2 GB |
+| **去噪 40 步** | **94.0 s（2.3 s/步）** | m = 1024 图像 token |
+| VAE 加载 / 解码 | 0.2 s / 4.1 s | 与 ORT maxabs 8e-5 |
+| **端到端** | **104.4 s** | 峰值 wired 21.3 GB，最低空闲 30%，内存压力正常 |
+
+DiT 要用 `--no-fusions=fuse_swiglu_down_proj` 转换。SwiGLU 融合 kernel 是给 decode 的小 M 设计的，到 m = 1024
+时要按 128 行切块，并且每块都占一份大 scratch。同一模型保留融合时是 4.9 s/步、峰值 wired 27.5 GB、加载时
+内存压力曾到 critical。DiT 的权重存在 Constant 节点里，要先提升成 initializer 才能流式转换
+（`dit_*_static_lifted.onnx`）：
+
+```bash
+cd model/pypi && python3 -m onnx2vkop.cli -i ../../image/exporter/dit_decode_static_lifted.onnx \
+  -o ../../image/exporter/dit_decode_static.vkopbin --no-fusions=fuse_swiglu_down_proj \
+  --master-archive ../../build/vkop_shaders.bin
+```
+
+36 GB 机器上一次只跑一个这类任务：文生图单次峰值 21 GB。实测过一次 OOM 重启：模型转换、fp32 的
+Phi-4 ORT 参考（约 15 GB）和 8 GB 的 llm_chat 同时在跑。
+
 ## 跨 GPU 参考数据（resnet，100 轮平均）
 
 | GPU | Model | Operators |Precision | latency (ms) |
