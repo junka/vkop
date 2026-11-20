@@ -271,7 +271,7 @@ class Conv2dImage : public Operator {
             });
             scale_index++;
         } else {
-            objs_.emplace_back(dummy_bufferview_);
+            objs_.emplace_back(dummy_bufferview_or_throw());
         }
 
         if (accuracy == 2) {
@@ -283,7 +283,7 @@ class Conv2dImage : public Operator {
                 objs_.emplace_back(scale_buffer);
             });
         } else {
-            objs_.emplace_back(dummy_bufferview_);
+            objs_.emplace_back(dummy_bufferview_or_throw());
         }
 
         auto out_gpu_shape = outputs[0]->getGPUShape();

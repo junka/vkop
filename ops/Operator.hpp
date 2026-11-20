@@ -186,12 +186,35 @@ class Operator {
             // A make_shared<> intermediate would delete the object when that
             // local goes out of scope, leaving a dangling pointer in the
             // static member -- the exact UAF this is here to fix.
+            //
+            // This buffer is deliberately NOT gated on is_support_images():
+            // the buffer-backend ops (Conv1d/Softmax/Attention/Gemm/Expand/
+            // EmbeddingForward/Nms) bind it as a placeholder SSBO, and it is
+            // created with plain buffer usage, which a compute-only device
+            // (the PPU ICD) accepts. Only the texel VIEW below needs format
+            // feature bits.
             dummy_buffer_ = std::shared_ptr<VulkanBuffer>(
                 new VulkanBuffer(
                     m_dev_, 16, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
                 [](VulkanBuffer *) {});
             assert(dummy_buffer_);
+        }
+        // The placeholder texel view is created only where it can exist. A
+        // VkBufferView needs the format's bufferFeatures to carry
+        // sampled-image|storage-texel-buffer, and vkCreateBufferView is
+        // refused outright by a device that has none -- which used to abort
+        // EVERY operator's construction, including the pure buffer-backend
+        // ones that never touch a texel buffer. is_support_images() is the
+        // right predicate: its probe rejects exactly those devices on that
+        // same bufferFeatures check before it looks at image tiling (see
+        // VulkanDevice::checkImageFormatSupport), so false means either "no
+        // image backend" or "no texel buffers", and the view's only consumers
+        // are image-backend ops (Conv2dImage's bias/scale slots). Those ops
+        // are refused by name at the top of set_runtime_device on such a
+        // device, so a null view is unreachable from a dispatch; see
+        // dummy_bufferview_or_throw() for the guard at the use site.
+        if (!dummy_bufferview_ && m_dev_ && m_dev_->is_support_images()) {
             dummy_bufferview_ = std::shared_ptr<VulkanBufferView>(
                 new VulkanBufferView(
                     m_dev_, dummy_buffer_,
@@ -511,6 +534,30 @@ class Operator {
     // consume a shape input override it.
     virtual void set_host_target_shape(const std::vector<int> &dims) {
         (void)dims;
+    }
+
+    // The placeholder texel-buffer view, for IMAGE-backend slots that stay
+    // unbound (Conv2dImage's absent bias / absent per-channel scale). It is
+    // null on a device with no texel-buffer/format support, where creating it
+    // would have thrown out of set_runtime_device -- see the creation site.
+    // Requesting it there is a bug in the caller, not a degraded mode: the
+    // op's shader is an image kernel and the device cannot run it, so say that
+    // by name instead of letting a null shared_ptr reach the descriptor write.
+    std::shared_ptr<VulkanBufferView> dummy_bufferview_or_throw() const {
+        if (!dummy_bufferview_) {
+            throw std::runtime_error(
+                "vkop: " +
+                (name_.empty() ? std::string(convert_optype_to_string(type_))
+                               : name_) +
+                " needs the placeholder texel-buffer view, but this device "
+                "has no texel-buffer/format support (" +
+                (m_dev_ && !m_dev_->image_unsupported_reason().empty()
+                     ? m_dev_->image_unsupported_reason()
+                     : std::string("images disabled")) +
+                "). This is an image-backend operator; load the model for "
+                "the buffer backend instead.");
+        }
+        return dummy_bufferview_;
     }
 
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
