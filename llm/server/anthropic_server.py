@@ -21,9 +21,10 @@ tokenizer's chat template, and streams token deltas back.
 
 Limits that are deliberate
 --------------------------
-* Greedy decoding only: sampling params (temperature/top_p/top_k) are ignored
-  because llm_serve's argmax is the only decode rule it implements. A client
-  that expects sampling gets determinism instead of an error.
+* Greedy by default. temperature/top_k/top_p are forwarded when the client
+  sends them; llm_serve samples from the GPU's top-64 logits and reads the
+  full row only on the steps the candidates cannot settle exactly
+  (Sampler::pick_topk in llm/exporter/driver/llm_common.hpp).
 * Images are not accepted (the vision tower is a separate graph); an image
   block is reported as text so the model at least knows one was dropped.
 * One request at a time: there is one GPU context and one KV cache.

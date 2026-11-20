@@ -1341,9 +1341,9 @@ if (ENABLE_LLM_CHAT)
 
     # Line-protocol inference server: the HTTP/Anthropic/SSE layer lives in
     # Python (llm/server), which spawns this binary and talks role/text pairs
-    # over two inherited fds. Same numerical path as llm_chat, minus the
-    # performance layers (ring KV, chunked prefill, zero-copy decode inputs,
-    # GPU argmax) that a correctness-first server does not need yet.
+    # over two inherited fds. Shares arch inference, input helpers, GPU argmax
+    # and the zero-copy decode inputs with llm_chat (driver/llm_common.hpp);
+    # the ring KV is still llm_chat-only.
     add_executable(llm_serve llm/exporter/driver/llm_serve.cpp)
     target_link_libraries(llm_serve PRIVATE vkop vload tokenizer)
     target_include_directories(llm_serve PRIVATE

@@ -49,6 +49,7 @@
 #include "image_preproc.hpp"
 #include "conversation.hpp"
 #include "kv_cache.hpp"
+#include "llm_common.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "include/stb_image.h"
@@ -68,6 +69,14 @@ using vkop::export_::RenderedContext;
 using vkop::export_::get_rope_index;
 using vkop::export_::preprocess_image_noresize;
 using qwen::Tokenizer;
+using vkop::llm::ModelArch;
+using vkop::llm::causal_bias;
+using vkop::llm::component_timer_on;
+using vkop::llm::embed_lookup;
+using vkop::llm::fill_fp16_input;
+using vkop::llm::fill_i64_input;
+using vkop::llm::fp16_to_f32;
+using vkop::llm::upload_input;
 
 namespace {
 
@@ -116,169 +125,6 @@ struct PerfMetrics {
     }
 };
 
-// Legacy fallback 默认值 (Qwen3-VL-2B)。真正的值在 LoadModel 之后从 runtime
-// inputs 的 shape 动态推断，存入 struct ModelArch 里。以下常量只用于
-// argmax_last_token 里 shape 不可靠时的 defensive fallback（极罕见）。
-constexpr int LEGACY_HIDDEN = 2048;
-constexpr int LEGACY_NKV = 8;
-constexpr int LEGACY_HD = 128;
-constexpr int LEGACY_NLAYERS = 28;
-
-// 架构参数 —— 在 LoadModel 之后由 infer_model_arch() 填充。
-// 纯文本 Qwen3 的 position_ids 是 2D (B, q)；多模态是 3D (3, B, q) MRoPE。
-struct ModelArch {
-    int hidden = LEGACY_HIDDEN;
-    int nkv = LEGACY_NKV;
-    int hd = LEGACY_HD;
-    int nlayers = LEGACY_NLAYERS;
-    int position_ids_dims = 2;   // 2 = 纯文本 2D RoPE, 3 = 多模态 3D MRoPE
-    bool has_deepstack = false;  // deepstack_embeds_{0,1,2} 输入存在
-    bool has_image_pad_mask = false;
-    // KV cache 存储语义：从 past_key_values_0 的 elem_kind() 读。fp16 是历史
-    // 默认；fp8 (E4M3/E5M2) 时 KVCache 用 int8_t 容器承载字节，显存减半。
-    ElemKind cache_kind = ElemKind::kFloat16;
-};
-
-// 结束符 / 图像占位符的 id 由 Tokenizer 从注册表查（Conversation 也走同一入口），
-// 这里不写死 —— 换 checkpoint 时那些 id 会变。
-// Qwen3-VL uses torch.finfo(float16).min ≈ -65504 as the causal mask fill, not
-// -inf, so softmax keeps a tiny but finite distinction. -65504 = 0xFBFF.
-constexpr uint16_t FP16_MIN = 0xFBFF;
-
-// ---- fp16 helpers (match ITensor::fp16_to_fp32 / fp32_to_fp16) ----
-inline float fp16_to_f32(uint16_t h) { return ITensor::fp16_to_fp32(h); }
-
-// 从 Runtime 的 inputs 动态推断架构参数。
-// 纯文本 Qwen3 (position_ids 2D, 无 deepstack_embeds / image_pad_mask)
-// 和多模态 Qwen3-VL (position_ids 3D, 有 deepstack_embeds / image_pad_mask)
-// 都能自动识别。
-ModelArch infer_model_arch(const std::shared_ptr<Runtime>& rt) {
-    ModelArch arch;
-
-    // ---- NLAYERS: 数 past_key_values_i 的个数 ----
-    int nlayers = 0;
-    for (;; ++nlayers) {
-        auto t = rt->GetInput("past_key_values_" + std::to_string(nlayers));
-        if (!t) break;
-    }
-    if (nlayers == 0) throw std::runtime_error("no past_key_values_* inputs in model");
-    arch.nlayers = nlayers;
-
-    // ---- NKV / HD: 从 past_key_values_0 shape ----
-    // getShape() 在 ITensor 基类上，与容器类型无关 —— fp8 cache 的 past 是
-    // Tensor<int8_t>，但仍能直接读 shape，无需 as_tensor 到具体容器。
-    auto pk0 = rt->GetInput("past_key_values_0");
-    auto pk0_shape = pk0->getShape();  // (B, 2, nkv, kv_len, hd)
-    if (pk0_shape.size() < 5) {
-        std::fprintf(stderr, "[arch] past_key_values_0 shape is %zu dims, expect 5\n",
-                     pk0_shape.size());
-    }
-    arch.nkv = pk0_shape.size() >= 3 ? static_cast<int>(pk0_shape[2]) : LEGACY_NKV;
-    arch.hd = pk0_shape.size() >= 5 ? static_cast<int>(pk0_shape[4]) : LEGACY_HD;
-
-    // ---- cache_kind: 从 past_key_values_0 的 elem_kind() 读 ----
-    // fp16 (默认) / fp8 (E4M3/E5M2)。shape 读取仍走 as_tensor<uint16_t> 是因为
-    // getShape() 在 ITensor 接口上、与容器类型无关；elem_kind() 才记录语义。
-    // 4-bit (kInt4/kNF4) 也走 int8_t 容器，但一个字节两个值 —— KVCache 内部按
-    // cache_kind 分派，逻辑元素数不变（见 kv_cache.hpp）。
-    arch.cache_kind = pk0->elem_kind();
-    if (arch.cache_kind != ElemKind::kFloat16 &&
-        arch.cache_kind != ElemKind::kFloat8E4M3FN &&
-        arch.cache_kind != ElemKind::kFloat8E5M2 &&
-        arch.cache_kind != ElemKind::kInt4 &&
-        arch.cache_kind != ElemKind::kNF4) {
-        std::fprintf(stderr, "[arch] past_key_values_0 cache dtype %s unsupported, "
-                     "falling back to fp16\n", elem_name(arch.cache_kind));
-        arch.cache_kind = ElemKind::kFloat16;
-    }
-
-    // ---- HIDDEN: 从 inputs_embeds shape ----
-    auto emb = rt->GetInput("inputs_embeds");
-    auto emb_g = as_tensor<uint16_t>(emb);
-    auto emb_shape = emb_g->getShape();  // (B, q, hidden)
-    arch.hidden = emb_shape.size() >= 3
-        ? static_cast<int>(emb_shape[emb_shape.size() - 1]) : LEGACY_HIDDEN;
-
-    // ---- position_ids dims ----
-    auto pid = rt->GetInput("position_ids");
-    // position_ids 是 int64，cast 到 int64 tensor 看 shape
-    auto pid_shape = pid ? rt->GetInput("position_ids")->getShape()
-                         : std::vector<int>{};
-    arch.position_ids_dims = static_cast<int>(pid_shape.size());  // 2 或 3
-
-    // ---- 视觉 I/O 是否存在 ----
-    arch.has_deepstack = (rt->GetInput("deepstack_embeds_0") != nullptr);
-    arch.has_image_pad_mask = (rt->GetInput("image_pad_mask") != nullptr);
-
-    return arch;
-}
-
-// Read the whole embed_tokens.bin (raw fp16, [vocab, hidden]) into memory.
-// hidden 必须等于模型的 HIDDEN（runtime inputs_embeds 的最后一维）。
-// 若 embed_tokens.bin 的 hidden 不匹配，尝试按模型 hidden 重新推断 vocab。
-std::pair<std::vector<uint16_t>, int>
-load_embed_table(const std::string& path, int hidden) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    auto bytes = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    const size_t row_bytes = hidden * sizeof(uint16_t);
-    if (row_bytes == 0) throw std::runtime_error("hidden must be > 0");
-    if (bytes % row_bytes != 0) {
-        // 可能是旧模型导出的 embed_tokens.bin（不同 hidden），
-        // 给出提示但仍按当前 hidden 推断 vocab。
-        std::fprintf(stderr,
-            "[warn] embed_tokens.bin size %zu not divisible by hidden*2=%zu, "
-            "model hidden=%d — will read max integer vocab, tail bytes ignored\n",
-            bytes, row_bytes, hidden);
-    }
-    int vocab = static_cast<int>(bytes / row_bytes);
-    std::vector<uint16_t> buf(static_cast<size_t>(vocab) * hidden);
-    f.read(reinterpret_cast<char*>(buf.data()),
-           static_cast<std::streamsize>(buf.size() * sizeof(uint16_t)));
-    if (!f) throw std::runtime_error("short read on " + path);
-    return {std::move(buf), vocab};
-}
-
-// Lookup L token ids → fp16 embedding rows, laid out as (1, L, hidden).
-std::vector<uint16_t> embed_lookup(const std::vector<uint16_t>& table,
-                                   const std::vector<uint32_t>& ids,
-                                   int vocab, int hidden) {
-    std::vector<uint16_t> out(ids.size() * hidden, 0);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        uint32_t id = ids[i];
-        if (id >= static_cast<uint32_t>(vocab)) {
-            std::fprintf(stderr, "[embed] token id %u >= vocab %d, zeroing\n", id, vocab);
-            continue;
-        }
-        std::memcpy(&out[i * hidden], &table[static_cast<size_t>(id) * hidden],
-                    hidden * sizeof(uint16_t));
-    }
-    return out;
-}
-
-// Fill a uint16_t (fp16) input tensor from a host buffer, after resizing it.
-void fill_fp16_input(const std::shared_ptr<Runtime>& rt,
-                     const std::string& name,
-                     const std::vector<uint32_t>& shape,
-                     const uint16_t* data) {
-    rt->ResizeInput(name, shape);
-    auto t = rt->GetInput(name);
-    auto tg = as_tensor<uint16_t>(t);
-    if (tg->num_elements() > 0) tg->fillToCPU(data);
-}
-
-// Fill an int64 input tensor from a host buffer.
-void fill_i64_input(const std::shared_ptr<Runtime>& rt,
-                    const std::string& name,
-                    const std::vector<uint32_t>& shape,
-                    const int64_t* data) {
-    rt->ResizeInput(name, shape);
-    auto t = rt->GetInput(name);
-    auto tg = as_tensor<int64_t>(t);
-    if (tg->num_elements() > 0) tg->fillToCPU(data);
-}
-
 // Fill the ring-head input ([1] int32, host-authoritative — the Attention op
 // reads it through has_cpu_data(), so there is nothing to upload).
 void fill_i32_input(const std::shared_ptr<Runtime>& rt,
@@ -288,133 +134,6 @@ void fill_i32_input(const std::shared_ptr<Runtime>& rt,
     if (t->getShape() != std::vector<int>{1}) rt->ResizeInput(name, {1u});
     auto tg = as_tensor<int>(rt->GetInput(name));
     if (tg->num_elements() > 0) tg->fillToCPU(&value);
-}
-
-// Upload whatever dtype input to GPU.
-void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
-                  const std::shared_ptr<ITensor>& t,
-                  const std::shared_ptr<vkop::VulkanCommandBuffer>& batch = nullptr) {
-    if (t->dtype() == typeid(int64_t)) as_tensor<int64_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
-    else if (t->dtype() == typeid(int)) as_tensor<int>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
-    else if (t->dtype() == typeid(int8_t)) as_tensor<int8_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
-    else if (t->dtype() == typeid(float)) as_tensor<float>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
-    else as_tensor<uint16_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
-}
-
-// 收益组件计时（VKOP_COMPONENT_TIMER=1）。端到端 wall 在本机热噪（±15%）下
-// 分辨不出 ~1ms 的优化收益，改为直接量被消掉的三块工作：CPU argmax
-// （logits readback + 扫描）、GPU argmax（dispatch + wait + winners 读）、
-// decode 上传 batch（record + submit + wait）。
-static bool component_timer_on() {
-    static const bool on = [] {
-        const char *e = std::getenv("VKOP_COMPONENT_TIMER");
-        return e && e[0] == '1';
-    }();
-    return on;
-}
-
-// ---- decode-step inputs as host-imported SSBOs ----
-// Install host-imported storage on the five per-step decode inputs, sized to
-// their DECODE shapes. After this the CPU writes per-step values straight
-// into device-visible host memory (zero staging submits); the zero-valued
-// inputs (attention_bias, deepstack, image_pad_mask) are memset once here —
-// only their logical SHAPE moves per step.
-//
-// Per decode round, not per session: the next prefill ResizeInput's these
-// tensors to larger shapes, which (per Tensor::as_host_imported_buffer)
-// drops the import and reverts to the normal device-local + copyToGPU path.
-// VKOP_DECODE_ZEROCOPY=0 disables; any import failure returns false and the
-// driver keeps the batched-upload path.
-bool install_decode_host_imports(
-    const std::shared_ptr<Runtime> &rt, std::shared_ptr<vkop::VulkanDevice> vd,
-    const ModelArch &arch, const std::vector<uint32_t> &ds_shape, int max_kv) {
-    if (const char *env = std::getenv("VKOP_DECODE_ZEROCOPY");
-        env && std::strcmp(env, "0") == 0) return false;
-    if (!vd->is_support_host_import()) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            std::printf("[perf] host import unavailable, decode keeps batched "
-                        "uploads\n");
-        }
-        return false;
-    }
-    // Bisection knobs (temporary): VKOP_ZC_ONLY=a,b installs imports on only
-    // those inputs; VKOP_ZC_UPLOAD=1 keeps the normal upload running on top
-    // (allocation-only test — the upload overwrites the mapping's bytes).
-    const char *only_env = std::getenv("VKOP_ZC_ONLY");
-    std::string only = only_env ? only_env : "";
-    auto want = [&](const char *name) {
-        return only.empty() || only.find(name) != std::string::npos;
-    };
-    static bool reported_ok = false;
-    auto report_ok = [&] {
-        if (!reported_ok) {
-            reported_ok = true;
-            std::printf("[perf] decode inputs host-imported: per-step upload "
-                        "submits eliminated\n");
-        }
-    };
-    auto zero_import = [&](const std::string &name, std::size_t max_elems) {
-        auto t = rt->GetInput(name);
-        if (!t || t->dtype() != typeid(uint16_t)) return;
-        auto g = as_tensor<uint16_t>(t);
-        g->as_host_imported_buffer(vd, max_elems);
-        std::memset(g->host_import_ptr(), 0, g->host_import_bytes());
-    };
-    try {
-        if (want("inputs_embeds"))
-            zero_import("inputs_embeds", static_cast<std::size_t>(arch.hidden));
-        if (want("attention_bias"))
-            zero_import("attention_bias", static_cast<std::size_t>(max_kv));
-        if (arch.has_deepstack && want("deepstack")) {
-            std::size_t ne = 1;
-            for (auto d : ds_shape) ne *= d;
-            for (int d = 0; d < 3; ++d)
-                zero_import("deepstack_embeds_" + std::to_string(d), ne);
-        }
-        if (arch.has_image_pad_mask) {
-            auto t = rt->GetInput("image_pad_mask");
-            if (t && t->dtype() == typeid(int8_t))
-                as_tensor<int8_t>(t)->as_host_imported_buffer(vd, 1);
-        }
-        if (want("position_ids")) {
-            auto pid = rt->GetInput("position_ids");
-            if (pid && pid->dtype() == typeid(int64_t))
-                as_tensor<int64_t>(pid)->as_host_imported_buffer(vd, 3);
-        }
-        report_ok();
-        return true;
-    } catch (const std::exception &) {
-        return false;
-    }
-}
-
-// ---- GPU argmax: Runtime::RegisterPostProcess(TopK, k=1) ----
-// 把 argmax 交给引擎的 Topk 算子，作为图末尾注册的后处理：bitonic 多 pass
-// 全部 record 进 Run 自己的 command buffer（submit_per_ds），每步因此**不新增
-// submit**，且 VKOP_SEGMENT_REPLAY 录段时自然把它折进去。要求模型 archive
-// 携带 TopK kernel（onnx2vkop --extra-shaders TopK 重转；图里没有该节点时
-// census 不会自动带上）。注册发生在 LoadModel 之后、任何 Run 之前：prefill/
-// decode 的 logits 行数变化由 Topk 自行 resize 输出消化，注册时定格的输入
-// 形状则被 reshape_view 的元素数守卫拒绝（live 形状始终作准）。
-// VKOP_GPU_ARGMAX=0 不注册，argmax_last_token 落回 CPU 扫描（对照臂）。
-static bool register_gpu_argmax(const std::shared_ptr<Runtime>& rt) {
-    if (const char *env = std::getenv("VKOP_GPU_ARGMAX");
-        env && env[0] == '0') {
-        return false;
-    }
-    auto logits = rt->GetOutput("logits");
-    if (!logits) {
-        return false;
-    }
-    auto tk_values = std::make_shared<vkop::core::Tensor<uint16_t>>();
-    auto tk_indexs = std::make_shared<vkop::core::Tensor<int>>();
-    rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "1"}},
-                            {logits}, {tk_values, tk_indexs});
-    std::printf("[perf] argmax = RegisterPostProcess(TopK k=1); "
-                "VKOP_GPU_ARGMAX=0 falls back to CPU scan\n");
-    return true;
 }
 
 // Argmax over the last-position logits: logits is (1, q, vocab) fp16, take
@@ -479,23 +198,6 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         std::printf("\n");
     }
     return best;
-}
-
-// Build the causal attention_bias (1,1,q,kv) fp16: upper-triangular above the
-// diagonal = FP16_MIN, else 0. For prefill q=kv=L; this is the only place a
-// non-zero bias is needed (decode rounds use all-zero full-history masks).
-std::vector<uint16_t> causal_bias(int q, int kv) {
-    std::vector<uint16_t> m(static_cast<size_t>(q) * kv, 0);
-    for (int i = 0; i < q; ++i) {
-        // mask position j (key) from query i if j > i + (kv - q)  (causal:
-        // query i sees keys [0, i + (kv-q)]). Equivalent to triu(diagonal =
-        // kv-q+1).
-        int threshold = i + (kv - q);
-        for (int j = threshold + 1; j < kv; ++j) {
-            m[static_cast<size_t>(i) * kv + j] = FP16_MIN;
-        }
-    }
-    return m;
 }
 
 // One image's visual outputs: image_features + 3 deepstack tensors, each
@@ -743,11 +445,11 @@ int main(int argc, char** argv) {
     std::printf("=== LoadModel ===\n");
     rt->LoadModel();
     // GPU argmax：图末尾注册 TopK k=1 后处理（VKOP_GPU_ARGMAX=0 跳过）。
-    register_gpu_argmax(rt);
+    vkop::llm::register_gpu_argmax(rt, "perf");
     std::printf("=== LoadModel done ===\n");
 
     // 从 runtime inputs 动态推断架构参数（纯文本 vs 多模态 自动识别）。
-    ModelArch arch = infer_model_arch(rt);
+    ModelArch arch = vkop::llm::infer_arch(rt, "arch");
     std::printf("[arch] hidden=%d nlayers=%d nkv=%d hd=%d "
                 "position_ids=%dD %s %s\n",
                 arch.hidden, arch.nlayers, arch.nkv, arch.hd,
@@ -759,7 +461,7 @@ int main(int argc, char** argv) {
     // past_key_values_0（见 infer_model_arch）。cache 宽度必须与图的 cache
     // 张量一致 —— 不一致时 vkop 会静默误读，所以这里硬警告。
     if (kv_kind_opt != "auto") {
-        const ElemKind pk0_kind = rt->GetInput("past_key_values_0")->elem_kind();
+        const ElemKind pk0_kind = rt->GetInput(arch.kv_in(0))->elem_kind();
         static const std::pair<const char*, ElemKind> kKinds[] = {
             {"fp16", ElemKind::kFloat16},
             {"fp8e4m3", ElemKind::kFloat8E4M3FN},
@@ -786,7 +488,7 @@ int main(int argc, char** argv) {
     std::printf("[arch] kv cache dtype = %s\n", elem_name(arch.cache_kind));
 
     // Embedding table: vocab inferred from file size，按 arch.hidden 推断。
-    auto [embed_table, vocab] = load_embed_table(embed_path, arch.hidden);
+    auto [embed_table, vocab] = vkop::llm::load_embed_table(embed_path, arch.hidden, "embed");
     std::printf("[embed] loaded %s  vocab=%d  hidden=%d  (~%.0fMB, %zu rows)\n",
                 embed_path.c_str(), vocab, arch.hidden,
                 static_cast<double>(vocab) * arch.hidden * 2 / 1e6,
@@ -832,7 +534,7 @@ int main(int argc, char** argv) {
     // 只做逻辑 resize + present→past 回填。生命周期见 kv_cache.hpp。
     // --max-kv 可调：它同时是滑窗环的表观容量 W（见 Attention 的 ring）。
     KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, max_kv,
-               arch.cache_kind);
+               arch.cache_kind, arch.kv_layers);
 
     // ---- 滑窗环（graph 侧带 kv_ring_head 时启用，见 ops/Attention.hpp）----
     // KV 变成 W 行的一个环：逻辑行 j 落在物理槽 (kv_head + j) % W，覆盖的绝对
@@ -889,8 +591,9 @@ int main(int argc, char** argv) {
 
     // Per-round reusable zero buffers (deepstack + decode attention_bias +
     // image_pad_mask). deepstack_embeds_{0,1,2}: (1, hidden) fp16 zeros.
-    std::vector<uint16_t> ds_zero(arch.hidden, 0);
-    std::vector<uint32_t> ds_shape = {1u, static_cast<uint32_t>(arch.hidden)};
+    vkop::llm::DecodeInputs dec_in(rt, dev, cmdpool, arch);
+    const std::vector<uint16_t> &ds_zero = dec_in.ds_zero();
+    const std::vector<uint32_t> &ds_shape = dec_in.ds_shape();
 
     // Profiling state (opt-in via VKOP_PROFILE=1).
     const char* prof_env = std::getenv("VKOP_PROFILE");
@@ -989,9 +692,9 @@ int main(int argc, char** argv) {
         //   P_abs —— 新算的那几个 token 的**绝对**位置起点 = kv_base + P。
         // 无环时 base 恒为 0，两者相等，代码路径与从前逐位一致。
         //
-        // 复用要求 ids 以「上一轮 KV 装的那段序列」为前缀，且前缀里的 mm 类型
-        // 与图像 span 逐位一致 —— 占位 token 相同但配错图，K/V 就是错的，而
-        // 这种错不会自己暴露。任何一条不满足都退回整段 prefill（P=0）。
+        // 复用的是 ids 与「上一轮 KV 装的那段序列」的公共前缀（环模式仍要求
+        // 窗口内整段对上），且前缀里的 mm 类型与图像 span 逐位一致 —— 占位
+        // token 相同但配错图，K/V 就是错的，而这种错不会自己暴露。
         int P = 0, P_abs = 0;
         if (ring) {
             // 环：先把窗口推到本轮结束时的位置。本轮算完 KV 只留最后 ≤W 行，
@@ -1061,26 +764,15 @@ int main(int argc, char** argv) {
             // 已有行往下算，否则从窗口起点整段重算。窗口起点 ≥ L-W，所以
             // S = L - P_abs <= W —— 环里的 prefill 永远装得下。
             P_abs = kv_base + kv_resident;
-        } else if (kv_reuse && !covered.ids.empty() && covered.ids.size() < ids.size() &&
-                   Conversation::prefixMatch(covered.ids, ids)) {
-            bool ok = covered.mm_types.size() == covered.ids.size();
-            for (int i = 0; ok && i < static_cast<int>(covered.ids.size()); ++i) {
-                ok = covered.mm_types[i] == rctx.mm_types[i];
-            }
-            size_t j = 0;
-            for (const auto& s : covered.spans) {
-                if (!ok) break;
-                // span 跨在边界上就没法只复用前半段：整段重算。
-                ok = s.start + s.count <= static_cast<int>(covered.ids.size()) &&
-                     j < rctx.spans.size();
-                if (!ok) break;
-                const auto& n = rctx.spans[j++];
-                ok = n.start == s.start && n.count == s.count && n.block == s.block;
-            }
-            for (; ok && j < rctx.spans.size(); ++j) {
-                ok = rctx.spans[j].start >= static_cast<int>(covered.ids.size());
-            }
-            if (ok) P = static_cast<int>(covered.ids.size());
+        } else if (kv_reuse && !covered.ids.empty()) {
+            // 无环：最长公共前缀（与 llm_serve 同一个函数）。比「上一轮整段
+            // 都是前缀」更宽：历史被 trimToBudget 丢了旧轮、或模板把旧的
+            // assistant 轮渲染得不一样时，分岔点之前的行照样能用；分岔点之后
+            // 的旧行由本轮 prefill 覆盖（attention 不读 past_len 之后的行）。
+            // span 不能被切开，前缀里的每个 span 两边必须是同一张图。
+            P = vkop::llm::reusable_prefix(covered.ids, ids, &covered.mm_types,
+                                           &rctx.mm_types, &covered.spans,
+                                           &rctx.spans);
         }
         if (!ring) P_abs = P;
         const int S = L - P_abs;
@@ -1090,7 +782,8 @@ int main(int argc, char** argv) {
         consumed_gen.reserve(static_cast<size_t>(max_new));
         if (P > 0) {
             std::printf("[prefill] reusing %d kv positions (base=%d, abs=%d), "
-                        "%d to compute\n", P, kv_base, P_abs, S);
+                        "%d to compute (previous kv covered %zu)\n", P, kv_base,
+                        P_abs, S, covered.ids.size());
         } else if (kv_reuse && !covered.ids.empty()) {
             std::printf("[prefill] no reusable prefix (previous kv covered %zu "
                         "tokens) — full prefill\n", covered.ids.size());
@@ -1106,8 +799,10 @@ int main(int argc, char** argv) {
         // 不同块边界必须得到同一个结果 —— 这是「窗口只由 W 决定」的直接检验），
         // 也用来给 lm_head 的 logits buffer 封顶。每块的丢行因此恒为 0，留着
         // 只是兜底。
-        bool chunked = ring && P + S > W;
-        int C_max = std::max(1, W / 2);
+        // 无环时同样分块（默认块长同 llm_serve）：图的 logits 输出是
+        // (1, q, vocab)，一次吃下整段长 prompt 就是 q*vocab*2 字节。
+        bool chunked = ring ? P + S > W : S > vkop::llm::kDefaultPrefillChunk;
+        int C_max = ring ? std::max(1, W / 2) : vkop::llm::kDefaultPrefillChunk;
         // 调试用：把块长压小并强制分块（W 不变，所以一块行都不会丢）。这样
         // 「分块 vs 单块」能在同一条序列上直接对比 —— 没有窗口损失时两者应当
         // 只差一个 softmax 归约顺序。
@@ -1115,14 +810,18 @@ int main(int argc, char** argv) {
             const int v = std::atoi(e);
             if (v > 0) {
                 C_max = v;
-                chunked = ring && S > C_max;
+                chunked = S > C_max;
             }
         }
         const int n_chunks = chunked ? (S + C_max - 1) / C_max : 1;
         if (chunked) {
-            std::printf("[prefill] 分块 prefill：本轮 %d 个 token，每块 ≤%d，"
-                        "共 %d 块（窗口 %d 行，起点 base=%d）\n",
-                        S, C_max, n_chunks, W, kv_base);
+            if (ring)
+                std::printf("[prefill] 分块 prefill：本轮 %d 个 token，每块 ≤%d，"
+                            "共 %d 块（窗口 %d 行，起点 base=%d）\n",
+                            S, C_max, n_chunks, W, kv_base);
+            else
+                std::printf("[prefill] 分块 prefill：本轮 %d 个 token，每块 ≤%d，"
+                            "共 %d 块\n", S, C_max, n_chunks);
             std::fflush(stdout);
         }
         double ms = 0, prefill_chunk_ms = 0;
@@ -1131,7 +830,7 @@ int main(int argc, char** argv) {
         // 本块的绝对起点 A、长度 C，以及本块能从 cache 读到几行 Pc。
         const int A = chunked ? P_abs + blk * C_max : P_abs;
         const int C = chunked ? std::min(C_max, P_abs + S - A) : S;
-        if (chunked) {
+        if (chunked && ring) {
             // 丢的只能是已经写进 KV 的最旧那些行。kv_resident + C <= W 是
             // Attention 侧的硬约束：新的 C 行要写进还空着的槽。
             const int drop = std::max(0, kv_resident + C - W);
@@ -1139,7 +838,8 @@ int main(int argc, char** argv) {
             kv_resident -= drop;
             kv_base += drop;
         }
-        const int Pc = chunked ? kv_resident : P;
+        // 无环分块时 base 恒为 0，cache 里的行数就是本块的绝对起点 A。
+        const int Pc = chunked ? (ring ? kv_resident : A) : P;
 
         // inputs_embeds (1, C, hidden): embed this chunk's tokens, then scatter
         // the visual image_features rows into the image-pad positions (多模态).
@@ -1309,11 +1009,11 @@ int main(int argc, char** argv) {
         cmdpool->getVulkanDevice()->wait_all_done();
 
         if (chunked) {
-            kv_resident += C;   // 本块的 C 行已经写进环里
+            if (ring) kv_resident += C;   // 本块的 C 行已经写进环里
             std::printf("[prefill] 第 %d/%d 块: A=%d C=%d Pc=%d → kv=%d "
                         "(base=%d, head=%d) %.1fms\n",
-                        blk + 1, n_chunks, A, C, Pc, kv_resident, kv_base,
-                        kv_head, run_ms);
+                        blk + 1, n_chunks, A, C, Pc, ring ? kv_resident : A + C,
+                        kv_base, kv_head, run_ms);
             std::fflush(stdout);
         }
         }   // for (blk)
@@ -1431,7 +1131,7 @@ int main(int argc, char** argv) {
         // ---- install host-imported decode inputs for this round ----
         // (each round reinstalls; the next prefill's larger shapes drop the
         // imports and revert to the batched-upload path automatically)
-        bool zerocopy = install_decode_host_imports(rt, dev, arch, ds_shape, max_kv);
+        dec_in.install(max_kv);
 
         // ---- Decode loop (q_len = 1) ----
         for (int step = 1; step < max_new; ++step) {
@@ -1446,29 +1146,6 @@ int main(int argc, char** argv) {
                                         vocab, arch.hidden);
             // 这个 token 马上要被模型吃进 KV，记下来（下一轮判断能否复用前缀）。
             consumed_gen.push_back(static_cast<uint32_t>(next_id));
-            // Dual path: an input whose storage is host-imported gets
-            // resize+memcpy (no upload); everything else takes the original
-            // fill+batch-upload path. VKOP_ZC_UPLOAD=1 (bisection) uploads on
-            // top of the imports too: the staging copy overwrites the
-            // mapping's bytes, isolating buffer-binding bugs from content
-            // bugs.
-            const bool upload_too =
-                zerocopy && std::getenv("VKOP_ZC_UPLOAD") != nullptr;
-            bool ie_imp = false, pid_imp = false, ab_imp = false;
-            bool ds_imp[3] = {false, false, false}, pm_imp = false;
-            {
-                rt->ResizeInput(
-                    "inputs_embeds",
-                    {1u, 1u, static_cast<uint32_t>(arch.hidden)});
-                auto ie = as_tensor<uint16_t>(rt->GetInput("inputs_embeds"));
-                ie_imp = ie->is_host_imported();
-                if (ie_imp)
-                    std::memcpy(ie->host_import_ptr(), cur_emb.data(),
-                                cur_emb.size() * sizeof(uint16_t));
-                else
-                    ie->fillToCPU(cur_emb.data());
-            }
-
             // 环：新的一行要进去，就得先给最旧的一行腾槽。丢的是 cache 第 0
             // 行（kv_base 那一行），头上那一格挪一格、行数减一，绝对位置前移
             // —— 一步里只动 host 侧的三个整数。每一步都要把 past 的逻辑
@@ -1487,108 +1164,11 @@ int main(int argc, char** argv) {
             // position_ids: 2D 纯文本 (1, 1) = 绝对位置；3D 多模态 (3, 1, 1)
             // = 绝对位置 + rope_delta（MRoPE delta）。环模式下图的 kv_past 是
             // 窗口内的序号，绝对位置是 dec_base + past_len。
-            {
-                int64_t p = static_cast<int64_t>(dec_base + past_len) + rope_delta;
-                if (arch.position_ids_dims == 3) {
-                    int64_t pos[3] = {p, p, p};
-                    rt->ResizeInput("position_ids", {3u, 1u, 1u});
-                    auto t = as_tensor<int64_t>(rt->GetInput("position_ids"));
-                    pid_imp = t->is_host_imported();
-                    // position_ids 还被 Gather 当索引走 has_cpu_data() 的 CPU
-                    // 快路径（ops/Gather.hpp readHostIndices 读的是 data_ 而非
-                    // 绑定的 buffer），所以映射写完还得同步 data_，缺一不可。
-                    if (pid_imp) {
-                        std::memcpy(t->host_import_ptr(), pos, sizeof(pos));
-                        t->fillToCPU(pos);
-                    } else
-                        t->fillToCPU(pos);
-                } else {
-                    rt->ResizeInput("position_ids", {1u, 1u});
-                    auto t = as_tensor<int64_t>(rt->GetInput("position_ids"));
-                    pid_imp = t->is_host_imported();
-                    if (pid_imp) {
-                        std::memcpy(t->host_import_ptr(), &p, sizeof(p));
-                        t->fillToCPU(&p);
-                    } else
-                        t->fillToCPU(&p);
-                }
-            }
-            // attention_bias (1, 1, 1, past_len+1) all zero (full history):
-            // imported storage was zero-filled to capacity at install — only
-            // the shape moves.
-            {
-                auto ab = as_tensor<uint16_t>(rt->GetInput("attention_bias"));
-                rt->ResizeInput("attention_bias", {1u, 1u, 1u,
-                                static_cast<uint32_t>(past_len + 1)});
-                ab_imp = ab->is_host_imported();
-                if (!ab_imp) {
-                    std::vector<uint16_t> zeros(static_cast<size_t>(past_len + 1), 0);
-                    ab->fillToCPU(zeros.data());
-                }
-            }
-            // deepstack zeros / image_pad_mask false（仅模型有这些输入时才写）。
-            if (arch.has_deepstack) {
-                for (int d = 0; d < 3; ++d) {
-                    auto t = as_tensor<uint16_t>(
-                        rt->GetInput("deepstack_embeds_" + std::to_string(d)));
-                    rt->ResizeInput("deepstack_embeds_" + std::to_string(d),
-                                    ds_shape);
-                    ds_imp[d] = t->is_host_imported();
-                    if (!ds_imp[d]) t->fillToCPU(ds_zero.data());
-                }
-            }
-            if (arch.has_image_pad_mask) {
-                rt->ResizeInput("image_pad_mask", {1u, 1u});
-                auto t = as_tensor<int8_t>(rt->GetInput("image_pad_mask"));
-                pm_imp = t->is_host_imported();
-                if (!pm_imp) {
-                    int8_t zero = 0;
-                    t->fillToCPU(&zero);
-                }
-            }
-
-            // Upload. 一次 submit 打包全部输入：copyToGPUBuffer 独立 submit+wait
-            // 时每条在 MoltenVK 上各付 ~0.5ms 固定开销。batch 模式只 record，
-            // 由这里统一 end/submit/wait，再复位 staging 池（同 runtime 的
-            // batch_flush 约定）。host-imported 的输入不进 batch（零拷贝）；
-            // upload_too 时全部上传（覆盖映射字节，分配隔离用）。
-            // pm_imp/ds_imp 只在对应输入存在时才有意义：文本模型没有
-            // image_pad_mask/deepstack，pm_imp 恒为 false，若无条件把它并进
-            // 判据就会每步都提交一个空 batch，正好把零拷贝省下的那笔 submit
-            // 又送回去。
-            bool need_upload =
-                !ie_imp || !pid_imp || !ab_imp;
-            if (arch.has_deepstack)
-                need_upload = need_upload ||
-                    (!ds_imp[0] || !ds_imp[1] || !ds_imp[2]);
-            if (arch.has_image_pad_mask)
-                need_upload = need_upload || !pm_imp;
-            if (upload_too || need_upload) {
-                auto tu0 = std::chrono::steady_clock::now();
-                auto batch = std::make_shared<vkop::VulkanCommandBuffer>(cmdpool);
-                batch->begin();
-                if (upload_too || !ie_imp)
-                    upload_input(cmdpool, rt->GetInput("inputs_embeds"), batch);
-                if (upload_too || !pid_imp)
-                    upload_input(cmdpool, rt->GetInput("position_ids"), batch);
-                if (upload_too || !ab_imp)
-                    upload_input(cmdpool, rt->GetInput("attention_bias"), batch);
-                if (arch.has_deepstack) {
-                    for (int d = 0; d < 3; ++d)
-                        if (upload_too || !ds_imp[d])
-                            upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)), batch);
-                }
-                if (arch.has_image_pad_mask && (upload_too || !pm_imp))
-                    upload_input(cmdpool, rt->GetInput("image_pad_mask"), batch);
-                batch->end();
-                batch->submit(cmdpool->getVulkanDevice()->getComputeQueue());
-                batch->wait();
-                cmdpool->getStagingBufferPool()->reset();
-                if (component_timer_on())
-                    std::printf("[p1t] upload %.3fms\n",
-                                std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - tu0).count());
-            }
+            // 写入走 DecodeInputs（llm_common.hpp）：host-imported 的输入原地
+            // 写，其余一次 batch 上传。
+            dec_in.step(cur_emb.data(),
+                        static_cast<int64_t>(dec_base + past_len) + rope_delta,
+                        past_len + 1);
 
             auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();

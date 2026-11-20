@@ -24,13 +24,14 @@
 //
 // stop_reason: "stop"（命中停止符或收到 STOP）/ "length"（max_new 用尽）。
 //
-// 与 llm_chat 的关系：prefill/decode 的数值路径与它逐位同构（同样的
-// embed 查表、causal bias、KVCache 语义、present→past 只改逻辑长度），但**故意
-// 不带**滑窗环、host-imported 零拷贝输入。
-// 那些是性能层，任何一个出问题都会静默错答案；服务端先要正确，快的那部分等
-// 行为被验证过再接。已接入的两项：GPU argmax（TopK k=1 后处理，仅贪心路径；
-// 与 host 扫描逐 token 对拍一致，VKOP_GPU_ARGMAX=0 回退）和 decode 输入的单次
-// batch 上传（与逐个 copyToGPU 同字节，只是一次 submit）。跨请求的 KV 前缀复用保留：下一段的 ids 以上一段覆盖的序列
+// 与 llm_chat 的关系：架构推断、embed 查表、causal bias、输入填充、GPU argmax
+// 和 decode 输入写入（DecodeInputs：host-imported 零拷贝，不可用时一次 batch
+// 上传）都在 llm_common.hpp 里共用，数值路径逐位同构。仍**故意不带**滑窗环。
+// GPU TopK 后处理（--sample-topk K，默认 64）：贪心读回第 0 个，采样只读回
+// K 个候选（Sampler::pick_topk，分布精确，候选定不下来的步才读整行）；
+// VKOP_GPU_ARGMAX=0 回退 host 扫描；零拷贝
+// VKOP_DECODE_ZEROCOPY=0 关闭，hybrid（linear-attention）模型默认不开，
+// 需 =1 显式打开。跨请求的 KV 前缀复用保留：下一段的 ids 以上一段覆盖的序列
 // 为前缀时只算新增的 token —— Claude Code 每轮都把整段历史重发，省下的正是
 // 「整个上下文重新 prefill」。
 //
@@ -78,6 +79,7 @@
 #include "core/runtime.hpp"
 #include "tokenizer.hpp"
 #include "kv_cache.hpp"
+#include "llm_common.hpp"
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
@@ -89,6 +91,11 @@ using vkop::core::elem_name;
 using vkop::export_::KVCache;
 using vkop::export_::LinearState;
 using qwen::Tokenizer;
+using vkop::llm::causal_bias;
+using vkop::llm::embed_lookup;
+using vkop::llm::fill_fp16_input;
+using vkop::llm::fill_i64_input;
+using vkop::llm::upload_input;
 
 namespace {
 
@@ -248,312 +255,108 @@ class LineReader {
     std::size_t pos_ = 0;
 };
 
-// --------------------------------------------------------------- model ----
-constexpr int LEGACY_HIDDEN = 2048;
-constexpr uint16_t FP16_MIN = 0xFBFF;  // -65504, Qwen's causal-mask fill
-
-struct ModelArch {
-    int hidden = LEGACY_HIDDEN;
-    int nkv = 8;
-    int hd = 128;
-    // Number of layers that carry a KV cache. Equal to the model's layer count
-    // for a dense graph (Qwen3-VL-2B: 28), and smaller for a hybrid one:
-    // Qwen3.5-27B has 64 layers of which only every 4th is full attention, so
-    // 16. Everything that walks "one cache per layer" uses this, and the layer
-    // NUMBERS live in kv_layers -- the graph does not name them 0..n-1.
-    int nlayers = 28;
-    // The layer index of each KV cache, in ascending order. The graph input is
-    // `past_key_values_<layer>`, and for a hybrid model those numbers are
-    // sparse (Qwen3.5-27B: 3, 7, 11, ... 63). A dense model leaves this as
-    // 0..nlayers-1, which is also what an older artifact carries, so nothing
-    // about the existing path changes.
-    std::vector<int> kv_layers;
-    int position_ids_dims = 2;
-    bool has_deepstack = false;
-    bool has_image_pad_mask = false;
-    ElemKind cache_kind = ElemKind::kFloat16;
-
-    // The graph input/output name for cache slot `i` (0-based position in
-    // kv_layers, NOT the layer index).
-    std::string kv_in(int i) const {
-        return "past_key_values_" + std::to_string(kv_layers[i]);
-    }
-    std::string kv_out(int i) const {
-        return "present_key_values_" + std::to_string(kv_layers[i]);
-    }
-};
-
-inline float fp16_to_f32(uint16_t h) { return ITensor::fp16_to_fp32(h); }
-
-ModelArch infer_arch(const std::shared_ptr<Runtime> &rt) {
-    ModelArch a;
-    // Enumerate the model's own input names rather than probing 0, 1, 2, ...
-    // A dense export numbers its caches consecutively and both agree, but a
-    // hybrid decoder only caches the full-attention layers: Qwen3.5-27B has
-    // past_key_values_3, _7, ... _63 and nothing at _0, so counting upward
-    // stops at the first gap and reported "no past_key_values_* inputs".
-    const std::string kv_prefix = "past_key_values_";
-    for (const auto &name : rt->ListInputNames()) {
-        if (name.rfind(kv_prefix, 0) != 0) continue;
-        const std::string digits = name.substr(kv_prefix.size());
-        if (digits.empty()) continue;
-        // The suffix must be a plain layer index: a name like
-        // `past_key_values_3_scale` belongs to a quantized-cache variant and is
-        // not a cache tensor.
-        if (digits.find_first_not_of("0123456789") != std::string::npos)
-            continue;
-        a.kv_layers.push_back(std::atoi(digits.c_str()));
-    }
-    std::sort(a.kv_layers.begin(), a.kv_layers.end());
-    if (a.kv_layers.empty())
-        throw std::runtime_error("model has no past_key_values_* inputs");
-    a.nlayers = static_cast<int>(a.kv_layers.size());
-    auto pk0 = rt->GetInput(a.kv_in(0));
-    if (!pk0)
-        throw std::runtime_error("model declares " + a.kv_in(0) +
-                                 " but the runtime has no such input");
-    auto s = pk0->getShape();
-    if (s.size() >= 3) a.nkv = static_cast<int>(s[2]);
-    if (s.size() >= 5) a.hd = static_cast<int>(s[4]);
-    a.cache_kind = pk0->elem_kind();
-    if (a.cache_kind != ElemKind::kFloat16 &&
-        a.cache_kind != ElemKind::kFloat8E4M3FN &&
-        a.cache_kind != ElemKind::kFloat8E5M2 &&
-        a.cache_kind != ElemKind::kInt4 && a.cache_kind != ElemKind::kNF4) {
-        std::fprintf(stderr, "[serve] cache dtype %s unsupported, using fp16\n",
-                     elem_name(a.cache_kind));
-        a.cache_kind = ElemKind::kFloat16;
-    }
-    auto emb = rt->GetInput("inputs_embeds");
-    auto es = emb->getShape();
-    if (es.size() >= 3) a.hidden = static_cast<int>(es[es.size() - 1]);
-    auto pid = rt->GetInput("position_ids");
-    a.position_ids_dims = pid ? static_cast<int>(pid->getShape().size()) : 2;
-    a.has_deepstack = rt->GetInput("deepstack_embeds_0") != nullptr;
-    a.has_image_pad_mask = rt->GetInput("image_pad_mask") != nullptr;
-    return a;
-}
-
-std::pair<std::vector<uint16_t>, int> load_embed_table(const std::string &path,
-                                                       int hidden) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    const auto bytes = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    const size_t row = static_cast<size_t>(hidden) * sizeof(uint16_t);
-    if (row == 0) throw std::runtime_error("hidden must be > 0");
-    if (bytes % row != 0) {
-        std::fprintf(stderr,
-                     "[serve] embed table %zu bytes / row %zu -> truncated vocab\n",
-                     bytes, row);
-    }
-    const int vocab = static_cast<int>(bytes / row);
-    std::vector<uint16_t> buf(static_cast<size_t>(vocab) * hidden);
-    f.read(reinterpret_cast<char *>(buf.data()),
-           static_cast<std::streamsize>(buf.size() * sizeof(uint16_t)));
-    if (!f) throw std::runtime_error("short read on " + path);
-    return {std::move(buf), vocab};
-}
-
-void fill_fp16_input(const std::shared_ptr<Runtime> &rt, const std::string &name,
-                     const std::vector<uint32_t> &shape, const uint16_t *data) {
-    rt->ResizeInput(name, shape);
-    auto t = rt->GetInput(name);
-    auto tg = as_tensor<uint16_t>(t);
-    if (tg->num_elements() > 0) tg->fillToCPU(data);
-}
-
-void fill_i64_input(const std::shared_ptr<Runtime> &rt, const std::string &name,
-                    const std::vector<uint32_t> &shape, const int64_t *data) {
-    rt->ResizeInput(name, shape);
-    auto t = rt->GetInput(name);
-    auto tg = as_tensor<int64_t>(t);
-    if (tg->num_elements() > 0) tg->fillToCPU(data);
-}
-
-// With `batch`, the copy is only recorded into it; the caller ends, submits
-// and waits once for every input and then resets the staging pool.
-void upload_input(const std::shared_ptr<vkop::VulkanCommandPool> &cp,
-                  const std::shared_ptr<ITensor> &t,
-                  const std::shared_ptr<vkop::VulkanCommandBuffer> &batch =
-                      nullptr) {
-    if (t->dtype() == typeid(int64_t))
-        as_tensor<int64_t>(t)->copyToGPU(cp, nullptr, nullptr, batch);
-    else if (t->dtype() == typeid(int))
-        as_tensor<int>(t)->copyToGPU(cp, nullptr, nullptr, batch);
-    else if (t->dtype() == typeid(int8_t))
-        as_tensor<int8_t>(t)->copyToGPU(cp, nullptr, nullptr, batch);
-    else if (t->dtype() == typeid(float))
-        as_tensor<float>(t)->copyToGPU(cp, nullptr, nullptr, batch);
-    else
-        as_tensor<uint16_t>(t)->copyToGPU(cp, nullptr, nullptr, batch);
-}
-
-std::vector<uint16_t> causal_bias(int q, int kv) {
-    std::vector<uint16_t> m(static_cast<size_t>(q) * kv, 0);
-    for (int i = 0; i < q; ++i) {
-        const int threshold = i + (kv - q);
-        for (int j = threshold + 1; j < kv; ++j)
-            m[static_cast<size_t>(i) * kv + j] = FP16_MIN;
-    }
-    return m;
-}
-
-std::vector<uint16_t> embed_lookup(const std::vector<uint16_t> &table,
-                                   const std::vector<uint32_t> &ids, int vocab,
-                                   int hidden) {
-    std::vector<uint16_t> out(ids.size() * hidden, 0);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] >= static_cast<uint32_t>(vocab)) {
-            std::fprintf(stderr, "[serve] token %u >= vocab %d (zeroed)\n",
-                         ids[i], vocab);
-            continue;
-        }
-        std::memcpy(&out[i * hidden], &table[static_cast<size_t>(ids[i]) * hidden],
-                    hidden * sizeof(uint16_t));
-    }
-    return out;
-}
+// The architecture, embedding and input helpers are shared with llm_chat
+// (llm_common.hpp); only the server's own pieces live below.
+using vkop::llm::ModelArch;
+using vkop::llm::fp16_to_f32;
 
 // ------------------------------------------------------------- sampling ----
-// Everything here runs on the host because the logits row is already copied
-// back for the greedy scan -- no shader, no extra GPU work, and no new
-// numerical path to validate. temperature <= 0 keeps the original argmax
-// bit-for-bit, so the default behaviour of every existing caller is unchanged.
-struct SampleParams {
-    float temperature = 0.0f;        // <= 0: greedy
-    int top_k = 0;                   // <= 0: keep the whole vocabulary
-    float top_p = 1.0f;              // >= 1: no nucleus cut
-    float repetition_penalty = 1.0f; // 1: off
-};
+using vkop::llm::SampleParams;
+using vkop::llm::Sampler;
 
-class Sampler {
-  public:
-    explicit Sampler(uint64_t seed = 0) : rng_(seed) {}
+// Candidates the GPU TopK keeps per row. 1 is plain argmax; larger lets
+// non-greedy requests sample from K values instead of reading back the whole
+// vocabulary row (see Sampler::pick_topk). --sample-topk / VKOP_SAMPLE_TOPK.
+constexpr int kDefaultSampleTopK = 64;
 
-    // `history` is the set of ids this round has already generated. Prompt
-    // tokens are deliberately excluded: penalising them would suppress the
-    // tool names and JSON punctuation an agent's system prompt legitimately
-    // repeats every turn.
-    int pick(const uint16_t *row, int vocab, const std::vector<uint32_t> &history,
-             const SampleParams &sp) {
-        if (sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f) {
-            int best = 0;
-            float bestv = -1e30f;
-            for (int i = 0; i < vocab; ++i) {
-                const float v = fp16_to_f32(row[i]);
-                if (v > bestv) { bestv = v; best = i; }
-            }
-            return best;
-        }
-
-        logits_.resize(static_cast<size_t>(vocab));
-        for (int i = 0; i < vocab; ++i) logits_[i] = fp16_to_f32(row[i]);
-        if (sp.repetition_penalty != 1.0f) {
-            for (const uint32_t id : history) {
-                if (id >= static_cast<uint32_t>(vocab)) continue;
-                float &v = logits_[id];
-                v = v > 0.0f ? v / sp.repetition_penalty : v * sp.repetition_penalty;
-            }
-        }
-        // Still deterministic: max_element takes the first maximum, the same
-        // tie rule as the strict `>` scan above.
-        if (sp.temperature <= 0.0f)
-            return static_cast<int>(std::max_element(logits_.begin(), logits_.end()) -
-                                    logits_.begin());
-
-        const float inv_t = 1.0f / sp.temperature;
-        for (float &v : logits_) v *= inv_t;
-
-        idx_.resize(static_cast<size_t>(vocab));
-        for (int i = 0; i < vocab; ++i) idx_[i] = i;
-        const auto better = [this](int a, int b) { return logits_[a] > logits_[b]; };
-        int k = vocab;
-        if (sp.top_k > 0 && sp.top_k < vocab) {
-            k = sp.top_k;
-            std::nth_element(idx_.begin(), idx_.begin() + k, idx_.end(), better);
-        }
-        // Nucleus needs descending order; plain top-k does not, and sorting
-        // 152k entries per token is not free.
-        const bool nucleus = sp.top_p > 0.0f && sp.top_p < 1.0f;
-        if (nucleus) std::sort(idx_.begin(), idx_.begin() + k, better);
-
-        float maxv = -std::numeric_limits<float>::infinity();
-        for (int i = 0; i < k; ++i) maxv = std::max(maxv, logits_[idx_[i]]);
-        probs_.resize(static_cast<size_t>(k));
-        float sum = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            const float e = std::exp(logits_[idx_[i]] - maxv);
-            probs_[i] = e;
-            sum += e;
-        }
-        int n = k;
-        if (nucleus) {
-            float cum = 0.0f;
-            for (int i = 0; i < k; ++i) {
-                cum += probs_[i] / sum;
-                if (cum >= sp.top_p) { n = i + 1; break; }
-            }
-            sum = 0.0f;
-            for (int i = 0; i < n; ++i) sum += probs_[i];
-        }
-        std::uniform_real_distribution<float> u(0.0f, 1.0f);
-        float r = u(rng_) * sum;
-        for (int i = 0; i < n; ++i) {
-            r -= probs_[i];
-            if (r <= 0.0f) return idx_[i];
-        }
-        return idx_[n - 1];
-    }
-
-  private:
-    std::mt19937_64 rng_;
-    std::vector<float> logits_;
-    std::vector<int> idx_;
-    std::vector<float> probs_;
-};
-
+// The next token from the last logits row. `topk_k` is the k of the TopK
+// post-process registered at load (0: none, 1: argmax only).
+//
+// Greedy reads back one id per row from the GPU TopK. Sampling with k > 1
+// reads back the K candidates and lets Sampler::pick_topk decide, which only
+// reads the full 151936-wide row on the steps it cannot settle exactly from
+// the candidates. VKOP_LOGIT_TOP (debug: print the head of the distribution)
+// always takes the full row.
 int sample_last_token(const std::shared_ptr<Runtime> &rt,
                       const std::shared_ptr<vkop::VulkanCommandPool> &cp,
-                      int fallback_vocab, Sampler &sampler,
+                      int fallback_vocab, int topk_k, Sampler &sampler,
                       const std::vector<uint32_t> &history,
                       const SampleParams &sp) {
-    // Greedy fast path: the TopK(k=1) post-op registered at load already
-    // reduced every logits row on the GPU, so read back one int per row
-    // instead of the 151936-wide fp16 row and its host scan (~2 ms/token on
-    // M5 Max). Same first-maximum answer as Sampler::pick's greedy branch --
-    // llm_chat's two-turn A/B against the CPU scan is token-identical.
-    // Anything that needs the distribution (temperature, repetition
-    // penalty, VKOP_LOGIT_TOP) still takes the full readback below.
-    if (sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f &&
-        !std::getenv("VKOP_LOGIT_TOP")) {
-        if (auto idx_out = rt->GetOutput("post_TopK1")) {
-            auto ti = as_tensor<int>(idx_out);
-            ti->copyToCPU(cp);
-            return ti->at(static_cast<int>(ti->num_elements()) - 1);
+    const bool logit_top = std::getenv("VKOP_LOGIT_TOP") != nullptr;
+    const bool greedy = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+    auto idx_out = topk_k > 0 ? rt->GetOutput("post_TopK1") : nullptr;
+    if (idx_out && !logit_top && greedy) {
+        auto ti = as_tensor<int>(idx_out);
+        ti->copyToCPU(cp);
+        // (rows, k) sorted descending: the last row's first entry. With k == 1
+        // that is the last element, as before.
+        const auto shape = ti->getShape();
+        const int k = shape.empty() ? 1 : shape.back();
+        return ti->at(ti->num_elements() - k);
+    }
+
+    // The full row, read lazily: the candidate path below may not need it.
+    std::shared_ptr<vkop::core::Tensor<uint16_t>> lg;
+    int vocab = 0, q = 1;
+    auto full_row = [&]() -> const uint16_t * {
+        if (!lg) {
+            auto logits = rt->GetOutput("logits");
+            if (!logits) throw std::runtime_error("no 'logits' output");
+            lg = as_tensor<uint16_t>(logits);
+            lg->copyToCPU(cp);
+            const auto shape = lg->getShape();
+            vocab = shape.empty() ? 0 : shape.back();
+            q = shape.size() >= 2 ? shape[shape.size() - 2] : 1;
+            if (vocab <= 0 || q <= 0) {
+                vocab = fallback_vocab;
+                q = vocab > 0 ? lg->num_elements() / vocab : 1;
+            }
         }
+        return reinterpret_cast<const uint16_t *>(lg->data().data()) +
+               static_cast<std::ptrdiff_t>(q - 1) * vocab;
+    };
+
+    if (idx_out && topk_k > 1 && !logit_top) {
+        auto vt = as_tensor<uint16_t>(rt->GetOutput("post_TopK0"));
+        auto ti = as_tensor<int>(idx_out);
+        vt->copyToCPU(cp);
+        ti->copyToCPU(cp);
+        const auto shape = ti->getShape();
+        const int k = shape.empty() ? 1 : shape.back();
+        const size_t off = static_cast<size_t>(ti->num_elements() - k);
+        const uint16_t *vals =
+            reinterpret_cast<const uint16_t *>(vt->data().data()) + off;
+        const int *ids = ti->data().data() + off;
+        const int v = fallback_vocab;
+        const int tok = sampler.pick_topk(vals, ids, k, v, history, sp,
+                                          full_row);
+        // VKOP_TOPK_VERIFY: the candidates must be exactly the row's k
+        // largest values (as a multiset) -- the premise the exactness
+        // argument rests on.
+        if (std::getenv("VKOP_TOPK_VERIFY")) {
+            const uint16_t *row = full_row();
+            std::vector<float> all(static_cast<size_t>(vocab));
+            for (int i = 0; i < vocab; ++i) all[i] = fp16_to_f32(row[i]);
+            std::partial_sort(all.begin(), all.begin() + k, all.end(),
+                              std::greater<float>());
+            std::vector<float> got(static_cast<size_t>(k));
+            for (int i = 0; i < k; ++i) got[i] = fp16_to_f32(vals[i]);
+            std::sort(got.begin(), got.end(), std::greater<float>());
+            bool ok = true;
+            for (int i = 0; i < k; ++i) {
+                ok = ok && got[i] == all[i] && ids[i] >= 0 && ids[i] < vocab &&
+                     fp16_to_f32(row[ids[i]]) == fp16_to_f32(vals[i]);
+            }
+            std::fprintf(stderr, "[topk-verify] %s\n", ok ? "ok" : "MISMATCH");
+        }
+        return tok;
     }
-    auto logits = rt->GetOutput("logits");
-    if (!logits) throw std::runtime_error("no 'logits' output");
-    auto lg = as_tensor<uint16_t>(logits);
-    lg->copyToCPU(cp);
-    const uint16_t *p = reinterpret_cast<const uint16_t *>(lg->data().data());
-    auto shape = lg->getShape();
-    int vocab = shape.empty() ? 0 : shape.back();
-    int q = shape.size() >= 2 ? shape[shape.size() - 2] : 1;
-    const int total = lg->num_elements();
-    if (vocab <= 0 || q <= 0) {
-        vocab = fallback_vocab;
-        q = vocab > 0 ? total / vocab : 1;
-    }
-    const uint16_t *row = p + static_cast<std::ptrdiff_t>(q - 1) * vocab;
-    // VKOP_LOGIT_TOP: print the head of the distribution. A model that is
-    // producing plausible text has a broad top-5; one whose state or mask is
-    // wrong tends to pin a single token (often EOS) far above the rest, and
-    // that is indistinguishable from "the model chose to stop" without it.
-    // Printed before the greedy early-return below, which is the path a
-    // benchmark run takes.
-    if (std::getenv("VKOP_LOGIT_TOP")) {
+
+    const uint16_t *row = full_row();
+    if (logit_top) {
+        // The head of the distribution. A model producing plausible text has
+        // a broad top-5; one whose state or mask is wrong tends to pin a
+        // single token (often EOS) far above the rest.
         std::vector<std::pair<float, int>> top;
         for (int i = 0; i < vocab; ++i) {
             const float v = fp16_to_f32(row[i]);
@@ -573,36 +376,13 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
 
 // ------------------------------------------------------------- the server ----
 class InferenceServer {
-  private:
-    // GPU argmax as a TopK(k=1) post-process over 'logits' (the same hook
-    // llm_chat uses). Needs the model archive to carry the TopK kernel
-    // (onnx2vkop --extra-shaders TopK); a model without it throws inside
-    // RegisterPostProcess before the graph is touched, so it just keeps the
-    // host scan. VKOP_GPU_ARGMAX=0 forces the host scan (A/B arm).
-    void register_gpu_argmax() {
-        if (const char *e = std::getenv("VKOP_GPU_ARGMAX"); e && e[0] == '0') {
-            std::printf("[serve] argmax: host scan (VKOP_GPU_ARGMAX=0)\n");
-            return;
-        }
-        auto logits = rt_->GetOutput("logits");
-        if (!logits) return;
-        try {
-            rt_->RegisterPostProcess(
-                vkop::ops::OpType::TOPK, {{"k", "1"}}, {logits},
-                {std::make_shared<vkop::core::Tensor<uint16_t>>(),
-                 std::make_shared<vkop::core::Tensor<int>>()});
-            std::printf("[serve] argmax: GPU TopK(k=1) post-process\n");
-        } catch (const std::exception &e) {
-            std::printf("[serve] argmax: host scan (%s)\n", e.what());
-        }
-    }
-
   public:
     InferenceServer(const std::string &model, const std::string &embed,
                     const std::string &tok_path, int max_kv,
                     const std::string &kv_kind, int prefill_chunk,
                     const std::string &kv_warm = "",
-                    float repetition_penalty = 1.0f, uint64_t seed = 0)
+                    float repetition_penalty = 1.0f, uint64_t seed = 0,
+                    int sample_topk = kDefaultSampleTopK)
         : max_kv_(max_kv), prefill_chunk_(std::max(1, prefill_chunk)),
           model_path_(model) {
         sampler_ = Sampler(seed);
@@ -625,8 +405,8 @@ class InferenceServer {
         std::printf("[serve] === LoadModel ===\n");
         rt_->LoadModel();
         std::printf("[serve] === LoadModel done ===\n");
-        register_gpu_argmax();
-        arch_ = infer_arch(rt_);
+        topk_k_ = vkop::llm::register_gpu_topk(rt_, "serve", sample_topk);
+        arch_ = vkop::llm::infer_arch(rt_, "serve");
         if (kv_kind != "auto") {
             // The cache dtype belongs to the artifact: the converter wires
             // QuantizeLinear/DequantizeLinear around past/present and the
@@ -656,7 +436,7 @@ class InferenceServer {
                     arch_.position_ids_dims, (int)arch_.has_deepstack,
                     (int)arch_.has_image_pad_mask, elem_name(arch_.cache_kind));
 
-        auto loaded = load_embed_table(embed, arch_.hidden);
+        auto loaded = vkop::llm::load_embed_table(embed, arch_.hidden, "serve");
         embed_table_ = std::move(loaded.first);
         vocab_ = loaded.second;
         std::printf("[serve] embed vocab=%d hidden=%d\n", vocab_, arch_.hidden);
@@ -677,8 +457,8 @@ class InferenceServer {
         }
         for (int32_t id : tok_.stop_token_ids())
             stop_ids_.push_back(static_cast<uint32_t>(id));
-        ds_zero_.assign(static_cast<size_t>(arch_.hidden), 0);
-        ds_shape_ = {1u, static_cast<uint32_t>(arch_.hidden)};
+        dec_in_ = std::make_unique<vkop::llm::DecodeInputs>(rt_, dev_, cmdpool_,
+                                                            arch_);
         if (!tok_.chat_template().empty())
             std::printf("[serve] chat template loaded\n");
         else
@@ -1248,12 +1028,10 @@ class InferenceServer {
         //
         // At least one token must stay outside the prefix: with nothing left to
         // compute there would be no Run() to produce the first logits row.
-        size_t match = 0;
-        if (!covered_ids_.empty()) {
-            const size_t limit = std::min(covered_ids_.size(),
-                                          ids.size() ? ids.size() - 1 : 0);
-            while (match < limit && covered_ids_[match] == ids[match]) ++match;
-        }
+        // Same rule as llm_chat (llm_common.hpp); the server has no image
+        // spans, so it is the plain longest common prefix.
+        size_t match = static_cast<size_t>(
+            vkop::llm::reusable_prefix(covered_ids_, ids));
         // VKOP_SERVE_PREFIX_DEBUG: why the prefix stopped matching. A short
         // reuse is otherwise indistinguishable from "the client sent a
         // different prompt" -- which is what it was blamed on once -- so dump
@@ -1370,7 +1148,7 @@ class InferenceServer {
             if (arch_.has_deepstack) {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt_, "deepstack_embeds_" + std::to_string(d),
-                                    ds_shape_, ds_zero_.data());
+                                    dec_in_->ds_shape(), dec_in_->ds_zero().data());
             }
             if (arch_.has_image_pad_mask) {
                 std::vector<int8_t> mask(static_cast<size_t>(C), 0);
@@ -1433,7 +1211,7 @@ class InferenceServer {
                 penalised.push_back(id);
             }
         };
-        int next_id = sample_last_token(rt_, cmdpool_, vocab_, sampler_,
+        int next_id = sample_last_token(rt_, cmdpool_, vocab_, topk_k_, sampler_,
                                         penalised, sp);
         out_ids.push_back(static_cast<uint32_t>(next_id));
         note(static_cast<uint32_t>(next_id));
@@ -1453,7 +1231,17 @@ class InferenceServer {
         if (is_stop(static_cast<uint32_t>(next_id))) {
             reason = "stop";
         } else {
-            std::vector<uint16_t> zeros;
+            // Host-imported decode inputs (llm_chat's zero-copy path): each
+            // step writes its embedding/position straight into device-visible
+            // memory instead of a staging submit+wait. Re-installed every
+            // round because a prefill wider than the import's capacity drops
+            // it. Hybrid (linear-attention) models keep the batched upload
+            // until that combination has been checked token-for-token;
+            // VKOP_DECODE_ZEROCOPY=1 opts them in.
+            const char *zc_env = std::getenv("VKOP_DECODE_ZEROCOPY");
+            const bool zc_forced = zc_env && std::strcmp(zc_env, "1") == 0;
+            if (!lin_state_->present() || zc_forced)
+                dec_in_->install(max_kv_);
             for (int step = 1; step < max_new; ++step) {
                 // Checked here rather than after on_token: the previous step
                 // already fed its token back and streamed it, so out_ids still
@@ -1465,68 +1253,13 @@ class InferenceServer {
                 auto cur = embed_lookup(embed_table_,
                                         {static_cast<uint32_t>(next_id)},
                                         vocab_, arch_.hidden);
-                fill_fp16_input(rt_, "inputs_embeds",
-                                {1u, 1u, static_cast<uint32_t>(arch_.hidden)},
-                                cur.data());
-
-                const int64_t p = past_len;
-                if (arch_.position_ids_dims == 3) {
-                    int64_t pos[3] = {p, p, p};
-                    fill_i64_input(rt_, "position_ids", {3u, 1u, 1u}, pos);
-                } else {
-                    fill_i64_input(rt_, "position_ids", {1u, 1u}, &p);
-                }
-                // All-zero full-history mask; only the shape moves.
-                if (zeros.size() < static_cast<size_t>(past_len + 1))
-                    zeros.assign(static_cast<size_t>(past_len + 1), 0);
-                fill_fp16_input(rt_, "attention_bias",
-                                {1u, 1u, 1u, static_cast<uint32_t>(past_len + 1)},
-                                zeros.data());
-                if (arch_.has_deepstack) {
-                    for (int d = 0; d < 3; ++d)
-                        fill_fp16_input(rt_, "deepstack_embeds_" + std::to_string(d),
-                                        ds_shape_, ds_zero_.data());
-                }
-                if (arch_.has_image_pad_mask) {
-                    int8_t zero = 0;
-                    rt_->ResizeInput("image_pad_mask", {1u, 1u});
-                    auto t = rt_->GetInput("image_pad_mask");
-                    auto tg = as_tensor<int8_t>(t);
-                    if (tg->num_elements() > 0) tg->fillToCPU(&zero);
-                }
-
-                // One submit for every per-step input. Each standalone
-                // copyToGPU is its own submit+wait, ~0.3 ms of fixed cost on
-                // MoltenVK, and a Qwen3-VL step has seven of them. Same bytes
-                // and same staging path as before, recorded into one buffer
-                // (llm_chat's batch upload).
-                {
-                    auto batch =
-                        std::make_shared<vkop::VulkanCommandBuffer>(cmdpool_);
-                    batch->begin();
-                    upload_input(cmdpool_, rt_->GetInput("inputs_embeds"), batch);
-                    upload_input(cmdpool_, rt_->GetInput("position_ids"), batch);
-                    upload_input(cmdpool_, rt_->GetInput("attention_bias"),
-                                 batch);
-                    if (arch_.has_deepstack) {
-                        for (int d = 0; d < 3; ++d)
-                            upload_input(cmdpool_,
-                                         rt_->GetInput("deepstack_embeds_" +
-                                                       std::to_string(d)),
-                                         batch);
-                    }
-                    if (arch_.has_image_pad_mask)
-                        upload_input(cmdpool_, rt_->GetInput("image_pad_mask"),
-                                     batch);
-                    batch->end();
-                    batch->submit(dev_->getComputeQueue());
-                    batch->wait();
-                    cmdpool_->getStagingBufferPool()->reset();
-                }
+                // Imported inputs are written in place; the rest go up in one
+                // batched submit (same bytes, same staging path as before).
+                dec_in_->step(cur.data(), past_len, past_len + 1);
 
                 if (lin_state_->present()) lin_state_->bind_for_round();
                 const double ms = rt_->Run();
-                next_id = sample_last_token(rt_, cmdpool_, vocab_, sampler_,
+                next_id = sample_last_token(rt_, cmdpool_, vocab_, topk_k_, sampler_,
                                             penalised, sp);
                 out_ids.push_back(static_cast<uint32_t>(next_id));
                 note(static_cast<uint32_t>(next_id));
@@ -1550,6 +1283,13 @@ class InferenceServer {
         // What the KV cache now covers: the prompt plus every token decode
         // fed back. The stop token was generated but never consumed, so it is
         // not part of it — matching kv_->feedback()'s row count.
+        if (sampler_.fast_picks + sampler_.full_picks > 0 &&
+            (sp.temperature > 0.0f || sp.repetition_penalty != 1.0f)) {
+            std::printf("[serve] sampling: %d step(s) from the GPU top-%d, %d "
+                        "needed the full row\n", sampler_.fast_picks, topk_k_,
+                        sampler_.full_picks);
+            std::fflush(stdout);
+        }
         covered_ids_ = ids;
         const size_t fed = out_ids.size() > 0 ? out_ids.size() - 1 : 0;
         covered_ids_.insert(covered_ids_.end(), out_ids.begin(),
@@ -1611,13 +1351,15 @@ class InferenceServer {
     }
 
     int max_kv_;
+    // k of the GPU TopK post-process (0: none, 1: argmax only).
+    int topk_k_ = 0;
     // Prompt tokens per prefill dispatch. Bounds the graph's (1, q, vocab)
     // logits output, which is q*vocab*2 bytes: at 2048 tokens and a 152k vocab
     // that is ~620 MB per dispatch, at 8192 it is ~2.5 GB. Larger is faster
     // (every chunk re-runs lm_head's [q,2048]x[2048,151936] MatMul), but the
     // buffer has to actually fit; VKOP_SERVE_CHUNK / --prefill-chunk override.
     // 8192 splits an 11k agent prompt into two dispatches instead of six.
-    int prefill_chunk_ = 8192;
+    int prefill_chunk_ = vkop::llm::kDefaultPrefillChunk;
     // The artifact this server loaded, kept because a cache file is only valid
     // for it: a .vkopbin reconverted with different shader keys, or with a
     // different --kv-kind, holds KV bytes that mean something else.
@@ -1659,8 +1401,8 @@ class InferenceServer {
     // captured after generation, in record_turn(), because only then is it
     // known how many tokens the model actually wrote.
     std::vector<qwen::ChatMessage> last_render_turns_;
-    std::vector<uint16_t> ds_zero_;
-    std::vector<uint32_t> ds_shape_;
+    // Per-step decode input writer (zero-copy where the device allows).
+    std::unique_ptr<vkop::llm::DecodeInputs> dec_in_;
 };
 
 void emit(int fd, const std::string &line) {
@@ -1680,7 +1422,7 @@ const char *kUsage =
     "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
     "[--max-kv N] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}] "
     "[--prefill-chunk N] [--kv-warm FILE] [--kv-dump FILE] "
-    "[--repetition-penalty F] [--seed N] "
+    "[--repetition-penalty F] [--seed N] [--sample-topk K] "
     "[--rpc-in FD] [--rpc-out FD]\n";
 
 }  // namespace
@@ -1694,7 +1436,9 @@ int main(int argc, char **argv) {
     const std::string embed_path = argv[2];
     const std::string tok_path = argv[3];
     int max_kv = 8192;
-    int prefill_chunk = 8192;
+    int prefill_chunk = vkop::llm::kDefaultPrefillChunk;
+    int sample_topk = kDefaultSampleTopK;
+    if (const char *e = std::getenv("VKOP_SAMPLE_TOPK")) sample_topk = std::atoi(e);
     int rpc_in = 3, rpc_out = 4;
     std::string kv_kind = "auto";
     std::string kv_warm, kv_dump;
@@ -1709,6 +1453,8 @@ int main(int argc, char **argv) {
         else if (a == "--kv-dump" && i + 1 < argc) kv_dump = argv[++i];
         else if (a == "--repetition-penalty" && i + 1 < argc)
             repetition_penalty = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--sample-topk" && i + 1 < argc)
+            sample_topk = std::atoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc)
             seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--rpc-in" && i + 1 < argc) rpc_in = std::atoi(argv[++i]);
@@ -1741,7 +1487,8 @@ int main(int argc, char **argv) {
     try {
         srv = std::make_unique<InferenceServer>(model_path, embed_path, tok_path,
                                                 max_kv, kv_kind, prefill_chunk,
-                                                kv_warm, repetition_penalty, seed);
+                                                kv_warm, repetition_penalty, seed,
+                                                sample_topk);
         srv->set_kv_dump_path(kv_dump);
     } catch (const std::exception &e) {
         emit(rpc_out, std::string("FATAL ") + b64_encode(e.what()));
