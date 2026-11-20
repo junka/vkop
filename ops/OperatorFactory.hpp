@@ -20,7 +20,6 @@
 #include "Pow.hpp"
 #include "Sub.hpp"
 
-#include "Col2Im.hpp"
 #include "Conv1d.hpp"
 #include "Conv2d.hpp"
 #include "Cumsum.hpp"
@@ -92,8 +91,6 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<AveragePool>(fp16, backend_buffer);
     case OpType::BATCHNORM:
         return std::make_unique<BatchNorm>(fp16, backend_buffer);
-    case OpType::COL2IM:
-        return std::make_unique<Col2Im>(fp16, backend_buffer);
     case OpType::CONCAT:
         return std::make_unique<Concat>(fp16, backend_buffer);
     case OpType::CONV2D:

@@ -43,8 +43,6 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {"averagepool", "averagepool", false, false};
         case T::BATCHNORM:
             return {"batchnorm", "batchnorm", false, false};
-        case T::COL2IM:
-            return {"col2im", nullptr, false, false};
         case T::CONCAT:
             return {"concat", "concat", false, true};
         case T::CONV2D:

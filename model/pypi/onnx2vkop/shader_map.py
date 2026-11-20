@@ -53,7 +53,6 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "AveragePool": ("averagepool", "averagepool", False, False),
     "BatchNorm": ("batchnorm", "batchnorm", False, False),
     "BatchNormalization": ("batchnorm", "batchnorm", False, False),
-    "Col2Im": ("col2im", None, False, False),
     "Concat": ("concat", "concat", False, True),
     "Conv": ("conv2d", "conv2d", True, True),
     "Conv2d": ("conv2d", "conv2d", True, True),
