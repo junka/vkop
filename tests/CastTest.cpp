@@ -131,9 +131,15 @@ TEST(CastTest, Int64ToF32) {
     // buffer_cast_int64 when the device has shaderInt64, and through the CPU
     // fallback otherwise; both must produce torch's conversion, including
     // values that exceed 2^24 and negative values that need the high word.
-    auto torch_a = torch::tensor({{0LL, 1LL, -1LL},
-                                  {3000000000LL, -4000000000LL, 123456789LL}},
-                                 torch::kLong);
+    // int64_t{}, not 0LL: on LP64 Linux int64_t is `long` while `long long` is
+    // a distinct type, so a `long long` literal converts to TensorDataContainer's
+    // int64_t/double/float/bool overloads at the same rank and the call is
+    // ambiguous. Spelling the type out is also the portable choice -- `long` is
+    // 32-bit on Windows, which would silently truncate the 3e9/-4e9 values.
+    auto torch_a = torch::tensor(
+        {{int64_t{0}, int64_t{1}, int64_t{-1}},
+         {int64_t{3000000000}, int64_t{-4000000000}, int64_t{123456789}}},
+        torch::kLong);
     auto ref = torch_a.to(torch::kFloat32);
     int n = static_cast<int>(torch_a.numel());
 
