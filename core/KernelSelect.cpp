@@ -510,8 +510,10 @@ void sk_last_configure(Ctx &c) {
 bool down_act_applies(const Ctx &c) {
     const MatmulShape &s = *c.s;
     const MatmulFeatures &f = *c.f;
+    // No N cap: the down/reduce passes walk N in 2048-column strides (see
+    // the MatMul host's sel_feat.down_act note).
     return f.down_act && c.av->down_act && f.fp16 && !f.transB && s.n_up >= 0 &&
-           (s.n % 4 == 0) && s.n <= 2048 && (s.n_up % 4 == 0) && s.k >= 1;
+           (s.n % 4 == 0) && (s.n_up % 4 == 0) && s.k >= 1;
 }
 
 bool tiled_ks_applies(const Ctx &c) {

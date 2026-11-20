@@ -1217,8 +1217,15 @@ class MatMulBuffer : public BufferFactory {
         sel_feat.a_int8 = a_int8;
         // The fold's structural half (the 4-input rewrite and the da_ok
         // geometry) is not expressible as a shape, so fold it into the flag.
+        // No N cap: the fold used to cover N with one 512-lane block (4 columns
+        // a lane, so N <= 2048), but the down and reduce passes now walk N in
+        // 2048-column strides and the scratch is sized by N, so any N works.
+        // The cap had outlived that, and since the converter folds every
+        // SwiGLU regardless of N, a hidden > 2048 model (Qwen3-4B 2560, the
+        // Qwen-Image text tower 4096) fell through to a plain GEMM over the
+        // folded node: x . Wd[:K_out] with gate, up and SiLU dropped.
         sel_feat.down_act = down_inputs_ok && down_k_out >= 1 && (n % 4 == 0) &&
-                            n <= 2048 && (down_n_up % 4 == 0);
+                            (down_n_up % 4 == 0);
 
         // Modules set_runtime_device() already built are facts. The ones built
         // on first use (WIDE GEMV, 512-lane split-K, tile-split-K, the down
@@ -1405,6 +1412,20 @@ class MatMulBuffer : public BufferFactory {
             }
             plan = core::select_matmul(m_dev_->device_traits(), sel_shape,
                                        sel_feat, sel_av, sel_knobs);
+        }
+        // A folded SwiGLU node carries [x, Wd, Wg, Wu]; only the fold kernel
+        // knows what inputs 2/3 mean. Any other route runs a plain down GEMM
+        // over x and silently drops gate, up and SiLU, so refuse it.
+        if (down_inputs_ok && plan.route != core::MatmulRoute::kDownActFold) {
+            throw std::runtime_error(
+                "vkop: MatMul " + get_name() +
+                " is a folded SwiGLU down_proj (down_act) but the fold kernel "
+                "cannot take it (m=" + std::to_string(m) +
+                " n=" + std::to_string(n) + " n_up=" +
+                std::to_string(down_n_up) + " k_out=" +
+                std::to_string(down_k_out) +
+                "); any other route would compute x . Wd and drop gate/up. "
+                "Reconvert without fuse_swiglu_down_proj.");
         }
 
         // The dispatch below reads the plan through these aliases so the
