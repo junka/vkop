@@ -51,14 +51,38 @@ add_library(vk_ppu_icd SHARED
   src/submit.cpp
   src/query.cpp
   src/dispatch_table.cpp
+  src/spirv_compile.cpp
+  spirv-emit/emit.cpp
 )
+
+# SPIRV-Tools is the emitter's only dependency. Ubuntu/Debian ship it as a
+# static-only package, so find the header directory and the archive by hand;
+# linking it privately into the ICD keeps the ICD self-contained (an
+# application must not need a SPIRV-Tools .so on its library path).
+find_path(PPU_SPIRV_TOOLS_INCLUDE_DIR
+  NAMES spirv-tools/libspirv.h
+  HINTS ${SPIRV_TOOLS_ROOT} /usr/include /usr/local/include)
+find_library(PPU_SPIRV_TOOLS_LIBRARY
+  NAMES SPIRV-Tools libSPIRV-Tools.a
+  HINTS ${SPIRV_TOOLS_ROOT} /usr/lib/x86_64-linux-gnu /usr/local/lib)
+if(NOT PPU_SPIRV_TOOLS_INCLUDE_DIR OR NOT PPU_SPIRV_TOOLS_LIBRARY)
+  message(FATAL_ERROR
+    "SPIRV-Tools not found (need spirv-tools/libspirv.h and libSPIRV-Tools.a). "
+    "Install libspirv-tools-dev, or set SPIRV_TOOLS_ROOT to a prefix that has both.")
+endif()
+message(STATUS "vk_ppu_icd: SPIRV-Tools at ${PPU_SPIRV_TOOLS_LIBRARY}")
 
 target_include_directories(vk_ppu_icd PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${PPU_SPIRV_TOOLS_INCLUDE_DIR}
   ${_vulkan_inc}
 )
 
-target_link_libraries(vk_ppu_icd PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(vk_ppu_icd PRIVATE
+  ${CMAKE_DL_LIBS}
+  ${PPU_SPIRV_TOOLS_LIBRARY}
+)
 
 # The ICD is loaded by the Vulkan loader; nothing links against it directly.
 #
@@ -74,6 +98,17 @@ target_compile_options(vk_ppu_icd PRIVATE -Wall -Wextra -Wno-unused-parameter)
 add_executable(ppu_roundtrip tests/roundtrip.cpp)
 target_include_directories(ppu_roundtrip PRIVATE ${_vulkan_inc})
 target_link_libraries(ppu_roundtrip PRIVATE ${CMAKE_DL_LIBS})
+
+# SPIR-V dispatch probe: compiles a .spv through the ICD's own
+# vkCreateComputePipelines and checks the numbers against a CPU reference.
+add_executable(ppu_spirv_dispatch tests/spirv_dispatch.cpp)
+target_include_directories(ppu_spirv_dispatch PRIVATE ${_vulkan_inc})
+target_link_libraries(ppu_spirv_dispatch PRIVATE ${CMAKE_DL_LIBS})
+# The emitter as a standalone tool, so the coverage sweeps in the other
+# workstream (and on a host without the SDK) still have one binary to drive.
+add_executable(ppu_emit spirv-emit/emit_main.cpp spirv-emit/emit.cpp)
+target_include_directories(ppu_emit PRIVATE ${PPU_SPIRV_TOOLS_INCLUDE_DIR})
+target_link_libraries(ppu_emit PRIVATE ${PPU_SPIRV_TOOLS_LIBRARY})
 
 # --- manifest --------------------------------------------------------------
 # Written next to the build output so VK_ICD_FILENAMES can point straight at it.

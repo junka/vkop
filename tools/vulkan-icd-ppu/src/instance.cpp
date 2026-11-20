@@ -581,11 +581,22 @@ void fill_features_pnext(void *pNext, bool usable) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
         auto *f = reinterpret_cast<VkPhysicalDeviceVulkan12Features *>(s);
         f->bufferDeviceAddress = usable ? VK_TRUE : VK_FALSE;
+        // Timeline semaphores are real here: one stream replays every op in
+        // order, and a value is promoted from pending to reached only when the
+        // CUDA event recorded at that submission has completed. See
+        // Semaphore_T in icd_common.hpp and vkWaitSemaphores in submit.cpp.
+        f->timelineSemaphore = VK_TRUE;
         f->shaderInt8 = VK_TRUE;
         f->storageBuffer8BitAccess = VK_TRUE;
         f->uniformAndStorageBuffer8BitAccess = VK_TRUE;
         f->scalarBlockLayout = VK_TRUE;
         f->shaderFloat16 = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: {
+        // VK_KHR_timeline_semaphore's standalone struct (pre-1.2 spelling).
+        auto *f = reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures *>(s);
+        f->timelineSemaphore = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
@@ -970,6 +981,10 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
       // vkGetPhysicalDeviceToolProperties is implemented (and answers with an
       // empty tool list: this ICD is a driver, not a tool).
       {"VK_EXT_tooling_info", 1},
+      // Real, and needed by a consumer whose command-buffer wait is a timeline
+      // wait rather than a fence: the single-stream replay model makes the
+      // counter exact (see Semaphore_T).
+      {"VK_KHR_timeline_semaphore", VK_KHR_TIMELINE_SEMAPHORE_SPEC_VERSION},
   };
   constexpr uint32_t kCount = sizeof(kExtensions) / sizeof(kExtensions[0]);
   if (pPropertyCount == nullptr) return VK_ERROR_INITIALIZATION_FAILED;

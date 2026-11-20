@@ -108,6 +108,11 @@ struct Api {
   VKFN(vkResetFences)
   VKFN(vkGetBufferDeviceAddress)
   VKFN(vkGetFenceStatus)
+  VKFN(vkCreateSemaphore)
+  VKFN(vkDestroySemaphore)
+  VKFN(vkGetSemaphoreCounterValue)
+  VKFN(vkWaitSemaphores)
+  VKFN(vkSignalSemaphore)
 #undef VKFN
 };
 
@@ -188,6 +193,11 @@ bool load_instance_level(Api *api, VkInstance instance) {
   VKRESOLVE(vkResetFences)
   VKRESOLVE(vkGetBufferDeviceAddress)
   VKRESOLVE(vkGetFenceStatus)
+  VKRESOLVE(vkCreateSemaphore)
+  VKRESOLVE(vkDestroySemaphore)
+  VKRESOLVE(vkGetSemaphoreCounterValue)
+  VKRESOLVE(vkWaitSemaphores)
+  VKRESOLVE(vkSignalSemaphore)
 #undef VKRESOLVE
   return true;
 }
@@ -640,6 +650,91 @@ int main(int argc, char **argv) {
       api.vkDestroyDescriptorSetLayout(device, dsl, nullptr);
       api.vkDestroyShaderModule(device, module, nullptr);
     }
+  }
+
+  // ---- Phase B: timeline semaphores ------------------------------------
+  // A consumer whose command-buffer wait is a timeline wait (vkWaitSemaphores
+  // on a counter) needs this; it is the difference between "the submission
+  // ran" and "the application can see that it ran". The model is exact: one
+  // stream replays every op in order, so a value is reached once the event
+  // recorded at the signalling submission has completed.
+  section("timeline semaphores");
+  {
+    VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    tci.initialValue = 3;
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    sci.pNext = &tci;
+    VkSemaphore sem = VK_NULL_HANDLE;
+    r = api.vkCreateSemaphore(device, &sci, nullptr, &sem);
+    std::printf("  vkCreateSemaphore(timeline, initial=3) -> %d\n", r);
+    CHECK(r == VK_SUCCESS && sem != VK_NULL_HANDLE);
+
+    uint64_t value = 0;
+    r = api.vkGetSemaphoreCounterValue(device, sem, &value);
+    std::printf("  vkGetSemaphoreCounterValue -> %d, value %llu (expect 3)\n", r,
+                static_cast<unsigned long long>(value));
+    CHECK(r == VK_SUCCESS);
+    CHECK(value == 3);
+
+    // Waiting on an already-reached value must return immediately, and a
+    // timeout must be honoured rather than hanging.
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &sem;
+    uint64_t want = 3;
+    wi.pValues = &want;
+    CHECK(api.vkWaitSemaphores(device, &wi, 1000000000ull) == VK_SUCCESS);
+
+    want = 9;
+    r = api.vkWaitSemaphores(device, &wi, 2000000ull);
+    std::printf("  vkWaitSemaphores(value 9, 2 ms timeout) -> %d (expect 3 = TIMEOUT)\n", r);
+    CHECK(r == VK_TIMEOUT);
+
+    // Host signal: the counter advances, and a wait on the new value succeeds.
+    VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    ssi.semaphore = sem;
+    ssi.value = 9;
+    r = api.vkSignalSemaphore(device, &ssi);
+    std::printf("  vkSignalSemaphore(value 9) -> %d\n", r);
+    CHECK(r == VK_SUCCESS);
+    CHECK(api.vkWaitSemaphores(device, &wi, 1000000000ull) == VK_SUCCESS);
+    CHECK(api.vkGetSemaphoreCounterValue(device, sem, &value) == VK_SUCCESS && value == 9);
+
+    // Submitting a signal: the value is only reached once the work is done, so
+    // the wait actually observes completion rather than a bookkeeping number.
+    {
+      CHECK(api.vkResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+      CHECK(api.vkBeginCommandBuffer(cmd, &cbbi) == VK_SUCCESS);
+      api.vkCmdFillBuffer(cmd, dst_buffer, 0, 16, 0x1234u);
+      CHECK(api.vkEndCommandBuffer(cmd) == VK_SUCCESS);
+
+      uint64_t sig = 10;
+      VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+      tsi.signalSemaphoreValueCount = 1;
+      tsi.pSignalSemaphoreValues = &sig;
+      VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si2.pNext = &tsi;
+      si2.commandBufferCount = 1;
+      si2.pCommandBuffers = &cmd;
+      si2.signalSemaphoreCount = 1;
+      VkSemaphore signal_sems[1] = {sem};
+      si2.pSignalSemaphores = signal_sems;
+      r = api.vkQueueSubmit(queue, 1, &si2, VK_NULL_HANDLE);
+      CHECK_MSG(r == VK_SUCCESS, "timeline submit -> %d", r);
+
+      uint64_t reached = 10;
+      VkSemaphoreWaitInfo wi2{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+      wi2.semaphoreCount = 1;
+      wi2.pSemaphores = &sem;
+      wi2.pValues = &reached;
+      r = api.vkWaitSemaphores(device, &wi2, 10000000000ull);
+      std::printf("  wait for submitted value 10 -> %d\n", r);
+      CHECK(r == VK_SUCCESS);
+      CHECK(api.vkGetSemaphoreCounterValue(device, sem, &value) == VK_SUCCESS && value == 10);
+    }
+
+    api.vkDestroySemaphore(device, sem, nullptr);
   }
 
   section("teardown");

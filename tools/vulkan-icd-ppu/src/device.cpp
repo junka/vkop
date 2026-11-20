@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "spirv_compile.hpp"
+
 namespace ppu {
 
 bool bind_context(Device_T *device) {
@@ -135,6 +137,10 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device,
   ppu::Driver &d = ppu::driver();
   if (dev->stream && d.cuStreamSynchronize) d.cuStreamSynchronize(dev->stream);
   if (dev->stream && d.cuStreamDestroy_v2) d.cuStreamDestroy_v2(dev->stream);
+  // Cached CUmodules belong to this context; unload them while it is still
+  // current, then destroy the context. (Otherwise cuModuleUnload -- which the
+  // cache would attempt on the next compile -- has no context to act on.)
+  if (dev->ctx) ppu::purge_spirv_cache(dev->ctx);
   if (dev->ctx && d.cuCtxDestroy_v2) d.cuCtxDestroy_v2(dev->ctx);
   delete dev->queue;
   delete dev;

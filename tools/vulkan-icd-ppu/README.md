@@ -80,7 +80,10 @@ Advertised honestly — see `src/instance.cpp`:
     `VK_EXT_subgroup_size_control` (min = max = 32),
     `VK_KHR_shader_integer_dot_product` (present with **every acceleration bit
     false**: `__dp4a` is four `v.madl.i32` ops, not an instruction),
-    `VK_KHR_workgroup_memory_explicit_layout`, `VK_EXT_tooling_info`.
+    `VK_KHR_workgroup_memory_explicit_layout`, `VK_EXT_tooling_info`,
+    `VK_KHR_timeline_semaphore` (one stream replays every op in order, so a
+    counter value is promoted only when the CUDA event recorded at that
+    submission completes — a wait observes real completion).
 * Deliberately **not** advertised, each verified or rejected above:
   `VK_KHR_cooperative_matrix` / `VK_NV_cooperative_matrix` (the SPIR-V emitter
   has no cooperative-matrix lowering and fails on every `matmul_coop*` shader),
@@ -89,24 +92,80 @@ Advertised honestly — see `src/instance.cpp`:
   `VK_KHR_zero_initialize_workgroup_memory` (measured: shared memory retains
   the previous block's residue instead of being zeroed).
 * Timestamp queries via CUDA events (see `docs/entry-points.md`).
-* Device extensions: no external memory/fence/semaphore handles, no timeline
-  semaphores, no push descriptors.
+* Device extensions: no external memory/fence/semaphore handles, no push
+  descriptors.
 
-## The SPIR-V boundary
+## The SPIR-V boundary: real compilation
 
-`ppu::compile_spirv_to_ppu_module()` (`src/pipeline.cpp`) is the single
-hand-off point for the SPIR-V → PPU code generation workstream. It currently
-returns `CUDA_ERROR_NOT_SUPPORTED`. Replace its body and pipelines built from
-SPIR-V will work; nothing else needs to change.
+`vkCreateComputePipelines` compiles SPIR-V. The chain is
 
-Until then:
+```
+SPIR-V --[emit, in process]--> LLVM 13 text IR --[llc -march=ppu]--> .o
+       --[cuModuleLoadData]--> CUmodule
+```
 
-* `vkCreateShaderModule` accepts SPIR-V and extracts `LocalSize` from
-  `OpExecutionMode`.
-* `vkCreateComputePipelines` returns a handle but logs that compilation is
-  unimplemented; the pipeline cannot execute.
-* `vkQueueSubmit` refuses to launch such a pipeline and returns
-  `VK_ERROR_DEVICE_LOST` rather than pretending success.
+* **The emitter is linked in.** `spirv-emit/` is a library form of the
+  standalone `emit` tool (the tool is now a thin `main()` over the same code,
+  so the two cannot drift). It is a pure function of the SPIR-V words: it needs
+  no files, and takes ~0.7 ms for a small shader and ~2 ms for the largest one
+  in vkop's archive. A process per shader would add fork/exec/dynamic-link cost
+  for nothing, and would turn a fail-loud reason into a string on a pipe.
+* **llc is spawned, not linked.** It is the whole PPU backend (an 84 MB LLVM
+  build) and only ships as a tool. `src/spirv_compile.cpp` uses `posix_spawnp`
+  with an argv built in-process -- never `system()`, which would put a shell and
+  its quoting between us and the compiler, report only the shell's exit status,
+  and open an injection surface. The child's stderr is drained through a pipe
+  concurrently with feeding stdin, so a 460 KiB module does not deadlock a
+  full pipe buffer, and a lowering failure is reported with llc's own message.
+* **Fail loud.** A shader the emitter cannot lower makes
+  `vkCreateComputePipelines` return `VK_ERROR_INVALID_SHADER_NV` and log the
+  entry point plus the exact instruction (`unsupported: GroupNonUniformFMax`).
+  Nothing is ever returned as a plausibly-wrong module. `vkQueueSubmit` then
+  never has an unlaunchable pipeline to trip over.
+
+The kernel keeps the SPIR-V entry-point name, so `cuModuleGetFunction` finds
+exactly the `pName` the application passed to
+`VkPipelineShaderStageCreateInfo`.
+
+### Caching
+
+Compilation is cached twice:
+
+* in memory: `(SPIR-V bytes, entry name) -> CUmodule`, reference counted. The
+  key material is retained and compared, so a hash collision is a cache miss,
+  never a wrong module.
+* on disk: the object file, keyed by the same hash, so the next process reuses
+  it too. The directory is `$VK_PPU_CACHE_DIR`, else
+  `$XDG_CACHE_HOME/vk_ppu_icd`, else `$HOME/.cache/vk_ppu_icd`, else
+  `/tmp/vk_ppu_icd-cache-$UID`.
+
+Measured on the device: a cold compile of vkop's real `buffer_softmax_sg` is
+**38.8 ms** (emit 2.2 ms, llc 36.0 ms); a warm one is a hash lookup.
+
+### Where llc comes from
+
+`$VK_PPU_LLC`, then `llc` on `PATH`, then the documented SDK locations
+(`/usr/local/PPU_SDK/CUDA_SDK/bin/llc`, `/usr/local/PPU_SDK/bin/llc`). When it
+cannot be found the compilation fails by name -- `vkCreateComputePipelines`
+returns an error saying so, and nothing crashes.
+
+### Coverage
+
+Measured over the 348-entry `vkop_shaders.bin` in a vkop build tree, and every
+step below was run, not inferred:
+
+* 124 of 348 emit;
+* 124 of 124 emitted modules pass `llc -march=ppu -filetype=obj`;
+* 124 of 124 objects pass `cuModuleLoad` **and** `cuModuleGetFunction("main")`
+  on the device.
+
+The other 224 fail loud, each naming its blocker. The largest groups are
+`VK_EXT_buffer_reference` shaders (`_bda`, ~132: a
+`PhysicalStorageBuffer` access chain does not yet resolve), the image backend
+(~43, irrelevant to a device with no images), cooperative matrix (~42) and
+`VectorShuffle` in fp16 matmul (6). Four shaders are verified numerically
+end-to-end (softmax, layernorm, rmsnorm, argmax in the emitter workstream), and
+this ICD was verified end-to-end on vkop's own `buffer_softmax_sg`.
 
 ### Cubin escape hatch
 
@@ -127,6 +186,8 @@ See `docs/entry-points.md` for the full table.
 | `VK_PPU_DEVICE_INDEX=N` | Expose only CUDA device N (default: all devices). |
 | `VK_PPU_SYNTHETIC_DEVICE=1` | On a host with no accelerator, report a clearly-labelled placeholder physical device so the loader handshake can be exercised. `vkCreateDevice` on it creates a null backend that refuses all memory allocation. |
 | `VK_PPU_CUBIN_BLOCK=N` | Block size for cubin-based pipelines (default 256). |
+| `VK_PPU_LLC=PATH` | The `llc` used to lower emitted IR to a PPU object. Default: `llc` on `PATH`, then the SDK's bin directory. |
+| `VK_PPU_CACHE_DIR=DIR` | Where compiled object files are cached. Default under `$XDG_CACHE_HOME`/`$HOME`/`/tmp`. |
 
 ## Verification
 

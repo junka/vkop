@@ -266,6 +266,10 @@ struct ComputePipeline_T {
 
   // Serialised kernel argument order, resolved from the pipeline layout.
   // Each entry is a descriptor binding that contributes one 64-bit pointer.
+  // For an SPIR-V pipeline this comes from the compiler's own kernel
+  // signature, which is authoritative: the shader may declare fewer bindings
+  // than the layout, and a layout-derived order would then pass extra
+  // arguments the kernel does not take.
   struct ArgSlot {
     uint32_t set;
     uint32_t binding;
@@ -332,6 +336,18 @@ struct Semaphore_T {
   Device_T *device = nullptr;
   ppu::CUevent event = nullptr;
   bool recorded = false;  // has an event record been enqueued since last wait
+
+  // Timeline semaphores. The device has one stream and replays every recorded
+  // operation onto it in order, so a timeline's counter can be modelled
+  // exactly: a value is "reached" once the stream has drained past the
+  // submission that signalled it. We track (value, CUevent recorded at the
+  // tail of that submission) and answer from cuEventQuery, so a wait is a
+  // poll on real completion rather than a guess. `value` is also what a
+  // host-side vkSignalSemaphore bumps.
+  bool timeline = false;
+  uint64_t value = 0;            // last reached or host-signalled value
+  uint64_t pending_value = 0;    // value the in-flight submission will reach
+  ppu::CUevent pending_event = nullptr;
 };
 
 // --- query pools ----------------------------------------------------------
@@ -456,14 +472,10 @@ PPU_INTERNAL bool replay_query_op(Device_T *dev, const RecordedOp &op);
 // false when the value is not (yet) available.
 PPU_INTERNAL bool query_value(QueryPool_T *pool, uint32_t index, uint64_t *out_ns);
 
-// The SPIR-V -> PPU code generation boundary. The compiler workstream drops
-// its implementation in here; the default returns CUDA_ERROR_NOT_SUPPORTED.
-PPU_INTERNAL CUresult compile_spirv_to_ppu_module(const uint32_t *spirv, size_t word_count,
-                                                  const char *entry_point,
-                                                  ppu::CUmodule *out_module);
-
 // Extract the LocalSize execution mode from a SPIR-V module. Returns false if
-// the module does not declare one (the spec default is 1,1,1).
+// the module does not declare one (the spec default is 1,1,1). For a compiled
+// SPIR-V pipeline this is only a fallback: the compiler reports the size that
+// belongs to the entry point actually being built.
 PPU_INTERNAL bool spirv_local_size(const uint32_t *spirv, size_t word_count, uint32_t out[3]);
 
 }  // namespace ppu

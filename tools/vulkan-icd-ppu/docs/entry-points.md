@@ -158,10 +158,12 @@ a fake success:
   `VK_ERROR_FEATURE_NOT_PRESENT` (VK_KHR_push_descriptor is not advertised)
 * `vkGetBufferDeviceAddressKHR and other KHR aliases` — same implementation as the core entry point
 * `vkGetMemoryFdKHR` — VK_ERROR_FEATURE_NOT_PRESENT (no external handles)
+* `vkGetSemaphoreCounterValue` / `vkWaitSemaphores` / `vkSignalSemaphore` on a
+  **binary** semaphore — an error, because a binary semaphore has no counter to
+  read or advance (timeline semaphores are supported; see below)
 * `vkCmdSetEvent` / `vkCmdWaitEvents` / `vkCmdResetEvent` — no-ops; single-stream replay
   already orders all work, and `vkCreateEvent` is unsupported so these cannot be reached
   with a valid event anyway
-* `vkGetSemaphoreCounterValue / vkWaitSemaphores / vkSignalSemaphore` — VK_ERROR_FEATURE_NOT_PRESENT (no timeline semaphores)
 
 ## Partial: records but cannot execute
 
@@ -172,9 +174,17 @@ a fake success:
 
 ## Behaviour worth knowing
 
-* `vkCreateComputePipelines` with SPIR-V returns a handle but logs that SPIR-V → PPU
-  compilation is unimplemented. `vkQueueSubmit` then fails the submission with
-  `VK_ERROR_DEVICE_LOST` instead of launching nothing silently.
+* `vkCreateComputePipelines` with SPIR-V compiles it (emitter in-process, then
+  `llc -march=ppu`, then `cuModuleLoadData`). A shader the emitter cannot lower
+  makes the call return `VK_ERROR_INVALID_SHADER_NV` and log the entry point
+  plus the exact unsupported instruction; it never returns a module that would
+  compute the wrong thing.
+* `vkGetSemaphoreCounterValue` / `vkWaitSemaphores` / `vkSignalSemaphore` are
+  implemented for timeline semaphores, and `VK_KHR_timeline_semaphore` is
+  advertised. A signalled value becomes visible only once the CUDA event
+  recorded at that submission completes, so a wait observes real completion.
+  A binary semaphore has no counter: those calls return an error rather than a
+  fabricated value.
 * `vkAllocateCommandBuffers` rejects `SECONDARY` buffers.
 * `vkCreateDescriptorSetLayout` / `vkCreateDescriptorPool` reject sampler and image
   descriptor types.

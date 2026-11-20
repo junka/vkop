@@ -30,8 +30,11 @@ using CUevent = void *;
 using CUdeviceptr = unsigned long long;
 
 constexpr CUresult CUDA_SUCCESS = 0;
+constexpr CUresult CUDA_ERROR_INVALID_VALUE = 1;
 constexpr CUresult CUDA_ERROR_NOT_READY = 600;
+constexpr CUresult CUDA_ERROR_NOT_FOUND = 500;
 constexpr CUresult CUDA_ERROR_NOT_SUPPORTED = 801;
+constexpr CUresult CUDA_ERROR_INVALID_SOURCE = 300;
 
 // CU_MEMHOSTALLOC_* flags (cuda.h).
 constexpr unsigned CU_MEMHOSTALLOC_PORTABLE = 0x01;

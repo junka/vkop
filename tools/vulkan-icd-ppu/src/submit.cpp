@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 
 namespace {
 
@@ -40,16 +41,28 @@ bool replay_op(Device_T *dev, RecordedOp &op) {
   switch (op.kind) {
     case RecordedOp::Kind::Dispatch: {
       if (op.pipeline == nullptr || op.pipeline->function == nullptr) {
-        PPU_ERR("submit: dispatch with no compiled kernel (SPIR-V compilation unimplemented)");
+        PPU_ERR("submit: dispatch with no compiled kernel");
         return false;
       }
       LaunchShape s = shape_for(op);
       std::vector<void *> kernel_args;
       kernel_args.reserve(op.args.size() + 1);
-      // cuLaunchKernel wants an array of pointers to each argument value.
-      for (auto &a : op.args) kernel_args.push_back(&a);
-      void *push_ptr = op.push_constant_addr != 0 ? &op.push_constant_addr : nullptr;
-      if (op.pipeline->has_push_constants) kernel_args.push_back(&push_ptr);
+      // cuLaunchKernel wants an array of pointers to each argument value. A
+      // buffer argument's value is the device address (already a uint64_t in
+      // op.args), so its address is &op.args[i]. The push-constant block is
+      // passed by pointer too -- the kernel signature takes
+      // `T addrspace(1)*`, so the *value* is the device address of the block
+      // and the argument slot points at that address, not at the slot that
+      // stores it.
+      for (size_t i = 0; i < op.args.size(); ++i) kernel_args.push_back(&op.args[i]);
+      uint64_t push_addr = op.push_constant_addr;
+      if (op.pipeline->has_push_constants) {
+        if (push_addr == 0) {
+          PPU_ERR("submit: kernel takes a push-constant block but none was recorded");
+          return false;
+        }
+        kernel_args.push_back(&push_addr);
+      }
 
       ppu::CUresult rc = d.cuLaunchKernel(op.pipeline->function, s.grid[0], s.grid[1],
                                           s.grid[2], s.block[0], s.block[1], s.block[2],
@@ -153,10 +166,42 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
   for (uint32_t i = 0; i < submitCount && ok; ++i) {
     const VkSubmitInfo &si = pSubmits[i];
 
+    // Timeline wait/signal values, if the application supplied them.
+    const auto *timeline = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo *>(si.pNext);
+    while (timeline != nullptr &&
+           timeline->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+      timeline = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo *>(timeline->pNext);
+    }
+
     // Wait semaphores: the recorded CUDA event must complete before our work.
     for (uint32_t s = 0; s < si.waitSemaphoreCount && ok; ++s) {
       auto *sem = reinterpret_cast<Semaphore_T *>(si.pWaitSemaphores[s]);
       if (sem == nullptr) continue;
+      if (sem->timeline) {
+        const uint64_t want = timeline != nullptr &&
+                                      timeline->waitSemaphoreValueCount > s
+                                  ? timeline->pWaitSemaphoreValues[s]
+                                  : 0;
+        // A timeline semaphore's pending event is the exact point in the stream
+        // where the value becomes visible, so ordering on it is the ordering
+        // the application asked for. A value the host already signalled needs
+        // no stream dependency at all.
+        if (sem->value >= want) continue;
+        if (sem->pending_event == nullptr) {
+          PPU_ERR("vkQueueSubmit: timeline wait on value %llu, but the semaphore "
+                  "has only reached %llu and nothing will advance it",
+                  static_cast<unsigned long long>(want),
+                  static_cast<unsigned long long>(sem->value));
+          ok = false;
+          break;
+        }
+        ppu::CUresult rc = d.cuStreamWaitEvent(dev->stream, sem->pending_event, 0);
+        if (rc != CUDA_SUCCESS) {
+          PPU_ERR("cuStreamWaitEvent(timeline) failed: %s", ppu::cu_strerror(rc));
+          ok = false;
+        }
+        continue;
+      }
       if (!sem->recorded) {
         PPU_ERR("vkQueueSubmit: waiting on a semaphore that was never signalled");
         ok = false;
@@ -186,6 +231,42 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t 
     for (uint32_t s = 0; s < si.signalSemaphoreCount && ok; ++s) {
       auto *sem = reinterpret_cast<Semaphore_T *>(si.pSignalSemaphores[s]);
       if (sem == nullptr) continue;
+      if (sem->timeline) {
+        const uint64_t mark = timeline != nullptr &&
+                                      timeline->signalSemaphoreValueCount > s
+                                  ? timeline->pSignalSemaphoreValues[s]
+                                  : sem->value + 1;
+        // The value must not be visible before the work is done, so it becomes
+        // the *pending* value now and is promoted by cuEventQuery in
+        // vkGetSemaphoreCounterValue / vkWaitSemaphores once the stream drains
+        // past this point.
+        //
+        // Each signal gets a fresh event when the previous one is still
+        // unpromoted: re-recording an event that a submitted
+        // cuStreamWaitEvent may be waiting on would move the point it refers
+        // to, and a later submission could then pass a wait it should have
+        // blocked on.
+        if (sem->pending_event != nullptr && sem->pending_value > sem->value) {
+          if (d.cuEventDestroy_v2) d.cuEventDestroy_v2(sem->pending_event);
+          sem->pending_event = nullptr;
+        }
+        if (sem->pending_event == nullptr && d.cuEventCreate)
+          d.cuEventCreate(&sem->pending_event, 0);
+        if (sem->pending_event == nullptr) {
+          PPU_ERR("vkQueueSubmit: cannot create an event for a timeline signal");
+          ok = false;
+          break;
+        }
+        ppu::CUresult rc = d.cuEventRecord(sem->pending_event, dev->stream);
+        if (rc != CUDA_SUCCESS) {
+          PPU_ERR("cuEventRecord(timeline) failed: %s", ppu::cu_strerror(rc));
+          ok = false;
+          break;
+        }
+        sem->pending_value = mark;
+        sem->recorded = true;
+        continue;
+      }
       ppu::CUresult rc = d.cuEventRecord(sem->event, dev->stream);
       if (rc != CUDA_SUCCESS) {
         PPU_ERR("cuEventRecord(semaphore) failed: %s", ppu::cu_strerror(rc));
@@ -330,6 +411,28 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(
     delete sem;
     return VK_ERROR_DEVICE_LOST;
   }
+
+  // VK_SEMAPHORE_TYPE_CREATE_INFO in pNext selects a timeline semaphore. The
+  // device models one exactly: every recorded op replays in order on a single
+  // stream, so "counter reached value N" is "the submission that signalled N
+  // has drained", which cuEventQuery answers directly.
+  for (const auto *base = static_cast<const VkBaseInStructure *>(pCreateInfo->pNext);
+       base != nullptr; base = base->pNext) {
+    if (base->sType != VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) continue;
+    const auto *ti = reinterpret_cast<const VkSemaphoreTypeCreateInfo *>(base);
+    if (ti->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) {
+      sem->timeline = true;
+      sem->value = ti->initialValue;
+    } else if (ti->semaphoreType != VK_SEMAPHORE_TYPE_BINARY) {
+      PPU_ERR("vkCreateSemaphore: semaphore type %d is not supported",
+              static_cast<int>(ti->semaphoreType));
+      if (d.cuEventDestroy_v2) d.cuEventDestroy_v2(sem->event);
+      delete sem;
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    break;
+  }
+
   *pSemaphore = reinterpret_cast<VkSemaphore>(sem);
   return VK_SUCCESS;
 }
@@ -342,6 +445,8 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(VkDevice device, VkSema
   if (sem == nullptr) return;
   ppu::Driver &d = ppu::driver();
   if (d.cuEventDestroy_v2) d.cuEventDestroy_v2(sem->event);
+  if (sem->timeline && sem->pending_event && d.cuEventDestroy_v2)
+    d.cuEventDestroy_v2(sem->pending_event);
   delete sem;
 }
 
@@ -351,22 +456,103 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice de
   (void)device;
   auto *sem = reinterpret_cast<Semaphore_T *>(semaphore);
   if (sem == nullptr || pValue == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
-  // Timeline semaphores are not supported (we do not advertise the feature).
-  (void)sem;
-  return VK_ERROR_FEATURE_NOT_PRESENT;
+  if (!sem->timeline) {
+    // A binary semaphore has no counter; the spec makes this a validation
+    // error, and returning the honest error is better than inventing a value.
+    PPU_ERR("vkGetSemaphoreCounterValue on a binary semaphore");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  // If a submission promised a higher value, it becomes visible only once that
+  // submission really finished. Polling the CUDA event is what makes the answer
+  // true rather than optimistic.
+  ppu::Driver &d = ppu::driver();
+  if (sem->pending_event != nullptr && sem->pending_value > sem->value &&
+      d.cuEventQuery && d.cuEventQuery(sem->pending_event) == ppu::CUDA_SUCCESS) {
+    sem->value = sem->pending_value;
+    sem->pending_event = nullptr;  // safe to forget: the value is already ours
+  }
+  *pValue = sem->value;
+  return VK_SUCCESS;
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(
     VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo, uint64_t timeout) {
+  if (pWaitInfo == nullptr || (pWaitInfo->semaphoreCount > 0 && pWaitInfo->pSemaphores == nullptr))
+    return VK_ERROR_INITIALIZATION_FAILED;
   (void)device;
-  (void)pWaitInfo;
-  (void)timeout;
-  return VK_ERROR_FEATURE_NOT_PRESENT;
+  ppu::Driver &d = ppu::driver();
+
+  auto satisfied = [&](uint32_t i) {
+    auto *sem = reinterpret_cast<Semaphore_T *>(pWaitInfo->pSemaphores[i]);
+    if (sem == nullptr) return true;
+    const uint64_t want =
+        pWaitInfo->pValues != nullptr ? pWaitInfo->pValues[i] : 0;
+    if (!sem->timeline) {
+      // A binary semaphore's "counter" is not meaningful; treat a signalled
+      // semaphore as reached. Nothing in this ICD submits binary-semaphore
+      // waits through this entry point, but answering honestly beats hanging.
+      return sem->recorded;
+    }
+    uint64_t cur = sem->value;
+    if (sem->pending_event != nullptr && sem->pending_value > cur &&
+        d.cuEventQuery && d.cuEventQuery(sem->pending_event) == ppu::CUDA_SUCCESS) {
+      sem->value = sem->pending_value;
+      sem->pending_event = nullptr;
+      cur = sem->value;
+    }
+    return cur >= want;
+  };
+
+  auto all_satisfied = [&]() {
+    if ((pWaitInfo->flags & VK_SEMAPHORE_WAIT_ANY_BIT) != 0) {
+      for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; ++i)
+        if (satisfied(i)) return true;
+      return pWaitInfo->semaphoreCount == 0;
+    }
+    for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; ++i)
+      if (!satisfied(i)) return false;
+    return true;
+  };
+
+  if (all_satisfied()) return VK_SUCCESS;
+
+  // Poll rather than block forever on a deadline the caller controls. The
+  // wait is on work already submitted to this device's single stream, so
+  // progress is guaranteed unless the GPU hangs.
+  const uint64_t kForever = ~0ull;
+  uint64_t waited_ns = 0;
+  constexpr uint64_t kPollNs = 100 * 1000;  // 100 us
+  while (!all_satisfied()) {
+    if (timeout != kForever && waited_ns >= timeout) return VK_TIMEOUT;
+    struct timespec ts{0, static_cast<long>(kPollNs)};
+    ::nanosleep(&ts, nullptr);
+    waited_ns += kPollNs;
+  }
+  return VK_SUCCESS;
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(
     VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo) {
   (void)device;
-  (void)pSignalInfo;
-  return VK_ERROR_FEATURE_NOT_PRESENT;
+  if (pSignalInfo == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+  auto *sem = reinterpret_cast<Semaphore_T *>(pSignalInfo->semaphore);
+  if (sem == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+  if (!sem->timeline) {
+    PPU_ERR("vkSignalSemaphore on a binary semaphore");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  // A host signal is only legal on a value above the current one; anything
+  // else is an application error, and accepting it would make the counter go
+  // backwards.
+  if (pSignalInfo->value <= sem->value) {
+    // The spec makes this a validation error (a counter never goes backwards).
+    // Refusing keeps the ordering guarantee a later wait relies on; accepting
+    // it would let a wait pass on a value nothing signalled.
+    PPU_ERR("vkSignalSemaphore: value %llu is not above the current %llu",
+            static_cast<unsigned long long>(pSignalInfo->value),
+            static_cast<unsigned long long>(sem->value));
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  sem->value = pSignalInfo->value;
+  return VK_SUCCESS;
 }

@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "spirv_compile.hpp"
+
 namespace {
 
 using ppu::CUDA_SUCCESS;
@@ -36,6 +38,7 @@ bool spirv_local_size(const uint32_t *spirv, size_t word_count, uint32_t out[3])
   if (spirv[0] != kSpirvMagic) return false;
 
   uint32_t entry_id = 0;
+  bool found = false;
   for (size_t i = 5; i < word_count;) {
     uint32_t instruction = spirv[i];
     uint16_t opcode = instruction & 0xFFFF;
@@ -44,26 +47,20 @@ bool spirv_local_size(const uint32_t *spirv, size_t word_count, uint32_t out[3])
     if (opcode == 15 /* OpEntryPoint */ && length >= 4) {
       entry_id = spirv[i + 2];
     }
+    // Every module in practice declares exactly one LocalSize; if a module had
+    // several entry points with different sizes, the compiler reports the one
+    // belonging to the entry point actually being built, and callers prefer
+    // that. This stays as the pre-compilation fallback (and for cubins).
     if (opcode == 16 /* OpExecutionMode */ && length >= 6 && spirv[i + 1] == entry_id &&
         spirv[i + 2] == 17 /* LocalSize */) {
       out[0] = spirv[i + 3];
       out[1] = spirv[i + 4];
       out[2] = spirv[i + 5];
-      return true;
+      found = true;
     }
     i += length;
   }
-  return false;
-}
-
-// Default implementation. The SPIR-V -> PPU compiler workstream replaces this.
-CUresult compile_spirv_to_ppu_module(const uint32_t *spirv, size_t word_count,
-                                     const char *entry_point, ppu::CUmodule *out_module) {
-  (void)spirv;
-  (void)word_count;
-  (void)entry_point;
-  (void)out_module;
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return found;
 }
 
 }  // namespace ppu
@@ -535,33 +532,73 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(
       pipeline->local_size[1] = 1;
       pipeline->local_size[2] = 1;
     } else {
-      // SPIR-V: the compiler workstream owns this boundary.
-      uint32_t local[3] = {1, 1, 1};
+      // SPIR-V: compile it. The pipeline's argument list, push-constant flag
+      // and workgroup size come from the compiler's view of the kernel
+      // signature, not from the Vulkan layout: the shader declares exactly the
+      // bindings it reads, and the layout may declare more (optional bindings
+      // that are never bound). Passing the layout's bindings would hand the
+      // kernel arguments it does not take.
       const auto *words = reinterpret_cast<const uint32_t *>(shader->code.data());
       size_t word_count = shader->code.size() / sizeof(uint32_t);
-      ppu::spirv_local_size(words, word_count, local);
-      pipeline->local_size[0] = local[0];
-      pipeline->local_size[1] = local[1];
-      pipeline->local_size[2] = local[2];
 
-      ppu::CUmodule module = nullptr;
-      ppu::CUresult rc = ppu::compile_spirv_to_ppu_module(words, word_count, entry, &module);
+      ppu::CompiledKernel compiled;
+      std::string why;
+      ppu::CUresult rc =
+          ppu::compile_spirv_to_ppu_kernel(dev->ctx, words, word_count, entry, &compiled, &why);
       if (rc != CUDA_SUCCESS) {
-        PPU_ERR("vkCreateComputePipelines: SPIR-V -> PPU compilation is not implemented "
-                "(entry '%s', local size %ux%ux%u). Pipelines are created unusable; "
-                "dispatch will fail.",
-                entry, local[0], local[1], local[2]);
-        // The pipeline handle is still returned so applications can complete
-        // their object lifecycle; dispatch reports the failure honestly.
-        pipeline->module = nullptr;
-        pipeline->function = nullptr;
-        *pPipelines = reinterpret_cast<VkPipeline>(pipeline);
+        // Fail loud: name the entry point and the instruction the emitter
+        // rejected. This is the one place a shader the backend cannot lower
+        // becomes visible to the application, so it must say what and where.
+        PPU_ERR("vkCreateComputePipelines: cannot compile SPIR-V entry '%s': %s", entry,
+                why.c_str());
+        delete pipeline;
+        if (first_error == VK_SUCCESS) first_error = VK_ERROR_INVALID_SHADER_NV;
         continue;
       }
-      pipeline->module = module;
+
+      pipeline->module = compiled.module;
+      pipeline->local_size[0] = compiled.local_size[0];
+      pipeline->local_size[1] = compiled.local_size[1];
+      pipeline->local_size[2] = compiled.local_size[2];
+
       ppu::CUfunction fn = nullptr;
-      if (d.cuModuleGetFunction(&fn, module, entry) == CUDA_SUCCESS)
-        pipeline->function = fn;
+      if (d.cuModuleGetFunction(&fn, compiled.module, entry) != CUDA_SUCCESS) {
+        PPU_ERR("vkCreateComputePipelines: compiled module has no entry '%s'", entry);
+        ppu::release_compiled_kernel(compiled);
+        delete pipeline;
+        if (first_error == VK_SUCCESS) first_error = VK_ERROR_INVALID_SHADER_NV;
+        continue;
+      }
+      pipeline->function = fn;
+
+      // Replace the layout-derived argument list with the kernel's real one.
+      // The push-constant block is not a descriptor slot in either case; it is
+      // appended as the trailing kernel argument at dispatch time.
+      pipeline->arg_slots.clear();
+      bool kernel_has_pc = false;
+      for (const ppu::KernelArgBinding &a : compiled.args) {
+        if (a.push_constant) {
+          kernel_has_pc = true;
+          continue;
+        }
+        VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        if (pipeline->layout != nullptr &&
+            a.set < pipeline->layout->set_layouts.size() &&
+            pipeline->layout->set_layouts[a.set] != nullptr) {
+          for (const auto &b : pipeline->layout->set_layouts[a.set]->bindings) {
+            if (b.binding == a.binding) {
+              type = b.type;
+              break;
+            }
+          }
+        }
+        pipeline->arg_slots.push_back({a.set, a.binding, type});
+      }
+      pipeline->has_push_constants = kernel_has_pc;
+      PPU_LOG("compiled SPIR-V entry '%s': %zu kernel argument(s), local size %ux%ux%u%s",
+              compiled.entry_name.c_str(), pipeline->arg_slots.size(),
+              pipeline->local_size[0], pipeline->local_size[1], pipeline->local_size[2],
+              kernel_has_pc ? ", push-constant block" : "");
     }
 
     *pPipelines = reinterpret_cast<VkPipeline>(pipeline);
@@ -576,8 +613,12 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice device, VkPipel
   (void)pAllocator;
   auto *p = reinterpret_cast<ComputePipeline_T *>(pipeline);
   if (p == nullptr) return;
-  ppu::Driver &d = ppu::driver();
-  if (p->module && d.cuModuleUnload) d.cuModuleUnload(p->module);
+  // The module may be shared with other pipelines built from the same SPIR-V;
+  // release_compiled_kernel drops this pipeline's reference and unloads only
+  // when the last one goes.
+  ppu::CompiledKernel handle;
+  handle.module = p->module;
+  ppu::release_compiled_kernel(handle);
   delete p;
 }
 
