@@ -183,7 +183,11 @@ class VulkanDevice {
     static bool checkDeviceExtensionFeature(
         const std::vector<VkExtensionProperties> &properties, const char *name);
 
-    void assertImageConfigurationSupported(VkFormat format);
+    // False when the device cannot provide the four RGBA formats the image
+    // backend uses; records the first missing combination in
+    // image_unsupported_reason_ and never aborts. Called from the constructor;
+    // see is_support_images().
+    bool probeImageConfigurationSupported(VkFormat format);
 
     std::vector<VkDeviceQueueCreateInfo>
     setupQueueCreateInfo(std::vector<std::vector<float>> &queue_priority);
@@ -204,6 +208,10 @@ class VulkanDevice {
                             const VkPhysicalDeviceFeatures2 &queryFeatures2,
                             const std::set<std::string> &supportedExtensions);
 
+    // Probe (not assert) the image backend's format/usage matrix. Logs each
+    // missing combination and leaves m_support_images_ false instead of
+    // aborting, so a device with no image support still yields a usable
+    // VulkanDevice for the buffer backend.
     void checkImageFormatSupport();
 
     std::vector<FeatureDescriptor>
@@ -281,6 +289,26 @@ class VulkanDevice {
         static const bool disabled =
             std::getenv("VKOP_NO_HOST_IMAGE_COPY") != nullptr;
         return m_support_host_image_copy_ && !disabled;
+    }
+    // The image backend (RGBA image2DArray tensors + image ops) is usable.
+    // Probed from the device's format/usage matrix in the constructor rather
+    // than asserted, so an image-less device (the Alibaba PPU) still creates a
+    // VulkanDevice and runs the buffer backend. VKOP_NO_IMAGES=1 forces the
+    // "no image support" answer for A/B on a device that has it; use it to
+    // exercise the degraded path without such hardware. Consumers must treat
+    // false as "image ops cannot run" and fail by name, never silently fall
+    // back to the buffer backend (that would silently change the tensors an op
+    // reads).
+    bool is_support_images() const {
+        static const bool disabled =
+            std::getenv("VKOP_NO_IMAGES") != nullptr;
+        return m_support_images_ && !disabled;
+    }
+    // Why is_support_images() is false, for the error a caller raises when it
+    // is asked for image work on this device. Empty when images are usable
+    // (or when only the env switch disabled them).
+    const std::string &image_unsupported_reason() const {
+        return image_unsupported_reason_;
     }
     // Host-pointer import (VK_EXT_external_memory_host) enabled at device
     // creation. Buffer ctor imports caller-provided aligned host memory as
@@ -498,6 +526,13 @@ class VulkanDevice {
     std::vector<std::shared_ptr<VulkanQueue>> graphicsQueues_;
 
     bool m_support_host_image_copy_ = false;
+    // Image backend usable: every required format/usage combination probed by
+    // checkImageFormatSupport() held. False on a buffer-only device.
+    bool m_support_images_ = false;
+    // First missing format+feature combination seen by
+    // checkImageFormatSupport()/probeImageConfigurationSupported(); empty when
+    // images are supported. Read via image_unsupported_reason().
+    std::string image_unsupported_reason_;
     bool m_is_unified_memory_ = false;
     // VK_EXT_external_memory_host: host-pointer import supported (extension
     // enabled). alignment = minImportedHostPointerAlignment (4096 on

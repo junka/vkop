@@ -125,6 +125,26 @@ class Operator {
     set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
                        const std::shared_ptr<VulkanCommandPool> &cmdpool,
                        VkPipelineCache cache = VK_NULL_HANDLE) {
+        // A device that failed the image-format probe (VulkanDevice::
+        // is_support_images() false, e.g. the Alibaba PPU) cannot back any of
+        // this op type's image resources. Fail here, by name, instead of
+        // letting as_input_image()/as_output_image() create a VkImage the
+        // device cannot use -- and never silently swap in the buffer impl: the
+        // tensors this op was handed were built for the image packing.
+        if (dev && !uses_buffer_backend() && !dev->is_support_images()) {
+            throw std::runtime_error(
+                "vkop: " +
+                (name_.empty() ? std::string(convert_optype_to_string(type_))
+                               : name_) +
+                " is an image-backend operator, but this device has no image "
+                "support (" +
+                (dev->image_unsupported_reason().empty()
+                     ? std::string("images disabled")
+                     : dev->image_unsupported_reason()) +
+                "). Load/convert the model for the buffer backend "
+                "(Runtime::set_backend_buffer(true), onnx2vkop "
+                "--target-backend buffer).");
+        }
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
         // Kept for the pipelines an op builds lazily on its first dispatch of

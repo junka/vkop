@@ -1797,6 +1797,21 @@ template <typename T> class Tensor : public ITensor {
         if (vkobj_) {
             return;
         }
+        // Last line of defence: a device without image support must never get
+        // a VkImage. The op-level gate (Operator::set_runtime_device) and the
+        // Runtime load gate name the failing op / backend choice; this names
+        // the tensor, for any caller that reached here directly (test
+        // fixtures, drivers). Creating the image anyway would fail deeper in
+        // vkCreateImage with no hint why.
+        if (!vd->is_support_images()) {
+            throw std::runtime_error(
+                "vkop: tensor needs an image tensor, but this device has no "
+                "image support (" +
+                (vd->image_unsupported_reason().empty()
+                     ? std::string("images disabled")
+                     : vd->image_unsupported_reason()) +
+                "); this tensor must be a storage buffer (buffer backend)");
+        }
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
         if constexpr (std::is_same_v<T, int8_t>) {
             format =

@@ -31,6 +31,14 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
                          VkMemoryPropertyFlags requireProperties, int ext_fd)
     : VulkanResource(vdev), m_dim_(dim), m_layers_(layers), m_format_(format),
       m_usage_(usage) {
+    if (!vdev->is_support_images()) {
+        throw std::runtime_error(
+            "VulkanImage: this device has no image support (" +
+            (vdev->image_unsupported_reason().empty()
+                 ? std::string("images disabled")
+                 : vdev->image_unsupported_reason()) +
+            "); use the buffer backend");
+    }
     if (m_format_ == VK_FORMAT_UNDEFINED) {
         throw std::runtime_error("Invalid Vulkan image format.");
     }

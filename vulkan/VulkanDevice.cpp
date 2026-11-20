@@ -475,63 +475,87 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
     return static_cast<uint32_t>(computeQueueIdxs_.size());
 }
 
-void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
-    const std::unordered_map<VkFormat, std::string> format_maps = {
-        {VK_FORMAT_R32G32B32A32_SFLOAT, "RGBA32_SFLOT"},
-        {VK_FORMAT_R16G16B16A16_SFLOAT, "RGBA16_SFLOAT"},
-        {VK_FORMAT_R8G8B8A8_UNORM, "RGBA8_UNORM"},
-        {VK_FORMAT_R8G8B8A8_SNORM, "RGBA8_SNORM"},
-    };
-    VkImageType img_type = VK_IMAGE_TYPE_2D;
-    VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
+namespace {
+// Human-readable name for the four formats the image backend uses. (Kept in
+// one place so the probe's "which combination is missing" log names the format
+// the same way as the support log did.)
+const char *image_format_name(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return "RGBA32_SFLOAT";
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        return "RGBA16_SFLOAT";
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        return "RGBA8_UNORM";
+    case VK_FORMAT_R8G8B8A8_SNORM:
+        return "RGBA8_SNORM";
+    default:
+        return "unknown";
+    }
+}
+} // namespace
+
+// Returns whether `format` can back an OPTIMAL-tiled image that is sampled,
+// stored to, and both a transfer source and destination -- the exact
+// combination the image backend creates. This used to be a chain of bare
+// asserts; on a device with no image support those aborted the constructor
+// before the buffer backend could be used, so the answer is now returned and
+// recorded (image_unsupported_reason_) instead.
+bool VulkanDevice::probeImageConfigurationSupported(VkFormat format) {
+    const VkImageType img_type = VK_IMAGE_TYPE_2D;
+    // The image backend only ever creates OPTIMAL-tiled images
+    // (Tensor::make_vkimg -> VulkanImage). A device that cannot back an
+    // OPTIMAL-tiled sampled+storage+transfer image is exactly what this probe
+    // reports instead of asserting.
+    const VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
     VkImageUsageFlags usage =
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    VkImageCreateFlags flags = 0;
+    const VkImageCreateFlags flags = 0;
 
-    VkFormatProperties format_props;
+    VkFormatProperties format_props{};
     vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &format_props);
 
-    const VkFormatFeatureFlags *required_features_ptr = nullptr;
-    if (tiling == VK_IMAGE_TILING_OPTIMAL) {
-        required_features_ptr = &format_props.optimalTilingFeatures;
-    } else if (tiling == VK_IMAGE_TILING_LINEAR) {
-        required_features_ptr = &format_props.linearTilingFeatures;
-    } else {
-        assert(false && "Unsupported tiling mode");
-        return;
+    const VkFormatFeatureFlags required_features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlags have = format_props.optimalTilingFeatures;
+    if ((have & required_features) != required_features) {
+        std::string why =
+            "optimalTilingFeatures 0x" + std::to_string(have) +
+            " lacks sampled|storage|transfer-src|transfer-dst (required 0x" +
+            std::to_string(required_features) + ")";
+        LOG_WARN("image backend unavailable: format %s: %s",
+                 image_format_name(format), why.c_str());
+        if (image_unsupported_reason_.empty()) {
+            image_unsupported_reason_ = std::string(image_format_name(format)) +
+                                        ": " + why;
+        }
+        return false;
     }
-    (void)required_features_ptr; // used only in the assert below (empty under
-                                 // NDEBUG)
-
-    VkFormatFeatureFlags required_features = 0;
-    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
-        required_features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-    }
-    if (usage & VK_IMAGE_USAGE_STORAGE_BIT) {
-        required_features |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
-    }
-    if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
-        required_features |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
-    }
-    if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) {
-        required_features |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    }
-
-    assert((*required_features_ptr & required_features) == required_features &&
-           "Format does not support required tiling features");
 
     VkImageFormatProperties props;
     VkResult result = vkGetPhysicalDeviceImageFormatProperties(
         physicalDevice_, format, img_type, tiling, usage, flags, &props);
-
-    if (result == VK_SUCCESS) {
-        LOG_INFO("format %s supports %u layers", format_maps.at(format).c_str(),
-                 props.maxArrayLayers);
+    if (result != VK_SUCCESS) {
+        std::string why = "vkGetPhysicalDeviceImageFormatProperties returned " +
+                          std::to_string(static_cast<int>(result)) +
+                          " for a sampled|storage|transfer image";
+        LOG_WARN("image backend unavailable: format %s: %s",
+                 image_format_name(format), why.c_str());
+        if (image_unsupported_reason_.empty()) {
+            image_unsupported_reason_ = std::string(image_format_name(format)) +
+                                        ": " + why;
+        }
+        return false;
     }
-    assert(result == VK_SUCCESS &&
-           "vkGetPhysicalDeviceImageFormatProperties failed: "
-           "requested image configuration is not supported!");
+    LOG_INFO("format %s supports %u layers", image_format_name(format),
+             props.maxArrayLayers);
+    // The host-transfer variant stays informational: whether host image copy is
+    // usable is decided by the feature probe in createLogicalDevice(), and at
+    // constructor time that flag has not been resolved yet.
     if (m_support_host_image_copy_) {
         usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
     }
@@ -539,11 +563,12 @@ void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
         physicalDevice_, format, img_type, tiling, usage, flags, &props);
     if (result == VK_SUCCESS) {
         LOG_INFO("format %s supports %u layers for hostImageCopy",
-                 format_maps.at(format).c_str(), props.maxArrayLayers);
+                 image_format_name(format), props.maxArrayLayers);
     } else {
         LOG_INFO("format %s not supports hostImageCopy",
-                 format_maps.at(format).c_str());
+                 image_format_name(format));
     }
+    return true;
 }
 
 EnableResult VulkanDevice::buildFeatureEnableChain(
@@ -629,69 +654,86 @@ QueryChainResult VulkanDevice::buildFeatureQueryChain(
 }
 
 void VulkanDevice::checkImageFormatSupport() {
-    VkFormatProperties3 formatProperties3{};
-    formatProperties3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3_KHR;
-    VkFormatProperties2 formatProperties2{};
-    formatProperties2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
-    formatProperties2.pNext = &formatProperties3;
+    // The four formats the image backend packs tensors into (see
+    // Tensor::make_vkimg): f32, f16, and the two int8 containers. Each must be
+    // usable as an OPTIMAL-tiled sampled+storage+transfer image; on top of that
+    // the image backend's upload path wants host image transfer, which this
+    // probe only reports (createLogicalDevice() decides whether it is enabled).
+    struct FormatReq {
+        VkFormat format;
+        const char *name;
+    };
+    const FormatReq formats[] = {
+        {VK_FORMAT_R32G32B32A32_SFLOAT, "RGBA32_SFLOAT"},
+        {VK_FORMAT_R16G16B16A16_SFLOAT, "RGBA16_SFLOAT"},
+        {VK_FORMAT_R8G8B8A8_SNORM, "RGBA8_SNORM"},
+        {VK_FORMAT_R8G8B8A8_UNORM, "RGBA8_UNORM"},
+    };
 
-    vkGetPhysicalDeviceFormatProperties2(
-        physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &formatProperties2);
-    assert(formatProperties2.formatProperties.bufferFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
-    assert(formatProperties2.formatProperties.optimalTilingFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
-            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
-            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
-    assert(formatProperties3.optimalTilingFeatures &
-           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
-    vkGetPhysicalDeviceFormatProperties2(
-        physicalDevice_, VK_FORMAT_R16G16B16A16_SFLOAT, &formatProperties2);
-    assert(formatProperties2.formatProperties.bufferFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
-    assert(formatProperties2.formatProperties.optimalTilingFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
-            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
-            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
-    assert(formatProperties3.optimalTilingFeatures &
-           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
-    // we would like SSCALE but not supported by most device, use SNORM instead
-    vkGetPhysicalDeviceFormatProperties2(
-        physicalDevice_, VK_FORMAT_R8G8B8A8_SNORM, &formatProperties2);
-    assert(formatProperties2.formatProperties.bufferFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
-    assert(formatProperties2.formatProperties.optimalTilingFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
-            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
-            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
-    assert(formatProperties3.optimalTilingFeatures &
-           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
-    vkGetPhysicalDeviceFormatProperties2(
-        physicalDevice_, VK_FORMAT_R8G8B8A8_UNORM, &formatProperties2);
-    assert(formatProperties2.formatProperties.bufferFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
-    assert(formatProperties2.formatProperties.optimalTilingFeatures &
-           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
-            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
-            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
-    assert(formatProperties3.optimalTilingFeatures &
-           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
-    assertImageConfigurationSupported(VK_FORMAT_R32G32B32A32_SFLOAT);
-    assertImageConfigurationSupported(VK_FORMAT_R16G16B16A16_SFLOAT);
-    assertImageConfigurationSupported(VK_FORMAT_R8G8B8A8_SNORM);
-    assertImageConfigurationSupported(VK_FORMAT_R8G8B8A8_UNORM);
+    // Deliberately the Vulkan 1.0 vkGetPhysicalDeviceFormatProperties and not
+    // the FormatProperties2/3 chain the old asserts used: the pNext chain is
+    // the part a driver we know nothing about (the target PPU) is most likely
+    // to mishandle, and none of the verdict below needs a 64-bit feature bit.
+    // Host image transfer is a Properties3-only bit, but it is NOT required
+    // here: createLogicalDevice() probes hostImageCopy for real and downgrades
+    // it, and the staged path covers its absence.
+    for (const FormatReq &fr : formats) {
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(physicalDevice_, fr.format,
+                                            &props);
+        // bufferFeatures: the image backend also exposes these formats as
+        // texel buffers (VulkanBufferView). Absent only on a device with no
+        // image/texel support at all.
+        if ((props.bufferFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                     VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) ==
+            0) {
+            LOG_WARN("no image support: format %s: bufferFeatures 0x%x lack "
+                     "sampled-image|storage-texel-buffer",
+                     fr.name, props.bufferFeatures);
+            if (image_unsupported_reason_.empty()) {
+                image_unsupported_reason_ =
+                    std::string(fr.name) +
+                    ": bufferFeatures lack sampled-image|storage-texel-buffer";
+            }
+            return;
+        }
+        // optimalTilingFeatures: all four are genuinely needed -- the image
+        // backend creates sampled+storage images and uploads/reads them back
+        // through transfers. (The previous asserts only tested for ANY one of
+        // them, which a sampled-only device would have passed.)
+        const VkFormatFeatureFlags required =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((props.optimalTilingFeatures & required) != required) {
+            LOG_WARN("no image support: format %s: optimalTilingFeatures 0x%x "
+                     "lack sampled|storage|transfer-src|transfer-dst "
+                     "(required 0x%x)",
+                     fr.name, props.optimalTilingFeatures, required);
+            if (image_unsupported_reason_.empty()) {
+                image_unsupported_reason_ =
+                    std::string(fr.name) +
+                    ": optimalTilingFeatures lack "
+                    "sampled|storage|transfer-src|transfer-dst";
+            }
+            return;
+        }
+        // Per-format image configuration (format/usage/tiling): the same
+        // sampled+storage+transfer matrix through the dedicated query.
+        if (!probeImageConfigurationSupported(fr.format)) {
+            return;
+        }
+    }
+    m_support_images_ = true;
+    // Say which verdict is in force: the probe passed, but VKOP_NO_IMAGES can
+    // still force the image backend off. Printing "supported" unconditionally
+    // would contradict the very next gate that refuses image work.
+    if (is_support_images()) {
+        LOG_INFO("image backend supported");
+    } else {
+        LOG_INFO("image backend disabled by VKOP_NO_IMAGES");
+    }
 }
 
 std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
@@ -2036,6 +2078,17 @@ void VulkanDevice::dumpShaderCapabilities() const {
                          "VK_KHR_shader_integer_dot_product)\n",
                  "dot_product_accel");
 #endif
+    // The image probe runs on the physical device before the feature chain
+    // exists, so it reports is_support_images() (the probed + VKOP_NO_IMAGES
+    // answer) and the recorded reason; print it here so a headless box with
+    // only this env switch set can still read the outcome.
+    const bool images = is_support_images();
+    if (images || image_unsupported_reason_.empty()) {
+        std::fprintf(stderr, "[devcaps] %-30s %s\n", "images", yes_no(images));
+    } else {
+        std::fprintf(stderr, "[devcaps] %-30s no (%s)\n", "images",
+                     image_unsupported_reason_.c_str());
+    }
     std::fflush(stderr);
 }
 
