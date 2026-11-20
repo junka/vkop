@@ -548,12 +548,16 @@ TEST(RobustnessTest, ResizeUnknownModeThrows) {
 
 // resize.comp implements `mode == 1` as bilinear and samples everything else as
 // nearest, so cubic silently degraded. The check is the first statement in
-// execute(): it fires before any input is touched.
+// execute(): it fires before any input is touched. Both backends refuse it and
+// say so by name, so the case runs on whichever backend this device can build
+// (VKOP_NO_IMAGES=1 leaves only the buffer one) instead of demanding an image
+// pipeline the device may not have.
 TEST(RobustnessTest, ResizeImageCubicThrows) {
     auto in = rt_make<float>({1, 2, 4, 4}, std::vector<float>(32, 1.f));
     auto out = std::make_shared<Tensor<float>>(std::vector<int>{1, 2, 2, 2});
 
-    auto op = std::make_unique<vkop::ops::Resize>(0, /*backend_buffer=*/false);
+    auto op = std::make_unique<vkop::ops::Resize>(
+        0, /*backend_buffer=*/!rt_dev()->is_support_images());
     op->set_runtime_device(rt_dev(), rt_cmdpool());
     op->setAttribute({{"mode", "cubic"}, {"size", "[2, 2]"}});
     expect_throw_contains([&] { op->onExecute({in}, {out}, 0); },
@@ -562,12 +566,14 @@ TEST(RobustnessTest, ResizeImageCubicThrows) {
 
 // resize.comp's transform_coordinate() names tf_crop_and_resize in its else
 // branch but leaves the coordinate at (0,0), so every output pixel sampled the
-// input corner and `extrapolation_value` was never read. Refused now instead.
+// input corner and `extrapolation_value` was never read. Both backends refuse
+// it rather than sample a corner; see the backend note above.
 TEST(RobustnessTest, ResizeTfCropAndResizeThrows) {
     auto in = rt_make<float>({1, 2, 4, 4}, std::vector<float>(32, 1.f));
     auto out = std::make_shared<Tensor<float>>(std::vector<int>{1, 2, 2, 2});
 
-    auto op = std::make_unique<vkop::ops::Resize>(0, /*backend_buffer=*/false);
+    auto op = std::make_unique<vkop::ops::Resize>(
+        0, /*backend_buffer=*/!rt_dev()->is_support_images());
     op->set_runtime_device(rt_dev(), rt_cmdpool());
     op->setAttribute({{"mode", "nearest"},
                       {"size", "[2, 2]"},

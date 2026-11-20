@@ -1,0 +1,141 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// AveragePool (SSBO) — rank-4 NCHW, the buffer twin of
+// shaders/image/averagepool.comp. Each thread produces one output element by
+// walking its kernel window over the compact (N, C, H, W) row-major input.
+//
+// ONE module serves fp32 and fp16 storage: `fp16` in the push constant says
+// whether elements are packed two per uint word (the same runtime dtype switch
+// buffer/gemm.comp's fp16a/fp16b use). The host sets it from the tensor it
+// bound, so a graph whose precision disagrees with its tensors still reads the
+// right words. Packed mode runs one thread per output WORD so no two threads
+// read-modify-write the same half2.
+//
+// Denominator semantics follow torch's avg_pool2d (and ONNX):
+//   count_include_pad != 0 -> every window position inside the PADDED extent
+//                             [-pad_begin, dim + pad_end) counts, even where
+//                             that extent is zero fill. A ceil_mode window
+//                             that overhangs pad_end is clipped, which is
+//                             torch's `pool_size` clamp.
+//   count_include_pad == 0 -> only positions inside the real input count.
+// (The image kernel counts all kernel positions for the include-pad case, so
+// the two agree wherever the window does not overhang pad_end — every covered
+// configuration — and this one matches torch where ceil_mode does overhang.)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uAveragePool {
+    int N;
+    int C;
+    int H_in;
+    int W_in;
+    int H_out;
+    int W_out;
+    int pad_top;
+    int pad_left;
+    int pad_bottom;
+    int pad_right;
+    int kernel_h;
+    int kernel_w;
+    int stride_h;
+    int stride_w;
+    int dilation_h;
+    int dilation_w;
+    int count_include_pad;
+    int fp16;
+} uParam;
+
+float load_elem(int idx) {
+    return (uParam.fp16 != 0)
+               ? unpackHalf2x16(uInput.data[idx >> 1])[idx & 1]
+               : uintBitsToFloat(uInput.data[idx]);
+}
+
+void store_elem(int idx, float v) {
+    if (uParam.fp16 != 0) {
+        uint w = uint(idx) >> 1;
+        vec2 pair = unpackHalf2x16(uOutput.data[w]);
+        pair[idx & 1] = v;
+        uOutput.data[w] = packHalf2x16(pair);
+    } else {
+        uOutput.data[idx] = floatBitsToUint(v);
+    }
+}
+
+int nchw_idx(int n, int c, int h, int w) {
+    return ((n * uParam.C + c) * uParam.H_in + h) * uParam.W_in + w;
+}
+
+float pool_one(int gid) {
+    int ow = gid % uParam.W_out;
+    int t = gid / uParam.W_out;
+    int oh = t % uParam.H_out;
+    t /= uParam.H_out;
+    int c = t % uParam.C;
+    int n = t / uParam.C;
+
+    int ih0 = oh * uParam.stride_h - uParam.pad_top;
+    int iw0 = ow * uParam.stride_w - uParam.pad_left;
+
+    // The PADDED extent is [-pad_begin, dim + pad_end). Every window position
+    // inside it counts toward the include-pad denominator, zero fill included.
+    // A ceil_mode window can reach past the upper end; torch clips those
+    // positions (its `pool_size` clamp) and so do we. The lower end needs no
+    // test: ih0 = oh*stride - pad_top >= -pad_top and kh*dilation >= 0.
+    int ih_end = uParam.H_in + uParam.pad_bottom;
+    int iw_end = uParam.W_in + uParam.pad_right;
+
+    float sum = 0.0;
+    int valid = 0;
+    int total = 0;
+    for (int kh = 0; kh < uParam.kernel_h; ++kh) {
+        int ih = ih0 + kh * uParam.dilation_h;
+        if (ih >= ih_end) continue;
+        for (int kw = 0; kw < uParam.kernel_w; ++kw) {
+            int iw = iw0 + kw * uParam.dilation_w;
+            if (iw >= iw_end) continue;
+            total++;
+            // Inside the padded extent but not the real input (a negative
+            // ih/iw from the begin padding) counts for the denominator and
+            // contributes zero -- never a load.
+            if (ih >= 0 && ih < uParam.H_in && iw >= 0 &&
+                iw < uParam.W_in) {
+                sum += load_elem(nchw_idx(n, c, ih, iw));
+                valid++;
+            }
+        }
+    }
+
+    int denom = (uParam.count_include_pad != 0) ? total : valid;
+    return (denom > 0) ? sum / float(denom) : 0.0;
+}
+
+void main() {
+    int out_total = uParam.N * uParam.C * uParam.H_out * uParam.W_out;
+    int gid = int(gl_GlobalInvocationID.x);
+
+    if (uParam.fp16 != 0) {
+        // One thread per output word: compute both elements, write once.
+        int nwords = (out_total + 1) / 2;
+        if (gid >= nwords) return;
+        int e0 = 2 * gid;
+        int e1 = 2 * gid + 1;
+        float v0 = pool_one(e0);
+        float v1 = (e1 < out_total) ? pool_one(e1) : 0.0;
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        return;
+    }
+
+    if (gid >= out_total) return;
+    store_elem(gid, pool_one(gid));
+}

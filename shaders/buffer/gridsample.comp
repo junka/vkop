@@ -1,0 +1,142 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// GridSample (SSBO) — 2-D grid sampler, the buffer twin of
+// shaders/image/gridsample.comp. Input is the compact (N, C, H_in, W_in)
+// row-major plane, the grid is the ONNX (N, H_out, W_out, 2) tensor (x, y per
+// output point), and the output is (N, C, H_out, W_out).
+//
+// The coordinate mapping, interpolation and padding rules are copied from the
+// image kernel on purpose — the tests compare the two against torch, so a
+// divergence in the math would be a second contract:
+//   inputX = ((gridX + 1) * (W_in - a) - (1 - a)) * 0.5,  a = align_corners
+//   bilinear: floor/floor+1 weights; nearest: round() to the nearest pixel
+//   zeros / border / reflection padding, as spelled in the image kernel.
+//
+// ONE module serves fp32 and fp16 storage: `fp16` in the push constant selects
+// the two-halves-per-word layout, and the host sets it from the tensors it
+// bound. Packed mode runs one thread per output WORD and writes it once, so no
+// two threads read-modify-write the same half2.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Grid {
+    uint data[];
+} uGrid;
+
+layout(push_constant) uniform PC_uGridSample {
+    int N;
+    int C;
+    int H_in;
+    int W_in;
+    int H_out;
+    int W_out;
+    int padding_mode;       // 0 zeros, 1 border, 2 reflection
+    int interpolation_mode; // 0 bilinear, 1 nearest
+    int align_corners;
+    int fp16;               // data (input/output) layout
+    int grid_fp16;          // grid layout (independent dtype in ONNX)
+    int _pad1;
+} uParam;
+
+int elem_word(int idx, int packed) { return packed != 0 ? (idx >> 1) : idx; }
+
+float unpack_at(uint raw, int idx, int packed) {
+    if (packed != 0) {
+        return unpackHalf2x16(raw)[idx & 1];
+    }
+    return uintBitsToFloat(raw);
+}
+
+float load_in(int idx) {
+    return unpack_at(uInput.data[elem_word(idx, uParam.fp16)], idx,
+                     uParam.fp16);
+}
+
+float load_grid(int idx) {
+    return unpack_at(uGrid.data[elem_word(idx, uParam.grid_fp16)], idx,
+                     uParam.grid_fp16);
+}
+
+// One channel plane of the input, with the padding rule applied to (px, py).
+float load_sample(int n, int c, int px, int py) {
+    if (px < 0 || px >= uParam.W_in || py < 0 || py >= uParam.H_in) {
+        if (uParam.padding_mode == 0) {
+            return 0.0;
+        }
+        if (uParam.padding_mode == 1) {
+            px = clamp(px, 0, uParam.W_in - 1);
+            py = clamp(py, 0, uParam.H_in - 1);
+        } else { // reflection (the same formula as the image kernel)
+            px = int(mod(float(px), 2.0 * float(uParam.W_in)));
+            if (px >= uParam.W_in) px = 2 * uParam.W_in - px - 1;
+            py = int(mod(float(py), 2.0 * float(uParam.H_in)));
+            if (py >= uParam.H_in) py = 2 * uParam.H_in - py - 1;
+            px = clamp(px, 0, uParam.W_in - 1);
+            py = clamp(py, 0, uParam.H_in - 1);
+        }
+    }
+    return load_in(((n * uParam.C + c) * uParam.H_in + py) * uParam.W_in + px);
+}
+
+float sample_one(int gid) {
+    int ow = gid % uParam.W_out;
+    int t = gid / uParam.W_out;
+    int oh = t % uParam.H_out;
+    t /= uParam.H_out;
+    int c = t % uParam.C;
+    int n = t / uParam.C;
+
+    int gi = ((n * uParam.H_out + oh) * uParam.W_out + ow) * 2;
+    float grid_x = load_grid(gi);
+    float grid_y = load_grid(gi + 1);
+
+    float a = float(uParam.align_corners);
+    float b = 1.0 - a;
+    float input_x = ((grid_x + 1.0) * (float(uParam.W_in) - a) - b) * 0.5;
+    float input_y = ((grid_y + 1.0) * (float(uParam.H_in) - a) - b) * 0.5;
+
+    if (uParam.interpolation_mode == 0) { // bilinear
+        int x0 = int(floor(input_x));
+        int y0 = int(floor(input_y));
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        float i00 = load_sample(n, c, x0, y0);
+        float i01 = load_sample(n, c, x1, y0);
+        float i10 = load_sample(n, c, x0, y1);
+        float i11 = load_sample(n, c, x1, y1);
+        float fx = input_x - float(x0);
+        float fy = input_y - float(y0);
+        float top = mix(i00, i01, fx);
+        float bot = mix(i10, i11, fx);
+        return mix(top, bot, fy);
+    }
+    return load_sample(n, c, int(round(input_x)), int(round(input_y)));
+}
+
+void main() {
+    int total = uParam.N * uParam.C * uParam.H_out * uParam.W_out;
+    int gid = int(gl_GlobalInvocationID.x);
+
+    if (uParam.fp16 != 0) {
+        int nwords = (total + 1) / 2;
+        if (gid >= nwords) return;
+        int e0 = 2 * gid;
+        int e1 = 2 * gid + 1;
+        float v0 = sample_one(e0);
+        float v1 = (e1 < total) ? sample_one(e1) : 0.0;
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        return;
+    }
+
+    if (gid >= total) return;
+    uOutput.data[gid] = floatBitsToUint(sample_one(gid));
+}

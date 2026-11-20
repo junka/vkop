@@ -6,11 +6,21 @@
 #endif
 #extension GL_EXT_scalar_block_layout : enable
 
-// Resize (SSBO) — nearest neighbour only, coordinate_transformation_mode
-// =asymmetric / nearest_mode=floor, which is exactly integer floor division:
-// in_coord = floor(out_coord * in_dim / out_dim). Handles arbitrary rank
-// (<=8) and both up- and down-sampling; a dim whose in/out sizes match is an
-// identity copy (no division).
+// Resize (SSBO) — the buffer twin of shaders/image/resize.comp.
+//
+// Two sampling modes share one coordinate-transform table (the same formulas
+// and constants as the image kernel, so the two backends agree):
+//
+//   nearest  rank-generic: every axis maps independently through
+//            transform_coord(), the configured nearest_mode rounding and a
+//            clamp to [0, dim-1]. With coordinate_transformation_mode=
+//            asymmetric + nearest_mode=floor this is exactly the integer floor
+//            division in_coord = floor(out_coord * in_dim / out_dim) the op
+//            shipped with before, so converted models keep their output.
+//   linear   bilinear over the LAST TWO axes (H, W), matching the image
+//            kernel's sample_bilinear. Every other axis must be unchanged; the
+//            host refuses a third resized axis by name (that would be
+//            trilinear, which neither backend implements).
 //
 // fp16 packs two halfs per uint word, so (like expand.comp) each thread owns a
 // whole output word and writes it once — a plain read-modify-write per element
@@ -36,15 +46,34 @@ layout(set = 0, binding = 1) readonly buffer inputBuffer {
 } uInput;
 #endif
 
+// Coordinate transformation modes (resize::CoordinateTransformationMode).
+#define TM_HALF_PIXEL 0
+#define TM_HALF_PIXEL_SYMMETRIC 1
+#define TM_PYTORCH_HALF_PIXEL 2
+#define TM_ALIGN_CORNERS 3
+#define TM_ASYMMETRIC 4
+#define TM_TF_CROP_AND_RESIZE 5
+
+// Nearest rounding rules (resize::NearestMode).
+#define NM_ROUND_PREFER_FLOOR 0
+#define NM_ROUND_PREFER_CEIL 1
+#define NM_FLOOR 2
+#define NM_CEIL 3
+
+#define MODE_NEAREST 0
+#define MODE_LINEAR 1
+
 layout(push_constant) uniform paraBuffer {
     int rank;
     int fp16;
+    int mode;
+    int nearest_mode;
+    int coord_mode;
+    int _pad0;
     IArr8 inDims;
     IArr8 outDims;
-    int _pad0;
-    int _pad1;
 #ifdef BDA
-    // Matches ops::ResizeBdaPC: 80-byte scalar prefix + out/in.
+    // Matches ops::ResizeBdaPC: 88-byte scalar prefix + out/in.
     DataBuf uOutput;
     DataBuf uInput;
 #endif
@@ -55,16 +84,112 @@ layout(push_constant) uniform paraBuffer {
 #define uInput uParam.uInput
 #endif
 
+float transform_coord(int out_coord, int in_dim, int out_dim) {
+    float ih = float(in_dim);
+    float oh = float(out_coord);
+    float od = float(out_dim);
+    float ih_m1 = ih - 1.0;
+
+    if (uParam.coord_mode == TM_HALF_PIXEL) {
+        return (out_dim > 1) ? (oh + 0.5) * ih / od - 0.5 : 0.5 * ih_m1;
+    }
+    if (uParam.coord_mode == TM_HALF_PIXEL_SYMMETRIC) {
+        float scale = max(ih / od, 1.0);
+        return (oh + 0.5) * scale - 0.5;
+    }
+    if (uParam.coord_mode == TM_PYTORCH_HALF_PIXEL) {
+        return (out_dim > 1) ? (oh + 0.5) * ih / od - 0.5 : 0.0;
+    }
+    if (uParam.coord_mode == TM_ALIGN_CORNERS) {
+        return (out_dim > 1) ? oh * ih_m1 / (od - 1.0) : 0.0;
+    }
+    // TM_ASYMMETRIC (tf_crop_and_resize is refused on the host).
+    return oh * ih / od;
+}
+
+int nearest_index(float uv, int dim) {
+    float v;
+    if (uParam.nearest_mode == NM_ROUND_PREFER_FLOOR) {
+        const float eps = 1e-5;
+        v = floor(uv + 0.5 - eps);
+    } else if (uParam.nearest_mode == NM_ROUND_PREFER_CEIL) {
+        v = floor(uv + 0.5);
+    } else if (uParam.nearest_mode == NM_FLOOR) {
+        v = floor(uv);
+    } else {
+        v = ceil(uv);
+    }
+    return clamp(int(v), 0, dim - 1);
+}
+
 int resize_elem(int gid) {
     IArr8 out_coord = linear_to_nd8(gid, uParam.outDims, uParam.rank);
     IArr8 in_coord;
     for (int i = 0; i < uParam.rank; ++i) {
         int od = uParam.outDims.v[i];
         int id = uParam.inDims.v[i];
-        in_coord.v[i] = (id == od) ? out_coord.v[i]
-                                   : (out_coord.v[i] * id) / od;
+        in_coord.v[i] = (od == id)
+                            ? out_coord.v[i]
+                            : nearest_index(
+                                  transform_coord(out_coord.v[i], id, od), id);
     }
     return nd_to_linear8(in_coord, uParam.inDims, uParam.rank);
+}
+
+// Bilinear over the last two axes inside one leading-axis plane.
+float sample_bilinear(int plane_base, float h, float w, int h_dim, int w_dim) {
+    float ch = clamp(h, 0.0, float(h_dim - 1));
+    float cw = clamp(w, 0.0, float(w_dim - 1));
+    int h0 = int(floor(ch));
+    int w0 = int(floor(cw));
+    int h1 = h0 + 1;
+    int w1 = w0 + 1;
+    float fy = ch - float(h0);
+    float fx = cw - float(w0);
+    if (h1 >= h_dim) {
+        h1 = h0;
+        fy = 0.0;
+    }
+    if (w1 >= w_dim) {
+        w1 = w0;
+        fx = 0.0;
+    }
+    float i00 = BUF_LOAD(uInput.data, plane_base + h0 * w_dim + w0);
+    float i01 = BUF_LOAD(uInput.data, plane_base + h0 * w_dim + w1);
+    float i10 = BUF_LOAD(uInput.data, plane_base + h1 * w_dim + w0);
+    float i11 = BUF_LOAD(uInput.data, plane_base + h1 * w_dim + w1);
+    return mix(mix(i00, i01, fx), mix(i10, i11, fx), fy);
+}
+
+float resize_elem_linear(int gid) {
+    int h_dim = uParam.inDims.v[uParam.rank - 2];
+    int w_dim = uParam.inDims.v[uParam.rank - 1];
+    int oh_dim = uParam.outDims.v[uParam.rank - 2];
+    int ow_dim = uParam.outDims.v[uParam.rank - 1];
+
+    IArr8 out_coord = linear_to_nd8(gid, uParam.outDims, uParam.rank);
+    int plane_base = 0;
+    for (int i = 0; i < uParam.rank - 2; ++i) {
+        plane_base = plane_base * uParam.inDims.v[i] + out_coord.v[i];
+    }
+    plane_base *= h_dim * w_dim;
+
+    float h = (oh_dim == h_dim)
+                  ? float(out_coord.v[uParam.rank - 2])
+                  : transform_coord(out_coord.v[uParam.rank - 2], h_dim,
+                                    oh_dim);
+    float w = (ow_dim == w_dim)
+                  ? float(out_coord.v[uParam.rank - 1])
+                  : transform_coord(out_coord.v[uParam.rank - 1], w_dim,
+                                    ow_dim);
+    return sample_bilinear(plane_base, h, w, h_dim, w_dim);
+}
+
+float one(int gid) {
+    if (uParam.mode == MODE_LINEAR) {
+        return resize_elem_linear(gid);
+    }
+    return BUF_LOAD(uInput.data, resize_elem(gid));
 }
 
 void main() {
@@ -78,15 +203,11 @@ void main() {
     if (gid >= nwords) return;
     int e0 = 2 * gid;
     int e1 = 2 * gid + 1;
-    float v0 = BUF_LOAD(uInput.data, resize_elem(e0));
-    if (e1 >= out_total) {
-        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
-    } else {
-        float v1 = BUF_LOAD(uInput.data, resize_elem(e1));
-        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
-    }
+    float v0 = one(e0);
+    float v1 = (e1 < out_total) ? one(e1) : 0.0;
+    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
 #else
     if (gid >= out_total) return;
-    BUF_STORE(uOutput.data, gid, BUF_LOAD(uInput.data, resize_elem(gid)));
+    BUF_STORE(uOutput.data, gid, one(gid));
 #endif
 }

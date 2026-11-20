@@ -333,16 +333,20 @@ def test_plan_variants_carry_their_backend_prefix():
 def test_plan_cells_are_post_fallback():
     """Each cell is the key the runtime will ask for, not a raw basename:
     an op without a variant on a backend resolves to the other backend's
-    spelling (Attention is buffer-only, AveragePool is image-only), and an op
+    spelling (Attention is buffer-only, Col2Im is image-only), and an op
     that is not in DUAL_FP16_SHADERS repeats its fp32 key in the fp16 cell
     rather than leaving the cell empty and letting the runtime guess."""
     attention = shader_map.plan_for_op("Attention")
     assert attention["image"] == "buffer_attention"
     assert attention["image_fp16"] == "buffer_attention_fp16"
     assert attention["buffer"] == "buffer_attention"
+    col2im = shader_map.plan_for_op("Col2Im")
+    assert col2im["buffer"] == "image_col2im"
+    assert col2im["buffer_fp16"] == "image_col2im"
+    # AveragePool gained a real buffer variant; its cells must not fall back.
     averagepool = shader_map.plan_for_op("AveragePool")
-    assert averagepool["buffer"] == "image_averagepool"
-    assert averagepool["buffer_fp16"] == "image_averagepool"
+    assert averagepool["buffer"] == "buffer_averagepool"
+    assert averagepool["buffer_fp16"] == "buffer_averagepool"
     # MaxPool gained a real buffer variant; its cells must not fall back.
     maxpool = shader_map.plan_for_op("MaxPool")
     assert maxpool["buffer"] == "buffer_maxpool2d"

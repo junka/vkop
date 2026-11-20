@@ -40,9 +40,9 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::ATAN:
             return {"atan", "atan", false, true};
         case T::AVERAGEPOOL:
-            return {"averagepool", nullptr, false, false};
+            return {"averagepool", "averagepool", false, false};
         case T::BATCHNORM:
-            return {"batchnorm", nullptr, false, false};
+            return {"batchnorm", "batchnorm", false, false};
         case T::COL2IM:
             return {"col2im", nullptr, false, false};
         case T::CONCAT:
@@ -72,7 +72,7 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::GLOBALAVERAGEPOOL:
             return {"globalaveragepool", "globalaveragepool", false, true};
         case T::GRIDSAMPLE:
-            return {"gridsample", nullptr, false, false};
+            return {"gridsample", "gridsample", false, false};
         case T::LAYERNORM:
             return {"layernorm", "layernorm", false, true};
         case T::MATMUL:

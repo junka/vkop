@@ -1,0 +1,107 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// BatchNorm (SSBO) — the buffer twin of shaders/image/batchnorm.comp.
+// y = scale * (x - mean) / sqrt(var + eps) + bias, with the per-channel
+// parameters in the merged layout the converter (and the C++ fixtures) emit:
+// every group of 4 channels occupies 16 consecutive scalars
+// [scale4, bias4, mean4, var4]. Channel c therefore reads group g = c / 4,
+// lane = c % 4, at g*16 + {0,4,8,12} + lane.
+//
+// ONE module serves every dtype combination: `fp16` says the DATA edges are
+// packed two halves per word and `params_fp16` says the same about the
+// parameter tensor — they are independent (the merge pass keeps each
+// parameter's original dtype). The host sets both from the tensors it bound,
+// so a graph whose precision disagrees with its tensors still reads the right
+// words. Both are runtime branches, like buffer/gemm.comp's fp16a/fp16b.
+//
+// Packed mode runs one thread per output WORD and writes it once, so no two
+// threads read-modify-write the same half2.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Params {
+    uint data[];
+} uParams;
+
+layout(push_constant) uniform PC_uBatchNorm {
+    int outer;     // dims before the channel axis
+    int channels;  // C
+    int spatial;   // product of the dims after the channel axis
+    int params_fp16;
+    int fp16;
+    int activation; // ACTIVATION_* from shaders/common/activation.comp (0=none)
+    float eps;
+    int _pad0;
+} uParam;
+
+float param_at(int idx) {
+    if (uParam.params_fp16 != 0) {
+        return unpackHalf2x16(uParams.data[idx >> 1])[idx & 1];
+    }
+    return uintBitsToFloat(uParams.data[idx]);
+}
+
+float load_elem(int idx) {
+    return (uParam.fp16 != 0)
+               ? unpackHalf2x16(uInput.data[idx >> 1])[idx & 1]
+               : uintBitsToFloat(uInput.data[idx]);
+}
+
+// The same table as shaders/common/activation.comp, applied per scalar. Batch
+// norm accumulates in fp32 on both backends, so this does too.
+float apply_activation(float x, int act) {
+    switch (act) {
+    case 1: return max(0.0, x);
+    case 2: return 1.0 / (1.0 + exp(-x));
+    case 3: return tanh(x);
+    case 4: return x * clamp(x + 3.0, 0.0, 6.0) / 6.0;
+    case 5: return x * tanh(log(1.0 + exp(x)));
+    case 6: return clamp(x, 0.0, 6.0);
+    case 7: return x / (1.0 + exp(-x));
+    default: return x;
+    }
+}
+
+float bn_one(int gid) {
+    int c = (gid / uParam.spatial) % uParam.channels;
+
+    int g = c >> 2;
+    int lane = c & 3;
+    float scale = param_at(g * 16 + lane);
+    float bias = param_at(g * 16 + 4 + lane);
+    float mean = param_at(g * 16 + 8 + lane);
+    float var = param_at(g * 16 + 12 + lane);
+
+    float inv_std = inversesqrt(var + uParam.eps);
+    float x = load_elem(gid);
+    return apply_activation(scale * (x - mean) * inv_std + bias,
+                            uParam.activation);
+}
+
+void main() {
+    int total = uParam.outer * uParam.channels * uParam.spatial;
+    int gid = int(gl_GlobalInvocationID.x);
+
+    if (uParam.fp16 != 0) {
+        int nwords = (total + 1) / 2;
+        if (gid >= nwords) return;
+        int e0 = 2 * gid;
+        int e1 = 2 * gid + 1;
+        float v0 = bn_one(e0);
+        float v1 = (e1 < total) ? bn_one(e1) : 0.0;
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        return;
+    }
+
+    if (gid >= total) return;
+    uOutput.data[gid] = floatBitsToUint(bn_one(gid));
+}

@@ -386,17 +386,24 @@ class ResizeImage : public Operator {
     std::vector<float> scales_;
     std::vector<float> roi_;
 };
-// Buffer (SSBO) Resize. Nearest-neighbour with asymmetric/floor coordinate
-// mapping: out element (n,c,y,x...) reads in coord floor(out*i*in_dim/out_dim)
-// per axis, so the whole op is an indexed copy — the index math is exact in
-// integer arithmetic (no scale floats in the push constant).
+// Buffer (SSBO) Resize PC (mirrors shaders/buffer/resize.comp). Covers both
+// sampling modes the buffer kernel implements:
+//   nearest — rank-generic; with asymmetric/floor this is the original
+//             integer floor-division copy, and the mode/nearest_mode/
+//             coord_mode fields now also carry the ONNX transform variants the
+//             image path supports.
+//   linear  — bilinear over the last two axes (H, W); the host refuses a
+//             third resized axis by name because that would be trilinear.
+// fp16 packs two halfs per uint word (one thread per output word).
 struct ResizeBufferPC {
     int rank;
     int fp16;
+    int mode;        // resize::ResizeMode: 0 nearest, 1 linear
+    int nearest_mode; // resize::NearestMode
+    int coord_mode;  // resize::CoordinateTransformationMode
+    int _pad0;
     int inDims[8];
     int outDims[8];
-    int _pad0;
-    int _pad1;
 };
 
 struct alignas(16) ResizeBdaPC {
@@ -404,8 +411,8 @@ struct alignas(16) ResizeBdaPC {
     VkDeviceAddress out_addr;
     VkDeviceAddress in_addr;
 };
-static_assert(offsetof(ResizeBdaPC, out_addr) == 80, "ResizeBdaPC drift");
-static_assert(sizeof(ResizeBdaPC) == 96, "ResizeBdaPC drift");
+static_assert(offsetof(ResizeBdaPC, out_addr) == 88, "ResizeBdaPC drift");
+static_assert(sizeof(ResizeBdaPC) == 112, "ResizeBdaPC drift");
 
 class ResizeBuffer : public BufferFactory {
   public:
@@ -428,16 +435,63 @@ class ResizeBuffer : public BufferFactory {
                 mode_ = 0;
             } else if (*s == "linear" || *s == "bilinear") {
                 mode_ = 1;
-            } else {
+            } else if (*s == "cubic" || *s == "bicubic") {
                 mode_ = 2;
+            } else {
+                throw std::runtime_error(
+                    "Resize: unknown mode '" + *s +
+                    "' (expected nearest, linear or cubic)");
             }
         }
         if (const auto *s = get("coordinate_transformation_mode")) {
-            coordinate_transformation_mode_ =
-                (*s == "asymmetric")
-                    ? static_cast<int>(
-                          resize::CoordinateTransformationMode::ASYMMETRIC)
-                    : -1;
+            static const std::unordered_map<
+                std::string, resize::CoordinateTransformationMode>
+                kTmodeMap = {
+                    {"half_pixel",
+                     resize::CoordinateTransformationMode::HALF_PIXEL},
+                    {"half_pixel_symmetric",
+                     resize::CoordinateTransformationMode::
+                         HALF_PIXEL_SYMMETRIC},
+                    {"pytorch_half_pixel",
+                     resize::CoordinateTransformationMode::PYTORCH_HALF_PIXEL},
+                    {"align_corners",
+                     resize::CoordinateTransformationMode::ALIGN_CORNERS},
+                    {"asymmetric",
+                     resize::CoordinateTransformationMode::ASYMMETRIC},
+                    {"tf_crop_and_resize",
+                     resize::CoordinateTransformationMode::TF_CROP_AND_RESIZE}};
+            auto fit = kTmodeMap.find(*s);
+            if (fit == kTmodeMap.end()) {
+                throw std::runtime_error(
+                    "Resize: unknown coordinate_transformation_mode '" + *s +
+                    "'");
+            }
+            coordinate_transformation_mode_ = static_cast<int>(fit->second);
+        }
+        if (const auto *s = get("nearest_mode")) {
+            static const std::unordered_map<std::string, resize::NearestMode>
+                kNearestMap = {
+                    {"round_prefer_floor",
+                     resize::NearestMode::ROUND_PREFER_FLOOR},
+                    {"round_prefer_ceil",
+                     resize::NearestMode::ROUND_PREFER_CEIL},
+                    {"floor", resize::NearestMode::FLOOR},
+                    {"ceil", resize::NearestMode::CEIL}};
+            auto nit = kNearestMap.find(*s);
+            if (nit == kNearestMap.end()) {
+                throw std::runtime_error("Resize: unknown nearest_mode '" +
+                                         *s + "'");
+            }
+            nearest_mode_ = static_cast<int>(nit->second);
+        }
+        if (const auto *s = get("antialias")) {
+            if (*s == "True" || *s == "1") {
+                antialias_ = 1;
+            } else if (*s == "False" || *s == "0") {
+                antialias_ = 0;
+            } else {
+                antialias_ = std::stol(*s);
+            }
         }
         if (const auto *s = get("axes"); s && !s->empty()) {
             axes_ = parse_attr_list<int>(*s);
@@ -446,6 +500,11 @@ class ResizeBuffer : public BufferFactory {
             scales_ = parse_attr_list<float>(*s);
         }
         if (const auto *s = get("sizes"); s && !s->empty()) {
+            sizes_ = parse_attr_list<int>(*s);
+        }
+        // The tests (and some exporters) spell the output extent as `size`,
+        // the same key the image path reads.
+        if (const auto *s = get("size"); s && !s->empty()) {
             sizes_ = parse_attr_list<int>(*s);
         }
     }
@@ -457,13 +516,24 @@ class ResizeBuffer : public BufferFactory {
         // Host work here is the roi/sizes/scales tensor readback (the image
         // path reads all three when the graph supplies them).
         set_did_host_work_last_round(inputs.size() > 1);
-        if (mode_ != 0 ||
-            coordinate_transformation_mode_ !=
-                static_cast<int>(
-                    resize::CoordinateTransformationMode::ASYMMETRIC)) {
+        // Refuse what the buffer kernel does not implement, by name — the same
+        // contract the image path uses. Cubic and tf_crop_and_resize have no
+        // kernel on either backend; antialias has none anywhere.
+        if (mode_ == 2) {
             throw std::runtime_error(
-                "Resize (buffer backend) supports only mode=nearest with "
-                "coordinate_transformation_mode=asymmetric");
+                "Resize (buffer backend) does not implement cubic/bicubic "
+                "sampling; only nearest and linear are available");
+        }
+        if (antialias_ != 0) {
+            throw std::runtime_error(
+                "Resize (buffer backend) does not implement antialias");
+        }
+        if (coordinate_transformation_mode_ ==
+            static_cast<int>(
+                resize::CoordinateTransformationMode::TF_CROP_AND_RESIZE)) {
+            throw std::runtime_error(
+                "Resize (buffer backend) does not implement "
+                "coordinate_transformation_mode=tf_crop_and_resize");
         }
 
         auto inshape = inputs[0]->getShape();
@@ -504,6 +574,23 @@ class ResizeBuffer : public BufferFactory {
             outshape = recorded;
         }
 
+        // Linear mode is bilinear over the last two axes only. A resized axis
+        // anywhere else would need trilinear (or n-linear), which neither
+        // backend has — refuse it rather than sample the wrong plane.
+        if (mode_ == 1) {
+            for (int i = 0; i + 2 < rank; ++i) {
+                if (outshape[i] != inshape[i]) {
+                    throw std::runtime_error(
+                        "Resize (buffer backend) implements linear only over "
+                        "the last two axes; axis " +
+                        std::to_string(i) + " changes from " +
+                        std::to_string(inshape[i]) + " to " +
+                        std::to_string(outshape[i]) +
+                        " and neither backend has n-linear sampling");
+                }
+            }
+        }
+
         std::shared_ptr<VulkanBuffer> out_buf;
         std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
@@ -521,7 +608,15 @@ class ResizeBuffer : public BufferFactory {
 
         ResizeBufferPC pc{};
         pc.rank = rank;
+        // Resize's buffer shader keeps a compile-time -DFP16 build (it is in
+        // DUAL_FP16_SHADERS and its packing is selected by #ifdef, unlike the
+        // runtime branch the three new pool/norm/sampler kernels use), so the
+        // thread count and the PC flag must follow the module the op loaded,
+        // i.e. the constructor's fp16_ — not the tensor dtype.
         pc.fp16 = (fp16_ != 0) ? 1 : 0;
+        pc.mode = mode_;
+        pc.nearest_mode = nearest_mode_;
+        pc.coord_mode = coordinate_transformation_mode_;
         fill_dims(pc.inDims, inshape);
         fill_dims(pc.outDims, outshape);
         // fp16 packs two elements per uint word; dispatch one thread per word
@@ -545,8 +640,17 @@ class ResizeBuffer : public BufferFactory {
         submit(&pc, groups, 1, 1);
     }
 
-    int mode_ = 0;
+    // Defaults reproduce the legacy buffer kernel exactly: nearest +
+    // asymmetric + floor (integer floor-division sampling). Artifacts that
+    // converted for the buffer backend were accepted only with asymmetric and
+    // carried no nearest_mode, and the old kernel always floored — so an
+    // unset nearest_mode MUST stay FLOOR or asymmetric nearest sampling would
+    // silently change (e.g. 5 -> 7 maps differently under round_prefer_floor).
+    // When the attributes are given, the full image-impl table applies.
+    int mode_ = 0;                           // NEAREST
+    int nearest_mode_ = 2;                   // FLOOR
     int coordinate_transformation_mode_ = 4; // ASYMMETRIC
+    int antialias_ = 0;
     std::vector<int> axes_;
     std::vector<float> scales_;
     std::vector<int> sizes_;
