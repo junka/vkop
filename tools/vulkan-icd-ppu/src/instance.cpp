@@ -278,12 +278,28 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties
     const char *pLayerName, uint32_t *pPropertyCount,
     VkExtensionProperties *pProperties) {
   (void)pLayerName;
-  // This ICD contributes no instance extensions; the loader's own extensions
-  // are still visible to the application.
+  // One instance extension. VK_KHR_get_physical_device_properties2 is the
+  // instance-level name under which the vkGetPhysicalDevice*Properties2 family
+  // was introduced in Vulkan 1.0; this ICD implements that whole family (core
+  // 1.1 plus every KHR alias), so advertising the name is accurate. It is also
+  // the gate a consumer uses to decide whether chaining a property struct is
+  // legal: vulkaninfo resolves vkGetPhysicalDeviceProperties2 either way, but
+  // only calls it when this name is present, so without it the subgroup and
+  // integer-dot-product blocks are never printed even though the ICD returns
+  // them.
+  static const VkExtensionProperties kInstanceExtensions[] = {
+      {"VK_KHR_get_physical_device_properties2", 2},
+  };
+  constexpr uint32_t kCount = sizeof(kInstanceExtensions) / sizeof(kInstanceExtensions[0]);
   if (pPropertyCount == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
-  *pPropertyCount = 0;
-  (void)pProperties;
-  return VK_SUCCESS;
+  if (pProperties == nullptr) {
+    *pPropertyCount = kCount;
+    return VK_SUCCESS;
+  }
+  uint32_t n = std::min(*pPropertyCount, kCount);
+  for (uint32_t i = 0; i < n; ++i) pProperties[i] = kInstanceExtensions[i];
+  *pPropertyCount = n;
+  return (n < kCount) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(
@@ -462,9 +478,20 @@ void fill_features(VkPhysicalDeviceFeatures *f, bool usable) {
   (void)usable;
 }
 
-// Fill the Vulkan 1.1/1.2 extension feature structs we can honestly claim.
-// Walks the caller's pNext chain so we never write a struct they did not ask
-// about.
+// Fill the extension feature structs we can honestly claim. Walks the caller's
+// pNext chain so we never write a struct they did not ask about.
+//
+// What is deliberately NOT here (each was considered and rejected):
+//  - VkPhysicalDeviceCooperativeMatrixFeaturesKHR / ...NV: the SPIR-V emitter
+//    this ICD is paired with does not implement cooperative matrix (it fails
+//    loud on every matmul_coop* shader). Advertising the feature would let a
+//    consumer select a shader class that can never compile.
+//  - VkPhysicalDeviceShaderSubgroupRotateFeatures: the device has
+//    shuffle.idx/up/down but no rotate semantics, and nothing below lowers a
+//    rotate to three shuffles.
+//  - VkPhysicalDeviceShaderAtomicFloatFeatures / ...AtomicFloat16VectorNV:
+//    fp32/fp16 atomic add on storage or shared memory was never verified on
+//    this hardware; a false "yes" here silently changes the split-K strategy.
 void fill_features_pnext(void *pNext, bool usable) {
   for (auto *s = reinterpret_cast<VkBaseOutStructure *>(pNext); s != nullptr; s = s->pNext) {
     switch (s->sType) {
@@ -476,6 +503,81 @@ void fill_features_pnext(void *pNext, bool usable) {
         f->multiview = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
+        // The standalone pre-1.1 spelling. A consumer at apiVersion 1.1 asks
+        // with Vk11Features above; one that checks the extension by name asks
+        // with this struct, so both answer the same.
+        auto *f = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures *>(s);
+        f->storageBuffer16BitAccess = VK_TRUE;
+        f->uniformAndStorageBuffer16BitAccess = VK_TRUE;
+        f->storagePushConstant16 = VK_TRUE;
+        f->storageInputOutput16 = VK_FALSE;  // no fragment stage exists
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: {
+        auto *f = reinterpret_cast<VkPhysicalDevice8BitStorageFeatures *>(s);
+        f->storageBuffer8BitAccess = VK_TRUE;
+        f->uniformAndStorageBuffer8BitAccess = VK_TRUE;
+        f->storagePushConstant8 = VK_FALSE;  // push constants stay 32-bit here
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: {
+        // Both halves, honestly: fp16 arithmetic (__hmul/__hadd measured) and
+        // 8-bit integer arithmetic (the int8 kernels rely on it).
+        auto *f = reinterpret_cast<VkPhysicalDeviceShaderFloat16Int8Features *>(s);
+        f->shaderFloat16 = VK_TRUE;
+        f->shaderInt8 = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
+        // The device has exactly one subgroup size (32), so "control" cannot
+        // change anything, but the feature is what lets a pipeline pin
+        // requiredSubgroupSize -- and 32 is the only value the range permits,
+        // so every legal request is already what the hardware runs.
+        // computeFullSubgroups stays VK_FALSE: it promises that a pipeline may
+        // set REQUIRE_FULL_SUBGROUPS with a local size that is NOT a multiple
+        // of the subgroup size and still have every subgroup fully populated.
+        // This ICD hands the local size straight to cuLaunchKernel, which
+        // leaves a partial tail warp, and the SPIR-V emitter emits no
+        // predicated round-up, so the promise would be false.
+        auto *f = reinterpret_cast<VkPhysicalDeviceSubgroupSizeControlFeatures *>(s);
+        f->subgroupSizeControl = VK_TRUE;
+        f->computeFullSubgroups = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: {
+        // Permission to put OpCapability DotProduct in a module. It says
+        // nothing about speed; the matching *properties* struct reports every
+        // acceleration bit as false.
+        auto *f = reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductFeatures *>(s);
+        f->shaderIntegerDotProduct = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR: {
+        // 256 KiB/block of shared memory, and the emitter emits addrspace(3).
+        // Scalar block layout is already true in the Vulkan12 chain; 8/16-bit
+        // access to that memory was measured working.
+        auto *f = reinterpret_cast<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR *>(s);
+        f->workgroupMemoryExplicitLayout = VK_TRUE;
+        f->workgroupMemoryExplicitLayoutScalarBlockLayout = VK_TRUE;
+        f->workgroupMemoryExplicitLayout8BitAccess = VK_TRUE;
+        f->workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES: {
+        // VK_KHR_zero_initialize_workgroup_memory is deliberately NOT
+        // advertised. Measured on this device: a kernel that reads a
+        // `__shared__` array it never wrote sees 0xFFFFFFFF residue left by
+        // the previous block, so the guarantee the feature name promises does
+        // not hold in hardware. Backing it would require the SPIR-V emitter
+        // (a separate workstream) to inject a zero-fill prologue for every
+        // workgroup variable, and no such lowering exists today. Advertising
+        // it would let a consumer drop an explicit initialisation it needs.
+        // We still answer a consumer that chains this struct: false.
+        auto *f = reinterpret_cast<VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures *>(s);
+        f->shaderZeroInitializeWorkgroupMemory = VK_FALSE;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
         auto *f = reinterpret_cast<VkPhysicalDeviceVulkan12Features *>(s);
         f->bufferDeviceAddress = usable ? VK_TRUE : VK_FALSE;
@@ -483,6 +585,7 @@ void fill_features_pnext(void *pNext, bool usable) {
         f->storageBuffer8BitAccess = VK_TRUE;
         f->uniformAndStorageBuffer8BitAccess = VK_TRUE;
         f->scalarBlockLayout = VK_TRUE;
+        f->shaderFloat16 = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
@@ -525,6 +628,47 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(
   (void)pd->total_memory;
 }
 
+namespace {
+
+// The subgroup facts, in one place so the standalone 1.1 struct, the Vulkan 1.1
+// aggregate struct and the extension spellings cannot drift apart.
+struct SubgroupFacts {
+  uint32_t size;
+  VkShaderStageFlags stages;
+  VkSubgroupFeatureFlags operations;
+  VkBool32 quad_in_all_stages;
+};
+
+// What the device actually provides, measured with nvcc -keep + llvm-dis and
+// confirmed with end-to-end kernels on the hardware:
+//   BASIC    - gl_SubgroupSize etc. (warpSize printed on device = 32)
+//   VOTE     - __any_sync/__all_sync -> ballot + emsk test (verified)
+//   BALLOT   - llvm.ppu.ballot.i32 (verified)
+//   SHUFFLE  - llvm.ppu.shuffle.{idx,up,down}.pred, including xor and the
+//              width argument (both verified)
+//   ARITHMETIC - __reduce_{add,min,max,and,or,xor}_sync lower to a SINGLE
+//              hardware instruction (`v.red.add.u32`, `v.red.max.i32`,
+//              `v.red.and.b32`, ...), not a shuffle loop. Vulkan requires the
+//              bit to cover ADD/MUL/MIN/MAX for integer and float; integer is
+//              native hardware and float add/max/min/mul via shuffles measured
+//              numerically exact. See the ARITHMETIC caveat in the report:
+//              the SPIR-V emitter must lower OpGroupNonUniformArithmetic to
+//              llvm.ppu.redux.* / the shuffle sequence for this to hold.
+// Deliberately absent:
+//   QUAD_*    - no evidence for quad (2x2 lane) operations; not measured.
+//   CLUSTERED - no cluster semantics on this hardware.
+//   SHUFFLE_RELATIVE - never verified.
+constexpr SubgroupFacts kSubgroupFacts = {
+    ppu::kSubgroupSize,
+    VK_SHADER_STAGE_COMPUTE_BIT,
+    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+        VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT,
+    VK_FALSE,
+};
+
+}  // namespace
+
 extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
   if (pProperties == nullptr) return;
@@ -546,6 +690,96 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(
         auto *m3 = reinterpret_cast<VkPhysicalDeviceMaintenance3Properties *>(s);
         m3->maxPerSetDescriptors = 1024;
         m3->maxMemoryAllocationSize = pd->total_memory ? pd->total_memory : (1ull << 32);
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
+        // Core Vulkan 1.1, standalone spelling. This is the struct the
+        // reference consumer chains (VulkanDevice::getProperties).
+        auto *sg = reinterpret_cast<VkPhysicalDeviceSubgroupProperties *>(s);
+        sg->subgroupSize = kSubgroupFacts.size;
+        sg->supportedStages = kSubgroupFacts.stages;
+        sg->supportedOperations = kSubgroupFacts.operations;
+        sg->quadOperationsInAllStages = kSubgroupFacts.quad_in_all_stages;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES: {
+        // The Vulkan 1.1 aggregate struct. A consumer at apiVersion 1.1 (which
+        // is what this ICD reports) may query this instead of the standalone
+        // structs above, and vulkaninfo does exactly that -- without this case
+        // no subgroup block is printed at all even though the standalone
+        // struct carries the same values.
+        auto *p11 = reinterpret_cast<VkPhysicalDeviceVulkan11Properties *>(s);
+        std::memset(p11->deviceUUID, 0, VK_UUID_SIZE);
+        std::memcpy(p11->deviceUUID, pd->uuid, VK_UUID_SIZE);
+        std::memset(p11->driverUUID, 0, VK_UUID_SIZE);
+        std::memcpy(p11->driverUUID, pd->uuid, VK_UUID_SIZE);
+        std::memset(p11->deviceLUID, 0, VK_LUID_SIZE);
+        p11->deviceNodeMask = 0;
+        p11->deviceLUIDValid = VK_FALSE;
+        p11->subgroupSize = kSubgroupFacts.size;
+        p11->subgroupSupportedStages = kSubgroupFacts.stages;
+        p11->subgroupSupportedOperations = kSubgroupFacts.operations;
+        p11->subgroupQuadOperationsInAllStages = kSubgroupFacts.quad_in_all_stages;
+        p11->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
+        p11->maxMultiviewViewCount = 0;
+        p11->maxMultiviewInstanceIndex = 0;
+        p11->protectedNoFault = VK_FALSE;
+        p11->maxPerSetDescriptors = 1024;
+        p11->maxMemoryAllocationSize = pd->total_memory ? pd->total_memory : (1ull << 32);
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: {
+        // Vulkan 1.3 core, but this ICD reports apiVersion 1.1.0, so it is
+        // reached through VK_EXT_subgroup_size_control. There is exactly one
+        // subgroup size, so the range is degenerate: pinning 32 always works
+        // and pinning anything else is a caller error.
+        auto *ssc = reinterpret_cast<VkPhysicalDeviceSubgroupSizeControlProperties *>(s);
+        ssc->minSubgroupSize = ppu::kSubgroupSize;
+        ssc->maxSubgroupSize = ppu::kSubgroupSize;
+        ssc->maxComputeWorkgroupSubgroups = ppu::kMaxComputeWorkgroupSubgroups;
+        ssc->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES: {
+        // Measured negative result: __dp4a does NOT map to a device
+        // instruction. `nvcc -keep` + `llvm-dis` shows it expanded into four
+        // `v.madl.i32` ops plus prmt byte-extracts in the PPU assembly, i.e.
+        // pure emulation. Every acceleration bit is therefore VK_FALSE --
+        // including integerDotProduct4x8BitPackedSignedAccelerated, which a
+        // consumer might otherwise route an int8 GEMV to. All 30 fields are
+        // written explicitly rather than relying on the caller's zeroing, so
+        // the answer holds even for an uninitialised struct.
+        auto *ip = reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductProperties *>(s);
+        ip->integerDotProduct8BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProduct8BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProduct8BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProduct4x8BitPackedUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProduct4x8BitPackedSignedAccelerated = VK_FALSE;
+        ip->integerDotProduct4x8BitPackedMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProduct16BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProduct16BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProduct16BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProduct32BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProduct32BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProduct32BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProduct64BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProduct64BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProduct64BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating8BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating8BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating8BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating4x8BitPackedUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating4x8BitPackedMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating16BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating16BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating16BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating32BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating32BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating32BitMixedSignednessAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating64BitUnsignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating64BitSignedAccelerated = VK_FALSE;
+        ip->integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = VK_FALSE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES: {
@@ -701,11 +935,38 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
     if (pPropertyCount) *pPropertyCount = 0;
     return VK_SUCCESS;
   }
+  // The device extension list. Every name here is backed by a feature or
+  // property the ICD actually returns, and the matching KHR/EXT entry point
+  // (where the extension defines one) is served from dispatch_table.cpp.
+  //
+  // Deliberately absent, and why:
+  //   VK_KHR_cooperative_matrix / VK_NV_cooperative_matrix -- the paired
+  //     SPIR-V emitter does not implement cooperative matrix and fails loud on
+  //     every matmul_coop* shader, so advertising it would route a consumer to
+  //     a path that cannot compile.
+  //   VK_KHR_shader_subgroup_rotate -- the device has shuffle.idx/down/up but
+  //     no rotate, and nothing lowers rotate to three shuffles.
+  //   VK_EXT_shader_atomic_float / VK_NV_shader_atomic_float16_vector -- not
+  //     verified on this hardware; a false yes would change split-K strategy.
+  //   VK_KHR_zero_initialize_workgroup_memory -- measured NOT to hold: shared
+  //     memory retains the previous block's 0xFFFFFFFF residue.
   static const VkExtensionProperties kExtensions[] = {
       {"VK_KHR_buffer_device_address", 1},
       {"VK_KHR_maintenance3", 1},
       {"VK_KHR_storage_buffer_storage_class", 1},
-      {"VK_KHR_shader_float16_int8", 1},
+      {"VK_KHR_shader_float16_int8", VK_KHR_SHADER_FLOAT16_INT8_SPEC_VERSION},
+      // Feature structs already answered TRUE in the Vulkan11/12 chains; the
+      // names are what a consumer that checks the extension list (rather than
+      // only the core feature bit) gates on.
+      {"VK_KHR_16bit_storage", VK_KHR_16BIT_STORAGE_SPEC_VERSION},
+      {"VK_KHR_8bit_storage", VK_KHR_8BIT_STORAGE_SPEC_VERSION},
+      {"VK_EXT_subgroup_size_control", VK_EXT_SUBGROUP_SIZE_CONTROL_SPEC_VERSION},
+      // Present with every acceleration bit false: it tells a consumer the
+      // capability exists but is not accelerated, which is the truthful and
+      // useful answer (see the properties case for the dp4a measurement).
+      {"VK_KHR_shader_integer_dot_product", VK_KHR_SHADER_INTEGER_DOT_PRODUCT_SPEC_VERSION},
+      {"VK_KHR_workgroup_memory_explicit_layout",
+       VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_SPEC_VERSION},
       // vkGetPhysicalDeviceToolProperties is implemented (and answers with an
       // empty tool list: this ICD is a driver, not a tool).
       {"VK_EXT_tooling_info", 1},

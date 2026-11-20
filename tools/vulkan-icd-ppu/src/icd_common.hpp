@@ -100,6 +100,17 @@ constexpr VkDeviceSize kMaxUniformBufferRange = 64 * 1024;
 constexpr uint32_t kTimestampValidBits = 64;
 constexpr float kTimestampPeriodNs = 1.0f;
 
+// Compute subgroup (hardware warp) size. Measured on the device: `warpSize`
+// printed from a kernel is 32, and the SPIR-V emitter's shuffle/redux
+// intrinsics (llvm.ppu.shuffle.{idx,up,down}.pred, llvm.ppu.redux.*,
+// llvm.ppu.ballot.i32) are all warp-wide. There is exactly one size, so
+// minSubgroupSize == maxSubgroupSize == kSubgroupSize.
+constexpr uint32_t kSubgroupSize = 32;
+
+// Largest number of subgroups in one workgroup:
+// maxComputeWorkGroupInvocations / minSubgroupSize = 1024 / 32.
+constexpr uint32_t kMaxComputeWorkgroupSubgroups = 1024 / kSubgroupSize;
+
 }  // namespace ppu
 
 // ---------------------------------------------------------------------------

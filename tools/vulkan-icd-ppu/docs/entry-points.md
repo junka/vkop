@@ -8,7 +8,7 @@ real PPU-ZW810E via `libvulkan.so.1`.
 * `vkEnumerateInstanceVersion`
 * `vkCreateInstance`
 * `vkDestroyInstance`
-* `vkEnumerateInstanceExtensionProperties`
+* `vkEnumerateInstanceExtensionProperties` (`VK_KHR_get_physical_device_properties2`)
 * `vkEnumerateInstanceLayerProperties`
 * `vkEnumeratePhysicalDevices`
 * `vkGetPhysicalDeviceProperties`

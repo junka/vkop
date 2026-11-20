@@ -65,9 +65,29 @@ Advertised honestly — see `src/instance.cpp`:
 * Limits that a compute consumer depends on: `maxPushConstantsSize = 128`
   (the largest operator parameter block), `maxUniformBufferRange = 64 KiB`,
   `maxStorageBufferRange = 4 GiB - 1`.
-* Extensions: `VK_KHR_buffer_device_address`, `VK_KHR_maintenance3`,
-  `VK_KHR_storage_buffer_storage_class`, `VK_KHR_shader_float16_int8`,
-  `VK_EXT_tooling_info`.
+* Default subgroup: size 32, compute stage only, `BASIC | VOTE | BALLOT |
+  SHUFFLE | ARITHMETIC`. `ARITHMETIC` rests on measured hardware:
+  `__reduce_{add,min,max,and,or,xor}_sync` are single `v.red.*` instructions and
+  float add/min/max/mul reduce exactly through shuffles. No `QUAD` bit (not
+  measured), no clustered ops.
+* Extensions:
+  * Instance: `VK_KHR_get_physical_device_properties2` (the whole
+    `vkGetPhysicalDevice*Properties2` family is implemented; without this name
+    `vulkaninfo` never calls it).
+  * Device: `VK_KHR_buffer_device_address`, `VK_KHR_maintenance3`,
+    `VK_KHR_storage_buffer_storage_class`, `VK_KHR_shader_float16_int8`,
+    `VK_KHR_16bit_storage`, `VK_KHR_8bit_storage`,
+    `VK_EXT_subgroup_size_control` (min = max = 32),
+    `VK_KHR_shader_integer_dot_product` (present with **every acceleration bit
+    false**: `__dp4a` is four `v.madl.i32` ops, not an instruction),
+    `VK_KHR_workgroup_memory_explicit_layout`, `VK_EXT_tooling_info`.
+* Deliberately **not** advertised, each verified or rejected above:
+  `VK_KHR_cooperative_matrix` / `VK_NV_cooperative_matrix` (the SPIR-V emitter
+  has no cooperative-matrix lowering and fails on every `matmul_coop*` shader),
+  `VK_KHR_shader_subgroup_rotate` (no rotate semantics), `VK_EXT_shader_atomic_float`
+  / `VK_NV_shader_atomic_float16_vector` (not verified),
+  `VK_KHR_zero_initialize_workgroup_memory` (measured: shared memory retains
+  the previous block's residue instead of being zeroed).
 * Timestamp queries via CUDA events (see `docs/entry-points.md`).
 * Device extensions: no external memory/fence/semaphore handles, no timeline
   semaphores, no push descriptors.
