@@ -230,6 +230,29 @@ Descriptor_T *find_descriptor(DescriptorSet_T *set, uint32_t binding, uint32_t e
   return nullptr;
 }
 
+// Apply one VkWriteDescriptorSet to a set. Shared by vkUpdateDescriptorSets
+// and the update-template path so both produce identical binding state.
+void apply_descriptor_write(DescriptorSet_T *set, const VkWriteDescriptorSet &w) {
+  for (uint32_t e = 0; e < w.descriptorCount; ++e) {
+    Descriptor_T *slot = find_descriptor(set, w.dstBinding, w.dstArrayElement + e);
+    if (slot == nullptr) {
+      PPU_ERR("descriptor write: binding %u element %u not in layout", w.dstBinding,
+              w.dstArrayElement + e);
+      continue;
+    }
+    slot->type = w.descriptorType;
+    if (w.pBufferInfo != nullptr) {
+      slot->buffer = reinterpret_cast<Buffer_T *>(w.pBufferInfo[e].buffer);
+      slot->offset = w.pBufferInfo[e].offset;
+      slot->range = w.pBufferInfo[e].range;
+    } else {
+      slot->buffer = nullptr;
+      slot->offset = 0;
+      slot->range = 0;
+    }
+  }
+}
+
 }  // namespace
 
 extern "C" VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(
@@ -237,26 +260,8 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(
     uint32_t descriptorCopyCount, const VkCopyDescriptorSet *pDescriptorCopies) {
   (void)device;
   for (uint32_t i = 0; i < descriptorWriteCount; ++i) {
-    const VkWriteDescriptorSet &w = pDescriptorWrites[i];
-    auto *set = reinterpret_cast<DescriptorSet_T *>(w.dstSet);
-    for (uint32_t e = 0; e < w.descriptorCount; ++e) {
-      Descriptor_T *slot = find_descriptor(set, w.dstBinding, w.dstArrayElement + e);
-      if (slot == nullptr) {
-        PPU_ERR("vkUpdateDescriptorSets: binding %u element %u not in layout", w.dstBinding,
-                w.dstArrayElement + e);
-        continue;
-      }
-      slot->type = w.descriptorType;
-      if (w.pBufferInfo != nullptr) {
-        slot->buffer = reinterpret_cast<Buffer_T *>(w.pBufferInfo[e].buffer);
-        slot->offset = w.pBufferInfo[e].offset;
-        slot->range = w.pBufferInfo[e].range;
-      } else {
-        slot->buffer = nullptr;
-        slot->offset = 0;
-        slot->range = 0;
-      }
-    }
+    auto *set = reinterpret_cast<DescriptorSet_T *>(pDescriptorWrites[i].dstSet);
+    apply_descriptor_write(set, pDescriptorWrites[i]);
   }
   for (uint32_t i = 0; i < descriptorCopyCount; ++i) {
     const VkCopyDescriptorSet &c = pDescriptorCopies[i];
@@ -266,6 +271,96 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(
       Descriptor_T *s = find_descriptor(src, c.srcBinding, c.srcArrayElement + e);
       Descriptor_T *d = find_descriptor(dst, c.dstBinding, c.dstArrayElement + e);
       if (s != nullptr && d != nullptr) *d = *s;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor update templates
+// ---------------------------------------------------------------------------
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorUpdateTemplate(
+    VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator, VkDescriptorUpdateTemplate *pDescriptorUpdateTemplate) {
+  (void)pAllocator;
+  Device_T *dev = as_device(device);
+  if (dev == nullptr || pCreateInfo == nullptr || pDescriptorUpdateTemplate == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  if (pCreateInfo->templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR) {
+    // Push-descriptor templates are only meaningful alongside
+    // VK_KHR_push_descriptor, which this ICD does not advertise (its shaders
+    // take the classic bind path). Refuse rather than accept a template whose
+    // later use would silently do nothing.
+    PPU_ERR("vkCreateDescriptorUpdateTemplate: push-descriptor templates are not "
+            "supported (VK_KHR_push_descriptor is not advertised)");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+  auto *tmpl = new DescriptorUpdateTemplate_T();
+  tmpl->device = dev;
+  tmpl->template_type = pCreateInfo->templateType;
+  tmpl->set_layout = reinterpret_cast<DescriptorSetLayout_T *>(pCreateInfo->descriptorSetLayout);
+  tmpl->pipeline_layout = reinterpret_cast<PipelineLayout_T *>(pCreateInfo->pipelineLayout);
+  tmpl->set = pCreateInfo->set;
+
+  if (tmpl->set_layout == nullptr) {
+    PPU_ERR("vkCreateDescriptorUpdateTemplate: a descriptor set layout is required");
+    delete tmpl;
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  for (uint32_t i = 0; i < pCreateInfo->descriptorUpdateEntryCount; ++i) {
+    const VkDescriptorUpdateTemplateEntry &e = pCreateInfo->pDescriptorUpdateEntries[i];
+    if (e.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+        e.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+      PPU_ERR("vkCreateDescriptorUpdateTemplate: descriptor type %d is not supported",
+              static_cast<int>(e.descriptorType));
+      delete tmpl;
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    DescriptorUpdateTemplateEntry entry;
+    entry.dst_binding = e.dstBinding;
+    entry.dst_array_element = e.dstArrayElement;
+    entry.descriptor_count = e.descriptorCount;
+    entry.type = e.descriptorType;
+    entry.offset = e.offset;
+    entry.stride = e.stride;
+    tmpl->entries.push_back(entry);
+  }
+  *pDescriptorUpdateTemplate = reinterpret_cast<VkDescriptorUpdateTemplate>(tmpl);
+  return VK_SUCCESS;
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorUpdateTemplate(
+    VkDevice device, VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+    const VkAllocationCallbacks *pAllocator) {
+  (void)device;
+  (void)pAllocator;
+  delete reinterpret_cast<DescriptorUpdateTemplate_T *>(descriptorUpdateTemplate);
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(
+    VkDevice device, VkDescriptorSet descriptorSet,
+    VkDescriptorUpdateTemplate descriptorUpdateTemplate, const void *pData) {
+  (void)device;
+  auto *set = reinterpret_cast<DescriptorSet_T *>(descriptorSet);
+  auto *tmpl = reinterpret_cast<const DescriptorUpdateTemplate_T *>(descriptorUpdateTemplate);
+  if (set == nullptr || tmpl == nullptr || pData == nullptr) return;
+
+  for (const auto &e : tmpl->entries) {
+    for (uint32_t i = 0; i < e.descriptor_count; ++i) {
+      const size_t off = e.offset + e.stride * i;
+      VkDescriptorBufferInfo bi{};
+      std::memcpy(&bi, static_cast<const uint8_t *>(pData) + off, sizeof bi);
+      Descriptor_T *slot = find_descriptor(set, e.dst_binding, e.dst_array_element + i);
+      if (slot == nullptr) {
+        PPU_ERR("vkUpdateDescriptorSetWithTemplate: binding %u element %u not in layout",
+                e.dst_binding, e.dst_array_element + i);
+        continue;
+      }
+      slot->type = e.type;
+      slot->buffer = reinterpret_cast<Buffer_T *>(bi.buffer);
+      slot->offset = bi.offset;
+      slot->range = bi.range;
     }
   }
 }

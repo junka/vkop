@@ -29,6 +29,9 @@ real PPU-ZW810E via `libvulkan.so.1`.
 * `vkGetPhysicalDeviceExternalBufferProperties`
 * `vkGetPhysicalDeviceExternalFenceProperties`
 * `vkGetPhysicalDeviceExternalSemaphoreProperties`
+* `vkGetPhysicalDeviceToolProperties` (answers with an empty tool list: this
+  is a driver, not a tooling layer) — advertised as `VK_EXT_tooling_info`;
+  the `...EXT` spelling is also served
 * `vkCreateDevice`
 * `vkDestroyDevice`
 * `vkGetDeviceQueue`
@@ -59,6 +62,16 @@ real PPU-ZW810E via `libvulkan.so.1`.
 * `vkAllocateDescriptorSets`
 * `vkFreeDescriptorSets`
 * `vkUpdateDescriptorSets`
+* `vkCreateDescriptorUpdateTemplate`
+* `vkDestroyDescriptorUpdateTemplate`
+* `vkUpdateDescriptorSetWithTemplate`
+* `vkCreateQueryPool` (timestamps only; other query types are rejected with
+  `VK_ERROR_FEATURE_NOT_PRESENT`)
+* `vkDestroyQueryPool`
+* `vkResetQueryPool`
+* `vkGetQueryPoolResults`
+* `vkCmdResetQueryPool`
+* `vkCmdWriteTimestamp`
 * `vkCreatePipelineLayout`
 * `vkDestroyPipelineLayout`
 * `vkCreateShaderModule`
@@ -131,9 +144,6 @@ a fake success:
 * `vkDestroyRenderPass`
 * `vkCreateFramebuffer`
 * `vkDestroyFramebuffer`
-* `vkCreateQueryPool`
-* `vkDestroyQueryPool`
-* `vkResetQueryPool`
 * `vkCreateEvent`
 * `vkDestroyEvent`
 * `vkGetEventStatus`
@@ -143,7 +153,9 @@ a fake success:
 ## Explicit errors in otherwise-implemented calls
 
 * `vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer` — logs an error, records nothing (images unsupported)
-* `vkCmdWriteTimestamp` — logs an error; timestampValidBits is 0
+* `vkCreateQueryPool` with a non-TIMESTAMP type — `VK_ERROR_FEATURE_NOT_PRESENT`
+* `vkCreateDescriptorUpdateTemplate` with `..._TYPE_PUSH_DESCRIPTORS_KHR` —
+  `VK_ERROR_FEATURE_NOT_PRESENT` (VK_KHR_push_descriptor is not advertised)
 * `vkGetBufferDeviceAddressKHR and other KHR aliases` — same implementation as the core entry point
 * `vkGetMemoryFdKHR` — VK_ERROR_FEATURE_NOT_PRESENT (no external handles)
 * `vkCmdSetEvent` / `vkCmdWaitEvents` / `vkCmdResetEvent` — no-ops; single-stream replay
@@ -168,3 +180,9 @@ a fake success:
   descriptor types.
 * `vkCreateDevice` rejects queue families other than 0 and queue counts other than 1.
 * `vkMapMemory` on device-only memory (type 0) returns `VK_ERROR_MEMORY_MAP_FAILED`.
+* Timestamp queries measure `cuEventElapsedTime` between a per-pool origin event
+  and a per-write event, and report nanoseconds (timestampPeriod = 1.0). The
+  value is a delta from that origin, not a hardware counter, which is exactly
+  what a begin/end subtraction needs. When the backend cannot create or time
+  events (`cuEventElapsedTime` missing), `timestampValidBits` is 0 and
+  `vkCreateQueryPool` returns `VK_ERROR_FEATURE_NOT_PRESENT`.

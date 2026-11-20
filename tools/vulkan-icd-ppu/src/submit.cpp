@@ -125,6 +125,9 @@ bool replay_op(Device_T *dev, RecordedOp &op) {
     case RecordedOp::Kind::Barrier:
       // Single-stream replay already orders everything.
       return true;
+    case RecordedOp::Kind::ResetQuery:
+    case RecordedOp::Kind::WriteTimestamp:
+      return ppu::replay_query_op(dev, op);
   }
   return true;
 }

@@ -476,11 +476,45 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer comman
                                                            VkPipelineStageFlagBits pipelineStage,
                                                            VkQueryPool queryPool,
                                                            uint32_t query) {
-  (void)commandBuffer;
   (void)pipelineStage;
-  (void)queryPool;
-  (void)query;
-  PPU_ERR("vkCmdWriteTimestamp: timestamps are not supported (timestampValidBits=0)");
+  auto *cb = as_cb(commandBuffer);
+  auto *pool = reinterpret_cast<QueryPool_T *>(queryPool);
+  if (cb == nullptr) return;
+  if (pool == nullptr || pool->type != VK_QUERY_TYPE_TIMESTAMP) {
+    PPU_ERR("vkCmdWriteTimestamp: query pool is not a TIMESTAMP pool");
+    return;
+  }
+  if (query >= pool->count) {
+    PPU_ERR("vkCmdWriteTimestamp: query %u out of range (%u queries)", query, pool->count);
+    return;
+  }
+  RecordedOp op;
+  op.kind = RecordedOp::Kind::WriteTimestamp;
+  op.query_pool = pool;
+  op.query_first = query;
+  op.query_count = 1;
+  cb->ops.push_back(std::move(op));
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer commandBuffer,
+                                                           VkQueryPool queryPool,
+                                                           uint32_t firstQuery,
+                                                           uint32_t queryCount) {
+  auto *cb = as_cb(commandBuffer);
+  auto *pool = reinterpret_cast<QueryPool_T *>(queryPool);
+  if (cb == nullptr) return;
+  if (pool == nullptr) return;
+  if (firstQuery >= pool->count || firstQuery + queryCount > pool->count) {
+    PPU_ERR("vkCmdResetQueryPool: range %u+%u out of bounds (%u queries)", firstQuery,
+            queryCount, pool->count);
+    return;
+  }
+  RecordedOp op;
+  op.kind = RecordedOp::Kind::ResetQuery;
+  op.query_pool = pool;
+  op.query_first = firstQuery;
+  op.query_count = queryCount;
+  cb->ops.push_back(std::move(op));
 }
 
 extern "C" VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event,

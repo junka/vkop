@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unistd.h>
 
 namespace ppu {
 
@@ -20,6 +21,33 @@ bool debug_enabled() {
 void stamp(VK_LOADER_DATA *data) { set_loader_magic_value(data); }
 
 namespace {
+
+// Host RAM in bytes, as the amount userspace can actually allocate. Prefers
+// /proc/meminfo's MemTotal (which excludes kernel-reserved memory) and falls
+// back to sysconf's raw physical page count. Zero when unknown; callers then
+// fall back to VK_WHOLE_SIZE rather than inventing a number.
+size_t host_ram_bytes() {
+  size_t mem_total = 0;
+  if (std::FILE *f = std::fopen("/proc/meminfo", "r")) {
+    char line[256];
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+      if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+        mem_total = static_cast<size_t>(kb) * 1024u;
+        break;
+      }
+    }
+    std::fclose(f);
+  }
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long page_size = sysconf(_SC_PAGESIZE);
+  size_t raw = (pages > 0 && page_size > 0)
+                   ? static_cast<size_t>(pages) * static_cast<size_t>(page_size)
+                   : 0;
+  // Never report more than userspace can allocate.
+  if (mem_total != 0 && raw != 0) return std::min(mem_total, raw);
+  return mem_total != 0 ? mem_total : raw;
+}
 
 // Process-wide CUDA discovery, performed once.
 struct Enumeration {
@@ -38,6 +66,18 @@ void read_device_info(PhysicalDevice_T *pd, int index) {
 
   ppu::CUdevice dev = 0;
   if (d.cuDeviceGet(&dev, index) != CUDA_SUCCESS) return;
+
+  // Host RAM, reported as the capacity of the non-device-local heap. The
+  // accelerator is an add-in card, so this is the system memory the host can
+  // stage through, not a second accelerator partition.
+  pd->host_memory = host_ram_bytes();
+
+  // Timestamps are only usable if the backend can measure them. Both symbols
+  // are part of the CUDA driver API the shim exposes; a shim that has one but
+  // not the other would produce garbage, so require both.
+  pd->timestamps = d.cuEventCreate != nullptr && d.cuEventRecord != nullptr &&
+                   d.cuEventElapsedTime != nullptr && d.cuEventQuery != nullptr &&
+                   d.cuEventSynchronize != nullptr;
 
   char name[256] = {0};
   if (d.cuDeviceGetName(name, sizeof name, dev) == CUDA_SUCCESS)
@@ -130,6 +170,8 @@ PhysicalDevice_T *make_synthetic_device() {
 
   // Plausible values so queries have something coherent to return.
   pd->total_memory = 96ull << 30;
+  pd->host_memory = host_ram_bytes() ? host_ram_bytes() : (32ull << 30);
+  pd->timestamps = false;  // no accelerator, so no events to measure
   pd->max_threads_per_block = 1024;
   pd->max_threads_per_mp = 2048;
   pd->mp_count = 64;
@@ -296,6 +338,10 @@ void fill_limits(PhysicalDevice_T *pd, VkPhysicalDeviceLimits *l) {
   l->sparseAddressSpaceSize = 0;
   l->maxBoundDescriptorSets = 8;
 
+  // Resource limits are constrained by what the replay path actually binds:
+  // one 64-bit address per descriptor into a cuLaunchKernel argument list, in
+  // layout order. 32 storage buffers + 32 uniform buffers per stage and 64 per
+  // set are what the kernel-argument packing supports today.
   l->maxPerStageDescriptorSamplers = 0;
   l->maxPerStageDescriptorUniformBuffers = 32;
   l->maxPerStageDescriptorStorageBuffers = 32;
@@ -335,6 +381,16 @@ void fill_limits(PhysicalDevice_T *pd, VkPhysicalDeviceLimits *l) {
   l->subPixelPrecisionBits = 0;
   l->subTexelPrecisionBits = 0;
   l->mipmapPrecisionBits = 0;
+
+  // Descriptor/constant ranges. maxPushConstantsSize is 128 because the
+  // largest parameter block an operator pushes is exactly that; a smaller
+  // value makes the consumer clamp its range and drop every field past the
+  // clamp. Uniform buffers are used for weights and small constants, so the
+  // range follows the Vulkan minimum of 64 KiB; storage buffers stay at the
+  // 4 GiB - 1 ceiling the address space supports.
+  l->maxPushConstantsSize = ppu::kMaxPushConstantsSize;
+  l->maxUniformBufferRange = static_cast<uint32_t>(ppu::kMaxUniformBufferRange);
+
   l->maxDrawIndexedIndexValue = 0;
   l->maxDrawIndirectCount = 0;
   l->maxSamplerLodBias = 0;
@@ -370,8 +426,12 @@ void fill_limits(PhysicalDevice_T *pd, VkPhysicalDeviceLimits *l) {
   l->sampledImageStencilSampleCounts = 0;
   l->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
   l->maxSampleMaskWords = 0;
-  l->timestampComputeAndGraphics = VK_FALSE;
-  l->timestampPeriod = 0;
+  // Timestamps come from CUDA events, so the period is a fixed 1 ns per tick
+  // (see kTimestampPeriodNs): the query value is a nanosecond delta, not a
+  // hardware counter. This is only claimed when the backend can honour it;
+  // the synthetic placeholder device leaves it at zero.
+  l->timestampComputeAndGraphics = pd->timestamps ? VK_TRUE : VK_FALSE;
+  l->timestampPeriod = pd->timestamps ? ppu::kTimestampPeriodNs : 0.0f;
   l->maxClipDistances = 0;
   l->maxCullDistances = 0;
   l->maxCombinedClipAndCullDistances = 0;
@@ -515,7 +575,7 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
 extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(
     VkPhysicalDevice physicalDevice, uint32_t *pQueueFamilyPropertyCount,
     VkQueueFamilyProperties *pQueueFamilyProperties) {
-  (void)physicalDevice;
+  PhysicalDevice_T *pd = as_phys(physicalDevice);
   if (pQueueFamilyPropertyCount == nullptr) return;
   if (pQueueFamilyProperties == nullptr) {
     *pQueueFamilyPropertyCount = 1;
@@ -529,7 +589,7 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(
   std::memset(&q, 0, sizeof q);
   q.queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
   q.queueCount = 1;
-  q.timestampValidBits = 0;
+  q.timestampValidBits = (pd != nullptr && pd->timestamps) ? ppu::kTimestampValidBits : 0;
   q.minImageTransferGranularity = {0, 0, 0};
   pQueueFamilyProperties[0] = q;
   *pQueueFamilyPropertyCount = 1;
@@ -552,23 +612,35 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties2(
 
 extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *pMemoryProperties) {
-  (void)physicalDevice;
+  PhysicalDevice_T *pd = as_phys(physicalDevice);
   if (pMemoryProperties == nullptr) return;
   VkPhysicalDeviceMemoryProperties m;
   std::memset(&m, 0, sizeof m);
+
+  // Two heaps. The accelerator has device memory and the host has system
+  // memory, and reporting them as one heap is the signal applications read as
+  // "unified memory architecture" - which would then select backends this ICD
+  // does not implement. Both memory types below still live in heap 0 because
+  // both are backed by device memory (type 1 is cuMemHostAlloc(DEVICEMAP), a
+  // device allocation with a CPU-visible address, not system memory).
   m.memoryHeapCount = ppu::kHeapCount;
-  m.memoryHeaps[0].size = VK_WHOLE_SIZE;
+  m.memoryHeaps[ppu::kHeapDevice].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+  m.memoryHeaps[ppu::kHeapDevice].size =
+      pd != nullptr && pd->total_memory != 0 ? pd->total_memory : VK_WHOLE_SIZE;
+  m.memoryHeaps[ppu::kHeapHost].flags = 0;
+  m.memoryHeaps[ppu::kHeapHost].size =
+      pd != nullptr && pd->host_memory != 0 ? pd->host_memory : VK_WHOLE_SIZE;
 
   m.memoryTypeCount = ppu::kMemoryTypeCount;
 
   // Type 0: device-local, not host visible (cuMemAlloc).
-  m.memoryTypes[ppu::kMemoryTypeDevice].heapIndex = 0;
+  m.memoryTypes[ppu::kMemoryTypeDevice].heapIndex = ppu::kHeapDevice;
   m.memoryTypes[ppu::kMemoryTypeDevice].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
   // Type 1: host-visible, coherent and device-local. This maps to
   // cuMemHostAlloc(DEVICEMAP), which on this hardware hands back a pointer
   // that is simultaneously a valid CPU address and a valid device address.
-  m.memoryTypes[ppu::kMemoryTypeHost].heapIndex = 0;
+  m.memoryTypes[ppu::kMemoryTypeHost].heapIndex = ppu::kHeapDevice;
   m.memoryTypes[ppu::kMemoryTypeHost].propertyFlags =
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -634,6 +706,9 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
       {"VK_KHR_maintenance3", 1},
       {"VK_KHR_storage_buffer_storage_class", 1},
       {"VK_KHR_shader_float16_int8", 1},
+      // vkGetPhysicalDeviceToolProperties is implemented (and answers with an
+      // empty tool list: this ICD is a driver, not a tool).
+      {"VK_EXT_tooling_info", 1},
   };
   constexpr uint32_t kCount = sizeof(kExtensions) / sizeof(kExtensions[0]);
   if (pPropertyCount == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
@@ -669,6 +744,19 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProper
   (void)pProperties;
   (void)physicalDevice;
   if (pPropertyCount) *pPropertyCount = 0;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolProperties(
+    VkPhysicalDevice physicalDevice, uint32_t *pToolCount,
+    VkPhysicalDeviceToolProperties *pToolProperties) {
+  (void)physicalDevice;
+  if (pToolCount == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
+  // This ICD is a driver, not a tooling layer, so the tool list is empty. The
+  // entry point exists because applications query it unconditionally at
+  // startup; an honest empty list is the correct answer, not an error.
+  *pToolCount = 0;
+  (void)pToolProperties;
+  return VK_SUCCESS;
 }
 
 extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalBufferProperties(

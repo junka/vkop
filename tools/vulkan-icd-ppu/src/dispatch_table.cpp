@@ -37,6 +37,7 @@
   X(vkGetPhysicalDeviceExternalBufferProperties)                               \
   X(vkGetPhysicalDeviceExternalFenceProperties)                                \
   X(vkGetPhysicalDeviceExternalSemaphoreProperties)                            \
+  X(vkGetPhysicalDeviceToolProperties)                                         \
   X(vkCreateDevice)                                                            \
   X(vkDestroyDevice)                                                           \
   X(vkGetDeviceQueue)                                                          \
@@ -98,10 +99,18 @@
   X(vkCmdPipelineBarrier)                                                      \
   X(vkCmdPipelineBarrier2)                                                     \
   X(vkCmdWriteTimestamp)                                                       \
+  X(vkCmdResetQueryPool)                                                       \
   X(vkCmdSetEvent)                                                             \
   X(vkCmdWaitEvents)                                                           \
   X(vkCmdResetEvent)                                                           \
   X(vkQueueSubmit)                                                             \
+  X(vkCreateQueryPool)                                                         \
+  X(vkDestroyQueryPool)                                                        \
+  X(vkResetQueryPool)                                                          \
+  X(vkGetQueryPoolResults)                                                     \
+  X(vkCreateDescriptorUpdateTemplate)                                          \
+  X(vkDestroyDescriptorUpdateTemplate)                                         \
+  X(vkUpdateDescriptorSetWithTemplate)                                         \
   X(vkCreateFence)                                                             \
   X(vkDestroyFence)                                                            \
   X(vkGetFenceStatus)                                                          \
@@ -172,6 +181,10 @@ VkResult stub_GetImageSubresourceLayout(VkDevice, VkImage, const VkImageSubresou
 VkResult stub_CreateBufferView(VkDevice, const VkBufferViewCreateInfo *,
                                const VkAllocationCallbacks *, VkBufferView *pView) {
   if (pView) *pView = VK_NULL_HANDLE;
+  // Texel buffers are an image-backend concept: they need format feature bits
+  // this device reports as zero. Applications that create one unconditionally
+  // (the reference consumer does, as a placeholder) get an honest error.
+  PPU_STUB_WARN("vkCreateBufferView");
   return kUnsupported;
 }
 void stub_DestroyBufferView(VkDevice, VkBufferView, const VkAllocationCallbacks *) {}
@@ -198,13 +211,8 @@ VkResult stub_CreateFramebuffer(VkDevice, const VkFramebufferCreateInfo *,
 void stub_DestroyFramebuffer(VkDevice, VkFramebuffer, const VkAllocationCallbacks *) {}
 
 // --- queries --------------------------------------------------------------
-VkResult stub_CreateQueryPool(VkDevice, const VkQueryPoolCreateInfo *,
-                              const VkAllocationCallbacks *, VkQueryPool *p) {
-  if (p) *p = VK_NULL_HANDLE;
-  return kUnsupported;
-}
-void stub_DestroyQueryPool(VkDevice, VkQueryPool, const VkAllocationCallbacks *) {}
-void stub_ResetQueryPool(VkDevice, VkQueryPool, uint32_t, uint32_t) {}
+// Query pools are real objects now (src/query.cpp); only the query types this
+// backend cannot answer are rejected, at vkCreateQueryPool.
 
 // --- events ---------------------------------------------------------------
 VkResult stub_CreateEvent(VkDevice, const VkEventCreateInfo *, const VkAllocationCallbacks *,
@@ -250,6 +258,10 @@ const std::vector<Entry> &table() {
       PPU_ALIAS(vkBindBufferMemory2KHR, vkBindBufferMemory2)
       PPU_ALIAS(vkCmdPipelineBarrier2KHR, vkCmdPipelineBarrier2)
 
+      // Tooling info: VK_EXT_tooling_info spells the entry point with a suffix
+      // in Vulkan 1.0/1.1 headers; both are the same function here.
+      PPU_ALIAS(vkGetPhysicalDeviceToolPropertiesEXT, vkGetPhysicalDeviceToolProperties)
+
       // Buffer device address is a core 1.2 feature here; expose both spellings.
       PPU_ALIAS(vkGetBufferDeviceAddressKHR, vkGetBufferDeviceAddress)
       PPU_ALIAS(vkGetDeviceBufferMemoryRequirementsKHR, vkGetDeviceBufferMemoryRequirements)
@@ -275,9 +287,6 @@ const std::vector<Entry> &table() {
       PPU_ALIAS(vkDestroyRenderPass, stub_DestroyRenderPass)
       PPU_ALIAS(vkCreateFramebuffer, stub_CreateFramebuffer)
       PPU_ALIAS(vkDestroyFramebuffer, stub_DestroyFramebuffer)
-      PPU_ALIAS(vkCreateQueryPool, stub_CreateQueryPool)
-      PPU_ALIAS(vkDestroyQueryPool, stub_DestroyQueryPool)
-      PPU_ALIAS(vkResetQueryPool, stub_ResetQueryPool)
       PPU_ALIAS(vkCreateEvent, stub_CreateEvent)
       PPU_ALIAS(vkDestroyEvent, stub_DestroyEvent)
       PPU_ALIAS(vkGetEventStatus, stub_GetEventStatus)

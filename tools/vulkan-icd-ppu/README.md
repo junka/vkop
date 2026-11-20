@@ -57,10 +57,20 @@ Advertised honestly — see `src/instance.cpp`:
   reports zero features for every format, and
   `vkGetPhysicalDeviceImageFormatProperties` returns
   `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+* Two memory heaps: heap 0 is the accelerator's DEVICE_LOCAL memory, heap 1 is
+  ordinary host RAM. Both memory types point at heap 0 (type 1 is
+  `cuMemHostAlloc(DEVICEMAP)`, device memory with a CPU-visible address). Two
+  heaps, rather than one, is what tells an application this is *not* a unified
+  memory device, which is the truth.
+* Limits that a compute consumer depends on: `maxPushConstantsSize = 128`
+  (the largest operator parameter block), `maxUniformBufferRange = 64 KiB`,
+  `maxStorageBufferRange = 4 GiB - 1`.
 * Extensions: `VK_KHR_buffer_device_address`, `VK_KHR_maintenance3`,
-  `VK_KHR_storage_buffer_storage_class`, `VK_KHR_shader_float16_int8`.
+  `VK_KHR_storage_buffer_storage_class`, `VK_KHR_shader_float16_int8`,
+  `VK_EXT_tooling_info`.
+* Timestamp queries via CUDA events (see `docs/entry-points.md`).
 * Device extensions: no external memory/fence/semaphore handles, no timeline
-  semaphores, no timestamps.
+  semaphores, no push descriptors.
 
 ## The SPIR-V boundary
 

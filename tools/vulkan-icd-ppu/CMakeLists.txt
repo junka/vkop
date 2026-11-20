@@ -49,6 +49,7 @@ add_library(vk_ppu_icd SHARED
   src/pipeline.cpp
   src/command.cpp
   src/submit.cpp
+  src/query.cpp
   src/dispatch_table.cpp
 )
 

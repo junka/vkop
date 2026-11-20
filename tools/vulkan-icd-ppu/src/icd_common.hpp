@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,15 +60,45 @@ PPU_INTERNAL bool debug_enabled();
 // Constants advertised to applications
 // ---------------------------------------------------------------------------
 
-// We expose a single unified heap backed by the accelerator's memory.
+// Two heaps, because the device genuinely has two kinds of memory: the
+// accelerator's device memory (heap 0) and ordinary host RAM (heap 1). A
+// single-heap description is the conventional "UMA" signal, and consumers act
+// on it (vkop enables VK_EXT_descriptor_buffer by default on a one-heap
+// device). Both memory types still point at heap 0: type 1 is
+// cuMemHostAlloc(DEVICEMAP), which is device memory that also happens to be
+// CPU-addressable, not a system-memory allocation.
+constexpr uint32_t kHeapDevice = 0;  // DEVICE_LOCAL
+constexpr uint32_t kHeapHost = 1;    // non-device-local system memory
+constexpr uint32_t kHeapCount = 2;
+
 constexpr uint32_t kMemoryTypeDevice = 0;  // DEVICE_LOCAL only
 constexpr uint32_t kMemoryTypeHost = 1;    // HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL
 constexpr uint32_t kMemoryTypeCount = 2;
-constexpr uint32_t kHeapCount = 1;
 
 constexpr VkDeviceSize kBufferAlignment = 256;
 constexpr VkDeviceSize kMinUniformBufferOffsetAlignment = 256;
 constexpr VkDeviceSize kMinStorageBufferOffsetAlignment = 16;
+
+// Push-constant block size. Every operator in the reference consumer passes
+// its parameters through one push-constant block and the largest of those
+// descriptors is 128 bytes (matmul's GpuMatMulParam, alignas(16), is exactly
+// 128); a smaller advertised limit makes such an application clamp its range
+// and silently zero everything past the clamp.
+constexpr uint32_t kMaxPushConstantsSize = 128;
+
+// Uniform buffers hold weight tensors and small constants. 64 KiB is the
+// Vulkan-required minimum for maxUniformBufferRange; larger weights ride
+// storage buffers, which stay at the 4 GiB - 1 ceiling.
+constexpr VkDeviceSize kMaxUniformBufferRange = 64 * 1024;
+
+// Timestamps. The accelerator measures elapsed time between CUDA events, which
+// the queue-submit replay models exactly. The reported unit is nanoseconds per
+// tick (so a raw delta is already in ns) and timestampPeriod is therefore 1.0
+// ns; the 64-bit query value is not a hardware counter but a nanosecond
+// delta from the start of the submission, which is what a profiling consumer
+// subtracts anyway.
+constexpr uint32_t kTimestampValidBits = 64;
+constexpr float kTimestampPeriodNs = 1.0f;
 
 }  // namespace ppu
 
@@ -98,6 +129,13 @@ struct PhysicalDevice_T {
   uint8_t uuid[VK_UUID_SIZE] = {};
   size_t total_memory = 0;
   size_t free_memory = 0;
+  // Size reported for the non-device-local system heap. Derived from host RAM,
+  // not from the accelerator, so it is a plausible capacity for host-memory
+  // allocations rather than a device-memory claim.
+  size_t host_memory = 0;
+  // True when cuEventElapsedTime is usable on this device, which is exactly
+  // when vkCmdWriteTimestamp/vkGetQueryPoolResults can return correct data.
+  bool timestamps = false;
   uint32_t max_threads_per_block = 1024;
   uint32_t max_threads_per_mp = 0;
   uint32_t mp_count = 0;
@@ -250,6 +288,28 @@ struct DescriptorSet_T {
   std::vector<Descriptor_T> descriptors;
 };
 
+struct DescriptorUpdateTemplateEntry {
+  uint32_t dst_binding = 0;
+  uint32_t dst_array_element = 0;
+  uint32_t descriptor_count = 0;
+  VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  size_t offset = 0;
+  size_t stride = 0;
+};
+
+// A resolved update template. It is a pure host-side description of "where in
+// the caller's data is each descriptor", so applying it is a vkUpdateDescriptorSets
+// in disguise: the same Descriptor_T array is written, nothing new is stored.
+struct DescriptorUpdateTemplate_T {
+  Device_T *device = nullptr;
+  VkDescriptorUpdateTemplateType template_type =
+      VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+  DescriptorSetLayout_T *set_layout = nullptr;
+  PipelineLayout_T *pipeline_layout = nullptr;
+  uint32_t set = 0;
+  std::vector<DescriptorUpdateTemplateEntry> entries;
+};
+
 // --- synchronisation ------------------------------------------------------
 struct Fence_T {
   Device_T *device = nullptr;
@@ -263,6 +323,30 @@ struct Semaphore_T {
   bool recorded = false;  // has an event record been enqueued since last wait
 };
 
+// --- query pools ----------------------------------------------------------
+// Timestamp queries are backed by CUDA events. Each recorded timestamp gets a
+// CUevent of its own; one long-lived "base" event per pool anchors the time
+// origin, so every value in the pool is on the same timeline even when the
+// writes are spread over several submissions. A value is a nanosecond delta
+// from that origin (timestampPeriod is 1.0), and a consumer subtracting an end
+// from a begin gets the GPU time between the two points. Because cuEventElapsedTime
+// is only defined between completed events, results are materialised on demand
+// (or at submit) and cached per slot.
+struct QuerySlot {
+  bool available = false;
+  uint64_t ns = 0;
+  ppu::CUevent event = nullptr;  // set when a timestamp has been recorded here
+};
+
+struct QueryPool_T {
+  Device_T *device = nullptr;
+  VkQueryType type = VK_QUERY_TYPE_TIMESTAMP;
+  uint32_t count = 0;
+  std::vector<QuerySlot> slots;
+  ppu::CUevent base = nullptr;
+  bool base_recorded = false;
+};
+
 // --- commands -------------------------------------------------------------
 struct RecordedOp {
   enum class Kind {
@@ -272,6 +356,8 @@ struct RecordedOp {
     FillBuffer,
     UpdateBuffer,
     Barrier,
+    ResetQuery,
+    WriteTimestamp,
   };
 
   Kind kind = Kind::Barrier;
@@ -295,6 +381,11 @@ struct RecordedOp {
   // UpdateBuffer
   uint64_t update_addr = 0;
   std::vector<uint8_t> update_data;
+
+  // ResetQuery / WriteTimestamp
+  QueryPool_T *query_pool = nullptr;
+  uint32_t query_first = 0;
+  uint32_t query_count = 0;
 };
 
 struct CommandBuffer_T {
@@ -345,6 +436,14 @@ PPU_INTERNAL bool alloc_scratch(CommandBuffer_T *cb, VkDeviceSize bytes,
 PPU_INTERNAL void free_scratch(CommandBuffer_T *cb);
 
 PPU_INTERNAL uint64_t buffer_address(const Buffer_T *buffer, VkDeviceSize offset);
+
+// Replay a query-pool op (reset or timestamp write) onto the CUDA stream.
+// Defined in query.cpp; returns false when the operation cannot be replayed.
+PPU_INTERNAL bool replay_query_op(Device_T *dev, const RecordedOp &op);
+
+// Materialise a query slot's value if its CUDA event has completed. Returns
+// false when the value is not (yet) available.
+PPU_INTERNAL bool query_value(QueryPool_T *pool, uint32_t index, uint64_t *out_ns);
 
 // The SPIR-V -> PPU code generation boundary. The compiler workstream drops
 // its implementation in here; the default returns CUDA_ERROR_NOT_SUPPORTED.
