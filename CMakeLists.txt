@@ -10,8 +10,29 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_program(CCACHE ccache)
 if(CCACHE)
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE})
-    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE})
+    if(CMAKE_GENERATOR MATCHES "Makefiles")
+        # RULE_LAUNCH_COMPILE / RULE_LAUNCH_LINK are private to the Makefile
+        # generators.  Ninja silently ignores them, so the ninja tree would
+        # compile without ccache unless it took the branch below.
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE})
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE})
+    else()
+        # Generator-agnostic mechanism.  Leave a launcher the user picked
+        # (command line, preset, sccache, distcc) untouched.  Linker launchers
+        # keep parity with the Makefile branch, which launches links too.
+        if(NOT CMAKE_C_COMPILER_LAUNCHER)
+            set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE})
+        endif()
+        if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+            set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE})
+        endif()
+        if(NOT CMAKE_C_LINKER_LAUNCHER)
+            set(CMAKE_C_LINKER_LAUNCHER ${CCACHE})
+        endif()
+        if(NOT CMAKE_CXX_LINKER_LAUNCHER)
+            set(CMAKE_CXX_LINKER_LAUNCHER ${CCACHE})
+        endif()
+    endif()
 endif(CCACHE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(FP16_CXX_FLAGS "-mf16c")

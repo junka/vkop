@@ -1,0 +1,77 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 23,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "ninja",
+      "displayName": "Ninja (dev, ccache, tests + benchmarks)",
+      "description": "Ninja build tree in build-ninja/. Mirrors the long-standing Makefiles configuration: no CMAKE_BUILD_TYPE (the project hardcodes -O0 -g -Wall -Wextra -Werror in CMakeLists.txt), glslc auto-discovered, system cc/c++, XCB+XLIB, VMA off, validation layers off, all demos and the GoogleTest suite on. LIBTORCH_ROOT is pinned at third_party/libtorch so a fresh tree never triggers tests/CMakeLists.txt's ~800 MB libtorch download.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LIBTORCH_ROOT": "${sourceDir}/third_party/libtorch",
+
+        "ENABLE_ASAN": "OFF",
+        "ENABLE_BENCHMARK": "ON",
+        "ENABLE_CUDA_LAUNCH": "OFF",
+        "ENABLE_EXAMPLE": "ON",
+        "ENABLE_IMAGE_GEN": "ON",
+        "ENABLE_LLM_CHAT": "ON",
+        "ENABLE_TESTS": "ON",
+
+        "USE_DEBUG_LAYERS": "OFF",
+        "USE_MEASURE_TIME": "OFF",
+        "USE_PLATFORM_ANDROID": "OFF",
+        "USE_PLATFORM_METAL": "OFF",
+        "USE_PLATFORM_WAYLAND": "OFF",
+        "USE_PLATFORM_WIN32": "OFF",
+        "USE_PLATFORM_XCB": "ON",
+        "USE_PLATFORM_XLIB": "ON",
+        "USE_VALIDATION_LAYERS": "OFF",
+        "USE_VMA": "OFF",
+
+        "VKOP_ENABLE_FLOAT8": "ON",
+        "YOLO_USE_FREETYPE": "OFF",
+        "YOLO_USE_GLFW": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ninja",
+      "displayName": "Ninja build (all)",
+      "configurePreset": "ninja",
+      "jobs": 12
+    },
+    {
+      "name": "ninja-tests",
+      "displayName": "Ninja build (all_tests + vkop only)",
+      "configurePreset": "ninja",
+      "jobs": 12,
+      "targets": [
+        "vkop",
+        "all_tests"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "ninja",
+      "displayName": "ctest on build-ninja",
+      "configurePreset": "ninja",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

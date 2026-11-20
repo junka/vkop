@@ -32,6 +32,11 @@ llm/*.weights.bin
 # CMakeCache.txt) when a build directory is accidentally configured in-tree.
 /build/
 /build_*/
+/build-ninja/
+# libtorch is downloaded by tests/CMakeLists.txt, not committed. It lives here
+# rather than inside a build tree so every build directory can share one 800 MB
+# copy (-DLIBTORCH_ROOT=third_party/libtorch).
+/third_party/libtorch/
 /CMakeFiles/
 /CMakeCache.txt
 /.cache/
