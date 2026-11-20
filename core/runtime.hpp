@@ -45,6 +45,14 @@ class Runtime {
     // (NCHW->RGBA). Each op's PIMPL façade selects its BufferImpl when this
     // is set (if a buffer port exists) or falls back to its ImageImpl.
     bool backend_buffer_ = false;
+    // Whether a caller chose backend_buffer_ explicitly (set_backend_buffer).
+    // When it did, the choice is honoured and a device that cannot run it is a
+    // hard error. When it did not, LoadModel picks from the device: images
+    // when the device has them, the buffer backend otherwise. The buffer side
+    // is the complete one -- Gemm/Topk/Gather/Shape/Where/Range/Squeeze/
+    // Conv1d/LinearAttention have no image twin at all -- so a device without
+    // image support can still run any converted graph.
+    bool backend_buffer_explicit_ = false;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
     // VKOP_DUMP_NODE=<substr>[,<substr>...], read once at LoadModel. Empty
@@ -429,7 +437,13 @@ class Runtime {
     int getPrecision() const { return precision_; }
 
     // Select the buffer (SSBO) backend for subsequently-loaded operators.
-    void set_backend_buffer(bool b) { backend_buffer_ = b; }
+    // Marked explicit: LoadModel then honours it verbatim and refuses an
+    // image-capable request on a device that cannot run images, rather than
+    // overriding a deliberate choice.
+    void set_backend_buffer(bool b) {
+        backend_buffer_ = b;
+        backend_buffer_explicit_ = true;
+    }
     bool get_backend_buffer() const { return backend_buffer_; }
 
     // Turn on per-op GPU timestamp profiling programmatically. Same path

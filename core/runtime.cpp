@@ -495,6 +495,37 @@ void Runtime::LoadModel() {
 
     auto dev = m_cmdpool_->getVulkanDevice();
 
+    // The image backend packs every >=3-D initializer/input as an RGBA
+    // image2DArray and the converter's kernel plans name image shaders, so a
+    // device without image support cannot run that layout at all.
+    //
+    // The buffer backend is the complete one (Gemm/Topk/Gather/Shape/Where/
+    // Range/Squeeze/Conv1d/LinearAttention have no image twin), and the
+    // converter fills BOTH the image and buffer columns of every KernelPlan,
+    // so a graph converted for image still carries buffer keys. Switching here
+    // -- before any tensor is allocated, which is what makes it safe: every
+    // layout decision below derives from backend_buffer_ -- keeps any graph
+    // runnable on an image-less device.
+    //
+    // Only when the caller did NOT pick a backend. An explicit
+    // set_backend_buffer(false) is a deliberate request and is refused rather
+    // than silently rewritten, because the tensors the caller then hands in
+    // are packed for the image layout (ResizeInput/fill paths) and a late
+    // switch would misread them.
+    if (!backend_buffer_ && !dev->is_support_images()) {
+        if (backend_buffer_explicit_) {
+            throw std::runtime_error(
+                "Runtime: the image backend was requested, but the device has "
+                "no image support (" +
+                (dev->image_unsupported_reason().empty()
+                     ? std::string("images disabled")
+                     : dev->image_unsupported_reason()) +
+                "). Drop set_backend_buffer(false) to let the device choose, "
+                "or pass set_backend_buffer(true).");
+        }
+        LOG_INFO("device has no image support; using the buffer backend");
+        backend_buffer_ = true;
+    }
     // Stream initializers straight out of the file instead of reading them
     // through the mmap: faulting a multi-GB blob in one 16KB page at a time
     // measures ~1.4 GB/s here, large preads ~13 GB/s in isolation (~4 GB/s once

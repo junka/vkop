@@ -312,6 +312,14 @@ public:
             const char *env = std::getenv("VKOP_BUFFER_BACKEND");
             return env && env[0] == '1';
         }();
+        // A device without image support cannot build any image-backed op, so
+        // use the buffer backend regardless of the env var. Mirrors
+        // Runtime::LoadModel, which makes the same choice for a loaded graph:
+        // the buffer side is the complete one, so the test still exercises a
+        // real implementation rather than being skipped.
+        if (dev_ && !dev_->is_support_images()) {
+            use_buffer = true;
+        }
         // Softmax over a 1-D/2-D tensor has no image (image2DArray needs
         // >=3-D) representation, so it must use the buffer backend even when
         // VKOP_BUFFER_BACKEND is unset.
