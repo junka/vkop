@@ -72,9 +72,12 @@ DeviceTraits  (facts)  ->  DeviceProfile (measured policy, ordered table)
 - **DeviceTraits** — vendor/device/driver id, UMA, cooperative-matrix combos,
   subgroup arithmetic/size, buffer limits. No thresholds.
 - **DeviceProfile** — one row per `DeviceClass`, keyed by an ordered matcher
-  table (MoltenVK AMD, MoltenVK Intel, native discrete, generic). All numbers
-  are benchmark results. `ksplit_floor`, the WIDE thresholds and the
-  cache-resident byte budget are per-device fields now, not constants in the op.
+  table (MoltenVK AMD, MoltenVK Intel, MoltenVK Apple, native discrete,
+  generic). All numbers are benchmark results. `ksplit_floor`, the WIDE
+  thresholds and the cache-resident byte budget are per-device fields now, not
+  constants in the op. `ksplit_floor` is 8 everywhere except MoltenVK Apple
+  (32, M5 Max: the byte WIDE GEMV otherwise launches 8 blocks for N <= 32768);
+  `VKOP_KSPLIT_FLOOR` overrides the profile value.
 - **Rule table** — one ordered array per op. Each row is
   `{route, tag, predicate, configure}`. The first predicate that holds wins;
   `configure` fills the route parameters (split-K q, tile-split depth, wide

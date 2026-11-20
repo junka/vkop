@@ -27,6 +27,10 @@ bool match_mvk_intel(const DeviceTraits &t) {
     return is_moltenvk(t) && t.vendor_id == 0x8086; // Intel
 }
 
+bool match_mvk_apple(const DeviceTraits &t) {
+    return is_moltenvk(t) && t.vendor_id == 0x106B; // Apple
+}
+
 // A VRAM-backed dGPU on a native driver. Kept behavioural (not vendor-keyed)
 // because the GTX 1070 profile below is a memory-system profile: any native
 // discrete part without coopmat follows the same GEMV-first decode curve.
@@ -44,6 +48,7 @@ struct ClassRule {
 const ClassRule kClassRules[] = {
     {"moltenvk-amd", match_mvk_amd, DeviceClass::kMoltenVkAmd},
     {"moltenvk-intel", match_mvk_intel, DeviceClass::kMoltenVkIntel},
+    {"moltenvk-apple", match_mvk_apple, DeviceClass::kMoltenVkApple},
     {"native-discrete", match_native_discrete, DeviceClass::kNativeDiscrete},
 };
 
@@ -62,6 +67,11 @@ DeviceProfile make_profile(DeviceClass cls, const char *name, int byte_min_m,
     // ksplit_floor / wide thresholds / cache_resident_bytes keep the shipped
     // defaults from the header. A device that measures differently overrides
     // them here (one more field, one more measurement).
+    return p;
+}
+
+DeviceProfile with_ksplit_floor(DeviceProfile p, int floor) {
+    p.ksplit_floor = floor;
     return p;
 }
 
@@ -91,6 +101,22 @@ const DeviceProfile kProfiles[static_cast<int>(DeviceClass::kCount)] = {
     // point.
     make_profile(DeviceClass::kNativeDiscrete, "native-discrete", 9, 9, 6144, 9,
                  7, 128),
+    // kMoltenVkApple (M5 Max, 40 cores, ~438 GB/s read, bench_matmul
+    // 2026-11-21). The MSL tile's time is flat in m up to 64 (~135 GB/s of
+    // fp16 weight read, far below the GEMV's ~435), so the split-K GEMV wins the whole
+    // batch*m <= 8 window for both dtypes and every N measured:
+    //   fp16 K=4096 N=16384 m=3/4/8: tile 984 us vs GEMV ~570/330/700-830
+    //   fp16 K=2048 N=6144  m=3/8:   tile 187 us vs GEMV 81/120
+    //   int8 K=2048 N=151936 m=2/8:  tile 4.84 ms vs GEMV 1.30/2.82 (wall)
+    // and at m=9 the gate closes onto quad4 / column-parallel (2-4x slower
+    // than the tile), so the tile starts at 9 and no wide band is needed.
+    // ks_target_blocks keeps the generic 128 (not measured on this part).
+    // ksplit_floor 32: at the old floor 8 the byte WIDE GEMV launched 8
+    // blocks for every N <= 32768 (int8 K=2048 N=8192 123 us, N=32768 459 us);
+    // floor 32 gives 47 / 170 us (2.6-2.7x), 64 ties, >= 128 regresses.
+    with_ksplit_floor(make_profile(DeviceClass::kMoltenVkApple,
+                                   "moltenvk-apple", 9, 9, 0, 9, 9, 128),
+                      32),
 };
 
 // ---------------------------------------------------------------------------
@@ -128,6 +154,7 @@ struct Ctx {
     // the predicates never reach back into the knobs.
     int wide_thr_fp16 = 0;
     int wide_thr_byte = 0;
+    int ksplit_floor = 0;
     // Configured by the winning row:
     int q = 16;
     bool wide = false;
@@ -237,6 +264,7 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
                                                  : prof.wide_threshold_fp16;
     c.wide_thr_byte = kn.wide_threshold_byte > 0 ? kn.wide_threshold_byte
                                                  : prof.wide_threshold_byte;
+    c.ksplit_floor = kn.ksplit_floor > 0 ? kn.ksplit_floor : prof.ksplit_floor;
     c.ks512 = kn.ksplit512_enabled && !c.weight_4bit;
     return c;
 }
@@ -622,7 +650,7 @@ void q_dp4a(Ctx &c) {
     int q = c.kn->ksplit_q;
     if (q <= 0) {
         q = 256;
-        while (q > 4 && up_div(c.s->n / 4, q) < c.kn->ksplit_floor) {
+        while (q > 4 && up_div(c.s->n / 4, q) < c.ksplit_floor) {
             q /= 2;
         }
     }
@@ -682,7 +710,7 @@ void q_byte_wide(Ctx &c) {
         // 16 columns per lane, so the byte WIDE block count is UP_DIV(n/16, q)
         // and the profile's floor (8) is the only constraint.
         q = 256;
-        while (q > 4 && up_div(c.s->n / 16, q) < c.kn->ksplit_floor) {
+        while (q > 4 && up_div(c.s->n / 16, q) < c.ksplit_floor) {
             q /= 2;
         }
     }
@@ -1005,6 +1033,8 @@ const char *device_class_name(DeviceClass cls) {
         return "moltenvk-intel";
     case DeviceClass::kNativeDiscrete:
         return "native-discrete";
+    case DeviceClass::kMoltenVkApple:
+        return "moltenvk-apple";
     case DeviceClass::kGeneric:
     default:
         return "generic";

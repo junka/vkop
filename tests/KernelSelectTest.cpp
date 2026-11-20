@@ -61,6 +61,14 @@ DeviceTraits traits_mvk_intel() {
     return t;
 }
 
+DeviceTraits traits_mvk_apple() {
+    DeviceTraits t;
+    t.vendor_id = 0x106B;
+    t.driver_id = 14;
+    t.unified_memory = true;
+    return t;
+}
+
 // Ada-class: native discrete + the 16x16x16 fp16 MMA.
 DeviceTraits traits_ada() {
     DeviceTraits t = traits_native_discrete();
@@ -179,6 +187,16 @@ void test_profiles() {
     CHECK(intel.fp16_min_m == 9);
     CHECK(intel.wide_n == 0);
     CHECK(intel.ks_target_blocks == 32);
+
+    const DeviceTraits apple_traits = traits_mvk_apple();
+    const DeviceProfile &apple = device_profile_for(apple_traits);
+    CHECK(apple.device_class == DeviceClass::kMoltenVkApple);
+    CHECK(apple.byte_min_m == 9);
+    CHECK(apple.fp16_min_m == 9);
+    CHECK(apple.wide_n == 0);
+    CHECK(apple.ksplit_floor == 32);
+    CHECK(std::string(device_class_name(apple.device_class)) ==
+          "moltenvk-apple");
 
     // An unknown native iGPU keeps the ARL / Ada calibration.
     DeviceTraits igpu = traits_mvk_intel();
@@ -694,8 +712,58 @@ void print_native_decode_table() {
 
 } // namespace
 
+// Apple behind MoltenVK: the split-K GEMV keeps the whole batch*m <= 8 window
+// for both dtypes, the tile takes m >= 9, and the byte WIDE floor is 32 blocks.
+void test_mvk_apple_routes() {
+    const DeviceTraits dev = traits_mvk_apple();
+
+    // fp16 m = 3..8 used to fall to the tile on the generic profile.
+    for (int m : {1, 2, 3, 4, 8}) {
+        MatmulPlan p = select_matmul(dev, sh(1, m, 2048, 6144), fp16_w(),
+                                     fp16_splitk());
+        CHECK_ROUTE(p, kKsplitWide);
+        p = select_matmul(dev, sh(1, m, 4096, 16384), fp16_w(), fp16_splitk());
+        CHECK_ROUTE(p, kKsplitWide);
+    }
+    MatmulPlan p =
+        select_matmul(dev, sh(1, 9, 2048, 6144), fp16_w(), fp16_splitk());
+    CHECK(p.tiled);
+
+    // int8: GEMV for m <= 8, tile from 9.
+    const MatmulAvailability av8 = int8_modules();
+    for (int m : {2, 3, 8}) {
+        p = select_matmul(dev, sh(1, m, 2048, 151936), weight8(), av8);
+        CHECK_ROUTE(p, kKsplitW8Wide);
+    }
+    p = select_matmul(dev, sh(1, 9, 2048, 6144), weight8(), av8);
+    CHECK(p.tiled);
+
+    // Byte WIDE floor 32: n = 8192 -> 512 16-col groups, q = 16 -> 32 blocks
+    // (the generic floor 8 took q = 64 -> 8 blocks).
+    p = select_matmul(dev, sh(1, 1, 2048, 8192), weight8(), av8);
+    CHECK_ROUTE(p, kKsplitW8Wide);
+    CHECK(p.ksplit_q == 16);
+    p = select_matmul(dev, sh(1, 1, 2048, 32768), weight8(), av8);
+    CHECK(p.ksplit_q == 64);
+    // lm_head already clears 32 blocks at q = 256.
+    p = select_matmul(dev, sh(1, 1, 2048, 151936), weight8(), av8);
+    CHECK(p.ksplit_q == 256);
+
+    // The env knob still overrides the profile.
+    MatmulKnobs kn;
+    kn.ksplit_floor = 8;
+    p = select_matmul(dev, sh(1, 1, 2048, 8192), weight8(), av8, kn);
+    CHECK(p.ksplit_q == 64);
+
+    // Other classes keep floor 8.
+    p = select_matmul(traits_native_discrete(), sh(1, 1, 2048, 8192),
+                      weight8(), av8);
+    CHECK(p.ksplit_q == 64);
+}
+
 int main() {
     test_profiles();
+    test_mvk_apple_routes();
     test_decode_shapes_native();
     test_tiled_band_native();
     test_byte_weight_native();

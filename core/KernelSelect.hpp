@@ -108,6 +108,7 @@ enum class DeviceClass {
     kMoltenVkAmd,     // AMD dGPU behind MoltenVK
     kMoltenVkIntel,   // Intel iGPU behind MoltenVK
     kNativeDiscrete,  // native driver + VRAM-backed dGPU (GTX 1070 class)
+    kMoltenVkApple,   // Apple GPU behind MoltenVK (M-series, unified memory)
     kCount
 };
 
@@ -282,7 +283,9 @@ struct MatmulAvailability {
 // Env-backed tuning knobs, resolved once. Defaults are the shipped values; see
 // matmul_knobs_from_env() for the VKOP_* spelling of each.
 struct MatmulKnobs {
-    int ksplit_floor = 8;
+    // VKOP_KSPLIT_FLOOR: the byte WIDE / DP4A GEMV block floor. 0 = take the
+    // device profile's ksplit_floor.
+    int ksplit_floor = 0;
     // VKOP_KSPLIT_Q: pin the column quads / 8-column groups per block. 0 = auto.
     int ksplit_q = 0;
     // VKOP_KSPLIT_WIDE: -1 force off, 0 auto (per-N threshold), +1 force on.
