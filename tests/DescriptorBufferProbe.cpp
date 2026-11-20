@@ -24,9 +24,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
+#include <unistd.h>  // _exit: skip an atexit handler that segfaults
+#endif
 #include <memory>
 #include <vector>
 
+#include "probe_compat.hpp"  // aligned_free_host
 #include "include/logger.hpp"
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"

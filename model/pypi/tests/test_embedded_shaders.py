@@ -54,11 +54,19 @@ def tiny_dag():
 
 
 def read_embedded(path):
-    """The bytes of Model.shader_archive, exactly as the C++ reader sees them."""
+    """The bytes of Model.shader_archive, exactly as the C++ reader sees them.
+
+    save_to_binary reserves trailing zero slack after the archive so
+    tools/patch_model_shaders.py can swap in kernels of a different size in
+    place (see _SHADER_ARCHIVE_SLACK in dag.py). ShaderArchive::parse walks the
+    entry table and ignores everything past the last blob, so those bytes are
+    invisible to the runtime -- strip them here too, or the comparison would be
+    against the reservation rather than against the archive.
+    """
     buf = bytearray(Path(path).read_bytes())
     model = Model.GetRootAs(buf, 0)
     n = model.ShaderArchiveLength()
-    return bytes(model.ShaderArchive(j) for j in range(n))
+    return bytes(model.ShaderArchive(j) for j in range(n)).rstrip(b"\x00")
 
 
 def fake_spv(seed, words=8):

@@ -19,6 +19,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include "probe_compat.hpp"  // aligned_free_host
 #include "include/logger.hpp"
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"

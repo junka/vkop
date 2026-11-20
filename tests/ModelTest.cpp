@@ -106,6 +106,64 @@ public:
 };
 }
 
+// The whole model check, once per storage type. DataT is the container the
+// graph inputs and the graph output actually use: the fp16 image backend stores
+// halfs in uint16_t words, the buffer backend stores the model's own float32.
+template <typename DataT>
+int run_model_case(const std::shared_ptr<Runtime> &rt,
+                   const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+                   const std::shared_ptr<Tensor<DataT>> &t1,
+                   const std::shared_ptr<Tensor<DataT>> &t2) {
+    ModelTest<DataT> test;
+    test.initTestData(t1, t2);
+    t1->copyToGPU(cmdpool);
+    t2->copyToGPU(cmdpool);
+    rt->Run();
+    rt->ReadResult();
+    auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
+    auto weight = vkop::core::as_tensor<int8_t>(rt->GetInitializer("conv.weight"));
+    auto scale = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight_scale"));
+    auto result = vkop::core::as_tensor<DataT>(rt->GetOutput("output"));
+    if (!bias || !weight || !scale || !result) {
+        printf("missing initializer or output tensor\n");
+        return 1;
+    }
+    std::vector<float> ref_output_data;
+    bias->copyToCPU(cmdpool);
+    weight->copyToCPU(cmdpool);
+    scale->copyToCPU(cmdpool);
+    auto ori_weight = std::make_shared<Tensor<float>>(weight->getShape());
+    ori_weight->reserveOnCPU();
+    auto weight_shape = weight->getShape();
+    for (int i = 0; i < weight_shape[0]; ++i) {
+        for (int j = 0; j < weight_shape[1] * weight_shape[2] * weight_shape[3]; ++j) {
+            ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j) =
+                static_cast<float>(weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j)) * scale->at(i);
+        }
+    }
+    int batch = t1->getShape()[0];
+    int ic = t1->getShape()[1];
+    int ih = t1->getShape()[2];
+    int iw = t1->getShape()[3];
+    int oc = result->getShape()[1];
+    int kh = weight->getShape()[2];
+    int kw = weight->getShape()[3];
+    test.reference_conv2d(test.expectedOutput.data(), ori_weight, bias,
+                          ref_output_data, batch, ic, oc, ih, iw, 1, 1, kh, kw,
+                          1, 1, 1, 1, 16);
+    for (int i = 0; i < result->num_elements(); ++i) {
+        // fp16 storage holds a raw half; float32 storage is already a float.
+        const float got = (typeid(DataT) == typeid(float))
+                              ? static_cast<float>((*result)[i])
+                              : ITensor::fp16_to_fp32(result->at(i));
+        if (std::isnan(got) || std::fabs(got - ref_output_data[i]) > 1e-2) {
+            printf("Failed at %d, %.5f vs %.5f\n", i, got, ref_output_data[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
@@ -123,107 +181,32 @@ int main() {
     // one add and one conv2d operator
 
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path, 0);
+    // No set_backend_buffer call: LoadModel picks from the device (images when
+    // present, buffers otherwise), and the dtype checks below accept whichever
+    // containers that choice produces.
     rt->LoadModel();
+
+    // The image backend hands every graph input back as an fp16 container and
+    // its int8-conv chain writes an fp16 output. The buffer backend builds the
+    // inputs from the dtype the file declares -- float32 for this model -- and
+    // writes an output matching precision_ (also float32 here). Read whichever
+    // container the runtime actually made: a null as_tensor used to reach
+    // initTestData and crash rather than fail the test.
+    if (auto f1 = vkop::core::as_tensor<float>(rt->GetInput("input_x1"))) {
+        auto f2 = vkop::core::as_tensor<float>(rt->GetInput("input_x2"));
+        if (!f2) {
+            printf("float32 input_x1 but input_x2 is not float32\n");
+            return 1;
+        }
+        return run_model_case(rt, cmdpool, f1, f2);
+    }
 
     auto t1 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x1"));
     auto t2 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x2"));
+    if (!t1 || !t2) {
+        printf("graph inputs are neither float32 nor fp16\n");
+        return 1;
+    }
 
-    ModelTest<uint16_t> test;
-    test.initTestData(t1, t2);
-    t1->copyToGPU(cmdpool);
-    t2->copyToGPU(cmdpool);
-    rt->Run();
-    rt->ReadResult();
-    auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
-    auto weight = vkop::core::as_tensor<int8_t>(rt->GetInitializer("conv.weight"));
-    auto scale = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight_scale"));
-    // The int8 conv chain executes in the fp16 domain, so the graph output is
-    // an fp16 tensor even under precision 0 (see the graph-output dtype fixup
-    // in Runtime::LoadModel); reading it as float would yield a null tensor.
-    auto result = vkop::core::as_tensor<uint16_t>(rt->GetOutput("output"));
-    std::vector<float> ref_output_data;
-    bias->copyToCPU(cmdpool);
-    weight->copyToCPU(cmdpool);
-    scale->copyToCPU(cmdpool);
-    auto ori_weight = std::make_shared<Tensor<float>>(weight->getShape());
-    ori_weight->reserveOnCPU();
-    auto weight_shape = weight->getShape();
-    for (int i = 0; i < weight_shape[0]; ++i) {
-        for (int j = 0; j < weight_shape[1] * weight_shape[2] * weight_shape[3]; ++j) {
-            ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j) =
-                static_cast<float>(weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j)) * scale->at(i);
-        }
-    }
-#if 1
-    printf("input : [%d, %d, %d, %d]\n", t1->get_batch(), t1->get_channel(), t1->get_height(), t1->get_width());
-    for (int i = 0; i < t1->get_batch(); ++i) {
-        printf("[\n");
-        for (int j = 0; j < t1->get_channel(); ++j) {
-            printf("[\n");
-            for (int k = 0; k < t1->get_height(); ++k) {
-                printf("[");
-                for (int l = 0; l < t1->get_width(); ++l) {
-                    printf("%f, ", test.expectedOutput[(((i * t1->get_channel() + j) * t1->get_height() + k) * t1->get_width()) + l]);
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("]\n");
-    }
-    printf("Scale is:\n");
-    for (int i = 0 ; i < weight_shape[0]; ++i) {
-        printf("%f, ", scale->at(i));
-    }
-    printf("\n");
-    ori_weight->print_tensor();
-    printf("bias is:\n");
-    for (int i = 0; i < bias->getShape()[0]; ++i) {
-        printf("%f, ", bias->at(i));
-    }
-    printf("\n");
-#endif
-    int batch = t1->getShape()[0];
-    int ic = t1->getShape()[1];
-    int ih = t1->getShape()[2];
-    int iw = t1->getShape()[3];
-    int oc = result->getShape()[1];
-    int pad_h = 1;
-    int pad_w = 1;
-    int kh = weight->getShape()[2];
-    int kw = weight->getShape()[3];
-    int stride_h = 1;
-    int stride_w = 1;
-    int dilation_h = 1;
-    int dilation_w = 1;
-    int group = 16;
-    test.reference_conv2d(test.expectedOutput.data(), ori_weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
-#if 0
-    auto output_shape = result->getShape();
-    printf("Reference output : [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
-    for (int i = 0; i < output_shape[0]; ++i) {
-        printf("[\n");
-        for (int j = 0; j < output_shape[1]; ++j) {
-            printf("[\n");
-            for (int k = 0; k < output_shape[2]; ++k) {
-                printf("[");
-                for (int l = 0; l < output_shape[3]; ++l) {
-                    printf("%f, ", ref_output_data[(((i * output_shape[1] + j) * output_shape[2] + k) * output_shape[3]) + l]);
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("]\n");
-    }
-    printf("num_elements: %d\n", result->num_elements());
-#endif
-    for (int i = 0; i < result->num_elements(); ++i) {
-        const float got = ITensor::fp16_to_fp32(result->at(i));
-        if (std::isnan(got) || std::fabs(got - ref_output_data[i]) > 1e-2) {
-            printf("Failed at %d, %.5f vs %.5f\n", i, got, ref_output_data[i]);
-            return 1;
-        }
-    }
-    return 0;
+    return run_model_case(rt, cmdpool, t1, t2);
 }
