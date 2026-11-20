@@ -1,0 +1,229 @@
+#version 450 core
+
+#extension GL_EXT_scalar_block_layout : enable
+
+// Non-maximum suppression, SSBO port of shaders/image/nms.comp. Same
+// semantics, same workgroup mapping, same push-constant block; the only
+// difference is where the data comes from.
+//
+// The image kernel reads through texelFetch, which packs a [B][C][N] score
+// tensor as (W=N, H=C, lerp=B/4) with the batch index folded into the RGBA
+// component. There is no such packing here: both inputs are the compact
+// row-major arrays the buffer backend stores, so
+//   score(b, c, i) = uScores[(b * C + c) * N + i]
+//   box(b, i, k)   = uBoxes[((b * N + i) * 4) + k]
+// which is exactly the ONNX [B][C][N] / [B][N][4] layout.
+//
+// One workgroup per (batch, class): dispatch (1, B*C, 1). Thread 0 collects
+// and sorts the candidates, then the whole group suppresses; the group's
+// selected count is claimed in one atomicAdd on the global counter binding,
+// so the host knows how many output rows are valid after reading it back.
+// No sentinel row is written (the image kernel does not write one either).
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+// Output: [batch_index, class_index, box_index], three ints per kept box.
+// Cannot be ivec3 (vec3 alignment would be 16, not 12).
+layout(set = 0, binding = 0) writeonly buffer Output {
+    int data[];
+} uOutput;
+
+// Boxes: row-major [B][N][4].
+layout(set = 0, binding = 1) readonly buffer Boxes {
+    uint data[];
+} uBoxes;
+
+// Scores: row-major [B][C][N].
+layout(set = 0, binding = 2) readonly buffer Scores {
+    uint data[];
+} uScores;
+
+// Global atomic counter for the output offset. Zeroed by the host
+// (vkCmdFillBuffer) before every dispatch.
+layout(set = 0, binding = 3) buffer Counter {
+    uint total_count;
+} uCounter;
+
+// Same seven fields, same order, as nms::GpuNMSParam.
+layout(push_constant) uniform Params {
+    int B;                         // batch size
+    int C;                         // number of classes
+    int N;                         // number of boxes per image/class
+    int center_point_box;          // 0 = corner, 1 = center+wh
+    int max_output_boxes_per_class; // e.g., 100
+    float iou_threshold;           // e.g., 0.5
+    float score_threshold;         // e.g., 0.25
+} pc;
+
+// === Shared memory (max 1024 candidates) ===
+const uint MAX_CANDIDATES = 1024u;
+
+shared vec4 sh_boxes[MAX_CANDIDATES];
+shared float sh_scores[MAX_CANDIDATES];
+shared int sh_indices[MAX_CANDIDATES]; // original box index in [0, N)
+// 1/0 rather than a bool array: shared bool arrays are rejected by some
+// targets, and the predicate is uniform so an integer costs nothing.
+shared uint sh_active[MAX_CANDIDATES];
+shared uint sh_selected[MAX_CANDIDATES];
+shared uint sh_selected_count;
+shared uint sh_actual_count;
+shared uint sh_current_is_best;
+shared uint sh_current_idx;
+
+vec4 to_corners(vec4 b) {
+    if (pc.center_point_box == 0) {
+        return b;
+    } else {
+        // Input: [x_center, y_center, width, height]
+        float xc = b.x, yc = b.y, w = b.z, h = b.w;
+        return vec4(xc - w * 0.5, yc - h * 0.5, xc + w * 0.5, yc + h * 0.5);
+    }
+}
+
+float compute_iou(vec4 a, vec4 b) {
+    float x1 = max(a.x, b.x);
+    float y1 = max(a.y, b.y);
+    float x2 = min(a.z, b.z);
+    float y2 = min(a.w, b.w);
+    if (x2 <= x1 || y2 <= y1) return 0.0;
+    float inter = (x2 - x1) * (y2 - y1);
+    float area_a = (a.z - a.x) * (a.w - a.y);
+    float area_b = (b.z - b.x) * (b.w - b.y);
+    float union_area = area_a + area_b - inter;
+    return (union_area > 0.0) ? (inter / union_area) : 0.0;
+}
+
+void main() {
+    // === Map workgroup to (batch, class) ===
+    const uint batch_class_id = gl_WorkGroupID.y; // dispatch(1, B*C, 1)
+    const uint batch_id = batch_class_id / uint(pc.C);
+    const uint class_id = batch_class_id % uint(pc.C);
+
+    // Early exit if out of range
+    if (batch_id >= uint(pc.B) || class_id >= uint(pc.C)) return;
+
+    const uint gid = gl_LocalInvocationID.x; // 0 ~ 1023
+
+    const uint n = uint(pc.N);
+    const uint score_base = (batch_id * uint(pc.C) + class_id) * n;
+    const uint box_base = batch_id * n * 4u;
+
+    // === PHASE 1: Thread 0 collects & sorts top-K candidates (K <= 1024) ===
+    if (gid == 0u) {
+        uint count = 0u;
+        // Collect all boxes with score > threshold (up to MAX_CANDIDATES)
+        for (uint i = 0u; i < n && count < MAX_CANDIDATES; ++i) {
+            float s = BUF_LOAD(uScores.data, score_base + i);
+            if (s > pc.score_threshold) {
+                vec4 raw_box;
+                uint b4 = box_base + i * 4u;
+                raw_box.x = BUF_LOAD(uBoxes.data, b4 + 0u);
+                raw_box.y = BUF_LOAD(uBoxes.data, b4 + 1u);
+                raw_box.z = BUF_LOAD(uBoxes.data, b4 + 2u);
+                raw_box.w = BUF_LOAD(uBoxes.data, b4 + 3u);
+
+                sh_boxes[count] = to_corners(raw_box);
+                sh_scores[count] = s;
+                sh_indices[count] = int(i);
+                count++;
+            }
+        }
+
+        // Sort by score descending (selection sort, K <= 1024)
+        for (uint i = 0u; i < count; ++i) {
+            uint best_j = i;
+            for (uint j = i + 1u; j < count; ++j) {
+                if (sh_scores[j] > sh_scores[best_j]) {
+                    best_j = j;
+                }
+            }
+            if (best_j != i) {
+                float tmp_s = sh_scores[i];
+                sh_scores[i] = sh_scores[best_j];
+                sh_scores[best_j] = tmp_s;
+                vec4 tmp_b = sh_boxes[i];
+                sh_boxes[i] = sh_boxes[best_j];
+                sh_boxes[best_j] = tmp_b;
+                int tmp_idx = sh_indices[i];
+                sh_indices[i] = sh_indices[best_j];
+                sh_indices[best_j] = tmp_idx;
+            }
+        }
+
+        // Initialize active flags
+        for (uint i = 0u; i < count; ++i) {
+            sh_active[i] = 1u;
+        }
+        for (uint i = count; i < MAX_CANDIDATES; ++i) {
+            sh_active[i] = 0u;
+        }
+        sh_selected_count = 0u;
+    }
+
+    barrier();
+
+    // === PHASE 2: Sequential NMS on sorted list (no search needed!) ===
+    uint actual_count = 0u;
+    if (gid == 0u) {
+        // Count how many valid candidates we have
+        for (uint i = 0u; i < MAX_CANDIDATES; ++i) {
+            if (sh_active[i] == 0u) break;
+            actual_count = i + 1u;
+        }
+    }
+    if (gid == 0u) sh_actual_count = actual_count;
+    barrier();
+
+    if (sh_actual_count == 0u) return;
+
+    uint max_out =
+        (pc.max_output_boxes_per_class > 0)
+            ? uint(min(pc.max_output_boxes_per_class, int(sh_actual_count)))
+            : sh_actual_count;
+
+    // Since candidates are sorted by score descending,
+    // we just iterate in order and suppress overlapping ones.
+    for (uint i = 0u; i < sh_actual_count && sh_selected_count < max_out; ++i) {
+        uint current_is_best = 0u;
+        if (gid == 0u) {
+            if (sh_active[i] != 0u) {
+                current_is_best = 1u;
+                sh_selected[sh_selected_count] = i;
+                sh_selected_count++;
+            }
+        }
+
+        if (gid == 0u) {
+            sh_current_is_best = current_is_best;
+            sh_current_idx = i;
+        }
+        barrier();
+
+        if (sh_current_is_best == 0u) continue;
+
+        // Suppress all subsequent boxes that overlap with box[i]
+        if (gid < sh_actual_count && gid > sh_current_idx) {
+            if (sh_active[gid] != 0u) {
+                if (compute_iou(sh_boxes[gid], sh_boxes[sh_current_idx]) >
+                    pc.iou_threshold) {
+                    sh_active[gid] = 0u;
+                }
+            }
+        }
+        barrier();
+    }
+
+    // === PHASE 3: Write results to global output buffer ===
+    if (gid == 0u && sh_selected_count > 0u) {
+        uint base_offset = atomicAdd(uCounter.total_count, sh_selected_count);
+        for (uint i = 0u; i < sh_selected_count; ++i) {
+            uOutput.data[(base_offset + i) * 3u] = int(batch_id);
+            uOutput.data[(base_offset + i) * 3u + 1u] = int(class_id);
+            uOutput.data[(base_offset + i) * 3u + 2u] = sh_indices[sh_selected[i]];
+        }
+    }
+    // No sentinel row: the selected-box count is read back from total_count,
+    // so the host knows exactly how many output rows are valid.
+}

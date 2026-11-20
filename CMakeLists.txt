@@ -351,6 +351,11 @@ set(DUAL_FP16_SHADERS
     # already declare the buffer fp16 variant; without this entry an fp16
     # buffer MaxPool2d (VKOP_BUFFER_BACKEND=1) had no key to resolve.
     buffer/maxpool2d
+    # buffer/nms.comp reads both inputs through BUF_LOAD, so -DFP16 is the
+    # same kernel over packed half2 words. The image NMS handles fp16 through
+    # the image format; this is the buffer side of that, and without it an
+    # fp16 tensor would be walked as fp32 words.
+    buffer/nms
     # Image kernels accumulate in fp32 (ACC types in the .comp), so the fp16
     # variant only changes the load/store width. The op picks the module from
     # the tensor dtype; a fp32 graph must never land on the fp16 module.

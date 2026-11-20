@@ -88,7 +88,10 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::NEG:
             return {"neg", "neg", false, true};
         case T::NMS:
-            return {"nms", nullptr, false, false};
+            // The buffer kernel reads through BUF_LOAD, so it ships a packed
+            // half2 build; the image kernel carries fp16 in the image format
+            // and has no separate _fp16 module.
+            return {"nms", "nms", false, true};
         case T::NONZERO:
             return {nullptr, "nonzero", false, false};
         case T::POW:

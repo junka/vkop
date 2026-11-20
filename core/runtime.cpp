@@ -84,6 +84,7 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     case ops::OpType::MAX:
     case ops::OpType::MAXPOOL2D:
     case ops::OpType::MOD:
+    case ops::OpType::NMS:
     case ops::OpType::TOPK:
     case ops::OpType::GLOBALAVERAGEPOOL:
     case ops::OpType::CUMSUM:

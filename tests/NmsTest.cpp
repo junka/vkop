@@ -46,12 +46,30 @@ public:
                        int idx,
                        const std::shared_ptr<vkop::core::ITensor> &output,
                        const std::shared_ptr<vkop::core::ITensor> &expect) override {
+        (void)idx;
         auto *nms_op = dynamic_cast<vkop::ops::Nms *>(op.get());
         if (!nms_op) {
             LOG_ERROR("Failed to cast operator to Nms for count readback");
             return false;
         }
+        // The façade silently falls back to the image impl when a buffer port
+        // is missing, so "the test passed" says nothing about which kernel
+        // ran. Assert the impl the row asked for is the one that dispatched:
+        // run_test_on_both_backends sets VKOP_BUFFER_BACKEND for the buffer
+        // row and run_test re-reads it to build the op.
+        const char *backend_env = std::getenv("VKOP_BUFFER_BACKEND");
+        const bool want_buffer = backend_env && backend_env[0] == '1';
+        if (op->uses_buffer_backend() != want_buffer) {
+            LOG_ERROR("NMS ran on the wrong backend: asked %s, got %s",
+                      want_buffer ? "buffer" : "image",
+                      op->uses_buffer_backend() ? "buffer" : "image");
+            return false;
+        }
         auto count_buf = nms_op->get_count_buffer();
+        if (!count_buf) {
+            LOG_ERROR("NMS produced no count buffer");
+            return false;
+        }
         uint32_t count = 0;
         {
             vkop::VulkanCommandBuffer cmd(this->cmdpool_);
@@ -269,28 +287,51 @@ TEST(NmsTest, NmsComprehensiveTest) {
     };
 
     for (const auto &test_case : test_cases) {
-        auto [box_shape, scores_shape, max_per_class, iou_threshold, score_threshold] = test_case; 
+        auto [box_shape, scores_shape, max_per_class, iou_threshold, score_threshold] = test_case;
         LOG_INFO("NMS for max_per_class: %d, iou_threshold: %f, score_threshold: %f", max_per_class, iou_threshold, score_threshold);
-        LOG_INFO("Testing FP32");
-        NmsTest<float> nmstest(box_shape, scores_shape, max_per_class, iou_threshold, score_threshold);
-        EXPECT_TRUE(nmstest.run_test({nmstest.boxes, nmstest.scores}, {nmstest.indices}, [&nmstest](std::unique_ptr<vkop::ops::Operator> &op){
-            auto *topk_op = dynamic_cast<Nms *>(op.get());
-            if (!topk_op) {
-                LOG_ERROR("Failed to cast operator to Topk");
-                return;
-            }
-            topk_op->setAttribute(nmstest.attributes);
-        }));
 
-        LOG_INFO("Testing FP16");
-        NmsTest<uint16_t> nmstest1(box_shape, scores_shape, max_per_class, iou_threshold, score_threshold);
-        EXPECT_TRUE(nmstest1.run_test({nmstest1.boxes, nmstest1.scores}, {nmstest1.indices}, [&nmstest1](std::unique_ptr<vkop::ops::Operator> &op){
-            auto *topk_op = dynamic_cast<Nms *>(op.get());
-            if (!topk_op) {
-                LOG_ERROR("Failed to cast operator to Topk");
-                return;
-            }
-            topk_op->setAttribute(nmstest1.attributes);
-        }));
+        // Each row builds its own tensors: a Tensor binds one GPU storage form
+        // on first upload (image2DArray *or* SSBO) and never switches, so the
+        // image and buffer rows cannot share fixtures.
+        auto attrs_for = [](int max_per_class, float iou_threshold,
+                            float score_threshold) {
+            return std::unordered_map<std::string, std::string>{
+                {"max_output_boxes_per_class", std::to_string(max_per_class)},
+                {"iou_threshold", std::to_string(iou_threshold)},
+                {"score_threshold", std::to_string(score_threshold)},
+            };
+        };
+
+        LOG_INFO("Testing FP32, both backends");
+        NmsTest<float> nmstest(box_shape, scores_shape, max_per_class,
+                               iou_threshold, score_threshold);
+        EXPECT_TRUE(nmstest.run_test_on_both_backends(
+            [&]() -> NmsTest<float>::DualCase {
+                NmsTest<float> fresh(box_shape, scores_shape, max_per_class,
+                                     iou_threshold, score_threshold);
+                return {{fresh.boxes, fresh.scores},
+                        {fresh.indices},
+                        [attrs = attrs_for(max_per_class, iou_threshold,
+                                           score_threshold)](
+                            std::unique_ptr<vkop::ops::Operator> &op) {
+                            op->setAttribute(attrs);
+                        }};
+            }));
+
+        LOG_INFO("Testing FP16, both backends");
+        NmsTest<uint16_t> nmstest1(box_shape, scores_shape, max_per_class,
+                                   iou_threshold, score_threshold);
+        EXPECT_TRUE(nmstest1.run_test_on_both_backends(
+            [&]() -> NmsTest<uint16_t>::DualCase {
+                NmsTest<uint16_t> fresh(box_shape, scores_shape, max_per_class,
+                                        iou_threshold, score_threshold);
+                return {{fresh.boxes, fresh.scores},
+                        {fresh.indices},
+                        [attrs = attrs_for(max_per_class, iou_threshold,
+                                           score_threshold)](
+                            std::unique_ptr<vkop::ops::Operator> &op) {
+                            op->setAttribute(attrs);
+                        }};
+            }));
     }
 }
