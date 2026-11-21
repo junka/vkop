@@ -694,6 +694,21 @@ measured with `VKOP_SUBMIT_PROF=1` over 6 steps, which runs cooler than the 40-s
 40 steps with all of the above up to flash attention, on a hot machine (median step 1.59 s):
 text tower 2.24 s load, prefill 0.19 s, denoising **62.9 s**, VAE **0.80 s**, wall clock **71.2 s**.
 With the coopmat MatMul: denoising **55.3 s** (1.38 s/step), VAE 0.80 s, wall clock **62.7 s**.
+With the coopmat flash attention as well (`attention_flash_coop8.comp`, below): denoising
+**53.3 s**, wall clock **61.2 s**.
+
+**Cooperative-matrix flash attention.** `attention_flash_coop8.comp` is the tiled kernel on the
+same 8×8×8 matrices, with the same bindings, push constant, grid and host gates, so
+`AttentionBuffer::flash_pipeline` just picks it on MoltenVK (`VKOP_ATTN_COOP8=0` keeps the SIMT
+one; a model converted before the key existed falls back quietly). Each of the 8 subgroups owns
+8 query rows, so a row's softmax stays in its subgroup; Q lives in registers as D/8 A fragments,
+S (8×32 per subgroup and KV tile) and O (8×D) are accumulators. Accumulator elements cannot be
+addressed (SPIRV-Cross emits `.x` on a `simdgroup_matrix`, which Metal rejects), so S is spilled
+to a per-subgroup scratch for the softmax, P goes back as fp16 A fragments, and O is rescaled
+lazily: the softmax reference only moves when a row max outgrows it by 2^8, and only then is O
+round-tripped through the scratch. `bench_attention` (`BENCH_COOP8=1`, GPU ms, SIMT → coopmat):
+DiT 1024×1088 D128 2.42 → 1.88, LLM causal 2048 2.58 → 2.02, ViT 1024 D64 0.81 → 0.55, D80
+0.89 → 0.66. Register prefetch of the next K/V tile made it slower (2.11 on the DiT shape).
 
 **Cooperative-matrix MatMul on MoltenVK.** MoltenVK does not advertise
 `VK_KHR_cooperative_matrix`, but SPIRV-Cross lowers an 8×8 coopmat to Metal's

@@ -100,6 +100,7 @@ int main(int argc, char **argv) {
     const int samples = argc > 1 ? std::atoi(argv[1]) : 15;
     std::string want = "dit,llm,small,few";
     if (const char *e = std::getenv("BENCH_SHAPES")) want = e;
+    const bool coop_ab = std::getenv("BENCH_COOP8") != nullptr;
 
     std::vector<Case> cases = {
         // Qwen-Image DiT joint attention: 1024 image + 64 text tokens, the
@@ -201,12 +202,20 @@ int main(int argc, char **argv) {
             std::unique_ptr<VulkanQueryPool> ts;
             std::shared_ptr<VulkanCommandBuffer> cmd;
             std::vector<double> ms;
+            std::vector<double> wall;
         } arms[2];
         bool ok = true;
         for (int a = 0; a < 2; ++a) {
             auto &arm = arms[a];
             auto at = attrs;
-            at["flash"] = a == 0 ? "0" : "1";
+            // BENCH_COOP8=1: arm 0 is the SIMT tiled kernel, arm 1 the
+            // coopmat one (MoltenVK). Default: row kernel against tiled.
+            if (coop_ab) {
+                at["flash"] = "1";
+                at["flash_coop8"] = a == 0 ? "0" : "1";
+            } else {
+                at["flash"] = a == 0 ? "0" : "1";
+            }
             arm.op = ops::create_from_type(ops::OpType::ATTENTION, 1, 0, true);
             arm.op->set_runtime_device(dev, cmdpool);
             arm.op->setAttribute(at);
@@ -242,8 +251,12 @@ int main(int argc, char **argv) {
             for (int a = 0; a < 2; ++a) {
                 auto &arm = arms[(sidx & 1) ? 1 - a : a];
                 arm.ts->reset();
+                auto w0 = std::chrono::steady_clock::now();
                 arm.cmd->submit(queue);
                 dev->wait_all_done();
+                arm.wall.push_back(std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - w0)
+                                       .count());
                 auto t = arm.ts->getResults();
                 if (t[1] > t[0])
                     arm.ms.push_back(static_cast<double>(t[1] - t[0]) * period);
@@ -307,8 +320,11 @@ int main(int argc, char **argv) {
             }
         }
         double mo = median(arms[0].ms), mn = median(arms[1].ms);
-        printf("%-11s %5d %5d %4d | %9.3f %9.3f %6.2fx | %10.2e %10.2e %10.2e\n",
-               c.name, c.S, c.kv, c.D, mo, mn, mo / mn, d_on, e_old, e_new);
+        double wo = median(arms[0].wall), wn = median(arms[1].wall);
+        printf("%-11s %5d %5d %4d | %9.3f %9.3f %6.2fx | %10.2e %10.2e %10.2e"
+               " | wall %7.3f %7.3f %5.2fx\n",
+               c.name, c.S, c.kv, c.D, mo, mn, mo / mn, d_on, e_old, e_new, wo,
+               wn, wo / wn);
         fflush(stdout);
     }
     return 0;

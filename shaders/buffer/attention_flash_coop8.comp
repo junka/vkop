@@ -1,0 +1,460 @@
+#version 450 core
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// attention_flash.comp on 8x8x8 cooperative matrices, for Apple GPUs through
+// MoltenVK (SPIRV-Cross lowers them to simdgroup_matrix; see
+// matmul_coop8.comp for why this is off-spec and enabled by device). Same op,
+// bindings, push constant, grid and host gates as attention_flash.comp, so
+// AttentionBuffer swaps the module without touching the dispatch.
+//
+// Workgroup: 256 lanes = 8 subgroups of 32. A workgroup owns BR = 64 query
+// rows of one (b, h); subgroup g owns rows 8g .. 8g+7, so a row's softmax
+// never leaves its subgroup. Per KV tile of BC = 32 positions:
+//
+//   S  = Q · Kᵀ   8 x 32 per subgroup: 4 accumulators, inner D in 8-blocks.
+//                 Q stays in registers (D/8 A fragments, loaded once).
+//   softmax       S is spilled to the subgroup's own fp32 scratch; lane
+//                 (row = lane/4, quarter = lane%4) owns 8 columns of a row,
+//                 row reductions are two shuffles. P goes back to shared as
+//                 fp16 and is re-read as 4 A fragments.
+//   O += P · V    8 x D per subgroup: D/8 accumulators.
+//
+// Accumulator elements cannot be addressed (SPIRV-Cross emits `.x` on a
+// simdgroup_matrix, which Metal rejects), so O cannot be rescaled per row in
+// registers. Instead the softmax reference is LAZY: P = exp2(x - m_ref), and
+// m_ref (with l and O) is only moved when a tile's row max exceeds it by more
+// than 2^RESCALE_LOG2; then O goes through the scratch one fragment at a time.
+// P stays <= 2^RESCALE_LOG2, far inside fp16, and the result is the same
+// softmax (every term is scaled by the same exp2(-m_ref)). After the first
+// tile, rescales are rare.
+//
+// Shared memory (uvec4 pool, 30 KB at D = 128; Apple caps a threadgroup at
+// 32 KB):
+//   [0, 1088)      K tile [32 rows][D+8 halves] then V tile, same shape;
+//                  before the loop the Q block [64 rows][D+8] (staging only)
+//   [1088, 1600)   per-subgroup fp32 scratch, 8 x 32 floats (64 uvec4)
+//   [1600, 1920)   per-subgroup P tile, 8 rows x 40 halves (40 uvec4)
+//
+// Host-gated as attention_flash.comp: fp16, head_dim % 16 == 0 and <= 128,
+// no fp8 cache. Rows past S are zero Q rows whose output is not stored.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Q {
+    uint data[];
+} uQ;
+layout(set = 0, binding = 2) readonly buffer K {
+    uint data[];
+} uK;
+layout(set = 0, binding = 3) readonly buffer V {
+    uint data[];
+} uV;
+// 128-bit views of the same buffers for the staging loads (8 halves): every
+// row the kernel stages starts on a multiple of head_dim (% 16 == 0) elements,
+// except V under a non-multiple-of-8 v_base_extra / v_step_extra, which keeps
+// the word loop.
+layout(set = 0, binding = 1) readonly buffer Q4 {
+    uvec4 data[];
+} uQ4;
+layout(set = 0, binding = 2) readonly buffer K4 {
+    uvec4 data[];
+} uK4;
+layout(set = 0, binding = 3) readonly buffer V4 {
+    uvec4 data[];
+} uV4;
+layout(set = 0, binding = 5) readonly buffer CacheIn4 {
+    uvec4 data[];
+} uCacheIn4;
+layout(set = 0, binding = 4) readonly buffer Mask {
+    uint data[];
+} uMask;
+layout(set = 0, binding = 5) readonly buffer CacheIn {
+    uint data[];
+} uCacheIn;
+layout(set = 0, binding = 6) buffer CacheOut {
+    uint data[];
+} uCacheOut;
+layout(set = 0, binding = 7) readonly buffer DynParamsBuf {
+    ivec4 p;
+    uvec3 dispatch;
+    uint _pad;
+} uDyn;
+
+// Identical to attention.comp's PC_ATTN (one AttentionPC on the host).
+layout(push_constant) uniform PC_ATTN {
+    float scale;
+    int batch;
+    int heads;
+    int kv_heads;
+    int seq;
+    int kv_len;
+    int head_dim;
+    int rep;
+    int causal;
+    int has_mask;
+    int mask_causal;
+    int kv_past;
+    int has_cache;
+    int src_stride;
+    int dst_stride;
+    int inplace;
+    int ring;
+    int ring_head;
+    float cache_scale;
+    int cache_fp8;
+    int seq_major;
+    int v_base_extra;
+    int v_step_extra;
+    int dyn_ssbo;
+} uA;
+
+int dyn_kv_len() { return (uA.dyn_ssbo != 0) ? uDyn.p.x : uA.kv_len; }
+int dyn_kv_past() { return (uA.dyn_ssbo != 0) ? uDyn.p.y : uA.kv_past; }
+int dyn_ring_head() { return (uA.dyn_ssbo != 0) ? uDyn.p.z : uA.ring_head; }
+
+int kv_slot(int j) {
+    if (uA.ring == 0) {
+        return j;
+    }
+    return (dyn_ring_head() + j) % uA.src_stride;
+}
+
+#define BR 64
+#define BC 32
+#define LOG2E 1.4426950408889634
+#define RESCALE_LOG2 8.0
+
+#define KV_REGION 1088
+#define SCR_BASE KV_REGION
+#define P_BASE (KV_REGION + 8 * 64)
+#define P_PITCH 5 // uvec4 per P row (40 halves)
+#define POOL (P_BASE + 8 * 8 * P_PITCH)
+shared uvec4 sPool[POOL];
+
+#define FRA coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>
+#define FRB coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB>
+#define ACC coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>
+
+// The 16 possible D/8 blocks, unrolled; block i exists when i < nd (uniform).
+#define FOR16(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7) \
+                 M(8) M(9) M(10) M(11) M(12) M(13) M(14) M(15)
+
+void pool_store_word(int word, uint v) {
+    sPool[word >> 2][word & 3] = v;
+}
+
+// The cache workgroups (has_cache != 0), verbatim from attention_flash.comp.
+void copy_cache(int cwg) {
+    int D = uA.head_dim;
+    int nkv = uA.kv_heads;
+    int R = D >> 1;
+    int nrows = (uA.ring != 0) ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
+    int j0 = (uA.ring != 0) ? dyn_kv_past() : 0;
+    int total_words = 2 * nkv * nrows * R;
+    int gid = cwg * 256 + int(gl_LocalInvocationID.x);
+    if (gid >= total_words) {
+        return;
+    }
+    int w = gid % R;
+    int row = gid / R;
+    int j = j0 + row % nrows;
+    int h = (row / nrows) % nkv;
+    int c = row / (nrows * nkv);
+    uint word;
+    if (j < dyn_kv_past()) {
+        if (uA.inplace != 0) {
+            return;
+        }
+        word = uCacheIn
+                   .data[((c * nkv + h) * uA.src_stride + kv_slot(j)) * R + w];
+    } else {
+        int off = (h * uA.seq + (j - dyn_kv_past())) * R + w;
+        word = (c == 0) ? uK.data[off] : uV.data[off];
+    }
+    uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
+}
+
+void main() {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int sg = int(gl_SubgroupID);
+    const int lane = int(gl_SubgroupInvocationID);
+    const int S = uA.seq;
+    const int H = uA.heads;
+    const int D = uA.head_dim;
+    const int HW = D >> 1;
+    const int nd = D >> 3;
+    const int PK = D + 8;       // halves per staged row
+    const int PKV = PK >> 3;    // uvec4 per staged row
+    const int kv = dyn_kv_len();
+    const int kv_past = (uA.has_cache != 0) ? dyn_kv_past() : 0;
+    const int kv_new = kv - kv_past;
+
+    const int ntr = (S + BR - 1) / BR;
+    const int attn_wgs = uA.batch * H * ntr;
+    const int wg = int(gl_WorkGroupID.x);
+    if (uA.has_cache != 0 && wg >= attn_wgs) {
+        copy_cache(wg - attn_wgs);
+        return;
+    }
+    const int rt = ntr - 1 - (wg % ntr);
+    const int bh = wg / ntr;
+    const int h = bh % H;
+    const int b = bh / H;
+    const int h_kv = h / uA.rep;
+    const int r0 = rt * BR;
+    const bool smaj = uA.seq_major != 0;
+
+    const int q_rstep = smaj ? H * D : D;
+    const int q_base0 = smaj ? ((b * S + r0) * H + h) * D
+                             : ((b * H + h) * S + r0) * D;
+    const int k_base = smaj ? (b * kv_new * uA.kv_heads + h_kv) * D
+                            : ((b * uA.kv_heads + h_kv) * kv_new) * D;
+    const int v_base = k_base + uA.v_base_extra;
+    const int kv_step = smaj ? uA.kv_heads * D : D;
+    const int v_step = kv_step + uA.v_step_extra;
+    const int c_base = (h_kv * uA.src_stride) * D;
+    const int c_v_base = c_base + (uA.kv_heads * uA.src_stride) * D;
+    const int past = kv - S;
+
+    // ---- Q block -> shared -> registers ----
+    const int HQ = D >> 3; // uvec4 per row
+    for (int e = lid; e < BR * HQ; e += 256) {
+        int rr = e / HQ;
+        int w = e - rr * HQ;
+        uvec4 v = uvec4(0u);
+        if (r0 + rr < S) {
+            v = uQ4.data[((q_base0 + rr * q_rstep) >> 3) + w];
+        }
+        sPool[rr * PKV + w] = v;
+    }
+    barrier();
+    FRA q0, q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q15;
+#define LOADQ(i) if (i < nd) { \
+        coopMatLoad(q##i, sPool, uint(sg * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutRowMajor); }
+    FOR16(LOADQ)
+
+    ACC o0 = ACC(0.0), o1 = ACC(0.0), o2 = ACC(0.0), o3 = ACC(0.0),
+        o4 = ACC(0.0), o5 = ACC(0.0), o6 = ACC(0.0), o7 = ACC(0.0),
+        o8 = ACC(0.0), o9 = ACC(0.0), o10 = ACC(0.0), o11 = ACC(0.0),
+        o12 = ACC(0.0), o13 = ACC(0.0), o14 = ACC(0.0), o15 = ACC(0.0);
+
+    // Lane's softmax row / columns within the subgroup's 8 x 32 tile.
+    const int lr = lane >> 2;
+    const int lq = lane & 3;
+    const int srow = r0 + sg * 8 + lr; // query row
+    const int scr = SCR_BASE + sg * 64;
+    const int pb = P_BASE + sg * 8 * P_PITCH;
+    float m_ref = -1e30;
+    float l = 0.0;
+
+    int t_end = kv;
+    if (uA.causal != 0 || uA.mask_causal != 0) {
+        int r_last = min(r0 + BR - 1, S - 1);
+        t_end = min(kv, past + r_last + 1);
+    }
+
+    const int kvw = (BC * PK) >> 1; // words per staged K (or V) tile
+    const bool v_vec = ((uA.v_base_extra | uA.v_step_extra) & 7) == 0;
+    for (int t0 = 0; t0 < t_end; t0 += BC) {
+        barrier(); // previous tile's (or the Q staging's) readers are done
+        if (v_vec) {
+            for (int e = lid; e < BC * HQ; e += 256) {
+                int rr = e / HQ;
+                int w = e - rr * HQ;
+                int j = t0 + rr;
+                uvec4 kw = uvec4(0u);
+                uvec4 vw = uvec4(0u);
+                if (j < kv) {
+                    if (j < kv_past) {
+                        int slot = kv_slot(j);
+                        kw = uCacheIn4.data[((c_base + slot * D) >> 3) + w];
+                        vw = uCacheIn4.data[((c_v_base + slot * D) >> 3) + w];
+                    } else {
+                        int jn = j - kv_past;
+                        kw = uK4.data[((k_base + jn * kv_step) >> 3) + w];
+                        vw = uV4.data[((v_base + jn * v_step) >> 3) + w];
+                    }
+                }
+                sPool[rr * PKV + w] = kw;
+                sPool[(kvw >> 2) + rr * PKV + w] = vw;
+            }
+        } else {
+            for (int e = lid; e < BC * HW; e += 256) {
+                int rr = e / HW;
+                int w = e - rr * HW;
+                int j = t0 + rr;
+                uint kw = 0u;
+                uint vw = 0u;
+                if (j < kv) {
+                    if (j < kv_past) {
+                        int slot = kv_slot(j);
+                        kw = uCacheIn.data[((c_base + slot * D) >> 1) + w];
+                        vw = uCacheIn.data[((c_v_base + slot * D) >> 1) + w];
+                    } else {
+                        int jn = j - kv_past;
+                        kw = uK.data[((k_base + jn * kv_step) >> 1) + w];
+                        vw = uV.data[((v_base + jn * v_step) >> 1) + w];
+                    }
+                }
+                int sw = ((rr * PK) >> 1) + w;
+                pool_store_word(sw, kw);
+                pool_store_word(kvw + sw, vw);
+            }
+        }
+        barrier();
+
+        // ---- S = Q · Kᵀ ----
+        ACC s0 = ACC(0.0), s1 = ACC(0.0), s2 = ACC(0.0), s3 = ACC(0.0);
+#define QK(i) if (i < nd) { \
+        FRB k0, k1, k2, k3; \
+        coopMatLoad(k0, sPool, uint(0 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutColumnMajor); \
+        coopMatLoad(k1, sPool, uint(1 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutColumnMajor); \
+        coopMatLoad(k2, sPool, uint(2 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutColumnMajor); \
+        coopMatLoad(k3, sPool, uint(3 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutColumnMajor); \
+        s0 = coopMatMulAdd(q##i, k0, s0); \
+        s1 = coopMatMulAdd(q##i, k1, s1); \
+        s2 = coopMatMulAdd(q##i, k2, s2); \
+        s3 = coopMatMulAdd(q##i, k3, s3); }
+        FOR16(QK)
+        coopMatStore(s0, sPool, uint(scr + 0), 8u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(s1, sPool, uint(scr + 2), 8u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(s2, sPool, uint(scr + 4), 8u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(s3, sPool, uint(scr + 6), 8u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // ---- scores (log2 domain) + mask / causal / bounds ----
+        float x[8];
+        {
+            vec4 a = uintBitsToFloat(sPool[scr + lr * 8 + lq * 2]);
+            vec4 c = uintBitsToFloat(sPool[scr + lr * 8 + lq * 2 + 1]);
+            x[0] = a.x; x[1] = a.y; x[2] = a.z; x[3] = a.w;
+            x[4] = c.x; x[5] = c.y; x[6] = c.z; x[7] = c.w;
+        }
+        const int j0 = t0 + lq * 8;
+        const int lim = (uA.causal != 0) ? (past + srow) : 0x7fffffff;
+        const bool mrow_ok = uA.has_mask != 0 && srow < S;
+        const int mrow = (b * S + srow) * kv;
+        float tmax = -1e30;
+        [[unroll]] for (int c = 0; c < 8; ++c) {
+            int j = j0 + c;
+            float mk = 0.0;
+            if (mrow_ok && j < kv) {
+                int e = mrow + j;
+                mk = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+            }
+            float v = (x[c] * uA.scale + mk) * LOG2E;
+            if (j > lim) v = -65504.0 * LOG2E;
+            if (j >= kv) v = -1e30;
+            x[c] = v;
+            tmax = max(tmax, v);
+        }
+        tmax = max(tmax, subgroupShuffleXor(tmax, 1u));
+        tmax = max(tmax, subgroupShuffleXor(tmax, 2u));
+
+        // Lazy reference: move only when the row max outgrows it.
+        const bool need = tmax > m_ref + RESCALE_LOG2;
+        float alpha = 1.0;
+        if (need) {
+            alpha = exp2(m_ref - tmax);
+            m_ref = tmax;
+            l *= alpha;
+        }
+
+        // ---- P (fp16) into the subgroup's P tile ----
+        uvec4 pw;
+        float ps = 0.0;
+        [[unroll]] for (int c2 = 0; c2 < 4; ++c2) {
+            uint w = packHalf2x16(vec2(exp2(x[2 * c2] - m_ref),
+                                       exp2(x[2 * c2 + 1] - m_ref)));
+            vec2 r = unpackHalf2x16(w);
+            ps += r.x + r.y;
+            pw[c2] = w;
+        }
+        l += ps;
+        sPool[pb + lr * P_PITCH + lq] = pw;
+
+        // ---- rescale O where a row's reference moved ----
+        if (subgroupAny(need)) {
+            // Fragment element e = lane*2 + {0,1} is row lane/4: the lane's
+            // own softmax row, so its alpha is already in a register.
+#define RESC(i) if (i < nd) { \
+            coopMatStore(o##i, sPool, uint(scr), 2u, \
+                         gl_CooperativeMatrixLayoutRowMajor); \
+            subgroupMemoryBarrierShared(); subgroupBarrier(); \
+            { int u = scr + (lane >> 1); int cc = (lane & 1) * 2; \
+              sPool[u][cc] = floatBitsToUint(uintBitsToFloat(sPool[u][cc]) * alpha); \
+              sPool[u][cc + 1] = floatBitsToUint(uintBitsToFloat(sPool[u][cc + 1]) * alpha); } \
+            subgroupMemoryBarrierShared(); subgroupBarrier(); \
+            coopMatLoad(o##i, sPool, uint(scr), 2u, \
+                        gl_CooperativeMatrixLayoutRowMajor); \
+            subgroupMemoryBarrierShared(); subgroupBarrier(); }
+            FOR16(RESC)
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // ---- O += P · V ----
+        FRA p0, p1, p2, p3;
+        coopMatLoad(p0, sPool, uint(pb + 0), uint(P_PITCH),
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(p1, sPool, uint(pb + 1), uint(P_PITCH),
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(p2, sPool, uint(pb + 2), uint(P_PITCH),
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(p3, sPool, uint(pb + 3), uint(P_PITCH),
+                    gl_CooperativeMatrixLayoutRowMajor);
+        const int vb = kvw >> 2; // V tile base, uvec4
+#define PV(i) if (i < nd) { \
+        FRB v0, v1, v2, v3; \
+        coopMatLoad(v0, sPool, uint(vb + 0 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutRowMajor); \
+        coopMatLoad(v1, sPool, uint(vb + 1 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutRowMajor); \
+        coopMatLoad(v2, sPool, uint(vb + 2 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutRowMajor); \
+        coopMatLoad(v3, sPool, uint(vb + 3 * 8 * PKV + i), uint(PKV), \
+                    gl_CooperativeMatrixLayoutRowMajor); \
+        o##i = coopMatMulAdd(p0, v0, o##i); \
+        o##i = coopMatMulAdd(p1, v1, o##i); \
+        o##i = coopMatMulAdd(p2, v2, o##i); \
+        o##i = coopMatMulAdd(p3, v3, o##i); }
+        FOR16(PV)
+    }
+
+    // ---- row sums and the Y store, one O fragment at a time ----
+    l += subgroupShuffleXor(l, 1u);
+    l += subgroupShuffleXor(l, 2u);
+    const float inv = 1.0 / (l + 1e-30);
+    const bool row_ok = srow < S;
+    const int yw = (q_base0 + (sg * 8 + lr) * q_rstep) >> 1;
+#define OUT(i) if (i < nd) { \
+        coopMatStore(o##i, sPool, uint(scr), 2u, \
+                     gl_CooperativeMatrixLayoutRowMajor); \
+        subgroupMemoryBarrierShared(); subgroupBarrier(); \
+        if (row_ok) { int u = scr + (lane >> 1); int cc = (lane & 1) * 2; \
+            vec2 y = vec2(uintBitsToFloat(sPool[u][cc]), \
+                          uintBitsToFloat(sPool[u][cc + 1])) * inv; \
+            uOutput.data[yw + i * 4 + lq] = packHalf2x16(y); } \
+        subgroupMemoryBarrierShared(); subgroupBarrier(); }
+    FOR16(OUT)
+}

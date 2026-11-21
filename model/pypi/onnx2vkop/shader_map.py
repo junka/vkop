@@ -480,6 +480,8 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # which the converter cannot know, so it ships with every Attention;
         # an archive without it keeps the row kernel.
         "buffer_attention_flash_fp16",
+        # Its 8x8x8 coopmat build; only the MoltenVK driver builds it.
+        "buffer_attention_flash_coop8",
     ],
     ("FusedElemwise", "buffer"): [
         "buffer_fused_elemwise_bda",

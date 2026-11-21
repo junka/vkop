@@ -187,6 +187,16 @@ class AttentionBuffer : public BufferFactory {
         if (const char *e = getenv("VKOP_ATTN_FLASH")) {
             flash_enabled_ = e[0] != '0';
         }
+        // Apple: the tiled kernel on 8x8x8 cooperative matrices
+        // (attention_flash_coop8.comp), MoltenVK only. `flash_coop8=0` or
+        // VKOP_ATTN_COOP8=0 keeps the SIMT tiled kernel.
+        if (attributes.find("flash_coop8") != attributes.end()) {
+            flash_coop8_ =
+                static_cast<int>(std::stol(attributes.at("flash_coop8"))) != 0;
+        }
+        if (const char *e = getenv("VKOP_ATTN_COOP8")) {
+            flash_coop8_ = e[0] != '0';
+        }
         if (const char *e = getenv("VKOP_ATTN_FLASH_MIN")) {
             const int v = std::atoi(e);
             if (v > 0) flash_min_rows_ = v;
@@ -908,6 +918,35 @@ class AttentionBuffer : public BufferFactory {
     VulkanPipeline *flash_pipeline() {
         if (flash_pipe_) return flash_pipe_.get();
         if (flash_unavailable_ || m_dev_ == nullptr) return nullptr;
+        const bool use_uab = update_after_bind_ &&
+                             m_dev_->is_support_descriptor_update_after_bind();
+        // MoltenVK does not advertise VK_KHR_cooperative_matrix but lowers an
+        // 8x8 coopmat to simdgroup_matrix (see matmul_coop8.comp), so the
+        // coopmat build is chosen by driver; a missing key or a refused
+        // pipeline falls through to the SIMT tiled kernel.
+        if (flash_coop8_ && m_dev_->device_traits().driver_id ==
+                                static_cast<uint32_t>(VK_DRIVER_ID_MOLTENVK)) {
+            std::pair<const uint32_t *, uint32_t> c8{nullptr, 0};
+            try {
+                c8 = resolve_spv("buffer_attention_flash_coop8");
+            } catch (const std::exception &) {
+                // A model converted before the key existed: quietly keep
+                // the SIMT tiled kernel.
+            }
+            if (c8.first != nullptr) try {
+                flash_pipe_ = std::make_unique<VulkanPipeline>(
+                    m_dev_->getLogicalDevice(), types_, sizeof(AttentionPC),
+                    c8.first, static_cast<int>(c8.second), use_uab, 0,
+                    pipeline_cache_);
+                return flash_pipe_.get();
+            } catch (const std::exception &e) {
+                flash_pipe_.reset();
+                std::fprintf(stderr,
+                             "[vkop] coopmat tiled Attention rejected (%s); "
+                             "using the SIMT tiled kernel\n",
+                             e.what());
+            }
+        }
         std::pair<const uint32_t *, uint32_t> spv;
         try {
             spv = resolve_spv("buffer_attention_flash_fp16");
@@ -920,9 +959,6 @@ class AttentionBuffer : public BufferFactory {
             return nullptr;
         }
         try {
-            const bool use_uab =
-                update_after_bind_ &&
-                m_dev_->is_support_descriptor_update_after_bind();
             flash_pipe_ = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(), types_, sizeof(AttentionPC),
                 spv.first, static_cast<int>(spv.second), use_uab, 0,
@@ -1067,6 +1103,7 @@ class AttentionBuffer : public BufferFactory {
     static constexpr size_t kDynBytes = 32;
     // Tiled route state (flash_route / flash_pipeline / submit_flash).
     bool flash_enabled_ = true;
+    bool flash_coop8_ = true;
     // Query rows from which the tiled kernel takes over, and the fewest
     // 64-row blocks worth a grid (both measured on the 32-core M5 Max, see
     // flash_route).

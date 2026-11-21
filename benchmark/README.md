@@ -453,6 +453,22 @@ BENCH_M=9 BENCH_INT8=1 ./build/bench_matmul.exe
   **int4 的 prefill 是 fp16 的 2.7 倍**。fp16 模型只用到带宽上限的 57–73%：MatMul 本身接近上限
   （lm_head 435 GB/s），差距在每步约 560 个小 op 的调度。
 
+**长 prompt prefill（2026-11-21）。** 两轮对话，第一轮 1399 token，第二轮再算 1336 token（KV 2736），
+Qwen3-VL-2B fp16，第二轮 prefill 的 wall 时间：
+
+| 配置 | 第二轮 prefill |
+|---|---|
+| 逐行 attention kernel（`VKOP_ATTN_FLASH=0`） | 1103 ms |
+| SIMT flash attention | 565 ms |
+| flash 走 8×8 coopmat（`attention_flash_coop8.comp`，仅 MoltenVK） | **538 ms**（比 SIMT flash 快 5%） |
+| 以上全部换回 SIMT（MatMul 与 attention 都不走 coopmat） | 657 ms |
+| 同一模型保留 `fuse_swiglu_down_proj` 融合（coopmat 全开） | 1462 ms |
+
+SwiGLU 融合 kernel 是为 decode 的小 M 写的，到 prefill 的 M≈1400 时比不融合慢 2.7 倍（第一轮 1556 → 570 ms），
+而 decode 不受影响（第 20 个 token 17.4–17.6 ms，两种模型相同），所以长 prompt 场景应当用
+`--no-fusions=fuse_swiglu_down_proj` 转换，和 DiT 一样。prefill 还会对全部位置算 lm_head 和 TopK，只有最后一个
+位置有用。注意：2026-11-19 转换的 `llm.vkopbin` 配现在的 runtime 第一个 token 就错（输出 "!"），要重新转换。
+
 复现（脚本只是把下面两条包起来串行跑，并比较输出）：
 
 ```bash
@@ -462,7 +478,8 @@ printf 'Explain in detail how a transformer language model works.\n' | VKOP_PROF
   ./build/llm_chat llm/exporter/llm.vkopbin llm/exporter/embed_tokens.bin llm/tokenizer/qwen3_vl.bin 64
 # 转换（每个模型约 10–30 s，权重流式读取，峰值内存约 0.2 GB）
 cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
-  -o ../../llm/exporter/llm.vkopbin -q fp16 --extra-shaders TopK --master-archive ../../build/vkop_shaders.bin
+  -o ../../llm/exporter/llm.vkopbin -q fp16 --extra-shaders TopK --no-fusions=fuse_swiglu_down_proj \
+  --master-archive ../../build/vkop_shaders.bin
 ```
 
 ### 文生图：Qwen-Image-2.1，512×512，40 步
@@ -474,11 +491,11 @@ cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
 | 文本塔 加载 / 前向 | 2.24 s / 0.45 s | 13.9 GB，用完即释放 |
 | DiT prefill 加载 / 前向 | 2.5 s / 0.19 s | 13.8 GB，32 层 KV |
 | DiT decode 加载 | 1.87 s | 14.2 GB |
-| **去噪 40 步** | **55.3 s（约 1.38 s/步，随芯片温度变化）** | m = 1024 图像 token；MatMul 占每步约 90%，在 MoltenVK 上走 8×8 coopmat（simdgroup_matrix），attention 走 flash kernel |
+| **去噪 40 步** | **53.3 s（约 1.33 s/步，随芯片温度变化）** | m = 1024 图像 token；MatMul 占每步约 90%；在 MoltenVK 上 MatMul 和 flash attention 都走 8×8 coopmat（simdgroup_matrix） |
 | VAE 加载 / 解码 | 0.36 s / 0.80 s | Conv2d 走 implicit GEMM |
-| **端到端** | **62.7 s** | 机器较热时测得 |
+| **端到端** | **61.2 s** | 机器较热时测得 |
 
-2026-11-21 测量。之前是去噪 94.0 s（2.3 s/步）、VAE 解码 4.1 s、端到端 104.4 s；加 coopmat MatMul 之前是去噪 62.9 s、端到端 71.2 s。逐项改动和每步算子拆分见
+2026-11-21 测量。之前是去噪 94.0 s（2.3 s/步）、VAE 解码 4.1 s、端到端 104.4 s；加 coopmat 之前是去噪 62.9 s、端到端 71.2 s；只有 MatMul 走 coopmat 时是 55.3 s / 62.7 s。逐项改动和每步算子拆分见
 `image/exporter/BASELINE.md` 的 2026-11-21 一节。
 
 DiT 要用 `--no-fusions=fuse_swiglu_down_proj` 转换。SwiGLU 融合 kernel 是给 decode 的小 M 设计的，到 m = 1024
