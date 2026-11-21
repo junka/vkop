@@ -20,9 +20,11 @@ What it does:
      it stays put. The archive parser stops at its own entry table, so the
      zero tail is never read as a shader.
 
-Safety: refuses unless --force when the key sets differ, and it verifies the
-patched file re-parses before the original is replaced (the write is atomic
-via a temp file when --out is given, in place otherwise after a backup).
+Safety: refuses unless --force when the key sets differ. The file is mmapped,
+never read whole: in place, only the archive range is written, after saving
+the old archive bytes to `<model>.bak_shaders@<offset>`; with --out the file
+is copied first and the copy is patched, then renamed into place. The result
+is re-parsed and compared entry by entry before the tool reports success.
 
 Requires the model to carry slack. `onnx2vkop` writes
 `_SHADER_ARCHIVE_SLACK` (4 MiB) of trailing zeros inside the shader_archive
@@ -37,7 +39,9 @@ Usage:
                         [--shrink-dead]
 """
 import argparse
+import mmap
 import os
+import shutil
 import struct
 import sys
 
@@ -111,7 +115,19 @@ def fb_field(data, table_off, field_index):
 
 def patch(model_path, master_path, out_path, dry_run, force,
           shrink_dead=False):
-    model = bytearray(open(model_path, "rb").read())
+    # mmap, not read(): a DiT/text-tower model is 14 GB and this machine has
+    # 36 GB, so a whole-file bytearray (plus the old whole-file backup) could
+    # push it into swap or an OOM reboot. Only the archive range is touched.
+    # --out copies the file first and patches the copy.
+    if out_path and not dry_run:
+        tmp = out_path + ".tmp"
+        shutil.copyfile(model_path, tmp)
+        target = tmp
+    else:
+        target = model_path
+    fh = open(target, "rb" if dry_run else "r+b")
+    model = mmap.mmap(fh.fileno(), 0,
+                      access=mmap.ACCESS_READ if dry_run else mmap.ACCESS_WRITE)
     root = fb_root(model)
 
     # shader_archive is field #15 (0-based) in `table Model` (magic, version,
@@ -235,30 +251,34 @@ def patch(model_path, master_path, out_path, dry_run, force,
 
     # Write in place, keeping the OLD declared length so nothing after the
     # vector moves. The parser uses the entry table, not the vector's tail.
+    # Back up only the bytes about to change (the archive range), with the
+    # offset in the name so it can be written back.
+    if not out_path:
+        backup = f"{model_path}.bak_shaders@{vec_data}"
+        with open(backup, "wb") as f:
+            f.write(model[vec_data:vec_data + vec_len])
+        print(f"[patch] old archive bytes saved to {backup}")
     model[vec_data:vec_data + vec_len] = archive + b"\x00" * (vec_len - len(archive))
 
-    # Verify before committing.
+    # Verify.
     check, _, _ = parse_vksp(model, vec_data)
-    if set(check) != set(old_ents):
-        raise SystemExit("patched archive does not round-trip; aborting")
+    ok = set(check) == set(old_ents)
     for name, blob in blobs:
-        o_off, o_size = check[name]
+        o_off, o_size = check.get(name, (0, -1))
         if o_size != len(blob) or model[o_off:o_off + o_size] != blob:
-            raise SystemExit("patched entry %s does not match the master" % name)
+            ok = False
+    if not ok:
+        if not out_path:
+            model[vec_data:vec_data + vec_len] = open(backup, "rb").read()
+        model.flush()
+        raise SystemExit("patched archive does not round-trip; restored")
+    model.flush()
+    model.close()
+    fh.close()
 
     dest = out_path or model_path
     if out_path:
-        tmp = out_path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(model)
-        os.replace(tmp, out_path)
-    else:
-        backup = model_path + ".bak_shaders"
-        with open(backup, "wb") as f:
-            f.write(open(model_path, "rb").read())
-        with open(model_path, "wb") as f:
-            f.write(model)
-        print(f"[patch] backup written to {backup}")
+        os.replace(target, out_path)
     print(f"[patch] OK: {n} shader(s) patched into {dest} "
           f"({new_size}/{vec_len} bytes used)")
     return 0

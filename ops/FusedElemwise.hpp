@@ -64,6 +64,8 @@ enum class FusedOp {
     // x*sigmoid(x). Emitted by the converter only when a SIGMOID's output is
     // consumed solely by MUL(same_input, sigmoid) — the SwiGLU gate pattern.
     SILU = 14,
+    MIN = 15,
+    MAX = 16,
 };
 
 struct alignas(16) FusedElemwisePC {
@@ -232,6 +234,66 @@ class FusedElemwise : public BufferFactory {
             uint32_t bits;
             std::memcpy(&bits, &s, sizeof(bits));
             prog_data_.push_back(static_cast<int32_t>(bits));
+        }
+        // Broadcast descriptors, 2 ints/input: the input's element index is
+        // (lin / div) % mod when the dims it keeps form ONE contiguous run of
+        // the output's non-1 dims (same shape, scalar, [1,1,C] over [1,N,C],
+        // [N,1] over [N,C], [1,1,S,T] over [1,H,S,T], ...). mod 0 = not
+        // affine; the shader then decomposes the N-d coordinate per element.
+        std::vector<int> o(rank, 1);
+        for (int i = 0; i < rank; ++i)
+            o[i] = (i < static_cast<int>(out_shp.size()) && out_shp[i] > 0)
+                       ? out_shp[i]
+                       : 1;
+        for (int k = 0; k < nInputs; ++k) {
+            const auto &s = in_shapes[k];
+            std::vector<int> p(rank, 1);
+            int r =
+                static_cast<int>(std::min(s.size(), static_cast<size_t>(rank)));
+            for (int i = 0; i < r; ++i)
+                p[rank - r + i] = (s[i] > 0) ? s[i] : 1;
+            int first = -1;
+            int last = -1;
+            bool affine = true;
+            bool gap = false;
+            for (int i = 0; i < rank; ++i) {
+                if (o[i] == 1)
+                    continue;
+                bool kept = (p[i] == o[i]);
+                if (!kept && p[i] != 1) {
+                    affine = false; // not a broadcast of the output shape
+                    break;
+                }
+                if (kept) {
+                    if (gap) {
+                        affine = false;
+                        break;
+                    }
+                    if (first < 0)
+                        first = i;
+                    last = i;
+                } else if (first >= 0) {
+                    gap = true;
+                }
+            }
+            int div = 1;
+            int mod = 0;
+            if (affine) {
+                if (first < 0) {
+                    mod = 1; // scalar
+                } else {
+                    long long m = 1;
+                    long long d = 1;
+                    for (int i = first; i <= last; ++i)
+                        m *= o[i];
+                    for (int i = last + 1; i < rank; ++i)
+                        d *= o[i];
+                    div = static_cast<int>(d);
+                    mod = static_cast<int>(m);
+                }
+            }
+            prog_data_.push_back(div);
+            prog_data_.push_back(mod);
         }
     }
     void execute(
