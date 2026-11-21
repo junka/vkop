@@ -147,6 +147,10 @@ struct alignas(16) TransposePC {
     int inDims[8];
     int outDims[8];
     int perm[8];
+    // fp16 words each thread copies (0/1 = one word per thread). 4 when the
+    // innermost dim is kept and a multiple of 8: a run of 8 halves is then
+    // contiguous on both sides and needs one index decomposition.
+    int chunk;
 };
 
 struct alignas(16) SoftmaxPC {
@@ -353,6 +357,7 @@ struct alignas(8) TransposeBdaPC {
     int inDims[8];
     int outDims[8];
     int perm[8];
+    int chunk;
     VkDeviceAddress out_addr;
     VkDeviceAddress in_addr;
 };
@@ -395,6 +400,51 @@ inline void fill_dims_broadcast(int (&dims)[8], const std::vector<int> &shape,
     int r = static_cast<int>(std::min<size_t>(shape.size(), 8));
     for (int i = 0; i < r; ++i)
         dims[out_rank - r + i] = shape[i];
+}
+
+// Affine broadcast descriptor: an input of shape `in` (ONNX right-aligned)
+// read for output element `lin` of shape `out` sits at (lin / div) % mod when
+// the output dims it keeps form ONE contiguous run of the output's non-1 dims
+// (same shape: div 1, mod total; scalar: mod 1; [1,1,C] over [1,N,C]: div 1,
+// mod C; [N,1] over [N,C]: div C, mod N; ...). Returns false (div 1, mod 0)
+// when the broadcast is not affine and needs the N-d decomposition.
+inline bool affine_broadcast(const std::vector<int> &in,
+                             const std::vector<int> &out, int &div, int &mod) {
+    const int rank = static_cast<int>(std::max(in.size(), out.size()));
+    std::vector<int> o(rank, 1);
+    std::vector<int> p(rank, 1);
+    for (size_t i = 0; i < out.size(); ++i)
+        o[rank - out.size() + i] = out[i] > 0 ? out[i] : 1;
+    for (size_t i = 0; i < in.size(); ++i)
+        p[rank - in.size() + i] = in[i] > 0 ? in[i] : 1;
+    div = 1;
+    mod = 0;
+    int first = -1;
+    int last = -1;
+    bool gap = false;
+    for (int i = 0; i < rank; ++i) {
+        if (o[i] == 1) continue;
+        const bool kept = p[i] == o[i];
+        if (!kept && p[i] != 1) return false; // not a broadcast of `out`
+        if (kept) {
+            if (gap) return false;
+            if (first < 0) first = i;
+            last = i;
+        } else if (first >= 0) {
+            gap = true;
+        }
+    }
+    if (first < 0) {
+        mod = 1; // scalar
+        return true;
+    }
+    long long m = 1;
+    long long d = 1;
+    for (int i = first; i <= last; ++i) m *= o[i];
+    for (int i = last + 1; i < rank; ++i) d *= o[i];
+    div = static_cast<int>(d);
+    mod = static_cast<int>(m);
+    return true;
 }
 
 // 4-int variants for ops whose PC uses ivec4 shapes (rank ≤ 4 — e.g. the

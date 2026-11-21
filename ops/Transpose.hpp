@@ -388,9 +388,16 @@ class TransposeBuffer : public BufferFactory {
             pc.perm[i] = (i < rank) ? perm[i] : i;
         }
         // fp16 packs two elements per uint word; dispatch one thread per output
-        // word (the fp16 shader writes each word once — no RMW race).
+        // word (the fp16 shader writes each word once — no RMW race), or one
+        // per 4 words when the innermost dim is kept and a multiple of 8.
         int total = total_elems(outshape);
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
+        pc.chunk = 1;
+        if (fp16_ != 0 && rank > 0 && perm[rank - 1] == rank - 1 &&
+            outshape[rank - 1] % 8 == 0) {
+            pc.chunk = 4;
+            nthreads = total / 8;
+        }
         int total_groups = UP_DIV(nthreads, 256);
         if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&
             in_buf->hasDeviceAddress()) {

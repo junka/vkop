@@ -159,3 +159,23 @@ TEST(TransposeTest, TransposeComprehensiveTest) {
     }
 
 }
+// fp16 buffer path with the innermost dim kept and a multiple of 8: the
+// shader copies 4 words per thread from one index decomposition (chunk == 4).
+// The first case is the DiT attention-output head swap.
+TEST(TransposeTest, TransposeFp16KeptInnerChunk) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
+        {{1, 4, 6, 16}, {0, 2, 1, 3}},
+        {{3, 5, 2, 8}, {2, 1, 0, 3}},
+    };
+    for (const auto &test_case : cases) {
+        auto [input_shape, perm] = test_case;
+        TransposeTest<uint16_t> t(input_shape, perm);
+        EXPECT_TRUE(t.run_test({t.input}, {t.output},
+                               [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *tran_op = dynamic_cast<Transpose *>(op.get());
+            ASSERT_NE(tran_op, nullptr);
+            tran_op->setAttribute(t.attributes);
+        }));
+    }
+}

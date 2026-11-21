@@ -453,6 +453,21 @@ class BufferBinaryFactory : public BufferFactory {
         pc.activation = activation_;
         pc.broadcast = (shape_a == out_shape && shape_b == out_shape) ? 0 : 1;
         pc.total = total;
+        // broadcast == 3: both inputs are affine broadcasts of the output, so
+        // the shader indexes them as (lin / div) % mod instead of the per-
+        // element N-d decomposition. The four ints ride in outDims[0..3] (the
+        // dims are unused in this mode and the PC is already at 128 B).
+        if (pc.broadcast == 1) {
+            int da = 1, ma = 0, db = 1, mb = 0;
+            if (affine_broadcast(shape_a, out_shape, da, ma) &&
+                affine_broadcast(shape_b, out_shape, db, mb)) {
+                pc.broadcast = 3;
+                pc.outDims[0] = da;
+                pc.outDims[1] = ma;
+                pc.outDims[2] = db;
+                pc.outDims[3] = mb;
+            }
+        }
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
         const int groups = UP_DIV(nthreads, 256);
 

@@ -33,9 +33,10 @@ layout(push_constant) uniform PC_uTrans {
     IArr8 inDims;
     IArr8 outDims;
     IArr8 perm;
+    int chunk;  // fp16: words per thread (4 = kept innermost dim, % 8 == 0)
 #ifdef BDA
-    // Matches ops::TransposeBdaPC: 100-byte scalar prefix, pointers at 104/112
-    // (120 B total; the 4-byte pad keeps the first pointer 8-aligned).
+    // Matches ops::TransposeBdaPC: 104-byte scalar prefix (chunk at 100),
+    // pointers at 104/112 (120 B total).
     DataBuf uOutput;
     DataBuf uInput;
 #endif
@@ -65,6 +66,15 @@ void main() {
     for (int i = 0; i < rank; ++i) out_total *= uTrans.outDims.v[i];
 
 #ifdef FP16
+    if (uTrans.chunk == 4) {
+        // 8 halves = 4 words, contiguous in both tensors: one decomposition.
+        if (gid >= out_total / 8) return;
+        int w = transpose_elem(8 * gid) >> 1;
+        for (int j = 0; j < 4; ++j) {
+            uOutput.data[4 * gid + j] = uInput.data[w + j];
+        }
+        return;
+    }
     // fp16 packs two halfs per uint word. One thread per output word: elements
     // 2*gid (lo half) and 2*gid+1 (hi half). Each output element reads its own
     // (non-contiguous under transpose) input element via BUF_LOAD (which

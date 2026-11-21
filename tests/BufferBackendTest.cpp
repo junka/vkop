@@ -149,6 +149,72 @@ TEST(BufferBackendTest, BinaryAddFp16) {
         [](const torch::Tensor &a, const torch::Tensor &b) { return a + b; }));
 }
 
+// Broadcast forms the binary kernel's affine path (broadcast == 3, index =
+// (lin / div) % mod) must get right: trailing, per-row (div > 1), middle,
+// scalar, a broadcast A operand, an odd fp16 element count; plus one
+// non-affine pair ([4,1,6] vs [1,5,1]) that must stay on the N-d path.
+template <typename T>
+bool run_binary_shapes(vkop::ops::OpType type, const std::vector<int> &sa,
+                       const std::vector<int> &sb,
+                       const std::function<torch::Tensor(
+                           const torch::Tensor &, const torch::Tensor &)> &ref) {
+    auto opt = torch::TensorOptions().dtype(
+        std::is_same_v<T, uint16_t> ? torch::kFloat16 : torch::kFloat32);
+    auto to64 = [](const std::vector<int> &v) {
+        return std::vector<int64_t>(v.begin(), v.end());
+    };
+    auto a = torch::randn(to64(sa), opt);
+    auto b = torch::randn(to64(sb), opt);
+    auto torch_out = ref(a, b);
+    std::vector<int> so(torch_out.sizes().begin(), torch_out.sizes().end());
+
+    auto in0 = std::make_shared<Tensor<T>>(sa);
+    auto in1 = std::make_shared<Tensor<T>>(sb);
+    fill(in0, a);
+    fill(in1, b);
+    auto out = std::make_shared<Tensor<T>>(so);
+
+    auto op = vkop::ops::create_from_type(type,
+        std::is_same_v<T, uint16_t> ? 1 : 0, 0, true);
+    auto dev = vkop::tests::TestEnv::get_device();
+    auto cmdpool = vkop::tests::TestEnv::get_command_pool();
+    op->set_runtime_device(dev, cmdpool);
+    in0->as_storage_buffer(dev); in0->copyToGPU(cmdpool);
+    in1->as_storage_buffer(dev); in1->copyToGPU(cmdpool);
+    out->as_storage_buffer(dev); out->toGPU();
+    op->onExecute({in0, in1}, {out}, 0);
+    auto cmd = op->get_record();
+    std::vector<VkSubmitInfo> info{cmd->buildSubmitInfo()};
+    vkop::VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
+    cmd->wait(); dev->wait_all_done();
+    out->copyToCPU(cmdpool);
+    return close_to_torch(out, torch_out);
+}
+
+TEST(BufferBackendTest, BinaryAffineBroadcast) {
+    const std::vector<std::pair<std::vector<int>, std::vector<int>>> cases = {
+        {{3, 7, 5}, {5}},          // trailing
+        {{6, 9}, {6, 1}},          // per-row, div > 1
+        {{2, 5, 7}, {1, 5, 1}},    // middle run
+        {{3, 7, 5}, {1}},          // scalar
+        {{1, 5, 1}, {2, 5, 7}},    // broadcast A
+        {{3, 1, 7}, {3, 5, 7}},    // A per-outer-row: not contiguous -> N-d
+        {{4, 1, 6}, {1, 5, 1}},    // both broadcast, not affine -> N-d
+        {{1, 1, 33}, {1, 1, 1}},   // odd total
+    };
+    auto mul = [](const torch::Tensor &a, const torch::Tensor &b) {
+        return a * b;
+    };
+    auto mx = [](const torch::Tensor &a, const torch::Tensor &b) {
+        return torch::max(a, b);
+    };
+    for (const auto &[sa, sb] : cases) {
+        EXPECT_TRUE(run_binary_shapes<float>(vkop::ops::OpType::MUL, sa, sb, mul));
+        EXPECT_TRUE(run_binary_shapes<uint16_t>(vkop::ops::OpType::MUL, sa, sb, mul));
+        EXPECT_TRUE(run_binary_shapes<uint16_t>(vkop::ops::OpType::MAX, sa, sb, mx));
+    }
+}
+
 // Reshape canary: {2,3,4} -> {6,4}.
 TEST(BufferBackendTest, Reshape) {
     auto torch_in = torch::randn({2, 3, 4});

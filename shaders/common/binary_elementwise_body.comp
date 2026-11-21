@@ -141,8 +141,58 @@ float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
 #define BIN_APPLY(a, b) bin_op((a), (b))
 #endif
 
+// broadcast == 3 (host-classified affine broadcasts, see BufferBinaryFactory):
+// input index = (lin / div) % mod with (div, mod) for A in outDims[0..1] and
+// for B in outDims[2..3]. The q < mod test skips the modulo for a same-shape
+// input.
+int aff_index(int lin, int d, int m) {
+    if (m == 1) return 0;
+    int q = (d == 1) ? lin : lin / d;
+    return (q < m) ? q : q % m;
+}
+
+#ifdef FP16
+vec2 load_pair(bool isA, int a0, int a1) {
+    if (a1 == a0 + 1 && (a0 & 1) == 0) {
+        return unpackHalf2x16(isA ? B_INA(a0 >> 1) : B_INB(a0 >> 1));
+    }
+    float v0 = unpackHalf2x16(isA ? B_INA(a0 >> 1) : B_INB(a0 >> 1))[a0 & 1];
+    float v1 = (a1 == a0)
+                   ? v0
+                   : unpackHalf2x16(isA ? B_INA(a1 >> 1) : B_INB(a1 >> 1))[a1 & 1];
+    return vec2(v0, v1);
+}
+#endif
+
+void main_affine(IArr8 out_d) {
+    int gid = int(gl_GlobalInvocationID.x);
+    int dA = out_d.v[0], mA = out_d.v[1], dB = out_d.v[2], mB = out_d.v[3];
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = min(2 * gid + 1, uPC.total - 1);
+    vec2 a = load_pair(true, aff_index(i0, dA, mA), aff_index(i1, dA, mA));
+    vec2 b = load_pair(false, aff_index(i0, dB, mB), aff_index(i1, dB, mB));
+    vec2 out_pair = vec2(BIN_APPLY(a.x, b.x), BIN_APPLY(a.y, b.y));
+    if (2 * gid + 1 >= uPC.total) {
+        out_pair[1] = unpackHalf2x16(B_OUT(gid))[1];  // keep the high half
+    }
+    B_OUT(gid) = packHalf2x16(out_pair);
+#else
+    if (gid >= uPC.total) return;
+    float a = uintBitsToFloat(B_INA(aff_index(gid, dA, mA)));
+    float b = uintBitsToFloat(B_INB(aff_index(gid, dB, mB)));
+    B_OUT(gid) = floatBitsToUint(BIN_APPLY(a, b));
+#endif
+}
+
 void main() {
     IArr8 out_d = B_OUTDIMS;
+    if (uPC.broadcast == 3) {
+        main_affine(out_d);
+        return;
+    }
     IArr8 in0_d = B_IN0DIMS;
     IArr8 in1_d = B_IN1DIMS;
 #ifndef BDA
