@@ -84,7 +84,9 @@ TEST(GlobalAveragePoolTest, GlobalAveragePoolComprehensiveTest) {
     };
 
     for (const auto &t : testcases) {
-        auto [shape] = t;
+        // Not a structured binding: lambdas below capture it, and capturing
+        // a structured binding is C++20 (-Werror,-Wc++20-extensions).
+        const std::vector<int> shape = std::get<0>(t);
         std::string str = "[";
         for (auto i : shape) {
             str += std::to_string(i) + ", ";

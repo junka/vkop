@@ -287,7 +287,13 @@ TEST(NmsTest, NmsComprehensiveTest) {
     };
 
     for (const auto &test_case : test_cases) {
-        auto [box_shape, scores_shape, max_per_class, iou_threshold, score_threshold] = test_case;
+        // Not a structured binding: the [&] lambdas below capture these, and
+        // capturing a structured binding is C++20 (-Werror,-Wc++20-extensions).
+        std::vector<int> box_shape = std::get<0>(test_case);
+        std::vector<int> scores_shape = std::get<1>(test_case);
+        const int max_per_class = std::get<2>(test_case);
+        const float iou_threshold = std::get<3>(test_case);
+        const float score_threshold = std::get<4>(test_case);
         LOG_INFO("NMS for max_per_class: %d, iou_threshold: %f, score_threshold: %f", max_per_class, iou_threshold, score_threshold);
 
         // Each row builds its own tensors: a Tensor binds one GPU storage form
