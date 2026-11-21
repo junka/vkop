@@ -611,6 +611,85 @@ class Conv2dFp8Test : public TestCase<float> {
     }
 };
 
+// Buffer-backend shapes that take the implicit-GEMM route in
+// buffer/conv2d.comp (conv_igemm3 / conv_igemm1): stride 1, dilation 1,
+// groups 1, 3x3 or 1x1. The cases cover both 3x3 tile shapes (64x256 and
+// 128x128) and every tile width (TW = 16/32/64/128 from OW), partial
+// output-channel tiles (OC not a multiple of the tile), partial pixel tiles
+// in both directions (OH % TR, OW % TW), pad 0 / 1 / 2, IC not a multiple of
+// the 1x1 path's 16-channel step, batch > 1, and the VAE's own channel counts
+// at small spatial sizes. Every case runs in fp16 and fp32 (both modules carry
+// the kernel). The odd-size cases at the end qualify only in fp32 (the fp16
+// build moves half pairs as one word): they exercise the fp32 build's tails,
+// and in fp16 the direct-kernel fallback.
+TEST(Conv2dTest, Conv2dImplicitGemmBuffer) {
+    const char *env = std::getenv("VKOP_BUFFER_BACKEND");
+    if (!env || env[0] != '1') {
+        GTEST_SKIP() << "implicit-GEMM conv is a buffer-backend route; set "
+                        "VKOP_BUFFER_BACKEND=1";
+    }
+    std::vector<std::tuple<std::vector<int>, int, int, int, int, int, int>>
+        cases = {
+            // Tile choice: maps of >= 512 output pixels take the 64x256 tile,
+            // smaller ones the 128x128 tile unless OC % 128 is in (0, 64].
+            // OC >= 32 throughout (fewer stays on the direct kernels).
+            {{1, 288, 16, 16}, 3, 1, 1, 1, 1, 144},  // 64x256 TW=16, OC partial
+            {{1, 64, 12, 30}, 3, 1, 1, 1, 1, 130},   // TW=32, OH%TR, OW%TW
+            {{2, 36, 9, 64}, 3, 1, 1, 1, 1, 40},     // TW=64, batch 2
+            {{1, 16, 3, 200}, 3, 1, 1, 1, 1, 40},    // TW=128, 2 col tiles
+            {{1, 8, 48, 12}, 3, 1, 1, 1, 1, 40},     // TW=16, TR=16, 3 row tiles
+            {{1, 10, 20, 40}, 3, 1, 1, 1, 1, 70},    // TW=64, 2 OC tiles
+            {{1, 18, 10, 20}, 3, 1, 0, 1, 1, 36},    // pad 0
+            {{1, 18, 10, 34}, 3, 1, 0, 1, 1, 36},    // pad 0, OW=32 exact
+            {{1, 8, 6, 8}, 3, 1, 2, 1, 1, 32},       // pad 2
+            {{1, 576, 8, 8}, 3, 1, 1, 1, 1, 576},    // VAE channels
+            {{1, 32, 10, 12}, 3, 1, 1, 1, 1, 128},   // 128x128, TW=16
+            {{1, 16, 6, 20}, 3, 1, 1, 1, 1, 96},     // 128x128, TW=32
+            {{1, 288, 16, 16}, 1, 1, 0, 1, 1, 144},  // 1x1 VAE conv_shortcut
+            {{2, 40, 9, 14}, 1, 1, 0, 1, 1, 136},    // 1x1 IC%16, P%128
+            {{1, 6, 7, 2}, 1, 1, 0, 1, 1, 40},       // 1x1 tiny
+            // fp32-only qualifiers (odd IC / odd widths / odd pixel count).
+            {{1, 7, 9, 13}, 3, 1, 1, 1, 1, 44},      // odd IC, odd IW (64x256)
+            {{1, 7, 9, 13}, 3, 1, 1, 1, 1, 100},     // same, 128x128
+            {{1, 1, 5, 33}, 3, 1, 1, 1, 1, 33},      // IC 1
+            {{1, 15, 7, 7}, 3, 1, 0, 1, 1, 34},      // odd IC, pad 0, OW 5
+            {{1, 21, 5, 9}, 1, 1, 0, 1, 1, 34},      // 1x1 odd IC, odd P
+        };
+    for (const auto &tc : cases) {
+        auto [input_shape, kernel_size, stride, pad, group, dilation,
+              feature_size] = tc;
+        const std::string what =
+            "shape " + std::to_string(input_shape[0]) + "x" +
+            std::to_string(input_shape[1]) + "x" +
+            std::to_string(input_shape[2]) + "x" +
+            std::to_string(input_shape[3]) + " k" +
+            std::to_string(kernel_size) + " p" + std::to_string(pad) + " oc" +
+            std::to_string(feature_size);
+
+        Conv2dTest<uint16_t> t16(input_shape, kernel_size, stride, pad, group,
+                                 dilation, feature_size);
+        EXPECT_TRUE(t16.run_test(
+            {t16.input, t16.weight_data_, t16.bias_data_}, {t16.output},
+            [&t16](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+                ASSERT_NE(conv_op, nullptr);
+                conv_op->setAttribute(t16.attributes);
+            }))
+            << what << " fp16";
+
+        Conv2dTest<float> t32(input_shape, kernel_size, stride, pad, group,
+                              dilation, feature_size);
+        EXPECT_TRUE(t32.run_test(
+            {t32.input, t32.weight_data_, t32.bias_data_}, {t32.output},
+            [&t32](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+                ASSERT_NE(conv_op, nullptr);
+                conv_op->setAttribute(t32.attributes);
+            }))
+            << what << " fp32";
+    }
+}
+
 TEST(Conv2dTest, Conv2dInt8WeightOnlyBuffer) {
     // Buffer-backend int8 weight-only Conv2d. Requires VKOP_BUFFER_BACKEND=1.
     const char *env = std::getenv("VKOP_BUFFER_BACKEND");

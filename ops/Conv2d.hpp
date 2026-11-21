@@ -79,11 +79,22 @@ struct alignas(16) Conv2dBufferPC {
     // shader switches on this being > 1 and chunks by its own #define RW, so
     // CONV_OW_BLOCK and RW must agree.
     int ow_blk;
+    // 0 = the direct kernels above. Non-zero selects the implicit-GEMM route
+    // in buffer/conv2d.comp (conv_igemm3 / conv_igemm1). 3x3: bits 0..7 = the
+    // pixel-tile width TW (16..128), bit 8 = 64-channel x 256-pixel tiles
+    // instead of 128 x 128. 1x1: 128. The grid is (pixel tiles,
+    // ceil(OC / tile rows), N) and the kernel writes the output itself (in
+    // fp16: no scratch, no pack pass).
+    int igemm;
 };
+static_assert(sizeof(Conv2dBufferPC) <= 128, "Conv2d push constants > 128 B");
 
 // Columns per thread in the register-blocked path; must match #define RW in
 // shaders/buffer/conv2d.comp.
 constexpr int CONV_OW_BLOCK = 8;
+
+// Smallest output-channel count routed to the implicit-GEMM kernels.
+constexpr int CONV_IGEMM_MIN_OC = 32;
 
 } // namespace conv2d
 
@@ -325,8 +336,10 @@ class Conv2dImage : public Operator {
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
 };
 
-// Conv2d buffer-backend (SSBO) op. Naive direct convolution: one thread per
-// output element [n,oc,oh,ow], accumulating IC/groups * KH * KW MACs in fp32.
+// Conv2d buffer-backend (SSBO) op. Stride-1 ungrouped 3x3 / 1x1 float convs
+// run as an implicit GEMM (single pass, see the igemm gate in execute()); the
+// rest is direct convolution: one thread per output element [n,oc,oh,ow] (or
+// per 8 columns for 3x3), accumulating IC/groups * KH * KW MACs in fp32.
 // Mirrors the MatMulBuffer two-pass fp16 pattern: the reduce pass (this
 // shader, fp16 build) writes fp32 results to a scratch buffer (one uint per
 // output element — no half2 word race); the pack pass (buffer_matmul_pack,
@@ -598,6 +611,82 @@ class Conv2dBuffer : public BufferFactory {
                                  !std::getenv("VKOP_CONV_ELEM_ONLY");
         const int ow_blk = row_blocked ? conv2d::CONV_OW_BLOCK : 1;
 
+        // Implicit-GEMM route (conv_igemm3 / conv_igemm1 in
+        // buffer/conv2d.comp, both the fp32 and the fp16 module): 128x128 (or
+        // 64x256) output tiles, fp32 accumulation, the output written directly
+        // (in the fp16 build that also drops the scratch + pack pass). It takes
+        // 3x3 (any pad) and 1x1 (pad 0) convs with float weights, groups 1,
+        // stride 1, dilation 1. A rank-5 [N,C,1,H,W] conv with KD == 1 is a 2-D
+        // conv and qualifies. Everything else keeps the direct kernels: byte
+        // weights, groups, strides, dilations, real 3-D convs, other kernel
+        // sizes -- and, in fp16, odd channel or width counts, because that
+        // build moves half pairs as one word (an odd IC would misalign weight
+        // rows, an odd IW / OW input or output rows). Fewer than
+        // CONV_IGEMM_MIN_OC output channels also stay direct: a 64/128-row tile
+        // would be mostly idle (the VAE's 144->4 conv_out ran 4.4x slower on
+        // it). VKOP_CONV_NO_IGEMM=1 pins the direct kernels for A/B runs.
+        const std::type_info &act_t =
+            fp16_ != 0 ? typeid(uint16_t) : typeid(float);
+        const bool ig_ok =
+            !weight_int8 && inputs[0]->dtype() == act_t &&
+            inputs[1]->dtype() == act_t && outputs[0]->dtype() == act_t &&
+            groups_ == 1 && stride_h == 1 && stride_w == 1 && dil_h == 1 &&
+            dil_w == 1 && kd == 1 && in_depth == 1 && out_d == 1 &&
+            pad_d == 0 && out_height > 0 && out_width > 0 &&
+            out_depth >= conv2d::CONV_IGEMM_MIN_OC &&
+            (fp16_ == 0 || depth % 2 == 0) &&
+            !std::getenv("VKOP_CONV_NO_IGEMM");
+        const bool fp16_even_w =
+            fp16_ == 0 || (in_width % 2 == 0 && out_width % 2 == 0);
+        const bool fp16_even_p =
+            fp16_ == 0 || (out_height * out_width) % 2 == 0;
+        int igemm = 0;
+        int ig_tm = 128; // output channels per tile
+        int ig_tn = 128; // output pixels per tile
+        if (ig_ok && kernel_h == 3 && kernel_w == 3 && fp16_even_w) {
+            // Two tiles, the same 8x8 block per lane. 64 channels x 256 pixels
+            // is the default: it was faster even where both grids are full
+            // (1152 -> 1152 @64x64: 13.4 vs 14.9 ms -- a SIMD's 32 lanes then
+            // share one tile row, so every A fetch is a single broadcast), and
+            // it wastes less on channel counts just past a multiple of 128
+            // (144 / 288 / 576 keep 75% / 90% / 100% of the rows busy instead
+            // of 56% / 75% / 90%). 128 x 128 is kept for small maps (< 512
+            // output pixels), where a 256-pixel tile would mostly be padding.
+            // VKOP_CONV_IGEMM_M128=1 pins the 128x128 tile for A/B runs.
+            const int rem = out_depth % 128;
+            const bool small_map = out_height * out_width < 512;
+            if ((!small_map || (rem != 0 && rem <= 64)) &&
+                !std::getenv("VKOP_CONV_IGEMM_M128")) {
+                ig_tm = 64;
+                ig_tn = 256;
+            }
+            // Narrowest power-of-two tile width (16..128) that spans OW, so
+            // narrow maps fill the pixel tile with more rows instead of
+            // masking off columns.
+            int tw = 16;
+            while (tw < 128 && tw < out_width) {
+                tw *= 2;
+            }
+            igemm = tw | (ig_tm == 64 ? 0x100 : 0);
+        } else if (ig_ok && kernel_h == 1 && kernel_w == 1 && pad_h == 0 &&
+                   pad_w == 0 && fp16_even_p) {
+            igemm = 128;
+        }
+        // VKOP_CONV_DEBUG=1: one line per dispatch with the geometry and the
+        // kernel it took (igemm<pc.igemm> / row8 / elem1).
+        if (std::getenv("VKOP_CONV_DEBUG")) {
+            const char *route =
+                igemm != 0 ? "igemm" : (row_blocked ? "row" : "elem");
+            std::fprintf(
+                stderr,
+                "[conv] %s N%d IC%d %dx%dx%d -> OC%d %dx%dx%d k%dx%dx%d "
+                "s%d,%d p%d,%d d%d,%d g%d byte_w=%d fp16=%d route=%s%d\n",
+                name_.c_str(), batch, depth, in_depth, in_height, in_width,
+                out_depth, out_d, out_height, out_width, kd, kernel_h, kernel_w,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups_,
+                weight_int8 ? 1 : 0, fp16_, route, igemm != 0 ? igemm : ow_blk);
+        }
+
         // int8 weight-only quantization: weight (inputs[1]) is int8 and a
         // per-output-channel scale is appended as the last input. Layout:
         //   fp32/fp16, no bias : [X, W]
@@ -625,7 +714,7 @@ class Conv2dBuffer : public BufferFactory {
             bind_ssbo<T>(inputs[1], /*is_output=*/false); // W
         });
 
-        if (fp16_ != 0) {
+        if (fp16_ != 0 && igemm == 0) {
             // fp16 two-pass: scratch holds fp32 reduce results (one uint per
             // output element). Clamp empty (total==0) to a 16-byte dummy —
             // vkCreateBuffer rejects size 0 on Intel, and the dispatch is 0
@@ -697,6 +786,21 @@ class Conv2dBuffer : public BufferFactory {
         pc.fp8 = weight_fp8 ? 1 : 0;
         pc.fp8_e5m2 = wkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
         pc.ow_blk = ow_blk;
+        pc.igemm = igemm;
+
+        if (igemm != 0) {
+            // One workgroup per (ig_tm channels x ig_tn pixels) tile; single
+            // pass.
+            int tiles = 0;
+            if (kernel_w == 1) {
+                tiles = UP_DIV(out_height * out_width, 128);
+            } else {
+                const int tw = igemm & 0xFF;
+                tiles = UP_DIV(out_width, tw) * UP_DIV(out_height, ig_tn / tw);
+            }
+            submit(&pc, tiles, UP_DIV(out_depth, ig_tm), batch);
+            return;
+        }
 
         // gid space: output elements for the element path, (row, chunk) pairs
         // for the blocked path.

@@ -122,6 +122,8 @@ layout(push_constant) uniform PC {
                      // E4M3. Only meaningful with fp8.
     int ow_blk; // output columns per thread: 1 = conv_fp element path,
                  // RW = conv_row3 register-blocked path (host gates the shape)
+    int igemm;  // 0 = direct paths above; else the fp16 implicit-GEMM route:
+                // the 3x3 tile width TW, or 128 for 1x1 (see conv_igemm3)
 } uPC;
 
 // fp32/fp16-weight convolution — the hot path. Same math as the int8 nest
@@ -322,7 +324,448 @@ void conv_row3(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
     }
 }
 
+#ifndef FP8_HW
+// ---------------------------------------------------------------------------
+// Implicit-GEMM convolution (uPC.igemm != 0), fp32 accumulation. Built into
+// both the fp32 and the fp16 module; only global staging and the final store
+// differ between them.
+//
+// A KxK stride-1 dilation-1 ungrouped conv is the GEMM
+//   Y[oc, p] = sum_k W[oc, k] * B[k, p],   k = (ic, ky, kx), p = (oh, ow)
+// with W the weight in its own [OC, IC*KH*KW] layout (no reorder) and B the
+// im2col of X -- which is never materialized: each K step stages the input
+// patch its output pixels touch into shared memory, and the FMA loop reads
+// the KH*KW taps out of that patch.
+//
+// Tile: TM output channels x TN output pixels per 256-lane workgroup, either
+// 128 x 128 or 64 x 256 (3x3 only; uPC.igemm bit 8). Either way a lane owns an
+// 8x8 block -- rows {ty*4..+3, TM/2+ty*4..+3}, pixels {tx*4..+3,
+// TN/2+tx*4..+3} -- the matmul16_tiled128 geometry. For 3x3 the TN pixels are
+// TR rows of TW = uPC.igemm & 0xFF columns (TW*TR = TN, TW in
+// {16,32,64,128}), so each lane's two 4-pixel groups lie inside one output row
+// each. For 1x1 (always 128 x 128) the pixels are simply 128 consecutive
+// flattened positions.
+//
+// Shared layout (one K step):
+//   sIgA: [k][row/4] vec4 -- the weight tile transposed to k-major, so a lane
+//         fetches its 4 rows of one k as a single vec4 (2 per k for 8 rows).
+//   sIgX: the fp32 input patch: [c][TR+2][TW+2] for 3x3 (a 1-pixel halo on
+//         every side; positions outside the image hold 0), [c][128] for 1x1.
+// 3x3: 2 input channels (18 k) per step; a lane reads 6 patch values per
+// (channel, kernel row) and reuses them across the 3 kx taps, so each
+// (channel, ky) costs 6 vec4 A + 12 scalar X reads for 192 FMAs.
+// 1x1: 16 input channels per step, 2 vec4 A + 8 X reads per 64 FMAs.
+// Threadgroup memory: 9216 + 8192 B; nothing else in this module uses any.
+//
+// Measured on the M5 Max (MoltenVK), fp32 VAE decoder shapes: 7.8-8.6
+// TFLOP/s on full tiles (1152/576/288 channels), ~6.5 on 144 channels. What
+// did not help: 4 input channels per step (more staging registers, -14%),
+// fully unrolling the six (channel, ky) iterations (-20%).
+//
+// Global staging is register double-buffered (loads for step s+1 are issued
+// before step s's FMA nest), as in matmul16_tiled128. A staging "word" is one
+// uint of the SSBO: two halves in the fp16 build (IG_EPW = 2), one float in
+// the fp32 build. The epilogue adds bias, applies the fused activation and
+// writes the output directly -- in the fp16 build that means no fp32 scratch
+// and no separate pack pass (pixel pairs are word-aligned because the host
+// requires an even OW, resp. an even OH*OW for 1x1).
+//
+// Host gate (Conv2dBuffer::execute): float weights, groups == 1, stride 1,
+// dilation 1, D == 1, 3x3 or 1x1 (pad 0). The fp16 build additionally needs
+// even IC (weight rows word-aligned) and even IW/OW (3x3) or even OH*OW (1x1).
+#ifdef FP16
+#define IG_EPW 2
+#else
+#define IG_EPW 1
+#endif
+#define IG_ICB1 16  // input channels per K step, 1x1 path (3x3 uses 2)
+// Staging slots per lane (ceil(words / 256)), sized for the larger geometry
+// (conv_igemm3 loops over the ones its tile shape uses).
+#define IG_NA3 ((128 * 18 / IG_EPW + 255) / 256)   // 5 (fp16) / 9 (fp32)
+#define IG_NX3 (IG_EPW == 2 ? 3 : 5)               // patch words, see below
+#define IG_NA1 (128 * IG_ICB1 / IG_EPW / 256)      // 4 / 8
+#define IG_NX1 (IG_ICB1 * 128 / IG_EPW / 256)      // 4 / 8
+shared vec4 sIgA[2 * 9 * 32];   // 576 vec4 = 9216 B (1x1 uses 512)
+shared float sIgX[2048];        // 8192 B (3x3 uses <= 2 * 520)
+
+// Accumulate one k: 8 rows (A0 = rows r..r+3, A1 = rows rh+r..+3) times 8
+// pixels (BA = pixels p..p+3, BB = pixels nh+p..+3).
+#define IG_FMA8R(A0, A1, BA, BB) { \
+    acc00 += (A0).x * (BA); acc01 += (A0).x * (BB); \
+    acc10 += (A0).y * (BA); acc11 += (A0).y * (BB); \
+    acc20 += (A0).z * (BA); acc21 += (A0).z * (BB); \
+    acc30 += (A0).w * (BA); acc31 += (A0).w * (BB); \
+    acc40 += (A1).x * (BA); acc41 += (A1).x * (BB); \
+    acc50 += (A1).y * (BA); acc51 += (A1).y * (BB); \
+    acc60 += (A1).z * (BA); acc61 += (A1).z * (BB); \
+    acc70 += (A1).w * (BA); acc71 += (A1).w * (BB); }
+
+// Sixteen named accumulators rather than an array: the epilogue walks them
+// with literal names, so nothing can be demoted to thread-private memory.
+#define IG_ACC_DECL \
+    vec4 acc00 = vec4(0.0), acc01 = vec4(0.0), acc10 = vec4(0.0), acc11 = vec4(0.0); \
+    vec4 acc20 = vec4(0.0), acc21 = vec4(0.0), acc30 = vec4(0.0), acc31 = vec4(0.0); \
+    vec4 acc40 = vec4(0.0), acc41 = vec4(0.0), acc50 = vec4(0.0), acc51 = vec4(0.0); \
+    vec4 acc60 = vec4(0.0), acc61 = vec4(0.0), acc70 = vec4(0.0), acc71 = vec4(0.0);
+
+// Bias + activation + store of one 4-pixel group. base is the linear output
+// index of the group's first pixel, cnt how many of its 4 pixels exist (the
+// fp16 build only ever sees 0, 2 or 4: pixel pairs are all-in or all-out).
+void ig_store4(vec4 v, float bias, int base, int cnt) {
+    if (cnt <= 0) return;
+    v += bias;
+    v.x = activation(v.x, uPC.activation);
+    v.y = activation(v.y, uPC.activation);
+    v.z = activation(v.z, uPC.activation);
+    v.w = activation(v.w, uPC.activation);
+#ifdef FP16
+    uOutput.data[base >> 1] = packHalf2x16(v.xy);
+    if (cnt >= 4) uOutput.data[(base >> 1) + 1] = packHalf2x16(v.zw);
+#else
+    uOutput.data[base] = floatBitsToUint(v.x);
+    if (cnt >= 2) uOutput.data[base + 1] = floatBitsToUint(v.y);
+    if (cnt >= 3) uOutput.data[base + 2] = floatBitsToUint(v.z);
+    if (cnt >= 4) uOutput.data[base + 3] = floatBitsToUint(v.w);
+#endif
+}
+
+#define IG_EPI_ROW(R, ACC0, ACC1) { \
+    int _oc = oc0 + (R); \
+    if (_oc < uPC.OC) { \
+        float _b = (uPC.has_bias != 0) ? BUF_LOAD(uBias.data, _oc) : 0.0; \
+        int _cb = (n * uPC.OC + _oc) * ostride; \
+        ig_store4(ACC0, _b, _cb + o0, cnt0); \
+        ig_store4(ACC1, _b, _cb + o1, cnt1); \
+    } }
+
+// rh = half the tile's row count: a lane's rows are ty*4..+3 and rh+ty*4..+3.
+#define IG_EPILOGUE \
+    IG_EPI_ROW(ty * 4 + 0, acc00, acc01) \
+    IG_EPI_ROW(ty * 4 + 1, acc10, acc11) \
+    IG_EPI_ROW(ty * 4 + 2, acc20, acc21) \
+    IG_EPI_ROW(ty * 4 + 3, acc30, acc31) \
+    IG_EPI_ROW(rh + ty * 4 + 0, acc40, acc41) \
+    IG_EPI_ROW(rh + ty * 4 + 1, acc50, acc51) \
+    IG_EPI_ROW(rh + ty * 4 + 2, acc60, acc61) \
+    IG_EPI_ROW(rh + ty * 4 + 3, acc70, acc71)
+
+// One weight word (IG_EPW consecutive k of one tile row) -> the transposed A
+// tile, whose k stride is KS vec4 (TM / 4).
+void ig_put_a(int k, int row, uint w, int KS) {
+#ifdef FP16
+    vec2 h = unpackHalf2x16(w);
+    sIgA[k * KS + (row >> 2)][row & 3] = h.x;
+    sIgA[(k + 1) * KS + (row >> 2)][row & 3] = h.y;
+#else
+    sIgA[k * KS + (row >> 2)][row & 3] = uintBitsToFloat(w);
+#endif
+}
+
+// 3x3 tile geometry, from uPC.igemm: bits 0..7 = TW, bit 8 = the 64-channel x
+// 256-pixel tile (else 128 x 128); main() passes bit 8 as a literal so the
+// tile constants fold. Both give every lane the same 8x8 block; the 64-row
+// tile wastes less on an output-channel count just past a multiple of 128
+// (144, 288, 576 = 1.125, 2.25, 4.5 tiles of 128 but 2.25, 4.5, 9 tiles of
+// 64), and a SIMD's 32 lanes share one tile row, so each A fetch is a single
+// broadcast -- it was faster even where both grids are full.
+void conv_igemm3(const bool m64) {
+    const int tid = int(gl_LocalInvocationID.x);
+    const int TM = m64 ? 64 : 128;      // output channels per tile
+    const int TN = m64 ? 256 : 128;     // output pixels per tile
+    const int TXN = TN >> 3;            // lanes across pixels (16 / 32)
+    const int tx = tid % TXN;
+    const int ty = tid / TXN;
+    const int rh = TM >> 1;
+    const int nh = TN >> 1;
+    const int KS = TM >> 2;             // sIgA vec4 per k
+    const int TW = uPC.igemm & 0xFF;
+    const int TR = TN / TW;
+    const int PW = TW + 2;
+    const int PR = TR + 2;
+    const int PCH = PR * PW;
+    const int tiles_w = (uPC.OW + TW - 1) / TW;
+    const int gx = int(gl_WorkGroupID.x);
+    const int ow0 = (gx % tiles_w) * TW;
+    const int oh0 = (gx / tiles_w) * TR;
+    const int oc0 = int(gl_WorkGroupID.y) * TM;
+    const int n = int(gl_WorkGroupID.z);
+    const int IC = uPC.IC;
+    const int IH = uPC.IH;
+    const int IW = uPC.IW;
+
+    // A staging: TM rows x 18 k (2 channels x 9 taps) per step = RWD words
+    // per row. Row oc's words for channel pair ic0 start at (oc*IC*9 +
+    // ic0*9) / IG_EPW; in the fp16 build IC and ic0 are even, so that start is
+    // word-aligned. Slots whose row is past OC (or past the tile) read 0.
+    const int RWD = 18 / IG_EPW;
+    const int AW = TM * RWD;
+    // Slots actually used by this tile shape. Both fold to constants once m64
+    // is a literal, so the 64-row tile does not carry the 128-row tile's
+    // staging registers (fp32: 5 + 5 instead of 9 + 5).
+    const int NA = (AW + 255) / 256;
+    const int NX = m64 ? IG_NX3 : (IG_EPW == 2 ? 2 : 4);
+    const int kwords = (IC * 9) / IG_EPW;
+    int a_off[IG_NA3];
+    for (int j = 0; j < NA; ++j) {
+        int w = tid + 256 * j;
+        int row = w / RWD;
+        bool ok = w < AW && oc0 + row < uPC.OC;
+        a_off[j] = ok ? (oc0 + row) * kwords + (w - row * RWD) : -1;
+    }
+    // X staging: 2 channels x PR rows x NWR words of the TW+2-column patch.
+    // fp32: one word per patch column, starting at the patch origin
+    //   xs = ow0 - pad_w. fp16: the words start at the even column e0 at or
+    //   below xs (IW even keeps every input row word-aligned and makes each
+    //   word all-in or all-out of the image); the low half of word w is patch
+    //   column (e0 - xs) + 2w, which is -1 for w = 0 when xs is odd, and the
+    //   last word overhangs the patch by one column (xs odd) or entirely (xs
+    //   even, e.g. pad 0): halves outside [0, PW) are dropped, never spilled
+    //   into the next row.
+    // Words per step: fp16 2*PR*(TW/2+2) <= 528, fp32 2*PR*(TW+2) <= 1040,
+    // hence IG_NX3 = 3 / 5 slots.
+    const int xs = ow0 - uPC.pad_w;
+#ifdef FP16
+    const int e0 = xs & ~1;
+    const int NWR = (TW >> 1) + 2;
+#else
+    const int e0 = xs;
+    const int NWR = PW;
+#endif
+    const int XW = 2 * PR * NWR;
+    int x_off[IG_NX3];
+    int x_dst[IG_NX3];
+    int x_pc[IG_NX3];
+    for (int j = 0; j < NX; ++j) {
+        int e = tid + 256 * j;
+        int c = e / (PR * NWR);
+        int rem = e - c * PR * NWR;
+        int r = rem / NWR;
+        int w = rem - r * NWR;
+        int iy = oh0 + r - uPC.pad_h;
+        int col = e0 + IG_EPW * w;
+        bool ok = e < XW && iy >= 0 && iy < IH && col >= 0 && col < IW;
+        x_off[j] = ok ? (((n * IC + c) * IH + iy) * IW + col) / IG_EPW : -1;
+        x_pc[j] = e < XW ? col - xs : -1000;   // -1000: slot unused
+        x_dst[j] = c * PCH + r * PW + (col - xs);
+    }
+
+    // Channel 1 of a step exists unless IC is odd (fp32 build only) and this
+    // is the last step; its words are then masked to 0 so it adds nothing.
+    const bool c1_ok0 = IC > 1;
+    uint ra[IG_NA3];
+    uint rx[IG_NX3];
+    for (int j = 0; j < NA; ++j) {
+        bool ok = a_off[j] >= 0 && (c1_ok0 || ((tid + 256 * j) % RWD) * IG_EPW < 9);
+        ra[j] = ok ? uInputW.data[a_off[j]] : 0u;
+    }
+    for (int j = 0; j < NX; ++j) {
+        bool ok = x_off[j] >= 0 && (c1_ok0 || x_dst[j] < PCH);
+        rx[j] = ok ? uInputX.data[x_off[j]] : 0u;
+    }
+
+    // This lane's two pixel groups inside the tile, as patch offsets.
+    const int p0 = tx * 4;
+    const int p1 = nh + tx * 4;
+    const int pr0 = p0 / TW;
+    const int pc0 = p0 - pr0 * TW;
+    const int pr1 = p1 / TW;
+    const int pc1 = p1 - pr1 * TW;
+    const int xb0 = pr0 * PW + pc0;
+    const int xb1 = pr1 * PW + pc1;
+    const int x_step = 2 * IH * IW / IG_EPW;  // two channels, in words
+
+    IG_ACC_DECL
+
+    const int nsteps = (IC + 1) >> 1;
+    for (int s = 0; s < nsteps; ++s) {
+        barrier();
+        for (int j = 0; j < NA; ++j) {
+            int w = tid + 256 * j;
+            if (w < AW) {
+                int row = w / RWD;
+                ig_put_a(IG_EPW * (w - row * RWD), row, ra[j], KS);
+            }
+        }
+        for (int j = 0; j < NX; ++j) {
+            int pc = x_pc[j];
+#ifdef FP16
+            vec2 h = unpackHalf2x16(rx[j]);
+            if (pc >= 0 && pc < PW) sIgX[x_dst[j]] = h.x;
+            if (pc + 1 >= 0 && pc + 1 < PW) sIgX[x_dst[j] + 1] = h.y;
+#else
+            if (pc >= 0) sIgX[x_dst[j]] = uintBitsToFloat(rx[j]);
+#endif
+        }
+        barrier();
+        if (s + 1 < nsteps) {
+            const bool c1_ok = 2 * (s + 1) + 1 < IC;
+            for (int j = 0; j < NA; ++j) {
+                if (a_off[j] >= 0) a_off[j] += RWD;
+                bool ok = a_off[j] >= 0;
+#ifndef FP16
+                ok = ok && (c1_ok || ((tid + 256 * j) % RWD) < 9);
+#endif
+                ra[j] = ok ? uInputW.data[a_off[j]] : 0u;
+            }
+            for (int j = 0; j < NX; ++j) {
+                if (x_off[j] >= 0) x_off[j] += x_step;
+                bool ok = x_off[j] >= 0;
+#ifndef FP16
+                ok = ok && (c1_ok || x_dst[j] < PCH);
+#endif
+                rx[j] = ok ? uInputX.data[x_off[j]] : 0u;
+            }
+        }
+        // One (channel, kernel row) per iteration: 6 patch values per pixel
+        // group, reused across the 3 kx taps, and all six A fetches issued
+        // before the first FMA (interleaving them with the FMAs cost ~25%).
+        // Fully unrolling these six iterations was slower still.
+        for (int c = 0; c < 2; ++c) {
+            for (int ky = 0; ky < 3; ++ky) {
+                int q0 = c * PCH + ky * PW + xb0;
+                int q1 = c * PCH + ky * PW + xb1;
+                float u0 = sIgX[q0], u1 = sIgX[q0 + 1], u2 = sIgX[q0 + 2];
+                float u3 = sIgX[q0 + 3], u4 = sIgX[q0 + 4], u5 = sIgX[q0 + 5];
+                float v0 = sIgX[q1], v1 = sIgX[q1 + 1], v2 = sIgX[q1 + 2];
+                float v3 = sIgX[q1 + 3], v4 = sIgX[q1 + 4], v5 = sIgX[q1 + 5];
+                int kb = (c * 9 + ky * 3) * KS + ty;
+                vec4 a00 = sIgA[kb], a01 = sIgA[kb + (KS >> 1)];
+                vec4 a10 = sIgA[kb + KS], a11 = sIgA[kb + KS + (KS >> 1)];
+                vec4 a20 = sIgA[kb + 2 * KS], a21 = sIgA[kb + 2 * KS + (KS >> 1)];
+                IG_FMA8R(a00, a01, vec4(u0, u1, u2, u3), vec4(v0, v1, v2, v3))
+                IG_FMA8R(a10, a11, vec4(u1, u2, u3, u4), vec4(v1, v2, v3, v4))
+                IG_FMA8R(a20, a21, vec4(u2, u3, u4, u5), vec4(v2, v3, v4, v5))
+            }
+        }
+    }
+
+    const int ostride = uPC.OH * uPC.OW;
+    const int oh_0 = oh0 + pr0;
+    const int ow_0 = ow0 + pc0;
+    const int oh_1 = oh0 + pr1;
+    const int ow_1 = ow0 + pc1;
+    const int cnt0 = oh_0 < uPC.OH ? clamp(uPC.OW - ow_0, 0, 4) : 0;
+    const int cnt1 = oh_1 < uPC.OH ? clamp(uPC.OW - ow_1, 0, 4) : 0;
+    const int o0 = oh_0 * uPC.OW + ow_0;
+    const int o1 = oh_1 * uPC.OW + ow_1;
+    IG_EPILOGUE
+}
+
+// 1x1: always the 128 x 128 tile.
+void conv_igemm1() {
+    const int tid = int(gl_LocalInvocationID.x);
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const int rh = 64;
+    const int P = uPC.OH * uPC.OW;  // == IH*IW (stride 1, pad 0)
+    const int pix0 = int(gl_WorkGroupID.x) * 128;
+    const int oc0 = int(gl_WorkGroupID.y) * 128;
+    const int n = int(gl_WorkGroupID.z);
+    const int IC = uPC.IC;
+
+    // A: 128 rows x 16 channels per step (AWR words per row); X: 16 channels
+    // x 128 pixels (XWR words per channel). A word is IG_EPW channels (A) or
+    // pixels (X); in the fp16 build even IC / even P make it all-in or all-out.
+    const int AWR = IG_ICB1 / IG_EPW;
+    const int XWR = 128 / IG_EPW;
+    int a_off[IG_NA1];
+    int x_off[IG_NX1];
+    for (int j = 0; j < IG_NA1; ++j) {
+        int w = tid + 256 * j;
+        int row = w / AWR;
+        a_off[j] = oc0 + row < uPC.OC ? (oc0 + row) * (IC / IG_EPW) + (w - row * AWR) : -1;
+    }
+    for (int j = 0; j < IG_NX1; ++j) {
+        int w = tid + 256 * j;
+        int c = w / XWR;
+        int px = pix0 + IG_EPW * (w - c * XWR);
+        x_off[j] = px < P ? ((n * IC + c) * P + px) / IG_EPW : -1;
+    }
+    uint ra[IG_NA1];
+    uint rx[IG_NX1];
+    for (int j = 0; j < IG_NA1; ++j) {
+        int k = IG_EPW * ((tid + 256 * j) % AWR);
+        ra[j] = (a_off[j] >= 0 && k < IC) ? uInputW.data[a_off[j]] : 0u;
+    }
+    for (int j = 0; j < IG_NX1; ++j) {
+        int c = (tid + 256 * j) / XWR;
+        rx[j] = (x_off[j] >= 0 && c < IC) ? uInputX.data[x_off[j]] : 0u;
+    }
+
+    IG_ACC_DECL
+
+    const int nsteps = (IC + IG_ICB1 - 1) / IG_ICB1;
+    for (int s = 0; s < nsteps; ++s) {
+        barrier();
+        for (int j = 0; j < IG_NA1; ++j) {
+            int w = tid + 256 * j;
+            int row = w / AWR;
+            ig_put_a(IG_EPW * (w - row * AWR), row, ra[j], 32);
+        }
+        for (int j = 0; j < IG_NX1; ++j) {
+            int w = tid + 256 * j;
+            int c = w / XWR;
+            int d = c * 128 + IG_EPW * (w - c * XWR);
+#ifdef FP16
+            vec2 h = unpackHalf2x16(rx[j]);
+            sIgX[d] = h.x;
+            sIgX[d + 1] = h.y;
+#else
+            sIgX[d] = uintBitsToFloat(rx[j]);
+#endif
+        }
+        barrier();
+        if (s + 1 < nsteps) {
+            int ic1 = (s + 1) * IG_ICB1;
+            for (int j = 0; j < IG_NA1; ++j) {
+                int k = IG_EPW * ((tid + 256 * j) % AWR);
+                if (a_off[j] >= 0) a_off[j] += AWR;
+                ra[j] = (a_off[j] >= 0 && ic1 + k < IC) ? uInputW.data[a_off[j]] : 0u;
+            }
+            for (int j = 0; j < IG_NX1; ++j) {
+                int c = (tid + 256 * j) / XWR;
+                if (x_off[j] >= 0) x_off[j] += (IG_ICB1 / IG_EPW) * P;
+                rx[j] = (x_off[j] >= 0 && ic1 + c < IC) ? uInputX.data[x_off[j]] : 0u;
+            }
+        }
+        // Two k per iteration, every shared read issued before the FMAs.
+        for (int k = 0; k < IG_ICB1; k += 2) {
+            int xb = k * 128 + tx * 4;
+            vec4 b0 = vec4(sIgX[xb], sIgX[xb + 1], sIgX[xb + 2], sIgX[xb + 3]);
+            vec4 b1 = vec4(sIgX[xb + 64], sIgX[xb + 65], sIgX[xb + 66], sIgX[xb + 67]);
+            vec4 b2 = vec4(sIgX[xb + 128], sIgX[xb + 129], sIgX[xb + 130], sIgX[xb + 131]);
+            vec4 b3 = vec4(sIgX[xb + 192], sIgX[xb + 193], sIgX[xb + 194], sIgX[xb + 195]);
+            int kb = k * 32 + ty;
+            vec4 a00 = sIgA[kb], a01 = sIgA[kb + 16];
+            vec4 a10 = sIgA[kb + 32], a11 = sIgA[kb + 48];
+            IG_FMA8R(a00, a01, b0, b1)
+            IG_FMA8R(a10, a11, b2, b3)
+        }
+    }
+
+    const int ostride = P;
+    const int o0 = pix0 + tx * 4;
+    const int o1 = pix0 + 64 + tx * 4;
+    const int cnt0 = clamp(P - o0, 0, 4);
+    const int cnt1 = clamp(P - o1, 0, 4);
+    IG_EPILOGUE
+}
+#endif  // !FP8_HW
+
 void main() {
+#ifndef FP8_HW
+    // Implicit-GEMM route (host-gated; the grid is tiles, not elements).
+    if (uPC.igemm != 0) {
+        if (uPC.KW == 1) {
+            conv_igemm1();
+        } else if ((uPC.igemm & 0x100) != 0) {
+            conv_igemm3(true);  // literal arguments: the tile constants fold
+        } else {
+            conv_igemm3(false);
+        }
+        return;
+    }
+#endif
     int gid = int(gl_GlobalInvocationID.x);
     // 3D-convolution layout: input [N,IC,ID,IH,IW], weight [OC,icg,KD,KH,KW],
     // output [N,OC,OD,OH,OW]. A 2-D conv is the special case ID=OD=KD=1,
