@@ -66,7 +66,12 @@ shared int sh_indices[MAX_CANDIDATES]; // original box index in [0, N)
 // 1/0 rather than a bool array: shared bool arrays are rejected by some
 // targets, and the predicate is uniform so an integer costs nothing.
 shared uint sh_active[MAX_CANDIDATES];
-shared uint sh_selected[MAX_CANDIDATES];
+// No sh_selected[] list: a kept box is one still active when the loop reaches
+// it, and suppression only clears boxes AFTER the current one, so the kept set
+// is exactly the first sh_selected_count active entries in index order. Phase
+// 3 walks sh_active for them. Dropping the 4 KB list keeps the workgroup under
+// Apple's 32 KB threadgroup limit (it was 32796 bytes; MoltenVK refused the
+// pipeline).
 shared uint sh_selected_count;
 shared uint sh_actual_count;
 shared uint sh_current_is_best;
@@ -190,7 +195,6 @@ void main() {
         if (gid == 0u) {
             if (sh_active[i] != 0u) {
                 current_is_best = 1u;
-                sh_selected[sh_selected_count] = i;
                 sh_selected_count++;
             }
         }
@@ -218,10 +222,13 @@ void main() {
     // === PHASE 3: Write results to global output buffer ===
     if (gid == 0u && sh_selected_count > 0u) {
         uint base_offset = atomicAdd(uCounter.total_count, sh_selected_count);
-        for (uint i = 0u; i < sh_selected_count; ++i) {
-            uOutput.data[(base_offset + i) * 3u] = int(batch_id);
-            uOutput.data[(base_offset + i) * 3u + 1u] = int(class_id);
-            uOutput.data[(base_offset + i) * 3u + 2u] = sh_indices[sh_selected[i]];
+        uint k = 0u;
+        for (uint i = 0u; i < sh_actual_count && k < sh_selected_count; ++i) {
+            if (sh_active[i] == 0u) continue;
+            uOutput.data[(base_offset + k) * 3u] = int(batch_id);
+            uOutput.data[(base_offset + k) * 3u + 1u] = int(class_id);
+            uOutput.data[(base_offset + k) * 3u + 2u] = sh_indices[i];
+            k++;
         }
     }
     // No sentinel row: the selected-box count is read back from total_count,
