@@ -126,6 +126,11 @@ TEST(ConcatTest, ConcatComprehensiveTest) {
         {{{1, 2, 16}, {1, 2, 16}}, 0},
         {{{1, 14, 64},{1, 14, 16},{1, 14, 40}}, 2},
         {{{1, 4, 84}, {1, 80, 84}}, 1},
+        // DiT joint attention: text + image tokens along the sequence axis.
+        {{{1, 24, 2, 128}, {1, 40, 2, 128}}, 1},
+        {{{2, 3, 6}, {2, 5, 6}, {2, 1, 6}}, 1},
+        {{{3, 2, 8}, {3, 2, 6}}, 2},
+        {{{2, 3, 5}, {2, 2, 5}}, 1},
 
     };
     for (const auto &test_case : test_cases) {

@@ -25,7 +25,7 @@ layout(set = 0, binding = 0) readonly buffer BdaTable {
 #define uOutput (uBdaTable.b0)
 #define uInput (uBdaTable.b1)
 #else
-layout(set = 0, binding = 0) writeonly buffer Output {
+layout(set = 0, binding = 0) buffer Output {
     uint data[];
 } uOutput;
 layout(set = 0, binding = 1) readonly buffer Input {
@@ -45,12 +45,23 @@ layout(push_constant) uniform PC_uConcat {
 } uConcat;
 
 // Map an input element index to the output element index (axis offset added).
-int concat_elem(int gid) {
-    IArr8 in_coord = linear_to_nd8(gid, uConcat.inDims, uConcat.rank);
-    IArr8 out_coord;
-    for (int i = 0; i < 8; ++i) out_coord.v[i] = in_coord.v[i];
-    out_coord.v[uConcat.axis] += uConcat.offset;
-    return nd_to_linear8(out_coord, uConcat.outDims, uConcat.rank);
+// Concat only shifts the axis coordinate, so with inner = prod(dims after
+// axis) an input element e lands at
+//   (e / blk_in) * blk_out + offset * inner + e % blk_in
+// where blk_in = inDims[axis] * inner and blk_out = outDims[axis] * inner:
+// one div/mod instead of a full N-d decomposition per element.
+// Dims are copied out of the push constant before being indexed by the
+// runtime axis: indexing the push-constant array directly reads wrong values
+// once SPIRV-Cross lowers it to MSL (every input landed at offset 0).
+int concat_inner(IArr8 od, int axis, int rank) {
+    int inner = 1;
+    for (int i = axis + 1; i < rank; ++i) inner *= od.v[i];
+    return inner;
+}
+
+int concat_elem(int e, int blk_in, int blk_out, int base) {
+    int q = e / blk_in;
+    return q * blk_out + base + (e - q * blk_in);
 }
 
 void main() {
@@ -58,39 +69,43 @@ void main() {
     int rank = uConcat.rank;
     int in_total = 1;
     for (int i = 0; i < rank; ++i) in_total *= uConcat.inDims.v[i];
-
+    IArr8 id = uConcat.inDims;
+    IArr8 od = uConcat.outDims;
+    int axis = uConcat.axis;
+    int inner = concat_inner(od, axis, rank);
+    int blk_in = id.v[axis] * inner;
+    int blk_out = od.v[axis] * inner;
+    int base = uConcat.offset * inner;
 #ifdef FP16
-    // fp16 packs two halfs per uint word. One thread per input word: elements
-    // 2*gid (lo) and 2*gid+1 (hi). Each maps (non-contiguously under concat)
-    // to its own output element via concat_elem; the two results are packed
-    // into one output word written once — no read-modify-write race.
+    // Word-aligned case: both blocks and the shift are even, so every input
+    // word maps whole onto one output word.
+    if (((blk_in | blk_out | base) & 1) == 0) {
+        int nw = in_total >> 1;
+        if (gid >= nw) return;
+        int hb_in = blk_in >> 1;
+        int q = gid / hb_in;
+        uOutput.data[q * (blk_out >> 1) + (base >> 1) + (gid - q * hb_in)] =
+            uInput.data[gid];
+        return;
+    }
+    // Odd blocks: an output word can straddle two inputs, which are written
+    // by separate dispatches, so a whole-word store would clobber the half
+    // that belongs to the neighbouring input. Write each half on its own with
+    // atomics (clear our half, then set it); the other half is never touched.
     int nwords = (in_total + 1) / 2;
     if (gid >= nwords) return;
-    int e0 = 2 * gid;
-    int e1 = 2 * gid + 1;
-    int o0 = concat_elem(e0);
-    float v0 = BUF_LOAD(uInput.data, e0);
-    if (e1 >= in_total) {
-        uOutput.data[o0 >> 1] = packHalf2x16(vec2(v0, 0.0));
-    } else {
-        float v1 = BUF_LOAD(uInput.data, e1);
-        int o1 = concat_elem(e1);
-        // e0 and e1 are contiguous input elements (word gid), but under concat
-        // their output positions o0,o1 are also contiguous (the axis offset is
-        // constant; only the axis coord differs by 1, and it lands in the same
-        // output word when the axis is the fastest-varying dim, or in adjacent
-        // words otherwise). Pack into o0's word when o0 and o1 share a word;
-        // otherwise store separately (each into its own word's low half).
-        if ((o0 >> 1) == (o1 >> 1)) {
-            uOutput.data[o0 >> 1] = packHalf2x16(vec2(v0, v1));
-        } else {
-            uOutput.data[o0 >> 1] = packHalf2x16(vec2(v0, 0.0));
-            uOutput.data[o1 >> 1] = packHalf2x16(vec2(v1, 0.0));
-        }
+    uint w = uInput.data[gid];
+    for (int h = 0; h < 2; ++h) {
+        int e = 2 * gid + h;
+        if (e >= in_total) break;
+        int o = concat_elem(e, blk_in, blk_out, base);
+        uint sh = uint(o & 1) * 16u;
+        uint bits = ((w >> (uint(h) * 16u)) & 0xFFFFu) << sh;
+        atomicAnd(uOutput.data[o >> 1], ~(0xFFFFu << sh));
+        atomicOr(uOutput.data[o >> 1], bits);
     }
 #else
     if (gid >= in_total) return;
-    int out_linear = concat_elem(gid);
-    uOutput.data[out_linear] = floatBitsToUint(float(BUF_LOAD(uInput.data, gid)));
+    uOutput.data[concat_elem(gid, blk_in, blk_out, base)] = uInput.data[gid];
 #endif
 }
