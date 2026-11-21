@@ -1433,14 +1433,15 @@ class FusionOptimizer:
                 "fold_fp32_softmax_island",
                 FusionOptimizer.match_fp32_softmax_island,
                 FusionOptimizer.fold_fp32_softmax_island,
-                # After fuse_into_attention (75) on purpose: the fold must not
-                # change what attention fusion matches. Run first, it removed
-                # the Casts that kept Qwen-Image's MatMul/Softmax/MatMul out of
-                # the Attention op, whose one-workgroup-per-query-row kernel is
-                # 3x slower at 1024 query rows (332 vs ~111 ms per step).
-                # Before fuse_elemwise_chain (60), which would otherwise swallow
-                # the up-cast into the scale/bias chain.
-                priority=70,
+                # Before fuse_into_attention (75): with the Casts gone the
+                # MatMul/Softmax/MatMul chain fuses into Attention, whose tiled
+                # many-row kernel (attention_flash.comp) matches the unfused
+                # chain on Qwen-Image's 32x1024x1088 layers (2.17 ms/layer,
+                # ~1.43 s/step either way) without materializing the scores.
+                # (On the old one-workgroup-per-row kernel this ordering cost
+                # 332 vs ~72 ms per step.) Also before fuse_elemwise_chain
+                # (60), which would otherwise swallow the up-cast.
+                priority=97,
             )
         )
         optimizer.register_pass(

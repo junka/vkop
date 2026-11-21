@@ -648,7 +648,7 @@ give median rounds 36.2 / 40.5 / 41.4 ms with WIDE versus 41.5 / 41.6 / 44.7 ms 
 winning every pair. `MatMulInt8WeightOnlyBuffer` and `MatMulFp8WeightOnlyBuffer` now include N=896
 single-row shapes, the smallest that reach this kernel.
 
-### 2026-11-21: 1.5 s/step, 75 s per sample, and MatMul is now 92% of the step
+### 2026-11-21: 1.4–1.6 s/step, 71 s per sample, VAE 0.8 s; MatMul is ~92% of the step
 
 Same command as the `benchmark/README.md` row (512×512, 40 steps, seed 7,
 "A red fox sitting on a wooden bench in a sunlit park"), `VKOP_RUN_PROFILE=1`:
@@ -688,6 +688,36 @@ measured with `VKOP_SUBMIT_PROF=1` over 6 steps, which runs cooler than the 40-s
 | reconversion: Min/Max into FE chains, `LN(x,1,0)*s → LN(x,s,0)` | ~1.47 s | 1204 → 1012 nodes, Mul/Min/Max (12.5 ms) gone |
 | `image_gen` uploads static inputs once | ~1.47 s + 3 ms host | host time between steps 121 → ~8 ms |
 | fp16 attention scores: drop the fp32 Softmax island, one-pass fp16 row Softmax | ~1.435 s | Softmax 22.1 → 11.3 ms, Cast 16.8 → 0, FE 25.6 → 20.4 ms; 980 nodes |
+| tiled flash-attention kernel (`attention_flash.comp`); island fold moved before attention fusion | ~1.43 s | attention 69.4 ms (2.17 ms/layer) vs ~72 ms unfused; scores never materialized; 884 nodes |
+
+40 steps with all of the above, on a hot machine (median step 1.59 s): text tower 2.24 s load,
+prefill 0.19 s, denoising **62.9 s**, VAE **0.80 s**, wall clock **71.2 s**.
+
+**Attention.** The runtime `Attention` op used to run one workgroup per query row, which re-reads
+all of K/V per row and is 4× too slow at many rows. `attention_flash.comp` processes one
+64-row block of one head per 256-thread workgroup, walking K/V in 64-wide tiles with an online
+softmax in fp32, using 24 KB of shared memory. It is routed for fp16 with at least 48 query
+rows and at least 16 row blocks; decode (S = 1) keeps the row kernel. `VKOP_ATTN_FLASH=0` pins
+the old kernel. `benchmark/bench_attention.cpp`, old vs new:
+
+| Shape | Old | New |
+|---|---|---|
+| DiT layer: 32 heads, 1024 × 1088, D 128, mask | 10.40 ms | 2.41 ms |
+| LLM: 16/8 heads, causal, S 2048 | 11.47 ms | 2.60 ms |
+| LLM: 16/8 heads, causal mask, S 1024 | 2.92 ms | 1.09 ms |
+| ViT: 1024 rows, D 64 / D 80 | 2.50 / 3.16 ms | 0.81 / 0.88 ms |
+
+On the DiT it ties the now-cheaper unfused chain. It wins outright on LLM prefill and ViT towers,
+which always went through the fused op.
+
+**VAE.** Conv2d went from 3700 to 573 ms (1.15 → 7.4 TFLOPS), and the decode from 3.9 to
+0.75–0.8 s. Stride-1 3×3 and 1×1 convs now run as an implicit GEMM in `conv2d.comp`
+(`conv_igemm3` / `conv_igemm1`, 17 KB shared memory): weights stay in their [OC, IC·9] layout,
+and each K step stages its input patch with a halo, so no im2col buffer is written. The big
+convs went 562 → 50, 465 → 46 and 217 → 46 ms, and the 1×1 shortcuts 86–100 → 3–6 ms. The
+decoded image matches the old kernels to 5e-5. Note that **this VAE graph is fp32 end to end**;
+the fp16 build of the kernel is covered only by op tests and `benchmark/bench_conv.cpp`.
+`VKOP_CONV_NO_IGEMM=1` pins the old kernels.
 
 Where the step goes now (one 6-step-profile step, ms):
 
@@ -713,10 +743,8 @@ wrote fp32 to a scratch buffer, allocated `total×4` bytes on every execute, the
 - A tiled flash attention would not buy much here: QK + PV is ~580 GFLOP/step, which is already
   ~55 ms at MatMul speed.
 
-- **The VAE's Conv2d** is the biggest gap to peak: 3.67 of its 3.8 s. The 3×3 resample convs
-  run at 0.7–1.8 TFLOPS (up3: 391 GFLOP in 562 ms), and the 1×1 shortcut, which is a plain GEMM,
-  at 0.22 TFLOPS. At MatMul-tile speed (~10 TFLOPS), an implicit-GEMM conv would bring the VAE
-  under ~0.5 s.
+- **VAE in fp16**: the graph is still fp32. Converting it with `-q fp16` would halve its
+  traffic; the implicit-GEMM fp16 build is already a few percent faster than fp32.
 - **MatMul** is the remaining lever. The 128 tile sits at about 81% of the FMA ceiling this
   kernel shape reaches (~13.3 TFLOPS). The next step is Apple's `simdgroup_matrix` via coopmat 8×8
   SPIR-V, which MoltenVK accepts without advertising the extension. A naive version of that
