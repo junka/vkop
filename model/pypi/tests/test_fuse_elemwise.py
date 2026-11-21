@@ -514,3 +514,40 @@ def test_layernorm_scale_needs_unit_affine():
     for kw in ({"gamma": 2.0}, {"beta": 0.5}, {"scale_shape": (1, 4, 16)}):
         m = run_fusion(_make_ln_scale(**kw))
         assert "Mul_0" in m.nodes, (kw, [n.op_type for n in m.nodes.values()])
+
+
+def _make_softmax_island(extra_reader=False):
+    m = DAGBasedModel()
+    X = dict(tdict("X", [1, 2, 4, 8]), dtype=10)
+    x32 = dict(tdict("x32", [1, 2, 4, 8]), dtype=1)
+    p32 = dict(tdict("p32", [1, 2, 4, 8]), dtype=1)
+    out = dict(tdict("out", [1, 2, 4, 8]), dtype=10)
+    nodes = [Node("Cast", "Cast_up", {"to": 1}, [X], [x32]),
+             Node("Softmax", "Softmax_0", {"axis": -1}, [x32], [p32]),
+             Node("Cast", "Cast_down", {"to": 10}, [p32], [out])]
+    outs = [out]
+    if extra_reader:
+        n32 = dict(tdict("n32", [1, 2, 4, 8]), dtype=1)
+        nodes.append(Node("Neg", "Neg_0", {}, [dict(p32)], [n32]))
+        outs.append(n32)
+    for n in nodes:
+        m.nodes[n.name] = n
+    m.inputs = [X]
+    m.outputs = outs
+    m.build_dependencies()
+    return m
+
+
+def test_fp32_softmax_island_folds():
+    """Cast(f16->f32) -> Softmax -> Cast(f32->f16) runs as one fp16 Softmax."""
+    m = run_fusion(_make_softmax_island())
+    types = [n.op_type for n in m.nodes.values()]
+    assert types == ["Softmax"], types
+    sm = next(iter(m.nodes.values()))
+    assert sm.inputs[0]["name"] == "X" and sm.outputs[0]["name"] == "out"
+
+
+def test_fp32_softmax_island_kept_when_fp32_result_is_read():
+    """Another reader of the fp32 probabilities keeps the island."""
+    m = _make_softmax_island(extra_reader=True)
+    assert FusionOptimizer.match_fp32_softmax_island(m) == []

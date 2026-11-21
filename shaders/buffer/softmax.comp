@@ -107,10 +107,65 @@ void pack_pass() {
 }
 #endif
 
+#ifdef FP16
+// ---- fp16 row pass: softmax over the innermost axis, even length. ----
+// Each row then starts on a word boundary and owns all of its words, so the
+// workgroup writes packed half2 straight to uOutput: one pass, no fp32
+// scratch round trip (the host skips the pack dispatch and the scratch
+// buffer). Reads and math stay fp32 per element. Attention scores
+// ([B,H,S,kv] with softmax over kv) are this case.
+void row_pass(uint wg, uint lid) {
+    int nw = uSoft.axis_size >> 1;
+    int base = int(wg) * nw;
+    float localMax = -1e30f;
+    for (int w = int(lid); w < nw; w += int(gl_WorkGroupSize.x)) {
+        vec2 v = unpackHalf2x16(uInput.data[base + w]);
+        localMax = max(localMax, max(v.x, v.y));
+    }
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_MAX(s_max, localMax);
+#else
+    s_max[lid] = localMax;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) s_max[lid] = max(s_max[lid], s_max[lid + s]);
+        barrier();
+    }
+#endif
+    float globalMax = s_max[0];
+    float localSum = 0.0f;
+    for (int w = int(lid); w < nw; w += int(gl_WorkGroupSize.x)) {
+        vec2 v = unpackHalf2x16(uInput.data[base + w]);
+        localSum += exp(v.x - globalMax) + exp(v.y - globalMax);
+    }
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM(s_sum, localSum);
+#else
+    s_sum[lid] = localSum;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) s_sum[lid] += s_sum[lid + s];
+        barrier();
+    }
+#endif
+    float globalSum = s_sum[0];
+    for (int w = int(lid); w < nw; w += int(gl_WorkGroupSize.x)) {
+        vec2 v = unpackHalf2x16(uInput.data[base + w]);
+        vec2 r = vec2(exp(v.x - globalMax), exp(v.y - globalMax)) / globalSum;
+        uOutput.data[base + w] = packHalf2x16(r);
+    }
+}
+#endif
+
 void main() {
 #ifdef FP16
     if (uSoft.axis_size == 0) {
         pack_pass();
+        return;
+    }
+    if (uSoft.inner_size == 1 && (uSoft.axis_size & 1) == 0) {
+        if (gl_WorkGroupID.x < uint(uSoft.outer_size))
+            row_pass(gl_WorkGroupID.x, gl_LocalInvocationID.x);
         return;
     }
 #endif

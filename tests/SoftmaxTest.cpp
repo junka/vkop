@@ -199,6 +199,11 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
         {{1, 8, 64, 1}, 1},
         {{2, 6, 1, 32}, 2},
         {{2, 4, 8, 8}, 0},
+        // Innermost axis: even length takes the fp16 single-pass row path
+        // (attention scores, a row longer than the workgroup), odd length
+        // keeps the scratch + pack path.
+        {{1, 2, 8, 1088}, 3},
+        {{1, 2, 3, 7}, 3},
     };
     for (const auto &test_case: test_cases) {
         auto [input_shape, axis] = test_case;

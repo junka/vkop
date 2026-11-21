@@ -1430,6 +1430,21 @@ class FusionOptimizer:
         )
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "fold_fp32_softmax_island",
+                FusionOptimizer.match_fp32_softmax_island,
+                FusionOptimizer.fold_fp32_softmax_island,
+                # After fuse_into_attention (75) on purpose: the fold must not
+                # change what attention fusion matches. Run first, it removed
+                # the Casts that kept Qwen-Image's MatMul/Softmax/MatMul out of
+                # the Attention op, whose one-workgroup-per-query-row kernel is
+                # 3x slower at 1024 query rows (332 vs ~111 ms per step).
+                # Before fuse_elemwise_chain (60), which would otherwise swallow
+                # the up-cast into the scale/bias chain.
+                priority=70,
+            )
+        )
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "fold_cast_wrapped_layernorm",
                 FusionOptimizer.match_cast_wrapped_layernorm,
                 FusionOptimizer.fold_cast_wrapped_layernorm,
@@ -2247,6 +2262,59 @@ class FusionOptimizer:
             # 该 Cast 的输入应是 inner 的 fp16 输出（已满足），输出 f32 喂下游
             matches.append({"inner": inner, "post": post})
         return matches
+
+    # ---- fp32 softmax island ----
+    # Exports that keep softmax in fp32 write Cast(f16->f32) -> Softmax ->
+    # Cast(f32->f16) (Qwen-Image attention: 32 x [1,32,1024,1088] per step).
+    # The fp16 Softmax kernel already reduces and exponentiates in fp32
+    # registers, so the island only adds memory traffic: the scores are
+    # written and read as fp32 (2x the bytes) and the down-cast is a dispatch
+    # of its own. Drop both Casts and run Softmax on the fp16 tensor. The
+    # only numeric change is that the input is no longer widened before the
+    # kernel reads it, which the kernel does itself.
+    @staticmethod
+    def match_fp32_softmax_island(dag_model):
+        F16, F32 = 10, 1
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        matches = []
+        for sm in dag_model.nodes.values():
+            if sm.op_type != "Softmax" or len(sm.inputs) != 1 or len(sm.outputs) != 1:
+                continue
+            up = producer.get(sm.inputs[0]["name"])
+            if up is None or up.op_type != "Cast" or up.attributes.get("to") != F32:
+                continue
+            if FusionOptimizer._tensor_dtype(dag_model, up.inputs[0]["name"]) != F16:
+                continue
+            up_cons = consumers.get(up.outputs[0]["name"], [])
+            if len(up_cons) != 1 or up_cons[0][0].name != sm.name:
+                continue
+            sm_cons = consumers.get(sm.outputs[0]["name"], [])
+            if len(sm_cons) != 1:
+                continue
+            down = sm_cons[0][0]
+            if down.op_type != "Cast" or down.attributes.get("to") != F16:
+                continue
+            matches.append({"up": up, "softmax": sm, "down": down})
+        print(f"Found {len(matches)} fp32 Softmax islands for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_fp32_softmax_island(dag_model, match) -> bool:
+        up, sm, down = match["up"], match["softmax"], match["down"]
+        for n in (up, sm, down):
+            if n.name not in dag_model.nodes:
+                return False
+        fused = Node(
+            op_type="Softmax",
+            name=sm.name,
+            attributes=dict(sm.attributes),
+            inputs=[up.inputs[0]],
+            outputs=down.outputs[:],
+        )
+        del dag_model.nodes[up.name]
+        del dag_model.nodes[down.name]
+        dag_model.nodes[sm.name] = fused
+        return True
 
     @staticmethod
     def match_cast_wrapped_softmax(dag_model):

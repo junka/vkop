@@ -687,13 +687,36 @@ measured with `VKOP_SUBMIT_PROF=1` over 6 steps, which runs cooler than the 40-s
 | Concat as one div/mod per element | ~1.48 s | Concat 11.0 → 2.3 ms |
 | reconversion: Min/Max into FE chains, `LN(x,1,0)*s → LN(x,s,0)` | ~1.47 s | 1204 → 1012 nodes, Mul/Min/Max (12.5 ms) gone |
 | `image_gen` uploads static inputs once | ~1.47 s + 3 ms host | host time between steps 121 → ~8 ms |
+| fp16 attention scores: drop the fp32 Softmax island, one-pass fp16 row Softmax | ~1.435 s | Softmax 22.1 → 11.3 ms, Cast 16.8 → 0, FE 25.6 → 20.4 ms; 980 nodes |
 
 Where the step goes now (one 6-step-profile step, ms):
 
-| MatMul | FusedElemwise | Softmax | Cast | Reshape | RMSNorm | Rotary | Concat | Transpose | LayerNorm |
-|--------|---------------|---------|------|---------|---------|--------|--------|-----------|-----------|
-| 1364.6 | 25.6 | 22.1 | 16.8 | 15.5 | 6.8 | 5.6 | 2.2 | 2.2 | 1.5 |
+| MatMul | Reshape* | FusedElemwise | Softmax | RMSNorm | Rotary | Concat | Transpose | LayerNorm |
+|--------|----------|---------------|---------|---------|--------|--------|-----------|-----------|
+| 1352.1 | 20.7 | 20.4 | 11.3 | 6.8 | 5.6 | 2.4 | 2.2 | 1.5 |
 
+\* Not real work. A float Reshape aliases its input: no dispatch, no copy. Its ~0.7 ms per
+call on 28 of the 128 Reshapes is neighbouring GPU time, because MoltenVK timestamps land on
+encoder boundaries. Dropping the alias read barrier moved nothing: same totals, same bill.
+
+The attention scores used to cross memory as fp32. The export writes
+`Cast(f16→f32) → Softmax → Cast(f32→f16)`, and the fp16 Softmax was no cheaper anyway: it
+wrote fp32 to a scratch buffer, allocated `total×4` bytes on every execute, then ran a pack pass.
+
+- The kernel now has a single-pass row path for an innermost, even-length axis. Each row owns
+  whole words, so it writes packed half2 directly.
+- The converter's `fold_fp32_softmax_island` drops both Casts. It runs after
+  `fuse_into_attention` on purpose. Run first, it let attention fusion match these layers, and
+  the runtime `Attention` op is one workgroup per query row: correct, but **332 ms/step against
+  ~111 ms** for the unfused MatMul/FE/Softmax/MatMul at 1024 query rows. That kernel is built for
+  LLM decode (M = 1), and LLM prefill at long prompts goes through it too.
+- A tiled flash attention would not buy much here: QK + PV is ~580 GFLOP/step, which is already
+  ~55 ms at MatMul speed.
+
+- **The VAE's Conv2d** is the biggest gap to peak: 3.67 of its 3.8 s. The 3×3 resample convs
+  run at 0.7–1.8 TFLOPS (up3: 391 GFLOP in 562 ms), and the 1×1 shortcut, which is a plain GEMM,
+  at 0.22 TFLOPS. At MatMul-tile speed (~10 TFLOPS), an implicit-GEMM conv would bring the VAE
+  under ~0.5 s.
 - **MatMul** is the remaining lever. The 128 tile sits at about 81% of the FMA ceiling this
   kernel shape reaches (~13.3 TFLOPS). The next step is Apple's `simdgroup_matrix` via coopmat 8×8
   SPIR-V, which MoltenVK accepts without advertising the extension. A naive version of that

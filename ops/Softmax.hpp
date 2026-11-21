@@ -184,12 +184,18 @@ class SoftmaxBuffer : public BufferFactory {
             in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
-        // fp16 needs a scratch fp32 buffer (binding 2) for the decoupled
-        // reduce->pack write; binding 3 is unused by the shader but the
+        // fp16 over the innermost axis with an even length: every row owns
+        // whole words, so the shader's row pass writes packed half2 directly
+        // in one dispatch -- no fp32 scratch (it was total*4 bytes, allocated
+        // per execute) and no pack pass. Must match the shader's condition.
+        const bool fp16_rows =
+            fp16_ != 0 && inner_size == 1 && (axis_size % 2) == 0;
+        // Otherwise fp16 needs a scratch fp32 buffer (binding 2) for the
+        // decoupled reduce->pack write; binding 3 is unused by the shader but the
         // descriptor set declares 4 storage bindings, so bind the dummy
         // buffer there. fp32 leaves both binding 2/3 unused; bind dummy for
         // each so the descriptor set is valid.
-        if (fp16_ != 0) {
+        if (fp16_ != 0 && !fp16_rows) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0; clamp to 16 bytes
             // (the dispatch is 0 threads anyway). See Matmul.hpp.
@@ -216,23 +222,23 @@ class SoftmaxBuffer : public BufferFactory {
 
         bool bda_ok = bda_ready() && out_buf && in_buf &&
                       out_buf->hasDeviceAddress() && in_buf->hasDeviceAddress();
-        if (bda_ok && fp16_ != 0) {
+        if (bda_ok && fp16_ != 0 && !fp16_rows) {
             bda_ok = scratch_ && scratch_->hasDeviceAddress();
         }
         if (bda_ok) {
             const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
             const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
             const VkDeviceAddress scratch_addr =
-                (fp16_ != 0) ? scratch_->getDeviceAddress() : 0;
+                (fp16_ != 0 && !fp16_rows) ? scratch_->getDeviceAddress() : 0;
             bda_ok = (out_addr % 4) == 0 && (in_addr % 4) == 0 &&
-                     (fp16_ == 0 || (scratch_addr % 4) == 0);
+                     (fp16_ == 0 || fp16_rows || (scratch_addr % 4) == 0);
         }
         if (bda_ok) {
             const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
             const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
             const VkDeviceAddress scratch_addr =
-                (fp16_ != 0) ? scratch_->getDeviceAddress() : 0;
-            if (fp16_ != 0) {
+                (fp16_ != 0 && !fp16_rows) ? scratch_->getDeviceAddress() : 0;
+            if (fp16_ != 0 && !fp16_rows) {
                 // Reduce writes fp32 to scratch; pack reads scratch and
                 // writes packed half2 to output. Same pipeline, two PCs.
                 SoftmaxBdaPC rpc{};
@@ -263,7 +269,7 @@ class SoftmaxBuffer : public BufferFactory {
             return;
         }
 
-        if (fp16_ != 0) {
+        if (fp16_ != 0 && !fp16_rows) {
             // fp16 2-pass: use separate descriptor sets to avoid Intel ANV's
             // immediate-descriptor-update interference between passes.
             VkDescriptorSet reduce_ds = allocPassDescriptorSet();
