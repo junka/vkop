@@ -1,0 +1,539 @@
+#version 450 core
+#extension GL_EXT_control_flow_attributes : enable
+
+// Tiled ("flash") fused Attention for MANY query rows (prefill, ViT towers,
+// DiT blocks). Same op, bindings and push constant as attention.comp; the host
+// (ops/Attention.hpp, AttentionBuffer::flash_route) routes here only when the
+// query is tall enough to amortize a 64-row tile and the layout/feature combo
+// is one this kernel serves. Decode (S == 1) and everything else stay on
+// attention.comp unchanged.
+//
+// Why: attention.comp is one workgroup per QUERY ROW, so every row re-streams
+// all of K and V and does its dot products as GEMVs (one Q row against K).
+// Here one workgroup owns a BR x D block of Q for one (b, h) and walks the KV
+// axis in BC-wide tiles, so each K/V element fetched into shared memory is
+// reused by BR query rows, and both products are register-blocked GEMM tiles:
+//
+//   S  = Q_blk · K_tileᵀ           (BR x BC, inner D)   4x4 per thread
+//   online softmax per row         (fp32 running max m and sum l)
+//   O  = O·alpha + P · V_tile      (BR x D,  inner BC)  4 rows x D/16 per thread
+//
+// The softmax statistics and both accumulators are fp32; P is staged in
+// shared as fp16 pairs (it is in [0, 1]) and the row sum l is accumulated from
+// the SAME rounded values, so the normalization matches what P·V summed.
+// Scores are kept in the log2 domain (x * log2(e)) so the exponentials are
+// exp2; that is a pure rescale of the same softmax.
+//
+// Workgroup: 256 lanes, tx = lid & 15, ty = lid >> 4.
+//   S/P tile: rows ty*4 + r (r < 4), columns {2tx, 2tx+1, 32+2tx, 33+2tx}, so a
+//             lane owns two whole fp16 P words per row.
+//   O:        rows ty*4 + r, packed words 2tx + {0,1} and 32 + 2tx + {0,1}
+//             (the ones below D/2).
+// The 16 lanes of a row group are one half of a SIMD, so every shared read of
+// a Q row or a P row is a broadcast, and the K/V reads of the 16 tx lanes are
+// consecutive words.
+//
+// Shared memory (Apple caps a threadgroup at 32 KB, every live array counts):
+//   sQ    2 KB    Q stage  [64 rows][8 words]      (16 head dims per stage)
+//   sKt   2.1 KB  K stage  [8 d-pairs][68 cols]    stored transposed
+//   sV    8 KB    V stage  [32 rows][64 words]     (32 KV rows per stage)
+//   sP    8 KB    P tile   [64 rows][32 half2 words]
+//   sRow  4 KB    per-row partials of the tile max / final row sum
+//   total 24.1 KB
+// (Padding it to 31.7 KB did not move the DiT timing, so occupancy here is
+// not limited by shared memory.)
+//
+// What was measured on the M5 Max (DiT block, 32 heads x 1024 rows x 1088 kv,
+// D=128): 2.56 ms for the first form of this kernel, 2.45 with the vector
+// shared reads (uvec4 Q, transposed uvec2 K, uvec2 P/V), 2.41 with 32-row V
+// stages. Converting the operands to fp32 once at staging time (no unpack in
+// the inner loops) was SLOWER (2.92): the doubled shared traffic costs more
+// than the conversions it saves. So did 32-dim Q·Kᵀ stages (2.51) and 8 rows
+// per lane with 128 lanes (5.9, register spills). Q·Kᵀ and P·V each run at
+// ~8-9 TFLOPS of the ~10.8 the tiled GEMM reaches.
+//
+// Global loads are 8 lanes per Q/K row (32 contiguous bytes) and 16 lanes per
+// V row, the coalescing pattern that won in matmul16_tiled128; the next Q/K
+// stage is fetched into registers while the current one is multiplied.
+//
+// Supported (host-gated): fp16 storage, head_dim % 16 == 0 and <= 128, either
+// [B,H,S,D] or seq_major [B,S,H,D] (rank 3 included), V as a qkv component
+// (v_base_extra / v_step_extra), GQA, causal / mask_causal tile skipping, an
+// additive [B,S,kv] mask, and the fp16 KV-cache form including the ring and the
+// in-place / copying `present` write (the copy workgroups are appended after
+// the attention tiles exactly as in attention.comp). Not served: an fp8 cache.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Q {
+    uint data[];
+} uQ;
+layout(set = 0, binding = 2) readonly buffer K {
+    uint data[];
+} uK;
+layout(set = 0, binding = 3) readonly buffer V {
+    uint data[];
+} uV;
+layout(set = 0, binding = 4) readonly buffer Mask {
+    uint data[];
+} uMask;
+layout(set = 0, binding = 5) readonly buffer CacheIn {
+    uint data[];
+} uCacheIn;
+layout(set = 0, binding = 6) buffer CacheOut {
+    uint data[];
+} uCacheOut;
+layout(set = 0, binding = 7) readonly buffer DynParamsBuf {
+    ivec4 p;
+    uvec3 dispatch;
+    uint _pad;
+} uDyn;
+
+// Identical to attention.comp's PC_ATTN (one AttentionPC on the host).
+layout(push_constant) uniform PC_ATTN {
+    float scale;
+    int batch;
+    int heads;
+    int kv_heads;
+    int seq;
+    int kv_len;
+    int head_dim;
+    int rep;
+    int causal;
+    int has_mask;
+    int mask_causal;
+    int kv_past;
+    int has_cache;
+    int src_stride;
+    int dst_stride;
+    int inplace;
+    int ring;
+    int ring_head;
+    float cache_scale;
+    int cache_fp8;
+    int seq_major;
+    int v_base_extra;
+    int v_step_extra;
+    int dyn_ssbo;
+} uA;
+
+#ifdef FP16
+
+int dyn_kv_len() { return (uA.dyn_ssbo != 0) ? uDyn.p.x : uA.kv_len; }
+int dyn_kv_past() { return (uA.dyn_ssbo != 0) ? uDyn.p.y : uA.kv_past; }
+int dyn_ring_head() { return (uA.dyn_ssbo != 0) ? uDyn.p.z : uA.ring_head; }
+
+int kv_slot(int j) {
+    if (uA.ring == 0) {
+        return j;
+    }
+    return (dyn_ring_head() + j) % uA.src_stride;
+}
+
+#define BR 64       // query rows per workgroup
+#define BC 64       // KV positions per tile
+#define VROWS 32    // KV rows per P·V stage
+#define VSTRIDE 64  // words per staged V row (D <= 128)
+#define LOG2E 1.4426950408889634
+
+// Shared tiles, typed by the width they are READ at (GLSL cannot alias a
+// uint array as uvec2/uvec4); single words are written by component.
+//   sQ  [64 rows][8 words]    uvec4 reads, 4 d-pairs at a time (broadcast)
+//   sKt [8 d-pairs][68 cols]  K stage stored transposed, so a lane's two
+//       adjacent columns are one uvec2 read; the 68-word pitch makes the
+//       transposing store (8 d-pairs x 4 rows per SIMD) hit 32 distinct banks
+//   sV  [32 rows][64 words]   uvec2 reads, words 2tx + {0,1} (+32)
+//   sP  [64 rows][32 words]   P as fp16 pairs, uvec2 reads (4 columns)
+#define KT_PITCH 68
+shared uvec4 sQ[BR * 2];
+shared uvec2 sKt[8 * KT_PITCH / 2];
+shared uvec2 sV[VROWS * VSTRIDE / 2];
+shared uvec2 sP[BR * (BC / 4)];
+shared float sRow[BR * 16];
+
+// The cache workgroups (has_cache != 0): write `present` for [0, kv_len) (or
+// only the fresh rows under the ring / in place). Same mapping as
+// attention.comp's copy_cache, one packed word per lane.
+void copy_cache(int cwg) {
+    int D = uA.head_dim;
+    int nkv = uA.kv_heads;
+    int R = D >> 1;
+    int nrows = (uA.ring != 0) ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
+    int j0 = (uA.ring != 0) ? dyn_kv_past() : 0;
+    int total_words = 2 * nkv * nrows * R;
+    int gid = cwg * 256 + int(gl_LocalInvocationID.x);
+    if (gid >= total_words) {
+        return;
+    }
+    int w = gid % R;
+    int row = gid / R;
+    int j = j0 + row % nrows;
+    int h = (row / nrows) % nkv;
+    int c = row / (nrows * nkv);
+    uint word;
+    if (j < dyn_kv_past()) {
+        if (uA.inplace != 0) {
+            return;
+        }
+        word = uCacheIn
+                   .data[((c * nkv + h) * uA.src_stride + kv_slot(j)) * R + w];
+    } else {
+        int off = (h * uA.seq + (j - dyn_kv_past())) * R + w;
+        word = (c == 0) ? uK.data[off] : uV.data[off];
+    }
+    uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
+}
+
+void main() {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int tx = lid & 15;
+    const int ty = lid >> 4;
+    const int S = uA.seq;
+    const int H = uA.heads;
+    const int D = uA.head_dim;
+    const int HW = D >> 1; // packed words per row
+    const int kv = dyn_kv_len();
+    const int kv_past = (uA.has_cache != 0) ? dyn_kv_past() : 0;
+    const int kv_new = kv - kv_past;
+
+    const int ntr = (S + BR - 1) / BR;
+    const int attn_wgs = uA.batch * H * ntr;
+    const int wg = int(gl_WorkGroupID.x);
+    if (uA.has_cache != 0 && wg >= attn_wgs) {
+        copy_cache(wg - attn_wgs);
+        return;
+    }
+    // Heaviest row blocks first: under a causal bound the last block of a
+    // head sweeps the whole KV axis and the first only its own diagonal, so
+    // dispatching them longest-first keeps the tail of the grid short.
+    const int rt = ntr - 1 - (wg % ntr);
+    const int bh = wg / ntr;
+    const int h = bh % H;
+    const int b = bh / H;
+    const int h_kv = h / uA.rep;
+    const int r0 = rt * BR;
+    const bool sm = uA.seq_major != 0;
+
+    // Element offsets, exactly attention.comp's addressing.
+    const int q_rstep = sm ? H * D : D;
+    const int q_base0 = sm ? ((b * S + r0) * H + h) * D
+                           : ((b * H + h) * S + r0) * D;
+    const int k_base = sm ? (b * kv_new * uA.kv_heads + h_kv) * D
+                          : ((b * uA.kv_heads + h_kv) * kv_new) * D;
+    const int v_base = k_base + uA.v_base_extra;
+    const int kv_step = sm ? uA.kv_heads * D : D;
+    const int v_step = kv_step + uA.v_step_extra;
+    const int c_base = (h_kv * uA.src_stride) * D;
+    const int c_v_base = c_base + (uA.kv_heads * uA.src_stride) * D;
+    const int past = kv - S;
+
+    // Staging lanes: Q/K chunk rows lr8 and lr8+32, word lw8 of the 8.
+    const int lr8 = lid >> 3;
+    const int lw8 = lid & 7;
+    const bool q_ok0 = r0 + lr8 < S;
+    const bool q_ok1 = r0 + lr8 + 32 < S;
+    const int q_w0 = (q_base0 + lr8 * q_rstep) >> 1;
+    const int q_w1 = (q_base0 + (lr8 + 32) * q_rstep) >> 1;
+
+    float m[4];
+    float l[4];
+    vec2 o[4][4];
+    [[unroll]] for (int r = 0; r < 4; ++r) {
+        m[r] = -1e30;
+        l[r] = 0.0;
+        [[unroll]] for (int c = 0; c < 4; ++c) {
+            o[r][c] = vec2(0.0);
+        }
+    }
+
+    // Causal blocks stop at the diagonal of their LAST row: every later tile
+    // is fully masked for every row of the block, and (as in attention.comp)
+    // skipping it is exact once tile 0 -- which holds j = 0, valid for every
+    // row -- has made the running max a real score. Rows whose own diagonal
+    // ends earlier inside the swept range get -65504 per element, exactly the
+    // row kernel's treatment.
+    int t_end = kv;
+    if (uA.causal != 0 || uA.mask_causal != 0) {
+        int r_last = min(r0 + BR - 1, S - 1);
+        t_end = min(kv, past + r_last + 1);
+    }
+
+    for (int t0 = 0; t0 < t_end; t0 += BC) {
+        // Source word index of K row j = t0 + rr (cache or fresh rows).
+        int kj0 = t0 + lr8;
+        int kj1 = t0 + lr8 + 32;
+        int kw0 = -1;
+        int kw1 = -1;
+        bool kc0 = false;
+        bool kc1 = false;
+        if (kj0 < kv) {
+            kc0 = kj0 < kv_past;
+            kw0 = kc0 ? ((c_base + kv_slot(kj0) * D) >> 1)
+                      : ((k_base + (kj0 - kv_past) * kv_step) >> 1);
+        }
+        if (kj1 < kv) {
+            kc1 = kj1 < kv_past;
+            kw1 = kc1 ? ((c_base + kv_slot(kj1) * D) >> 1)
+                      : ((k_base + (kj1 - kv_past) * kv_step) >> 1);
+        }
+
+        // ---- S = Q · Kᵀ over D in 16-element stages ----
+        float acc[16];
+        [[unroll]] for (int i = 0; i < 16; ++i) {
+            acc[i] = 0.0;
+        }
+        // Two-deep: stage dw+8's words are fetched into registers while
+        // stage dw is multiplied out of shared.
+        uint wq0 = q_ok0 ? uQ.data[q_w0 + lw8] : 0u;
+        uint wq1 = q_ok1 ? uQ.data[q_w1 + lw8] : 0u;
+        uint wk0 = 0u;
+        uint wk1 = 0u;
+        if (kw0 >= 0) {
+            wk0 = kc0 ? uCacheIn.data[kw0 + lw8] : uK.data[kw0 + lw8];
+        }
+        if (kw1 >= 0) {
+            wk1 = kc1 ? uCacheIn.data[kw1 + lw8] : uK.data[kw1 + lw8];
+        }
+        for (int dw = 0; dw < HW; dw += 8) {
+            barrier(); // the previous stage's readers are done
+            sQ[lr8 * 2 + (lw8 >> 2)][lw8 & 3] = wq0;
+            sQ[(lr8 + 32) * 2 + (lw8 >> 2)][lw8 & 3] = wq1;
+            {
+                int e0 = lw8 * KT_PITCH + lr8;
+                int e1 = e0 + 32;
+                sKt[e0 >> 1][e0 & 1] = wk0;
+                sKt[e1 >> 1][e1 & 1] = wk1;
+            }
+            barrier();
+            int dn = dw + 8;
+            if (dn < HW) {
+                wq0 = q_ok0 ? uQ.data[q_w0 + dn + lw8] : 0u;
+                wq1 = q_ok1 ? uQ.data[q_w1 + dn + lw8] : 0u;
+                if (kw0 >= 0) {
+                    wk0 = kc0 ? uCacheIn.data[kw0 + dn + lw8]
+                              : uK.data[kw0 + dn + lw8];
+                }
+                if (kw1 >= 0) {
+                    wk1 = kc1 ? uCacheIn.data[kw1 + dn + lw8]
+                              : uK.data[kw1 + dn + lw8];
+                }
+            }
+            [[unroll]] for (int kq = 0; kq < 2; ++kq) {
+                uvec4 qa0 = sQ[(ty * 4 + 0) * 2 + kq];
+                uvec4 qa1 = sQ[(ty * 4 + 1) * 2 + kq];
+                uvec4 qa2 = sQ[(ty * 4 + 2) * 2 + kq];
+                uvec4 qa3 = sQ[(ty * 4 + 3) * 2 + kq];
+                [[unroll]] for (int k4 = 0; k4 < 4; ++k4) {
+                    int kt = kq * 4 + k4;
+                    vec2 a0 = unpackHalf2x16(qa0[k4]);
+                    vec2 a1 = unpackHalf2x16(qa1[k4]);
+                    vec2 a2 = unpackHalf2x16(qa2[k4]);
+                    vec2 a3 = unpackHalf2x16(qa3[k4]);
+                    uvec2 kb01 = sKt[(kt * KT_PITCH + 2 * tx) >> 1];
+                    uvec2 kb23 = sKt[(kt * KT_PITCH + 32 + 2 * tx) >> 1];
+                    vec2 b0 = unpackHalf2x16(kb01.x);
+                    vec2 b1 = unpackHalf2x16(kb01.y);
+                    vec2 b2 = unpackHalf2x16(kb23.x);
+                    vec2 b3 = unpackHalf2x16(kb23.y);
+                    acc[0] += a0.x * b0.x + a0.y * b0.y;
+                    acc[1] += a0.x * b1.x + a0.y * b1.y;
+                    acc[2] += a0.x * b2.x + a0.y * b2.y;
+                    acc[3] += a0.x * b3.x + a0.y * b3.y;
+                    acc[4] += a1.x * b0.x + a1.y * b0.y;
+                    acc[5] += a1.x * b1.x + a1.y * b1.y;
+                    acc[6] += a1.x * b2.x + a1.y * b2.y;
+                    acc[7] += a1.x * b3.x + a1.y * b3.y;
+                    acc[8] += a2.x * b0.x + a2.y * b0.y;
+                    acc[9] += a2.x * b1.x + a2.y * b1.y;
+                    acc[10] += a2.x * b2.x + a2.y * b2.y;
+                    acc[11] += a2.x * b3.x + a2.y * b3.y;
+                    acc[12] += a3.x * b0.x + a3.y * b0.y;
+                    acc[13] += a3.x * b1.x + a3.y * b1.y;
+                    acc[14] += a3.x * b2.x + a3.y * b2.y;
+                    acc[15] += a3.x * b3.x + a3.y * b3.y;
+                }
+            }
+        }
+
+        // ---- scores in the log2 domain, + mask / causal / bounds ----
+        // Column of acc[r*4 + cc]: (cc>>1)*32 + 2tx + (cc&1).
+        const int jA = t0 + 2 * tx;      // cc 0,1
+        const int jB = t0 + 32 + 2 * tx; // cc 2,3
+        [[unroll]] for (int r = 0; r < 4; ++r) {
+            int s = r0 + ty * 4 + r;
+            float mk0 = 0.0, mk1 = 0.0, mk2 = 0.0, mk3 = 0.0;
+            if (uA.has_mask != 0 && s < S) {
+                int mrow = (b * S + s) * kv;
+                if ((kv & 1) == 0) {
+                    if (jA < kv) {
+                        vec2 mv = unpackHalf2x16(uMask.data[(mrow + jA) >> 1]);
+                        mk0 = mv.x;
+                        mk1 = mv.y;
+                    }
+                    if (jB < kv) {
+                        vec2 mv = unpackHalf2x16(uMask.data[(mrow + jB) >> 1]);
+                        mk2 = mv.x;
+                        mk3 = mv.y;
+                    }
+                } else {
+                    int e;
+                    e = mrow + jA;
+                    if (jA < kv) mk0 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    e = mrow + jA + 1;
+                    if (jA + 1 < kv) mk1 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    e = mrow + jB;
+                    if (jB < kv) mk2 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    e = mrow + jB + 1;
+                    if (jB + 1 < kv) mk3 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                }
+            }
+            int lim = (uA.causal != 0) ? (past + s) : 0x7fffffff;
+            float x0 = (acc[r * 4 + 0] * uA.scale + mk0) * LOG2E;
+            float x1 = (acc[r * 4 + 1] * uA.scale + mk1) * LOG2E;
+            float x2 = (acc[r * 4 + 2] * uA.scale + mk2) * LOG2E;
+            float x3 = (acc[r * 4 + 3] * uA.scale + mk3) * LOG2E;
+            if (jA > lim) x0 = -65504.0 * LOG2E;
+            if (jA + 1 > lim) x1 = -65504.0 * LOG2E;
+            if (jB > lim) x2 = -65504.0 * LOG2E;
+            if (jB + 1 > lim) x3 = -65504.0 * LOG2E;
+            if (jA >= kv) x0 = -1e30;
+            if (jA + 1 >= kv) x1 = -1e30;
+            if (jB >= kv) x2 = -1e30;
+            if (jB + 1 >= kv) x3 = -1e30;
+            acc[r * 4 + 0] = x0;
+            acc[r * 4 + 1] = x1;
+            acc[r * 4 + 2] = x2;
+            acc[r * 4 + 3] = x3;
+            sRow[(ty * 4 + r) * 16 + tx] = max(max(x0, x1), max(x2, x3));
+        }
+        barrier();
+
+        // ---- online softmax: tile max, rescale, P to shared ----
+        [[unroll]] for (int r = 0; r < 4; ++r) {
+            int rb = (ty * 4 + r) * 16;
+            float tm = sRow[rb];
+            [[unroll]] for (int i = 1; i < 16; ++i) {
+                tm = max(tm, sRow[rb + i]);
+            }
+            float m_new = max(m[r], tm);
+            float alpha = exp2(m[r] - m_new);
+            m[r] = m_new;
+            vec2 p01 = vec2(exp2(acc[r * 4 + 0] - m_new),
+                            exp2(acc[r * 4 + 1] - m_new));
+            vec2 p23 = vec2(exp2(acc[r * 4 + 2] - m_new),
+                            exp2(acc[r * 4 + 3] - m_new));
+            uint w01 = packHalf2x16(p01);
+            uint w23 = packHalf2x16(p23);
+            // Sum what P·V will actually multiply by (the fp16-rounded P).
+            vec2 q01 = unpackHalf2x16(w01);
+            vec2 q23 = unpackHalf2x16(w23);
+            l[r] = l[r] * alpha + ((q01.x + q01.y) + (q23.x + q23.y));
+            [[unroll]] for (int c = 0; c < 4; ++c) {
+                o[r][c] *= alpha;
+            }
+            // Row word tx holds columns (2tx, 2tx+1), word 16+tx (32+2tx, ..).
+            int pr = (ty * 4 + r) * 32;
+            sP[(pr + tx) >> 1][tx & 1] = w01;
+            sP[(pr + 16 + tx) >> 1][tx & 1] = w23;
+        }
+
+        // ---- O += P · V over the tile in 16-row stages ----
+        int tn = min(BC, kv - t0);
+        for (int vc = 0; vc < tn; vc += VROWS) {
+            // Stage V rows t0+vc .. +VROWS-1: rows ty + 16i, 16 lanes per row,
+            // words 2tx+{0,1} (+32). sV's previous readers retired at the
+            // trailing barrier of the previous stage (or of the previous tile).
+            [[unroll]] for (int vi = 0; vi < VROWS / 16; ++vi) {
+                int vr = ty + 16 * vi;
+                int j = t0 + vc + vr;
+                int vw = -1;
+                bool vcache = false;
+                if (j < kv) {
+                    vcache = j < kv_past;
+                    vw = vcache ? ((c_v_base + kv_slot(j) * D) >> 1)
+                                : ((v_base + (j - kv_past) * v_step) >> 1);
+                }
+                [[unroll]] for (int c2 = 0; c2 < 2; ++c2) {
+                    int w = 2 * tx + 32 * c2;
+                    uvec2 word = uvec2(0u);
+                    if (vw >= 0 && w < HW) {
+                        word = vcache ? uvec2(uCacheIn.data[vw + w],
+                                              uCacheIn.data[vw + w + 1])
+                                      : uvec2(uV.data[vw + w],
+                                              uV.data[vw + w + 1]);
+                    }
+                    sV[(vr * VSTRIDE + w) >> 1] = word;
+                }
+            }
+            barrier(); // V stage and (first time) sP visible
+            [[unroll]] for (int j4 = 0; j4 < VROWS; j4 += 4) {
+                // P columns vc+j4 .. +3 for the lane's 4 rows: one uvec2 each.
+                int pw = (vc + j4) >> 1;
+                uvec2 pq0 = sP[((ty * 4 + 0) * 32 + pw) >> 1];
+                uvec2 pq1 = sP[((ty * 4 + 1) * 32 + pw) >> 1];
+                uvec2 pq2 = sP[((ty * 4 + 2) * 32 + pw) >> 1];
+                uvec2 pq3 = sP[((ty * 4 + 3) * 32 + pw) >> 1];
+                [[unroll]] for (int jh = 0; jh < 2; ++jh) {
+                    vec2 p0 = unpackHalf2x16(pq0[jh]);
+                    vec2 p1 = unpackHalf2x16(pq1[jh]);
+                    vec2 p2 = unpackHalf2x16(pq2[jh]);
+                    vec2 p3 = unpackHalf2x16(pq3[jh]);
+                    int jj = j4 + 2 * jh;
+                    [[unroll]] for (int c2 = 0; c2 < 2; ++c2) {
+                        int w = 2 * tx + 32 * c2;
+                        uvec2 va = sV[(jj * VSTRIDE + w) >> 1];
+                        uvec2 vb = sV[((jj + 1) * VSTRIDE + w) >> 1];
+                        vec2 va0 = unpackHalf2x16(va.x);
+                        vec2 va1 = unpackHalf2x16(va.y);
+                        vec2 vb0 = unpackHalf2x16(vb.x);
+                        vec2 vb1 = unpackHalf2x16(vb.y);
+                        o[0][2 * c2] += p0.x * va0 + p0.y * vb0;
+                        o[0][2 * c2 + 1] += p0.x * va1 + p0.y * vb1;
+                        o[1][2 * c2] += p1.x * va0 + p1.y * vb0;
+                        o[1][2 * c2 + 1] += p1.x * va1 + p1.y * vb1;
+                        o[2][2 * c2] += p2.x * va0 + p2.y * vb0;
+                        o[2][2 * c2 + 1] += p2.x * va1 + p2.y * vb1;
+                        o[3][2 * c2] += p3.x * va0 + p3.y * vb0;
+                        o[3][2 * c2 + 1] += p3.x * va1 + p3.y * vb1;
+                    }
+                }
+            }
+            barrier(); // readers of this V stage (and of sP) are done
+        }
+    }
+
+    // ---- final row sums (the l partials are per lane) and the Y store ----
+    [[unroll]] for (int r = 0; r < 4; ++r) {
+        sRow[(ty * 4 + r) * 16 + tx] = l[r];
+    }
+    barrier();
+    [[unroll]] for (int r = 0; r < 4; ++r) {
+        int s = r0 + ty * 4 + r;
+        int rb = (ty * 4 + r) * 16;
+        float lt = 0.0;
+        [[unroll]] for (int i = 0; i < 16; ++i) {
+            lt += sRow[rb + i];
+        }
+        float inv = 1.0 / (lt + 1e-30);
+        if (s < S) {
+            int yw = (q_base0 + (ty * 4 + r) * q_rstep) >> 1;
+            // o[r][c] holds word 2tx + (c & 1) + 32 * (c >> 1).
+            [[unroll]] for (int c = 0; c < 4; ++c) {
+                int w = 2 * tx + (c & 1) + 32 * (c >> 1);
+                if (w < HW) {
+                    uOutput.data[yw + w] = packHalf2x16(o[r][c] * inv);
+                }
+            }
+        }
+    }
+}
+
+#else
+// The flash kernel is fp16-only (packed half2 storage); the fp32 build of this
+// file exists only because every .comp gets a base module. It is never routed
+// to (AttentionBuffer::flash_route requires fp16).
+void main() {}
+#endif

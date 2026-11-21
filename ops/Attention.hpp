@@ -176,6 +176,25 @@ class AttentionBuffer : public BufferFactory {
         if (attributes.find("cache_scale") != attributes.end()) {
             cache_scale_ = std::stof(attributes.at("cache_scale"));
         }
+        // The tiled many-row kernel (attention_flash.comp, see flash_route).
+        // On by default; `flash=0` or VKOP_ATTN_FLASH=0 pins the row kernel
+        // for A/B; VKOP_ATTN_FLASH_MIN=<rows> and VKOP_ATTN_FLASH_MIN_WGS=<n>
+        // move the two routing thresholds.
+        if (attributes.find("flash") != attributes.end()) {
+            flash_enabled_ =
+                static_cast<int>(std::stol(attributes.at("flash"))) != 0;
+        }
+        if (const char *e = getenv("VKOP_ATTN_FLASH")) {
+            flash_enabled_ = e[0] != '0';
+        }
+        if (const char *e = getenv("VKOP_ATTN_FLASH_MIN")) {
+            const int v = std::atoi(e);
+            if (v > 0) flash_min_rows_ = v;
+        }
+        if (const char *e = getenv("VKOP_ATTN_FLASH_MIN_WGS")) {
+            const int v = std::atoi(e);
+            if (v > 0) flash_min_wgs_ = v;
+        }
     }
     bool has_host_side_effects() const override { return true; }
     // The INSTANCE answer. The only host work execute() does is the ring head
@@ -198,7 +217,13 @@ class AttentionBuffer : public BufferFactory {
     // answer becomes "no" once the dynamic form has actually run once (which
     // is what proves this op's shader has the binding-7 code path; an older
     // .vkopbin's kernel ignores the field and must keep re-recording).
-    bool recording_changes_per_round() const override { return !dyn_live_; }
+    //
+    // A cache-form round on the tiled prefill kernel (flash_route) is a direct
+    // dispatch whose PC bakes kv_len/kv_past, so it reports "changes" for as
+    // long as the last execute() took that route.
+    bool recording_changes_per_round() const override {
+        return !dyn_live_ || flash_cache_last_;
+    }
 
     // The per-round half of the above: refresh the parameter SSBO and the
     // indirect grid for THIS round. Runs on every level of every round,
@@ -336,9 +361,15 @@ class AttentionBuffer : public BufferFactory {
                                                : dim(k_shape, 2));
         if (heads <= 0 || seq <= 0 || batch <= 0 || kv_len <= 0) return false;
         // Mirrors execute()'s cache-less grid exactly: one workgroup per query
-        // row and nothing else (the copy half only exists with a cache).
+        // row and nothing else (the copy half only exists with a cache) -- or,
+        // on the tiled route, one per 64-row block of a head.
+        const int head_dim = dim(q_shape, q_shape.size() - 1);
+        const bool flash = flash_route(
+            batch, heads, seq, head_dim,
+            inputs[0]->dtype() == typeid(uint16_t), /*cache_fp8=*/false);
         return publish_dyn(kv_len, /*kv_past=*/0, /*ring_head=*/0,
-                           batch * heads * seq);
+                           flash ? batch * heads * flash_row_tiles(seq)
+                                 : batch * heads * seq);
     }
 
     // Rows a KV SSBO can hold at the packed layout: the buffer is preallocated
@@ -647,7 +678,14 @@ class AttentionBuffer : public BufferFactory {
         pc.v_step_extra =
             v_comp_count > 0 ? (v_comp_count - 1) * head_dim * kv_heads : 0;
 
-        int grid = batch * heads * seq;
+        // The tiled many-row kernel: one workgroup per 64-row block of a head
+        // instead of one per query row (see flash_route for what it serves).
+        const bool use_flash =
+            flash_route(batch, heads, seq, head_dim,
+                        inputs[0]->dtype() == typeid(uint16_t), cache_fp8);
+        int grid = use_flash ? batch * heads * flash_row_tiles(seq)
+                             : batch * heads * seq;
+        flash_cache_last_ = use_flash && has_cache;
         // Y is written in the [B,S,H,D] order under seq_major whatever rank Q
         // arrived at, because its bytes always land at the rank-4 seq-major
         // offset: for rank 3 that is the [1,S,H,D] form the converter's fold
@@ -789,8 +827,12 @@ class AttentionBuffer : public BufferFactory {
                 // publish_dyn() has to run BEFORE the dispatch is recorded --
                 // its buffer is the dispatch's indirect source and the kernel's
                 // parameter source.
+                // The tiled prefill route dispatches directly with the
+                // round's numbers in the PC (recording_changes_per_round
+                // reports it), so it leaves the parameter SSBO alone.
                 dyn_this_round_ =
-                    has_cache && publish_dyn(kv_len, kv_past, ring_head, grid);
+                    has_cache && !use_flash &&
+                    publish_dyn(kv_len, kv_past, ring_head, grid);
                 if (dyn_this_round_) {
                     // binding 7: the parameter SSBO. The write above went
                     // through a HOST_COHERENT mapping; readBarrier sets the
@@ -806,7 +848,12 @@ class AttentionBuffer : public BufferFactory {
             });
         });
 
-        if (dyn_this_round_) {
+        if (use_flash) {
+            submit_flash(&pc, dyn_this_round_, grid);
+            if (dyn_this_round_) {
+                dyn_live_ = true;
+            }
+        } else if (dyn_this_round_) {
             pc.kv_len = kv_len;
             pc.kv_past = kv_past;
             pc.ring_head = ring_head;
@@ -819,6 +866,99 @@ class AttentionBuffer : public BufferFactory {
             dyn_live_ = true;
         } else {
             submit(&pc, grid, 1, 1);
+        }
+    }
+
+    // ---- tiled many-row route (shaders/buffer/attention_flash.comp) ----
+    static constexpr int kFlashRows = 64; // BR in the shader
+
+    static int flash_row_tiles(int seq) {
+        return (seq + kFlashRows - 1) / kFlashRows;
+    }
+
+    // Whether this problem runs on the tiled kernel. A pure function of the
+    // shape and the op's attributes once the pipeline question is settled, so
+    // execute() and refresh_dynamic_params() always agree on the grid.
+    //   - fp16 storage only (the module is the packed-half2 build);
+    //   - head_dim % 16 == 0 and <= 128 (16-element Q·Kᵀ stages, at most four
+    //     packed output words per lane);
+    //   - no fp8 cache (the fp16 cache form, ring and in-place included, is
+    //     served);
+    //   - at least flash_min_rows_ query rows: below that a 64-row block is
+    //     mostly padding and the row kernel's one-workgroup-per-row wins
+    //     (M5 Max, GQA 16/8, D=128 against a ~1k history: S=32 0.85-0.93x,
+    //     S=48 1.22x, S=64 1.3-1.55x, S=128 2.9x);
+    //   - at least flash_min_wgs_ row blocks in the grid: each workgroup walks
+    //     the whole KV axis serially, so a grid of a few blocks leaves most of
+    //     the GPU idle where the row kernel has S*H workgroups to spread
+    //     (kv=4096, D=128: 4 blocks 0.49x, 8 blocks 0.9x, 16 blocks 1.6-1.8x).
+    // The pipeline is built lazily here; a missing archive key or a driver
+    // refusal latches the row kernel for good.
+    bool flash_route(int batch, int heads, int seq, int head_dim, bool fp16,
+                     bool cache_fp8) {
+        if (!flash_enabled_ || !fp16 || cache_fp8 || seq < flash_min_rows_ ||
+            head_dim <= 0 || head_dim > 128 || (head_dim % 16) != 0 ||
+            static_cast<int64_t>(batch) * heads * flash_row_tiles(seq) <
+                flash_min_wgs_) {
+            return false;
+        }
+        return flash_pipeline() != nullptr;
+    }
+
+    VulkanPipeline *flash_pipeline() {
+        if (flash_pipe_) return flash_pipe_.get();
+        if (flash_unavailable_ || m_dev_ == nullptr) return nullptr;
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv("buffer_attention_flash_fp16");
+        } catch (const std::exception &e) {
+            flash_unavailable_ = true;
+            std::fprintf(stderr,
+                         "[vkop] %s\n[vkop] Attention keeps the row kernel for "
+                         "prefill (reconvert to ship the tiled one)\n",
+                         e.what());
+            return nullptr;
+        }
+        try {
+            const bool use_uab =
+                update_after_bind_ &&
+                m_dev_->is_support_descriptor_update_after_bind();
+            flash_pipe_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(), types_, sizeof(AttentionPC),
+                spv.first, static_cast<int>(spv.second), use_uab, 0,
+                pipeline_cache_);
+        } catch (const std::exception &e) {
+            flash_unavailable_ = true;
+            flash_pipe_.reset();
+            std::fprintf(stderr,
+                         "[vkop] tiled Attention pipeline rejected (%s); the "
+                         "row kernel serves prefill\n",
+                         e.what());
+            return nullptr;
+        }
+        return flash_pipe_.get();
+    }
+
+    // Bind / push / dispatch on the tiled module. Same descriptor layout and
+    // PC as the row kernel, so objs_ and the PC are reused as built; only the
+    // pipeline and its descriptor set differ. Indirect (grid from the
+    // parameter SSBO) when the round is on the dynamic form, direct otherwise.
+    void submit_flash(AttentionPC *pc, bool indirect, int grid) {
+        VulkanPipeline *pipe = flash_pipe_.get();
+        if (!flash_ds_[m_id_]) {
+            flash_ds_[m_id_] = pipe->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(flash_ds_[m_id_]);
+        pipe->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipe, flash_ds_[m_id_]);
+        m_cmd_->push_constants(*pipe, static_cast<uint32_t>(sizeof(*pc)), pc);
+        if (indirect) {
+            m_cmd_->dispatch_indirect(dyn_buf_->getBuffer(), 16);
+            if (replay_enabled_) {
+                record_fingerprint(pc, 0, 0, 0);
+            }
+        } else {
+            dispatch_and_record(grid, 1, 1, pc);
         }
     }
 
@@ -925,6 +1065,18 @@ class AttentionBuffer : public BufferFactory {
     // The buffer is 32 bytes: ivec4 p (kv_len, kv_past, ring_head, pad) then
     // the VkDispatchIndirectCommand {x,y,z} + pad.
     static constexpr size_t kDynBytes = 32;
+    // Tiled route state (flash_route / flash_pipeline / submit_flash).
+    bool flash_enabled_ = true;
+    // Query rows from which the tiled kernel takes over, and the fewest
+    // 64-row blocks worth a grid (both measured on the 32-core M5 Max, see
+    // flash_route).
+    int flash_min_rows_ = 48;
+    int flash_min_wgs_ = 16;
+    bool flash_unavailable_ = false;
+    // The last execute() was a cache-form round on the tiled route.
+    bool flash_cache_last_ = false;
+    std::unique_ptr<VulkanPipeline> flash_pipe_;
+    VkDescriptorSet flash_ds_[vkop::kInflight] = {nullptr};
 };
 
 // PIMPL façade. Buffer-only (no image impl), like RMSNorm.

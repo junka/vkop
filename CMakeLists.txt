@@ -342,6 +342,10 @@ set(DUAL_FP16_SHADERS
     buffer/rmsnorm
     buffer/layernorm
     buffer/attention
+    # The tiled many-row (prefill) Attention kernel. fp16-only: its base
+    # module is an empty stub, the _fp16 build is what AttentionBuffer::
+    # flash_pipeline resolves.
+    buffer/attention_flash
     buffer/slice
     buffer/scatter_elements
     buffer/min

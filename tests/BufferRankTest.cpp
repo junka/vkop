@@ -2773,6 +2773,145 @@ TEST(BufferRankTest, AttentionSeqMajor) {
                                              false, false, 3));
 }
 
+// =========================================================================
+// The tiled many-row route (shaders/buffer/attention_flash.comp). Attention
+// sends an fp16 problem with at least 48 query rows and 16 row blocks of 64
+// (head_dim % 16 == 0 and <= 128, no fp8 cache) there instead of the
+// one-workgroup-per-row kernel, so every case below lands on it -- as do the
+// large fp16 cases in the tests above (196/257/512 rows x 4..16 heads). Each one targets a different edge of the 64x64 tiling: a partial
+// trailing row block, an odd kv (the mask is then read one element at a
+// time), head dims that leave lanes idle in the P·V phase, GQA, the causal
+// bound against a history, and the cache form, where the tiled kernel reads
+// the history out of cache_in and appends `present` itself.
+// =========================================================================
+TEST(BufferRankTest, AttentionTiledRoute) {
+    // Partial row blocks (65, 100 rows), batch 2, GQA, odd kv with a mask.
+    EXPECT_TRUE(brt_attention_case<uint16_t>(2, 4, 65, 64, 65, 2, false, true));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(2, 4, 100, 128, 131, 2, false,
+                                             true));
+    // head_dim 80 (Qwen-VL vision) at both seq_major ranks, 96 with GQA 3.
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 16, 128, 80, 128, 1, false,
+                                             false, false, 4));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 8, 150, 80, 150, 1, false,
+                                             false, false, 3));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 12, 96, 96, 200, 3, false, true,
+                                             false, 4));
+    // The causal attribute against a history (past = 70), GQA 4: the row
+    // blocks' diagonals land mid-tile, so the per-block KV bound and the
+    // per-element mask are both live.
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 8, 130, 128, 200, 4, true,
+                                             false));
+    // A declared causal mask (mask_causal) with a history, seq_major.
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 8, 192, 64, 250, 2, false, true,
+                                             true, 4));
+    // Cache form, both rounds on the tiled kernel: round 1 reads its history
+    // (positions < kv_past) from cache_in. Shape-sized caches, so `present`
+    // is checked too -- that is the copy workgroups at the end of the grid.
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 128, 130, 100, 2, false,
+                                                   true, false));
+    // Preallocated (row pitch = max_kv) with a mask, and in place with a
+    // declared causal mask.
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 64, 70, 90, 1, true, false,
+                                                   true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 128, 150, 80, 2, true,
+                                                   false, true, true, true));
+}
+
+// The tiled kernel on the sliding-window ring: history rows live at slot
+// (ring_head + j) mod W of a W-row in-place cache. Checked against the row
+// kernel (flash=0) on identical inputs -- the ring addressing is one shared
+// function, so the two must agree on Y and write the fresh rows to the same
+// slots, including the ones that wrap past W.
+TEST(BufferRankTest, AttentionTiledRingMatchesRowKernel) {
+    Dev d;
+    const int H = 8, Hkv = 4, D = 128, W = 256, kv_past = 150, S = 96;
+    const int ring_head = 60; // fresh rows 46.. of the round wrap to slot 0
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    auto opt = brt_torch_opt<uint16_t>();
+    auto q = torch::randn({1, H, S, D}, opt);
+    auto k = torch::randn({1, Hkv, S, D}, opt);
+    auto v = torch::randn({1, Hkv, S, D}, opt);
+    auto hist = torch::randn({1, 2, Hkv, W, D}, opt);
+    using torch::indexing::Slice;
+    auto mask = torch::full({1, 1, S, kv_past + S}, -65504.0f, opt);
+    for (int i = 0; i < S; ++i) {
+        mask.index_put_({Slice(), Slice(), i, Slice(0, kv_past + i + 1)}, 0.0f);
+    }
+
+    torch::Tensor y_arm[2], c_arm[2];
+    for (int arm = 0; arm < 2; ++arm) {
+        auto Qi = std::make_shared<Tensor<uint16_t>>(std::vector<int>{1, H, S, D});
+        brt_fill(Qi, q);
+        brt_upload(Qi, d);
+        auto Ki = std::make_shared<Tensor<uint16_t>>(std::vector<int>{1, Hkv, S, D});
+        brt_fill(Ki, k);
+        brt_upload(Ki, d);
+        auto Vi = std::make_shared<Tensor<uint16_t>>(std::vector<int>{1, Hkv, S, D});
+        brt_fill(Vi, v);
+        brt_upload(Vi, d);
+        auto Mi = std::make_shared<Tensor<uint16_t>>(
+            std::vector<int>{1, 1, S, kv_past + S});
+        brt_fill(Mi, mask);
+        brt_upload(Mi, d);
+        // One preallocated W-row buffer, past and present aliased (the ring
+        // requires in place), filled with the whole window's history.
+        auto past = std::make_shared<Tensor<uint16_t>>(
+            std::vector<int>{1, 2, Hkv, 0, D});
+        past->preallocate_buffer(d.dev, static_cast<std::size_t>(2) * Hkv * W * D);
+        past->resize(std::vector<int>{1, 2, Hkv, W, D});
+        brt_fill(past, hist);
+        past->copyToGPU(d.cmdpool);
+        past->resize(std::vector<int>{1, 2, Hkv, kv_past, D});
+        auto pres = std::make_shared<Tensor<uint16_t>>(
+            std::vector<int>{1, 2, Hkv, 0, D});
+        pres->alias_gpu_buffer(*past);
+        auto head = std::make_shared<Tensor<int>>(std::vector<int>{1});
+        head->fillToCPU(std::vector<int>{ring_head});
+
+        auto Y = brt_make_out<uint16_t>({1, H, S, D}, d);
+        auto op = brt_make_op(vkop::ops::OpType::ATTENTION, true,
+                              {{"scale", std::to_string(scale)},
+                               {"num_heads", std::to_string(H)},
+                               {"num_kv_heads", std::to_string(Hkv)},
+                               {"mask_causal", "1"},
+                               {"has_cache", "1"},
+                               {"has_ring", "1"},
+                               {"flash", arm == 0 ? "0" : "1"}},
+                              d);
+        ASSERT_TRUE(op != nullptr);
+        op->onExecute({Qi, Ki, Vi, past, Mi, head}, {Y, pres}, 0);
+        brt_run_op(op.get(), d);
+        Y->copyToCPU(d.cmdpool);
+        y_arm[arm] = torch::from_blob(Y->data().data(), {1, H, S, D},
+                                      torch::kFloat16)
+                         .clone()
+                         .to(torch::kFloat32);
+        auto view = std::make_shared<Tensor<uint16_t>>(
+            std::vector<int>{1, 2, Hkv, 0, D});
+        view->alias_gpu_buffer(*past);
+        view->resize(std::vector<int>{1, 2, Hkv, W, D});
+        view->copyToCPU(d.cmdpool);
+        c_arm[arm] = torch::from_blob(view->data().data(), {1, 2, Hkv, W, D},
+                                      torch::kFloat16)
+                         .clone();
+    }
+    // Same fp16 inputs, fp32 accumulation in both: they differ only by
+    // summation order and the tiled kernel's fp16 P.
+    EXPECT_TRUE(torch::allclose(y_arm[0], y_arm[1], 2e-2, 2e-2))
+        << "max |row - tiled| = "
+        << (y_arm[0] - y_arm[1]).abs().max().item<float>();
+    // The cache is a pure copy: bit-identical.
+    EXPECT_TRUE(torch::equal(c_arm[0], c_arm[1]));
+    // And the fresh rows really landed at their ring slots (K half).
+    auto kf = c_arm[1].index({0, 0}).to(torch::kFloat32);
+    for (int jn : {0, 45, 46, 95}) {
+        const int slot = (ring_head + kv_past + jn) % W;
+        EXPECT_TRUE(torch::equal(kf.index({Slice(), slot}),
+                                 k.index({0, Slice(), jn}).to(torch::kFloat32)))
+            << "fresh row " << jn << " not at slot " << slot;
+    }
+}
+
 // seq_major is defined only for the no-cache form. The cache form addresses its
 // fresh K/V rows at the native [H,S,D] pitch inside copy_cache / copy_cache_f8,
 // which seq_major does not touch, so accepting both would read the wrong rows

@@ -473,6 +473,11 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_attention_bda_fp16",
         "buffer_attention_sg_bda",
         "buffer_attention_fp16_sg_bda",
+        # The tiled many-row kernel (shaders/buffer/attention_flash.comp).
+        # AttentionBuffer::flash_route picks it from the live query length,
+        # which the converter cannot know, so it ships with every Attention;
+        # an archive without it keeps the row kernel.
+        "buffer_attention_flash_fp16",
     ],
     ("FusedElemwise", "buffer"): [
         "buffer_fused_elemwise_bda",

@@ -55,3 +55,15 @@ target_link_libraries(bench_conv_int8 PRIVATE vkop vload)
 target_compile_definitions(bench_conv_int8 PRIVATE
     VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
 
+
+# Fused Attention: the row kernel against the tiled many-row kernel, same
+# process, interleaved GPU-timestamp samples, plus an error check against each
+# other and an fp32 CPU reference (see the file header).
+add_executable(bench_attention bench_attention.cpp)
+# ops/Attention.hpp's cache-dtype lambda is instantiated for an 8-byte element
+# that never reaches it (it throws first); clang still diagnoses the folded
+# division in this target's flags.
+target_compile_options(bench_attention PRIVATE -Wno-division-by-zero)
+target_link_libraries(bench_attention PRIVATE vkop vload)
+target_compile_definitions(bench_attention PRIVATE
+    VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
