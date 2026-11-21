@@ -230,7 +230,8 @@ layout(push_constant) uniform PC {
     int batch;
     int fp32;
     int transB; // 1 = B is laid out as [batch, N, K] (transposed); read B[j*K+k]
-    int tile;   // 1 = shared-memory tiled GEMM (grid is x=N/64, y=M/64, z=batch)
+    int tile;   // 1 = shared-memory tiled GEMM (grid is x=N/64, y=M/64, z=batch);
+                // 2 = the 128x128 tile (x=N/128, y=M/128)
     int weight_int8; // 1 = B is one byte per quantized value, dequant via
                      // uScale[j]; fp8 when uPC.fp8, int8 otherwise
     int w8_quad;     // 1 = a byte-quantized B, N % 4 == 0 and B is [batch, K, N]:
@@ -2369,6 +2370,261 @@ void matmul16_tiled() {
     }
 }
 
+#ifdef FP16
+// 128x128 tile GEMM (uPC.tile == 2) for the plain fp16 [batch, K, N] shape:
+// no byte weight, no epilogue, N % 8 == 0 (uvec4 B loads), K % 16 == 0. Same
+// 16x16 workgroup and 16-deep K step as matmul16_tiled, but every thread owns
+// an 8x8 sub-tile -- rows {ty*4..+3, 64+ty*4..+3}, columns {tx*4..+3,
+// 64+tx*4..+3} -- so each k-pair costs 16 shared words for 128 FMAs instead of
+// 8 for 32. The two-group split keeps a SIMD's 16 column lanes on 32
+// contiguous words. Measured on the M5 Max at M=1024: 4096x12288 10.9 -> 9.6
+// ms, 12288x4096 11.1 -> 9.8 ms.
+//
+// Both stages live in the 64x64 kernel's sB (uint[2048], 8 KB): the module
+// already sits at ~32000 of Apple's 32768 B of threadgroup memory (MoltenVK
+// refuses the pipeline past that), and one entry point runs per dispatch, so
+// the two kernels never hold data in it at once.
+//   A: words [0, 1024)    = [row][k-pair], 128 rows x 8 words. Staged with 8
+//      lanes per row so each global read is 32 contiguous bytes; a SIMD's A
+//      reads are broadcasts (two distinct rows), so no padding is needed.
+//   B: words [1024, 2048) = [k][column-pair], global's own packing.
+// Grid: x = N/128, y = M/128, z = batch.
+void matmul16_tiled128() {
+    int tid = tile_tid();
+    int tx = int(gl_LocalInvocationID.x);
+    int ty = int(gl_LocalInvocationID.y);
+    int b = int(gl_WorkGroupID.z);
+    int bb = bmap(b);
+    int row0 = int(gl_WorkGroupID.y) * 128;
+    int col0 = int(gl_WorkGroupID.x) * 128;
+    if (row0 >= uPC.M || col0 >= uPC.N) return;
+    int halfK = uPC.K >> 1;
+    int ar = tid >> 3;
+    int akt = tid & 7;
+    int a_base = (b * uPC.M + row0 + ar) * halfK + akt;
+    int a_rs = 32 * halfK;
+    bool a_ok0 = row0 + ar + 0 < uPC.M;
+    bool a_ok1 = row0 + ar + 32 < uPC.M;
+    bool a_ok2 = row0 + ar + 64 < uPC.M;
+    bool a_ok3 = row0 + ar + 96 < uPC.M;
+    int bk = tid >> 4;
+    int bo = tid & 15;
+    bool b_ok = col0 + bo * 8 + 7 < uPC.N;
+    int b_base = ((bb * uPC.K + bk) * uPC.N + col0 + bo * 8) >> 3;
+    int b_step = (16 * uPC.N) >> 3;
+    uvec4 wb = uvec4(0u);
+    vec4 acc[8][2];
+    acc[0][0] = vec4(0.0);
+    acc[0][1] = vec4(0.0);
+    acc[1][0] = vec4(0.0);
+    acc[1][1] = vec4(0.0);
+    acc[2][0] = vec4(0.0);
+    acc[2][1] = vec4(0.0);
+    acc[3][0] = vec4(0.0);
+    acc[3][1] = vec4(0.0);
+    acc[4][0] = vec4(0.0);
+    acc[4][1] = vec4(0.0);
+    acc[5][0] = vec4(0.0);
+    acc[5][1] = vec4(0.0);
+    acc[6][0] = vec4(0.0);
+    acc[6][1] = vec4(0.0);
+    acc[7][0] = vec4(0.0);
+    acc[7][1] = vec4(0.0);
+    int ntile = uPC.K >> 4;
+    uint wa0 = 0u;
+    uint wa1 = 0u;
+    uint wa2 = 0u;
+    uint wa3 = 0u;
+    if (a_ok0) wa0 = uInputA.data[a_base + 0 * a_rs];
+    if (a_ok1) wa1 = uInputA.data[a_base + 1 * a_rs];
+    if (a_ok2) wa2 = uInputA.data[a_base + 2 * a_rs];
+    if (a_ok3) wa3 = uInputA.data[a_base + 3 * a_rs];
+    if (b_ok) wb = uInputB4.data4[b_base + 0];
+    for (int t = 0; t < ntile; ++t) {
+        barrier();
+        sB[(ar + 0) * 8 + akt] = wa0;
+        sB[(ar + 32) * 8 + akt] = wa1;
+        sB[(ar + 64) * 8 + akt] = wa2;
+        sB[(ar + 96) * 8 + akt] = wa3;
+        int bw = 1024 + bk * 64 + bo * 4;
+        sB[bw + 0] = wb.x;
+        sB[bw + 1] = wb.y;
+        sB[bw + 2] = wb.z;
+        sB[bw + 3] = wb.w;
+        barrier();
+        if (t + 1 < ntile) {
+            int ao = a_base + (t + 1) * 8;
+            if (a_ok0) wa0 = uInputA.data[ao + 0 * a_rs];
+            if (a_ok1) wa1 = uInputA.data[ao + 1 * a_rs];
+            if (a_ok2) wa2 = uInputA.data[ao + 2 * a_rs];
+            if (a_ok3) wa3 = uInputA.data[ao + 3 * a_rs];
+            if (b_ok) wb = uInputB4.data4[b_base + (t + 1) * b_step];
+        }
+#pragma unroll
+        for (int kt = 0; kt < 8; ++kt) {
+            vec2 a00 = unpackHalf2x16(sB[(0 + ty * 4 + 0) * 8 + kt]);
+            vec2 a01 = unpackHalf2x16(sB[(0 + ty * 4 + 1) * 8 + kt]);
+            vec2 a02 = unpackHalf2x16(sB[(0 + ty * 4 + 2) * 8 + kt]);
+            vec2 a03 = unpackHalf2x16(sB[(0 + ty * 4 + 3) * 8 + kt]);
+            vec2 a10 = unpackHalf2x16(sB[(64 + ty * 4 + 0) * 8 + kt]);
+            vec2 a11 = unpackHalf2x16(sB[(64 + ty * 4 + 1) * 8 + kt]);
+            vec2 a12 = unpackHalf2x16(sB[(64 + ty * 4 + 2) * 8 + kt]);
+            vec2 a13 = unpackHalf2x16(sB[(64 + ty * 4 + 3) * 8 + kt]);
+            int bw0_0 = 1024 + (2 * kt) * 64 + 0 + tx * 2;
+            vec4 p0 = vec4(unpackHalf2x16(sB[bw0_0]), unpackHalf2x16(sB[bw0_0 + 1]));
+            vec4 q0 = vec4(unpackHalf2x16(sB[bw0_0 + 64]), unpackHalf2x16(sB[bw0_0 + 64 + 1]));
+            int bw0_1 = 1024 + (2 * kt) * 64 + 32 + tx * 2;
+            vec4 p1 = vec4(unpackHalf2x16(sB[bw0_1]), unpackHalf2x16(sB[bw0_1 + 1]));
+            vec4 q1 = vec4(unpackHalf2x16(sB[bw0_1 + 64]), unpackHalf2x16(sB[bw0_1 + 64 + 1]));
+            acc[0][0] += a00.x * p0 + a00.y * q0;
+            acc[0][1] += a00.x * p1 + a00.y * q1;
+            acc[1][0] += a01.x * p0 + a01.y * q0;
+            acc[1][1] += a01.x * p1 + a01.y * q1;
+            acc[2][0] += a02.x * p0 + a02.y * q0;
+            acc[2][1] += a02.x * p1 + a02.y * q1;
+            acc[3][0] += a03.x * p0 + a03.y * q0;
+            acc[3][1] += a03.x * p1 + a03.y * q1;
+            acc[4][0] += a10.x * p0 + a10.y * q0;
+            acc[4][1] += a10.x * p1 + a10.y * q1;
+            acc[5][0] += a11.x * p0 + a11.y * q0;
+            acc[5][1] += a11.x * p1 + a11.y * q1;
+            acc[6][0] += a12.x * p0 + a12.y * q0;
+            acc[6][1] += a12.x * p1 + a12.y * q1;
+            acc[7][0] += a13.x * p0 + a13.y * q0;
+            acc[7][1] += a13.x * p1 + a13.y * q1;
+        }
+    }
+    { int grow = row0 + 0 + ty * 4 + 0;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[0][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[0][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[0][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[0][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 0 + ty * 4 + 1;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[1][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[1][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[1][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[1][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 0 + ty * 4 + 2;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[2][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[2][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[2][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[2][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 0 + ty * 4 + 3;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[3][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[3][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[3][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[3][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 64 + ty * 4 + 0;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[4][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[4][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[4][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[4][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 64 + ty * 4 + 1;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[5][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[5][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[5][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[5][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 64 + ty * 4 + 2;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[6][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[6][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[6][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[6][1].zw);
+        }
+      }
+    }
+    { int grow = row0 + 64 + ty * 4 + 3;
+      if (grow < uPC.M) {
+        int gcol0 = col0 + 0 + tx * 4;
+        if (gcol0 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[7][0].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[7][0].zw);
+        }
+        int gcol1 = col0 + 64 + tx * 4;
+        if (gcol1 + 3 < uPC.N) {
+            int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
+            uOutput.data[base] = packHalf2x16(acc[7][1].xy);
+            uOutput.data[base + 1] = packHalf2x16(acc[7][1].zw);
+        }
+      }
+    }
+}
+#endif
+
 // Odd-N fallback: one thread per output element, fp32 result to scratch;
 // matmul_pack.comp does the half2 pack afterwards.
 void matmul16_odd_n() {
@@ -2896,7 +3152,9 @@ void main() {
         matmul16_softmax();
         return;
     }
-    if (uPC.tile != 0) {
+    if (uPC.tile == 2) {
+        matmul16_tiled128();
+    } else if (uPC.tile != 0) {
         // This build has no fold pass behind it -- the pair is its own two
         // modules -- so a split range must not reach here. KSPLIT_BY is 0 in
         // this module so the kernel would ignore the range anyway; the guard

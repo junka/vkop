@@ -34,7 +34,7 @@ struct alignas(16) GpuMatMulParam {
     int fp32;     // 1 = fp32, 0 = fp16
     int transB;   // 1 = B is laid out as [batch, N, K] (transposed input); 0 =
                   // [batch, K, N]
-    int tile = 0; // 1 = shared-memory tiled GEMM; buffer path only
+    int tile = 0; // 1 = shared-memory tiled GEMM, 2 = its 128x128 form; buffer path only
     // 1 = B is a byte-packed int8 weight with a per-output-column fp32 scale
     // bound at binding 4 (buffer path only; the image shaders declare the slot
     // but never read it). Defaulted because MatMulImage never assigns it and an
@@ -2568,6 +2568,25 @@ class MatMulBuffer : public BufferFactory {
             // straddles a batch boundary, so no per-row batch fixups in the
             // shader.
             set_route(plan.tag, batch, m, n, k, rep);
+            // The 128x128 / 8x8-per-thread kernel (uPC.tile == 2) covers the
+            // plain fp16 [batch, K, N] shape: no byte weight, no epilogue,
+            // N % 8 == 0 for its uvec4 B loads, and enough rows and columns
+            // that a 128-wide block is not mostly padding. VKOP_TILE128=0
+            // keeps the 64x64 kernel (A/B switch).
+            static const bool t128_on = [] {
+                const char *e = std::getenv("VKOP_TILE128");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
+            if (t128_on && fp16_ != 0 && para_.transB == 0 &&
+                para_.weight_int8 == 0 && para_.epi_bias == 0 &&
+                n % 8 == 0 && k % 16 == 0 && m >= 256 && n >= 256) {
+                para_.tile = 2;
+                if (try_submit_bda(UP_DIV(n, 128), UP_DIV(m, 128), batch)) {
+                    return;
+                }
+                submit(&para_, UP_DIV(n, 128), UP_DIV(m, 128), batch);
+                return;
+            }
             if (try_submit_bda(UP_DIV(n, 64), UP_DIV(m, 64), batch)) {
                 return;
             }

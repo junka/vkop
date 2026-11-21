@@ -136,6 +136,26 @@ TEST(MatMulTest, MatMulTileGemvRowOverlap) {
     }
 }
 
+// The 128x128 tile kernel (uPC.tile == 2) takes fp16 [batch,K,N] shapes with
+// m >= 256, n >= 256, N % 8 == 0, once the shape has the 128 64x64 tiles the
+// selector wants before it picks plain `tiled` over `tiled_ks`. Ragged M and N (not
+// multiples of 128) hit its row/column guards; the batched case its per-batch
+// A/output offsets.
+TEST(MatMulTest, MatMulTile128) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
+        {{512, 128}, {128, 1024}},
+        {{520, 256}, {256, 1032}},
+        {{2, 264, 64}, {2, 64, 1288}},
+    };
+    for (const auto &test_case : cases) {
+        auto [t1, t2] = test_case;
+        MatMulTest<uint16_t> mmtest(t1, t2);
+        EXPECT_TRUE(mmtest.run_test({mmtest.inputa, mmtest.inputb},
+                                    {mmtest.output}));
+    }
+}
+
 // A batched activation times a shared rank-2 weight used to index B by flat
 // batch, as if every batch had its own slice: batch >= 1 read past the weight
 // (zeros in a fresh SSBO, or the next tensor in the unified weight region).

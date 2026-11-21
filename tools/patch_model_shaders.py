@@ -253,11 +253,17 @@ def patch(model_path, master_path, out_path, dry_run, force,
     # vector moves. The parser uses the entry table, not the vector's tail.
     # Back up only the bytes about to change (the archive range), with the
     # offset in the name so it can be written back.
+    prev = bytes(model[vec_data:vec_data + vec_len])
     if not out_path:
         backup = f"{model_path}.bak_shaders@{vec_data}"
-        with open(backup, "wb") as f:
-            f.write(model[vec_data:vec_data + vec_len])
-        print(f"[patch] old archive bytes saved to {backup}")
+        # A second patch keeps the first backup: that one holds the archive the
+        # model shipped with, which is what a restore wants.
+        if os.path.exists(backup):
+            print(f"[patch] keeping existing backup {backup}")
+        else:
+            with open(backup, "wb") as f:
+                f.write(prev)
+            print(f"[patch] old archive bytes saved to {backup}")
     model[vec_data:vec_data + vec_len] = archive + b"\x00" * (vec_len - len(archive))
 
     # Verify.
@@ -269,7 +275,7 @@ def patch(model_path, master_path, out_path, dry_run, force,
             ok = False
     if not ok:
         if not out_path:
-            model[vec_data:vec_data + vec_len] = open(backup, "rb").read()
+            model[vec_data:vec_data + vec_len] = prev
         model.flush()
         raise SystemExit("patched archive does not round-trip; restored")
     model.flush()
