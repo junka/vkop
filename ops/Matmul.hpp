@@ -2577,6 +2577,20 @@ class MatMulBuffer : public BufferFactory {
                 const char *e = std::getenv("VKOP_TILE128");
                 return e == nullptr || std::atoi(e) != 0;
             }();
+            // Apple: the same plain fp16 shape on 8x8x8 simdgroup matrices
+            // (64x64 workgroup tile, 16-deep K step).
+            if (fp16_ != 0 && para_.transB == 0 && para_.weight_int8 == 0 &&
+                para_.epi_bias == 0 && para_.attn_softmax == 0 &&
+                para_.w4 == 0 &&
+                n % 64 == 0 && k % 16 == 0 && m >= 64) {
+                if (VulkanPipeline *c8 = coop8_pipeline()) {
+                    set_route("coop8", batch, m, n, k, rep);
+                    para_.tile = 2;
+                    ks_submit(c8, coop8_ds_[m_id_], n / 64, UP_DIV(m, 64),
+                              batch);
+                    return;
+                }
+            }
             if (t128_on && fp16_ != 0 && para_.transB == 0 &&
                 para_.weight_int8 == 0 && para_.epi_bias == 0 &&
                 n % 8 == 0 && k % 16 == 0 && m >= 256 && n >= 256) {
@@ -3626,6 +3640,60 @@ class MatMulBuffer : public BufferFactory {
         dispatch_and_record(gx, gy, gz, &para_);
     }
 
+    // The 8x8x8 cooperative-matrix GEMM for Apple GPUs. MoltenVK does not
+    // list VK_KHR_cooperative_matrix (so the KHR probe in
+    // set_runtime_device never builds coop_pipeline_ there), yet SPIRV-Cross
+    // lowers an 8x8 coopmat to Metal simdgroup_matrix and the module runs.
+    // That is off-spec, so it is enabled by device, not by feature query:
+    // only on the MoltenVK driver, and a pipeline the driver refuses just
+    // leaves the SIMT tile in charge. VKOP_COOP8=0 turns it off.
+    VulkanPipeline *coop8_pipeline() {
+        if (coop8_state_ != 0 && coop8_nbind_ == objs_.size()) {
+            return coop8_state_ > 0 ? coop8_pipeline_.get() : nullptr;
+        }
+        if (coop8_state_ < 0) {
+            return nullptr;
+        }
+        static const bool env_on = [] {
+            const char *e = std::getenv("VKOP_COOP8");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        coop8_state_ = -1;
+        if (!env_on || m_dev_->device_traits().driver_id !=
+                           static_cast<uint32_t>(VK_DRIVER_ID_MOLTENVK)) {
+            return nullptr;
+        }
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv("buffer_matmul_coop8");
+        } catch (const std::exception &) {
+            return nullptr;
+        }
+        try {
+            bool use_uab = update_after_bind_ &&
+                           m_dev_->is_support_descriptor_update_after_bind();
+            coop8_pipeline_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>(objs_.size(),
+                                              DESCRIPTOR_TYPE_STORAGE),
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), use_uab, 0, nullptr);
+            for (auto &ds : coop8_ds_) {
+                ds = coop8_pipeline_->allocDescriptorSets();
+            }
+        } catch (const std::exception &e) {
+            std::fprintf(stderr,
+                         "[vkop] coop8 MatMul module rejected (%s); keeping "
+                         "the SIMT tile\n",
+                         e.what());
+            coop8_pipeline_.reset();
+            return nullptr;
+        }
+        coop8_nbind_ = objs_.size();
+        coop8_state_ = 1;
+        return coop8_pipeline_.get();
+    }
+
     // layout and push constants as the wide path above).
     void dispatch_on(VulkanPipeline *pipe, VkDescriptorSet ds, int gx, int gy) {
         fillDescriptorWrites(ds);
@@ -3703,6 +3771,13 @@ class MatMulBuffer : public BufferFactory {
     // from the same objs_ vector.
     std::unique_ptr<VulkanPipeline> coop_pipeline_;
     VkDescriptorSet coop_ds_[vkop::kInflight] = {nullptr};
+    // Apple 8x8x8 coopmat GEMM (matmul_coop8.comp), built on first use. 0 =
+    // not tried, 1 = built, -1 = unavailable (not MoltenVK, disabled, no
+    // archive bytes, or the driver refused the pipeline).
+    std::unique_ptr<VulkanPipeline> coop8_pipeline_;
+    VkDescriptorSet coop8_ds_[vkop::kInflight] = {nullptr};
+    int coop8_state_ = 0;
+    size_t coop8_nbind_ = 0;
     // Workgroup output footprint of the probed coopmat tile (bm = 2*cm,
     // bn = 4*cn): 16x32 for ARL's 8x8x16, 32x64 for Ada's 16x16x16, 32x32 for
     // the 16x8 tiles. Set when coop_pipeline_ is built; the dispatch grid

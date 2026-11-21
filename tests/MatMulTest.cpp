@@ -211,6 +211,27 @@ TEST(MatMulTest, MatMulBatchBroadcastWeight) {
     }
 }
 
+// The Apple 8x8x8 coopmat GEMM (matmul_coop8.comp, MoltenVK only; elsewhere
+// these shapes run the SIMT tile and the test still holds). It takes the
+// plain fp16 tile shape with N % 64 == 0, K % 16 == 0 and M >= 64: M off the
+// 64-row tile, a per-batch B, and a batched A over a shared rank-2 weight.
+TEST(MatMulTest, MatMulCoop8) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
+        {{130, 256}, {256, 192}},
+        {{2, 100, 64}, {2, 64, 128}},
+        {{64, 48}, {48, 64}},
+    };
+    for (const auto &test_case : cases) {
+        auto [t1, t2] = test_case;
+        MatMulTest<uint16_t> mmtest(t1, t2);
+        EXPECT_TRUE(mmtest.run_test({mmtest.inputa, mmtest.inputb},
+                                    {mmtest.output}));
+    }
+    MatMulBroadcastWeightTest<uint16_t> bw(3, 70, 128, 64, false);
+    EXPECT_TRUE(bw.run_test({bw.inputa, bw.inputb}, {bw.output}));
+}
+
 // ONNX MatMul with a 1-D operand: a rank-1 A is a single row [K] (promoted to
 // [1,K]), a rank-1 B a single column [K] (promoted to [K,1]), and the promoted
 // dim is dropped from the output again — {K}x{K,N} -> {N}, {M,K}x{K} -> {M}.

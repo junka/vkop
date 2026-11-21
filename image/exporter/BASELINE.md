@@ -689,9 +689,38 @@ measured with `VKOP_SUBMIT_PROF=1` over 6 steps, which runs cooler than the 40-s
 | `image_gen` uploads static inputs once | ~1.47 s + 3 ms host | host time between steps 121 → ~8 ms |
 | fp16 attention scores: drop the fp32 Softmax island, one-pass fp16 row Softmax | ~1.435 s | Softmax 22.1 → 11.3 ms, Cast 16.8 → 0, FE 25.6 → 20.4 ms; 980 nodes |
 | tiled flash-attention kernel (`attention_flash.comp`); island fold moved before attention fusion | ~1.43 s | attention 69.4 ms (2.17 ms/layer) vs ~72 ms unfused; scores never materialized; 884 nodes |
+| Apple 8×8×8 coopmat MatMul (`matmul_coop8.comp`, MoltenVK only) | 1.5 → 1.33 s/step wall | MatMul ~10.7 → ~12 TFLOPS at m = 1024 (see below; GPU timestamps not usable for this one) |
 
-40 steps with all of the above, on a hot machine (median step 1.59 s): text tower 2.24 s load,
-prefill 0.19 s, denoising **62.9 s**, VAE **0.80 s**, wall clock **71.2 s**.
+40 steps with all of the above up to flash attention, on a hot machine (median step 1.59 s):
+text tower 2.24 s load, prefill 0.19 s, denoising **62.9 s**, VAE **0.80 s**, wall clock **71.2 s**.
+With the coopmat MatMul: denoising **55.3 s** (1.38 s/step), VAE 0.80 s, wall clock **62.7 s**.
+
+**Cooperative-matrix MatMul on MoltenVK.** MoltenVK does not advertise
+`VK_KHR_cooperative_matrix`, but SPIRV-Cross lowers an 8×8 coopmat to Metal's
+`simdgroup_matrix`, and only that shape (the 8×16 / 16×16 modules fail pipeline creation).
+`matmul_coop8.comp` uses it for the plain fp16 tile shape (`transB = 0`, no byte weight, no
+epilogue, N % 64 == 0, K % 16 == 0, M ≥ 64): 4 subgroups per 128-thread workgroup, 64×64 output
+tile, each subgroup holding 4×4 fp32 accumulators as named variables (SPIRV-Cross mis-declares
+an array of coopmats), A/B staged through shared memory as `uvec4`, and the epilogue reusing the A
+stage to spill one 8-row strip at a time. Because it is off-spec, the module is enabled by
+device rather than by a feature query: only when `driverID == VK_DRIVER_ID_MOLTENVK`, and a
+pipeline the driver rejects leaves the SIMT tile in charge. `VKOP_COOP8=0` turns it off.
+
+`bench_matmul`, wall clock, fp16, before → after:
+
+| M × K × N | SIMT tile | coop8 |
+|-----------|-----------|-------|
+| 1024 × 3072 × 12288 | 7.26 ms | 6.35 ms |
+| 1024 × 12288 × 3072 | 7.51 ms | 6.47 ms |
+| 256 × 4096 × 12288 | 2.75 ms | 2.35 ms |
+| 64 × 4096 × 12288 | 0.93 ms | 0.73 ms |
+
+Tile sweeps (64×64, 128×64, 64×128; K step 16/32/64) all landed within ±3% of each other at
+~12 TFLOPS, so the limit is the ALUs rather than staging: `simdgroup_multiply_accumulate` on
+this part runs on the same FMA units as the SIMT kernel. The outputs are bit-identical to the
+SIMT tile (fp16 × fp16 products are exact in fp32 and both kernels accumulate K in order), so the
+40-step latent does not change. `VKOP_SUBMIT_PROF` reports MatMul at half its real cost with
+this kernel (657 ms of a 1.33 s wall step), so time it by wall clock.
 
 **Attention.** The runtime `Attention` op used to run one workgroup per query row, which re-reads
 all of K/V per row and is 4× too slow at many rows. `attention_flash.comp` processes one

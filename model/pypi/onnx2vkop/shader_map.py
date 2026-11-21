@@ -131,6 +131,8 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # so listing them under the wrong backend just ships dead bytes.
     ("MatMul", "buffer"): [
         "buffer_matmul_coop",
+        # Apple 8x8x8 coopmat GEMM; only the MoltenVK driver builds it.
+        "buffer_matmul_coop8",
         "buffer_matmul_coop16",
         # Larger 16x16x16 workgroups of the same coop16 source (-DACC_M/-DACC_N):
         # 64x64 and 64x128 output footprints. Which one a MatMul dispatches is a

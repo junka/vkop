@@ -474,11 +474,11 @@ cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
 | 文本塔 加载 / 前向 | 2.24 s / 0.45 s | 13.9 GB，用完即释放 |
 | DiT prefill 加载 / 前向 | 2.5 s / 0.19 s | 13.8 GB，32 层 KV |
 | DiT decode 加载 | 1.87 s | 14.2 GB |
-| **去噪 40 步** | **62.9 s（1.46–1.65 s/步，随芯片温度变化）** | m = 1024 图像 token；MatMul 占每步 92%，attention 走 flash kernel |
+| **去噪 40 步** | **55.3 s（约 1.38 s/步，随芯片温度变化）** | m = 1024 图像 token；MatMul 占每步约 90%，在 MoltenVK 上走 8×8 coopmat（simdgroup_matrix），attention 走 flash kernel |
 | VAE 加载 / 解码 | 0.36 s / 0.80 s | Conv2d 走 implicit GEMM |
-| **端到端** | **71.2 s** | 机器较热时测得 |
+| **端到端** | **62.7 s** | 机器较热时测得 |
 
-2026-11-21 测量。之前是去噪 94.0 s（2.3 s/步）、VAE 解码 4.1 s、端到端 104.4 s。逐项改动和每步算子拆分见
+2026-11-21 测量。之前是去噪 94.0 s（2.3 s/步）、VAE 解码 4.1 s、端到端 104.4 s；加 coopmat MatMul 之前是去噪 62.9 s、端到端 71.2 s。逐项改动和每步算子拆分见
 `image/exporter/BASELINE.md` 的 2026-11-21 一节。
 
 DiT 要用 `--no-fusions=fuse_swiglu_down_proj` 转换。SwiGLU 融合 kernel 是给 decode 的小 M 设计的，到 m = 1024
