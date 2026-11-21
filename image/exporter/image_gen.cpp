@@ -1206,12 +1206,17 @@ int main(int argc, char** argv) {
         std::vector<float> timestep_data(1, t);
         fill32(timestep_t, timestep_data);
         
+        // rope、past_kv 和 attention_bias 每步都一样，只在第 0 步上传一次。
+        // 之前每步都 ResizeInput + copyToGPU：ResizeInput 会 recreate_storage_buffer，
+        // 所以每步要重新分配 32 个 KV buffer 再同步上传，主机侧每步约 115 ms
+        // （KV 90 ms、bias 21 ms），占一步的 7%。这些输入在 decode 图里只读：
+        // 图里没有带 in-place cache 的 Attention，不 resize 时 buffer 就跨 Run 保留。
+        // ref 模式每步按参考文件重灌，保持原样。
+        const bool upload_static = ref_mode || step == 0;
         if (ref_mode) {
             if (!ref_fill(decode_rt.get(), "cos", "cos_decode.raw")) return 1;
             if (!ref_fill(decode_rt.get(), "sin", "sin_decode.raw")) return 1;
-        } else {
-            // 图像段的 rope 行每步都一样（位置不含 σ），但 SSBO 仍要重新上传：
-            // 上一次 Run 之后图里的 buffer 内容不作保证。
+        } else if (upload_static) {
             decode_rt->ResizeInput("cos", {(uint32_t)target_len, (uint32_t)hd});
             fill16(decode_rt->GetInput("cos"), rope.cos_img);
             decode_rt->ResizeInput("sin", {(uint32_t)target_len, (uint32_t)hd});
@@ -1219,7 +1224,7 @@ int main(int argc, char** argv) {
         }
         
         // Feed all past_kv inputs (dynamic count and shape based on prefill outputs)
-        for (int layer = 0; layer < num_kv_layers; ++layer) {
+        for (int layer = 0; upload_static && layer < num_kv_layers; ++layer) {
             std::string kv_name = "past_kv_" + std::to_string(layer);
             const auto& kv_shape = past_kv_shapes[layer];
             decode_rt->ResizeInput(kv_name, {
@@ -1236,7 +1241,7 @@ int main(int argc, char** argv) {
         // attention_bias: [1, 1, target_len, kv_len] (fp16)
         if (ref_mode) {
             if (!ref_fill(decode_rt.get(), "attention_bias", "bias_decode.raw")) return 1;
-        } else {
+        } else if (upload_static) {
             int total_kv_len = prefix_len + target_len;
             decode_rt->ResizeInput("attention_bias", {1u, 1u, (uint32_t)target_len, (uint32_t)total_kv_len});
             auto attn_bias_decode_t = decode_rt->GetInput("attention_bias");

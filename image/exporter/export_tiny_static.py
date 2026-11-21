@@ -8,8 +8,9 @@ the exporter's constant folding bakes every reshape spec into a Constant and
 the dynamic-shape machinery disappears.
 
 Writes dit_{prefill,decode}_tiny_static.onnx (+ .weights.bin) next to this
-script. Then convert with:
-    python convert_dit_to_vkop_static.py   (or the patched no-optimizer path)
+script. Then convert with the streaming CLI:
+    cd model/pypi && python3 -m onnx2vkop.cli -i <graph>.onnx -o <graph>.vkopbin \
+        --no-fusions=fuse_swiglu_down_proj --master-archive ../../build/vkop_shaders.bin
 """
 
 import sys

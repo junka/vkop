@@ -648,6 +648,98 @@ give median rounds 36.2 / 40.5 / 41.4 ms with WIDE versus 41.5 / 41.6 / 44.7 ms 
 winning every pair. `MatMulInt8WeightOnlyBuffer` and `MatMulFp8WeightOnlyBuffer` now include N=896
 single-row shapes, the smallest that reach this kernel.
 
+### 2026-11-21: 1.5 s/step, 75 s per sample, and MatMul is now 92% of the step
+
+Same command as the `benchmark/README.md` row (512×512, 40 steps, seed 7,
+"A red fox sitting on a wooden bench in a sunlit park"), `VKOP_RUN_PROFILE=1`:
+
+| Phase | `benchmark/README.md` before | 2026-11-21 |
+|-------|------------------------------|------------|
+| text tower load / forward | 1.67 s / 0.45 s | 1.62 s / 0.45 s |
+| DiT prefill load / run | 1.6 s / 0.21 s | 1.73 s / 0.19 s (GPU 118 ms) |
+| DiT decode load | 1.6 s | 1.71 s |
+| **denoising, 40 steps** | **94.0 s (2.3 s/step)** | **63.9 s** (`Run` 1.51–1.63 s/step depending on how hot the SoC is) |
+| VAE load / decode | 0.2 s / 4.1 s | 0.26 s / 3.94 s |
+| **wall clock** | **104.4 s** | **75.4 s** |
+| peak wired / lowest free | 21.3 GB / 30% | 22.5 GB / 25% |
+
+A step is pure GPU time: host record is 5.6 ms of a 1.5 s `Run`, and there are no readbacks
+(`[graph] 11 segments, 0 readback boundaries`). Record-once replay buys nothing at that size:
+`VKOP_REPLAY=1` leaves the step unchanged, and `VKOP_SEGMENT_REPLAY=1` is 100 ms slower (it splits
+the round into one segment per level and got 0 hits).
+
+What did cost host time was the driver *between* steps: 40 × `Run` summed to 62.75 s of a 67.6 s
+loop, i.e. ~121 ms/step outside the graph. `image_gen` re-ran `ResizeInput` + a synchronous
+`copyToGPU` on every input every step, and `ResizeInput` recreates the storage buffer, so each
+step reallocated and re-uploaded the 32 past_kv tensors (90 ms) and rebuilt the 1024×1088
+attention bias on the CPU (21 ms). None of them change across steps and nothing in the decode
+graph writes them, so they are now uploaded once at step 0 (only latent and timestep are
+refilled). The loop overhead fell to 0.3 s for 40 steps, and the latent is bit-identical. Per-change GPU time per decode step,
+measured with `VKOP_SUBMIT_PROF=1` over 6 steps, which runs cooler than the 40-step median above:
+
+| Change | Step GPU | What moved |
+|--------|----------|------------|
+| start (`84f0a43`) | 2.175 s | MatMul 1575 ms, FusedElemwise 387 ms, Mul/Min/Max/Transpose 104 ms |
+| `dd7e22d` FE affine broadcast + packed fp16 | 1.95 s | FE 387 → 170 ms |
+| `18b3406` 128×128 fp16 MatMul tile | ~1.70 s | MatMul 1575 → 1344 ms (about 9.4 → 10.8 TFLOPS) |
+| `413111a` FE programs as spec constants | ~1.57 s | FE 170 → 25 ms |
+| `b4e563c` affine broadcast for binary ops, chunked fp16 Transpose | ~1.49 s | those four ops 104 → 15 ms |
+| Concat as one div/mod per element | ~1.48 s | Concat 11.0 → 2.3 ms |
+| reconversion: Min/Max into FE chains, `LN(x,1,0)*s → LN(x,s,0)` | ~1.47 s | 1204 → 1012 nodes, Mul/Min/Max (12.5 ms) gone |
+| `image_gen` uploads static inputs once | ~1.47 s + 3 ms host | host time between steps 121 → ~8 ms |
+
+Where the step goes now (one 6-step-profile step, ms):
+
+| MatMul | FusedElemwise | Softmax | Cast | Reshape | RMSNorm | Rotary | Concat | Transpose | LayerNorm |
+|--------|---------------|---------|------|---------|---------|--------|--------|-----------|-----------|
+| 1364.6 | 25.6 | 22.1 | 16.8 | 15.5 | 6.8 | 5.6 | 2.2 | 2.2 | 1.5 |
+
+- **MatMul** is the remaining lever. The 128 tile sits at about 81% of the FMA ceiling this
+  kernel shape reaches (~13.3 TFLOPS). The next step is Apple's `simdgroup_matrix` via coopmat 8×8
+  SPIR-V, which MoltenVK accepts without advertising the extension. A naive version of that
+  kernel reached 11.6 TFLOPS.
+- **Softmax + Cast + the large Reshape copies** (~55 ms) all re-read the 32×1024×1088 attention
+  score tensor and are already at DRAM bandwidth. Only a fused (flash-style) attention removes them.
+
+The general broadcast path shared by Equal, PRelu and the binary ops (plain, BDA, int64) also
+got cheaper, although the DiT no longer exercises it. `broadcast_index` is now one div/mod per
+dimension, with no coordinate arrays. The hosts fill its dims through `fill_dims_coalesced`,
+which merges adjacent dimensions that every input treats alike and drops size-1 dimensions, so
+`[1,1024,32,128]` against `[1,1,32,128]` runs at rank 2 instead of rank 4.
+
+Numerics. The MatMul tile, binary-op, Transpose, Concat, broadcast and input-upload changes are
+bit-identical on the 6-step latent. Two changes are not, and both are expected:
+
+- FE specialization: latent cos 0.99998 against the interpreter. Metal fast-math rewrites the
+  now-constant program, for example division by a constant becoming multiplication by its
+  reciprocal.
+- Reconversion: cos 0.99997, maxabs 0.097. The clamp and the LN scale now act on fp32 registers
+  instead of fp16-rounded intermediates.
+
+The image is visually unchanged.
+
+Switches for A/B: `VKOP_TILE128=0` (back to the 64×64 tile) and `VKOP_FE_SPEC=0` (back to the FE
+interpreter).
+
+Workflow traps hit along the way:
+
+- A `.vkopbin` embeds its own SPIR-V. After editing a `.comp`, build the `shader_archive` target
+  explicitly; a plain `cmake --build build` does not refresh `build/vkop_shaders.bin`. Then run
+  `tools/patch_model_shaders.py <model> build/vkop_shaders.bin` on all four models, or the change
+  never reaches `image_gen`.
+- Restoring a shader with `cp` in the same second as the last build leaves make believing the
+  archive is current. Touch the file a second later.
+- Single-op tests use the image backend unless `VKOP_BUFFER_BACKEND=1` is set. Without it, a
+  broken buffer shader still passes.
+- Convert the DiT with the streaming CLI on the `_lifted` graphs: 7.5 s, 0.2 GB peak. (The old
+  `convert_dit_to_vkop.py`, which ran none of the fusion passes, is deleted.) Command:
+
+  ```bash
+  cd model/pypi && python3 -m onnx2vkop.cli -i ../../image/exporter/dit_decode_static_lifted.onnx \
+    -o ../../image/exporter/dit_decode_static.vkopbin --no-fusions=fuse_swiglu_down_proj \
+    --master-archive ../../build/vkop_shaders.bin
+  ```
+
 ### Sequential loading now has four segments
 
 | Phase | Size | Measured |

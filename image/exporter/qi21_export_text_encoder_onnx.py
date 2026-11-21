@@ -439,7 +439,7 @@ def main():
         os.chdir(prev_cwd)
     size = (out_dir / loc).stat().st_size
     print(f"\n[done] {path}\n[done] {out_dir / loc}（{size / 1e9:.2f} GB）")
-    print("[next] 转 vkopbin：>13 GB 的图必须跳过 optimizer（见 convert_dit_to_vkop.py），"
+    print("[next] 转 vkopbin：用 onnx2vkop.cli 流式转换（命令见 benchmark/README.md 的文生图一节），"
           "然后按 image/exporter/BASELINE.md 的口径与 ORT 对拍")
 
 
