@@ -1873,6 +1873,18 @@ class FusionOptimizer:
             )
         )
 
+        # adaLN modulation: LayerNormalization(x, ones, zeros) * s with a
+        # runtime per-channel s becomes LayerNormalization(x, s, zeros). Runs
+        # before fuse_elemwise_chain (60) so the Mul is still a plain node.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_layernorm_scale",
+                FusionOptimizer.match_layernorm_scale,
+                FusionOptimizer.fold_layernorm_scale,
+                priority=61,
+            )
+        )
+
         # fuse_bias_gelu / fuse_embedding_layernorm / fuse_bert_encoder used to
         # be registered here (priorities 85/80/75). They are deleted rather than
         # ported:
@@ -5531,6 +5543,92 @@ class FusionOptimizer:
         dag_model.nodes[fused.name] = fused
         return True
 
+    # ---- LayerNorm runtime-scale fusion (adaLN modulation) ----
+    # Folds `LayerNormalization(x, 1, 0) -> Mul(., s)`, where s is a runtime
+    # tensor holding one value per normalized channel (shape [1, .., 1, C]),
+    # into `LayerNormalization(x, s, 0)`: with gamma = 1 and beta = 0,
+    # LN(x) * s == (x - mu) / sigma * s, which is exactly LN with weight s.
+    # The runtime LayerNorm binds its weight as an ordinary SSBO of C
+    # elements, so a runtime weight needs no kernel change. Qwen-Image's DiT
+    # has 64 of these (norm1/norm2 per block, scaled by 1 + scale_msa/mlp).
+    @staticmethod
+    def match_layernorm_scale(dag_model):
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        def const_all(tname, value):
+            init = dag_model.initializers.get(tname)
+            if init is None:
+                return False
+            arr = numpy_helper.to_array(init)
+            return arr.size > 0 and bool(np.all(arr == value))
+
+        def numel(shape):
+            n = 1
+            for d in shape:
+                if not isinstance(d, int) or d <= 0:
+                    return None
+                n *= d
+            return n
+
+        matches = []
+        for ln in list(dag_model.nodes.values()):
+            if ln.op_type != "LayerNormalization" or len(ln.inputs) != 3:
+                continue
+            if len(ln.outputs) != 1:
+                continue
+            axis = ln.attributes.get("axis", -1)
+            x_shape = ln.inputs[0].get("shape") or []
+            if not x_shape or axis not in (-1, len(x_shape) - 1):
+                continue
+            chans = x_shape[-1]
+            if not isinstance(chans, int) or chans <= 0:
+                continue
+            if not (const_all(ln.inputs[1]["name"], 1.0)
+                    and const_all(ln.inputs[2]["name"], 0.0)):
+                continue
+            cons = consumers.get(ln.outputs[0]["name"], [])
+            if len(cons) != 1 or cons[0][0].op_type != "Mul":
+                continue
+            mul = cons[0][0]
+            if len(mul.inputs) != 2 or len(mul.outputs) != 1:
+                continue
+            others = [t for t in mul.inputs if t["name"] != ln.outputs[0]["name"]]
+            if len(others) != 1:
+                continue
+            sc = others[0]
+            # A runtime tensor (an initializer scale would be folded by the
+            # generic constant passes, and the LN weight dtype must match x).
+            if sc["name"] in dag_model.initializers:
+                continue
+            sc_shape = sc.get("shape") or []
+            if not sc_shape or sc_shape[-1] != chans or numel(sc_shape) != chans:
+                continue
+            if sc.get("dtype") != ln.inputs[0].get("dtype"):
+                continue
+            # The Mul must not broadcast x up (its output keeps x's shape).
+            if (mul.outputs[0].get("shape") or x_shape) != x_shape:
+                continue
+            matches.append({"ln": ln, "mul": mul, "scale": sc})
+        print(f"Found {len(matches)} LayerNorm*scale patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_layernorm_scale(dag_model, match) -> bool:
+        ln, mul = match["ln"], match["mul"]
+        if ln.name not in dag_model.nodes or mul.name not in dag_model.nodes:
+            return False
+        fused = Node(
+            op_type="LayerNormalization",
+            name=f"LayerNormScale_fused_{ln.name}",
+            attributes=dict(ln.attributes),
+            inputs=[ln.inputs[0], match["scale"], ln.inputs[2]],
+            outputs=mul.outputs[:],
+        )
+        del dag_model.nodes[ln.name]
+        del dag_model.nodes[mul.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
     # ---- Transpose-into-MatMul (transB) fusion ----
     # Folds Transpose(perm=[..., last two swapped]) -> MatMul(B) into the
     # MatMul with a transB attribute, so the matmul shader reads B transposed
@@ -6329,6 +6427,11 @@ class FusionOptimizer:
         # already enforces. This collapses e.g. Cast(fp32->fp16)+Mul(weight)
         # pairs that previously broke chains, cutting dispatch count.
         "Cast": 11,
+        # Min/Max (OP_MIN=15 / OP_MAX=16): the fp16 overflow clamp exports
+        # write after a residual add (Qwen-Image: Add -> Min(65500) ->
+        # Max(-65500) per block). Without them the clamp ran as two separate
+        # dispatches behind every residual chain.
+        "Min": 15, "Max": 16,
     }
     # A Cast folded into a chain is a no-op at the register level (the dtype
     # conversion is realized by the per-input load stride + the output store
@@ -6406,6 +6509,10 @@ class FusionOptimizer:
             return code in _FLOAT_ELEM_TYPES or is_scalar_init(td.get("name"))
 
         def is_chainable(node):
+            # ONNX Min/Max are variadic; a program word takes two operands.
+            if node is not None and node.op_type in ("Min", "Max") and \
+                    len(node.inputs) != 2:
+                return False
             return node is not None and node.op_type in chainable and \
                 len(node.inputs) >= 1 and len(node.outputs) == 1 and \
                 float_typed(node.outputs[0]) and \
@@ -6706,7 +6813,7 @@ class FusionOptimizer:
             if a_val is None:
                 return False
             b_val = 0
-            if op.op_type in ("Add", "Sub", "Mul", "Div", "Pow"):
+            if op.op_type in ("Add", "Sub", "Mul", "Div", "Pow", "Min", "Max"):
                 if len(op.inputs) < 2:
                     return False
                 b_val = operand_code(op, op.inputs[1])

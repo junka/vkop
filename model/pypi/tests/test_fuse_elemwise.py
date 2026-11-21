@@ -423,3 +423,94 @@ def test_the_fused_chain_evaluates_the_gated_formula():
         f"fused chain gave {got}, expected {want}. A value matching "
         f"{((core / math.sqrt(var + eps)) * w1) ** 2:.6f} means the gate was "
         f"dropped and the last MUL self-multiplied.")
+
+
+def _scalar_init(m, name, value):
+    import numpy as np
+    from onnx import numpy_helper
+    m.initializers[name] = numpy_helper.from_array(
+        np.array([value], dtype=np.float32), name)
+
+
+def test_residual_clamp_fuses():
+    """Add(A,B) -> Min(., 65500) -> Max(., -65500): the fp16 overflow clamp
+    behind a residual add folds into the Add's chain as MIN/MAX words."""
+    m = DAGBasedModel()
+    A = tdict("A", [8]); B = tdict("B", [8])
+    hi = tdict("hi", [1]); lo = tdict("lo", [1])
+    t1 = tdict("t1", [8]); t2 = tdict("t2", [8]); out = tdict("out", [8])
+    for n in (Node("Add", "Add_0", {}, [A, B], [t1]),
+              Node("Min", "Min_0", {}, [t1, hi], [t2]),
+              Node("Max", "Max_0", {}, [t2, lo], [out])):
+        m.nodes[n.name] = n
+    m.inputs = [A, B]
+    m.outputs = [out]
+    _scalar_init(m, "hi", 65500.0)
+    _scalar_init(m, "lo", -65500.0)
+    m.build_dependencies()
+    m = run_fusion(m)
+    fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
+    assert len(fused) == 1, [n.op_type for n in m.nodes.values()]
+    f = fused[0]
+    ops = f.attributes["ops"]
+    assert [ops[i] for i in range(0, len(ops), 4)] == [1, 15, 16], ops
+    # Both clamp bounds are program scalars, read as operand b.
+    assert ops[7] >= 100 and ops[11] >= 100, ops
+    assert sorted(f.attributes["scalars"]) == [-65500.0, 65500.0]
+
+
+def test_variadic_min_not_fused():
+    """A 3-input Min has no two-operand program word: it stays a node."""
+    m = DAGBasedModel()
+    A = tdict("A", [8]); B = tdict("B", [8]); C = tdict("C", [8])
+    t1 = tdict("t1", [8]); out = tdict("out", [8])
+    for n in (Node("Add", "Add_0", {}, [A, B], [t1]),
+              Node("Min", "Min_0", {}, [t1, B, C], [out])):
+        m.nodes[n.name] = n
+    m.inputs = [A, B, C]
+    m.outputs = [out]
+    m.build_dependencies()
+    m = run_fusion(m)
+    assert "Min_0" in m.nodes
+    assert not any(n.op_type == "FusedElemwise" for n in m.nodes.values())
+
+
+def _make_ln_scale(gamma=1.0, beta=0.0, scale_shape=(1, 1, 16)):
+    import numpy as np
+    from onnx import numpy_helper
+    m = DAGBasedModel()
+    X = dict(tdict("X", [1, 4, 16]), dtype=10)
+    S = dict(tdict("S", list(scale_shape)), dtype=10)
+    g = tdict("g", [16]); b = tdict("b", [16])
+    ln_out = dict(tdict("ln_out", [1, 4, 16]), dtype=10)
+    out = dict(tdict("out", [1, 4, 16]), dtype=10)
+    m.initializers["g"] = numpy_helper.from_array(
+        np.full(16, gamma, np.float16), "g")
+    m.initializers["b"] = numpy_helper.from_array(
+        np.full(16, beta, np.float16), "b")
+    for n in (Node("LayerNormalization", "LN_0", {"axis": -1, "epsilon": 1e-6},
+                   [X, g, b], [ln_out]),
+              Node("Mul", "Mul_0", {}, [ln_out, S], [out])):
+        m.nodes[n.name] = n
+    m.inputs = [X, S]
+    m.outputs = [out]
+    m.build_dependencies()
+    return m
+
+
+def test_layernorm_runtime_scale_folds():
+    """LN(x, 1, 0) * s -> LN(x, s, 0) for a per-channel runtime s."""
+    m = run_fusion(_make_ln_scale())
+    types = [n.op_type for n in m.nodes.values()]
+    assert types == ["LayerNormalization"], types
+    ln = next(iter(m.nodes.values()))
+    assert [i["name"] for i in ln.inputs] == ["X", "S", "b"]
+    assert ln.outputs[0]["name"] == "out"
+
+
+def test_layernorm_scale_needs_unit_affine():
+    """A real gamma, a real beta, or a scale that is not per-channel blocks
+    the fold."""
+    for kw in ({"gamma": 2.0}, {"beta": 0.5}, {"scale_shape": (1, 4, 16)}):
+        m = run_fusion(_make_ln_scale(**kw))
+        assert "Mul_0" in m.nodes, (kw, [n.op_type for n in m.nodes.values()])
