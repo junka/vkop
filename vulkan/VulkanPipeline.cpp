@@ -24,10 +24,11 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
                                size_t pushconstant_size, const uint32_t *spirv,
                                int codesize, bool update_after_bind,
                                uint32_t required_subgroup_size,
-                               VkPipelineCache cache)
+                               VkPipelineCache cache,
+                               const VkSpecializationInfo *spec)
     : VulkanBasePipeline(device, std::move(types)),
       m_pushconstant_size_(pushconstant_size),
-      required_subgroup_size_(required_subgroup_size) {
+      required_subgroup_size_(required_subgroup_size), spec_(spec) {
     const uint64_t t_ctor0 = pipeline_prof_now();
     VulkanShader shader(device, spirv, codesize);
     // Optional VK_EXT_descriptor_buffer backend. This only changes host-side
@@ -58,7 +59,7 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     shader_stage_create_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     shader_stage_create_info.module = shaderModule;
     shader_stage_create_info.pName = "main";
-    shader_stage_create_info.pSpecializationInfo = nullptr;
+    shader_stage_create_info.pSpecializationInfo = spec_;
 
     // Pin the compute shader's subgroup size when requested. Some shaders
     // (e.g. softmax.comp) hard-code numSubgroups = workgroup/subgroupSize and

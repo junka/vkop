@@ -221,7 +221,577 @@ int input_index(int k, int lin, int bcBase, int dimsBase, int rank) {
     return broadcast_index(lin, outDims, inDims, rank);
 }
 
+// ---------------------------------------------------------------------------
+// Specialized path (SC_ON == 1). The host passes the program's control words
+// as specialization constants, so the driver compiles one pipeline per
+// distinct program: opcodes, register indices, input dtypes and broadcast
+// kinds all fold to constants, the op switch disappears, and reg[] lives in
+// registers. Only values that may change between rounds stay in the program
+// SSBO (scalars, div/mod, dims). Generated text -- edit gen_fe.py's output
+// pattern, not individual lines.
+//   id 0          SC_ON
+//   id 1, 2       SC_NOPS, SC_NIN
+//   id 3 + k      SC_DT<k>  input k dtype (0 fp32, 1 fp16)
+//   id 11 + k     SC_BK<k>  input k broadcast kind: 0 identity (lin), 1 scalar,
+//                           2 affine (lin/div)%mod from the SSBO, 3 general N-d
+//   id 19 + 4i+j  op i word j {op, dst, a, b}
+layout(constant_id = 0) const int SC_ON = 0;
+layout(constant_id = 1) const int SC_NOPS = 0;
+layout(constant_id = 2) const int SC_NIN = 0;
+layout(constant_id = 3) const int SC_DT0 = 0;
+layout(constant_id = 4) const int SC_DT1 = 0;
+layout(constant_id = 5) const int SC_DT2 = 0;
+layout(constant_id = 6) const int SC_DT3 = 0;
+layout(constant_id = 7) const int SC_DT4 = 0;
+layout(constant_id = 8) const int SC_DT5 = 0;
+layout(constant_id = 9) const int SC_DT6 = 0;
+layout(constant_id = 10) const int SC_DT7 = 0;
+layout(constant_id = 11) const int SC_BK0 = 0;
+layout(constant_id = 12) const int SC_BK1 = 0;
+layout(constant_id = 13) const int SC_BK2 = 0;
+layout(constant_id = 14) const int SC_BK3 = 0;
+layout(constant_id = 15) const int SC_BK4 = 0;
+layout(constant_id = 16) const int SC_BK5 = 0;
+layout(constant_id = 17) const int SC_BK6 = 0;
+layout(constant_id = 18) const int SC_BK7 = 0;
+layout(constant_id = 19) const int SC_OC0 = 0;
+layout(constant_id = 20) const int SC_DST0 = -1;
+layout(constant_id = 21) const int SC_A0 = -1;
+layout(constant_id = 22) const int SC_B0 = -1;
+layout(constant_id = 23) const int SC_OC1 = 0;
+layout(constant_id = 24) const int SC_DST1 = -1;
+layout(constant_id = 25) const int SC_A1 = -1;
+layout(constant_id = 26) const int SC_B1 = -1;
+layout(constant_id = 27) const int SC_OC2 = 0;
+layout(constant_id = 28) const int SC_DST2 = -1;
+layout(constant_id = 29) const int SC_A2 = -1;
+layout(constant_id = 30) const int SC_B2 = -1;
+layout(constant_id = 31) const int SC_OC3 = 0;
+layout(constant_id = 32) const int SC_DST3 = -1;
+layout(constant_id = 33) const int SC_A3 = -1;
+layout(constant_id = 34) const int SC_B3 = -1;
+layout(constant_id = 35) const int SC_OC4 = 0;
+layout(constant_id = 36) const int SC_DST4 = -1;
+layout(constant_id = 37) const int SC_A4 = -1;
+layout(constant_id = 38) const int SC_B4 = -1;
+layout(constant_id = 39) const int SC_OC5 = 0;
+layout(constant_id = 40) const int SC_DST5 = -1;
+layout(constant_id = 41) const int SC_A5 = -1;
+layout(constant_id = 42) const int SC_B5 = -1;
+layout(constant_id = 43) const int SC_OC6 = 0;
+layout(constant_id = 44) const int SC_DST6 = -1;
+layout(constant_id = 45) const int SC_A6 = -1;
+layout(constant_id = 46) const int SC_B6 = -1;
+layout(constant_id = 47) const int SC_OC7 = 0;
+layout(constant_id = 48) const int SC_DST7 = -1;
+layout(constant_id = 49) const int SC_A7 = -1;
+layout(constant_id = 50) const int SC_B7 = -1;
+layout(constant_id = 51) const int SC_OC8 = 0;
+layout(constant_id = 52) const int SC_DST8 = -1;
+layout(constant_id = 53) const int SC_A8 = -1;
+layout(constant_id = 54) const int SC_B8 = -1;
+layout(constant_id = 55) const int SC_OC9 = 0;
+layout(constant_id = 56) const int SC_DST9 = -1;
+layout(constant_id = 57) const int SC_A9 = -1;
+layout(constant_id = 58) const int SC_B9 = -1;
+layout(constant_id = 59) const int SC_OC10 = 0;
+layout(constant_id = 60) const int SC_DST10 = -1;
+layout(constant_id = 61) const int SC_A10 = -1;
+layout(constant_id = 62) const int SC_B10 = -1;
+layout(constant_id = 63) const int SC_OC11 = 0;
+layout(constant_id = 64) const int SC_DST11 = -1;
+layout(constant_id = 65) const int SC_A11 = -1;
+layout(constant_id = 66) const int SC_B11 = -1;
+layout(constant_id = 67) const int SC_OC12 = 0;
+layout(constant_id = 68) const int SC_DST12 = -1;
+layout(constant_id = 69) const int SC_A12 = -1;
+layout(constant_id = 70) const int SC_B12 = -1;
+layout(constant_id = 71) const int SC_OC13 = 0;
+layout(constant_id = 72) const int SC_DST13 = -1;
+layout(constant_id = 73) const int SC_A13 = -1;
+layout(constant_id = 74) const int SC_B13 = -1;
+layout(constant_id = 75) const int SC_OC14 = 0;
+layout(constant_id = 76) const int SC_DST14 = -1;
+layout(constant_id = 77) const int SC_A14 = -1;
+layout(constant_id = 78) const int SC_B14 = -1;
+layout(constant_id = 79) const int SC_OC15 = 0;
+layout(constant_id = 80) const int SC_DST15 = -1;
+layout(constant_id = 81) const int SC_A15 = -1;
+layout(constant_id = 82) const int SC_B15 = -1;
+layout(constant_id = 83) const int SC_OC16 = 0;
+layout(constant_id = 84) const int SC_DST16 = -1;
+layout(constant_id = 85) const int SC_A16 = -1;
+layout(constant_id = 86) const int SC_B16 = -1;
+layout(constant_id = 87) const int SC_OC17 = 0;
+layout(constant_id = 88) const int SC_DST17 = -1;
+layout(constant_id = 89) const int SC_A17 = -1;
+layout(constant_id = 90) const int SC_B17 = -1;
+layout(constant_id = 91) const int SC_OC18 = 0;
+layout(constant_id = 92) const int SC_DST18 = -1;
+layout(constant_id = 93) const int SC_A18 = -1;
+layout(constant_id = 94) const int SC_B18 = -1;
+layout(constant_id = 95) const int SC_OC19 = 0;
+layout(constant_id = 96) const int SC_DST19 = -1;
+layout(constant_id = 97) const int SC_A19 = -1;
+layout(constant_id = 98) const int SC_B19 = -1;
+layout(constant_id = 99) const int SC_OC20 = 0;
+layout(constant_id = 100) const int SC_DST20 = -1;
+layout(constant_id = 101) const int SC_A20 = -1;
+layout(constant_id = 102) const int SC_B20 = -1;
+layout(constant_id = 103) const int SC_OC21 = 0;
+layout(constant_id = 104) const int SC_DST21 = -1;
+layout(constant_id = 105) const int SC_A21 = -1;
+layout(constant_id = 106) const int SC_B21 = -1;
+layout(constant_id = 107) const int SC_OC22 = 0;
+layout(constant_id = 108) const int SC_DST22 = -1;
+layout(constant_id = 109) const int SC_A22 = -1;
+layout(constant_id = 110) const int SC_B22 = -1;
+layout(constant_id = 111) const int SC_OC23 = 0;
+layout(constant_id = 112) const int SC_DST23 = -1;
+layout(constant_id = 113) const int SC_A23 = -1;
+layout(constant_id = 114) const int SC_B23 = -1;
+layout(constant_id = 115) const int SC_OC24 = 0;
+layout(constant_id = 116) const int SC_DST24 = -1;
+layout(constant_id = 117) const int SC_A24 = -1;
+layout(constant_id = 118) const int SC_B24 = -1;
+layout(constant_id = 119) const int SC_OC25 = 0;
+layout(constant_id = 120) const int SC_DST25 = -1;
+layout(constant_id = 121) const int SC_A25 = -1;
+layout(constant_id = 122) const int SC_B25 = -1;
+layout(constant_id = 123) const int SC_OC26 = 0;
+layout(constant_id = 124) const int SC_DST26 = -1;
+layout(constant_id = 125) const int SC_A26 = -1;
+layout(constant_id = 126) const int SC_B26 = -1;
+layout(constant_id = 127) const int SC_OC27 = 0;
+layout(constant_id = 128) const int SC_DST27 = -1;
+layout(constant_id = 129) const int SC_A27 = -1;
+layout(constant_id = 130) const int SC_B27 = -1;
+layout(constant_id = 131) const int SC_OC28 = 0;
+layout(constant_id = 132) const int SC_DST28 = -1;
+layout(constant_id = 133) const int SC_A28 = -1;
+layout(constant_id = 134) const int SC_B28 = -1;
+layout(constant_id = 135) const int SC_OC29 = 0;
+layout(constant_id = 136) const int SC_DST29 = -1;
+layout(constant_id = 137) const int SC_A29 = -1;
+layout(constant_id = 138) const int SC_B29 = -1;
+layout(constant_id = 139) const int SC_OC30 = 0;
+layout(constant_id = 140) const int SC_DST30 = -1;
+layout(constant_id = 141) const int SC_A30 = -1;
+layout(constant_id = 142) const int SC_B30 = -1;
+layout(constant_id = 143) const int SC_OC31 = 0;
+layout(constant_id = 144) const int SC_DST31 = -1;
+layout(constant_id = 145) const int SC_A31 = -1;
+layout(constant_id = 146) const int SC_B31 = -1;
+
+vec2 apply_op2(int oc, vec2 av, vec2 bv) {
+    if (oc == OP_ADD)      return av + bv;
+    if (oc == OP_SUB)      return av - bv;
+    if (oc == OP_MUL)      return av * bv;
+    if (oc == OP_DIV)      return av / bv;
+    if (oc == OP_POW)      return pow(av, bv);
+    if (oc == OP_SQRT)     return sqrt(av);
+    if (oc == OP_SIGMOID)  return 1.0 / (1.0 + exp(-av));
+    if (oc == OP_NEG)      return -av;
+    if (oc == OP_EXP)      return exp(av);
+    if (oc == OP_TANH)     return tanh(av);
+    if (oc == OP_ERF)      return vec2(buffer_erf(av.x), buffer_erf(av.y));
+    if (oc == OP_SILU)     return av / (1.0 + exp(-av));
+    if (oc == OP_CAST)     return av;
+    if (oc == OP_WHERE)    return vec2(bv.x != 0.0 ? av.x : 0.0, bv.y != 0.0 ? av.y : 0.0);
+    if (oc == OP_MIN)      return min(av, bv);
+    if (oc == OP_MAX)      return max(av, bv);
+    return vec2(0.0);
+}
+
+vec2 spec_operand(int x, vec2 reg[MAX_REGS], int scalarsBase) {
+    if (x >= 100) return vec2(uintBitsToFloat(uProg.data[scalarsBase + (x - 100)]));
+    if (x >= 0 && x < MAX_REGS) return reg[x];
+    return vec2(0.0);
+}
+
+// Element index of input k for output element lin, by broadcast kind.
+int spec_index(int kind, int k, int lin, int bcBase, int dimsBase, int rank) {
+    if (kind == 0) return lin;
+    if (kind == 1) return 0;
+    if (kind == 2) {
+        int dv = uProg.data[bcBase + 2 * k];
+        int md = uProg.data[bcBase + 2 * k + 1];
+        return (lin / dv) % md;
+    }
+    return input_index(k, lin, bcBase, dimsBase, rank);
+}
+
+vec2 spec_load0(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT0 != 0;
+#ifdef FP16
+    if (SC_BK0 == 0 && f16) return unpackHalf2x16(uIn0.data[gid]);
+#endif
+    if (SC_BK0 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn0.data[0]).x : uintBitsToFloat(uIn0.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK0, 0, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK0, 0, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn0.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn0.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn0.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn0.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn0.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load1(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT1 != 0;
+#ifdef FP16
+    if (SC_BK1 == 0 && f16) return unpackHalf2x16(uIn1.data[gid]);
+#endif
+    if (SC_BK1 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn1.data[0]).x : uintBitsToFloat(uIn1.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK1, 1, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK1, 1, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn1.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn1.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn1.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn1.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn1.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load2(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT2 != 0;
+#ifdef FP16
+    if (SC_BK2 == 0 && f16) return unpackHalf2x16(uIn2.data[gid]);
+#endif
+    if (SC_BK2 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn2.data[0]).x : uintBitsToFloat(uIn2.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK2, 2, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK2, 2, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn2.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn2.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn2.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn2.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn2.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load3(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT3 != 0;
+#ifdef FP16
+    if (SC_BK3 == 0 && f16) return unpackHalf2x16(uIn3.data[gid]);
+#endif
+    if (SC_BK3 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn3.data[0]).x : uintBitsToFloat(uIn3.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK3, 3, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK3, 3, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn3.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn3.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn3.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn3.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn3.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load4(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT4 != 0;
+#ifdef FP16
+    if (SC_BK4 == 0 && f16) return unpackHalf2x16(uIn4.data[gid]);
+#endif
+    if (SC_BK4 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn4.data[0]).x : uintBitsToFloat(uIn4.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK4, 4, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK4, 4, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn4.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn4.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn4.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn4.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn4.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load5(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT5 != 0;
+#ifdef FP16
+    if (SC_BK5 == 0 && f16) return unpackHalf2x16(uIn5.data[gid]);
+#endif
+    if (SC_BK5 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn5.data[0]).x : uintBitsToFloat(uIn5.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK5, 5, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK5, 5, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn5.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn5.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn5.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn5.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn5.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load6(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT6 != 0;
+#ifdef FP16
+    if (SC_BK6 == 0 && f16) return unpackHalf2x16(uIn6.data[gid]);
+#endif
+    if (SC_BK6 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn6.data[0]).x : uintBitsToFloat(uIn6.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK6, 6, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK6, 6, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn6.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn6.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn6.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn6.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn6.data[a1]);
+    return vec2(v0, v1);
+}
+vec2 spec_load7(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
+    bool f16 = SC_DT7 != 0;
+#ifdef FP16
+    if (SC_BK7 == 0 && f16) return unpackHalf2x16(uIn7.data[gid]);
+#endif
+    if (SC_BK7 == 1) {
+        float s = f16 ? unpackHalf2x16(uIn7.data[0]).x : uintBitsToFloat(uIn7.data[0]);
+        return vec2(s);
+    }
+    int a0 = spec_index(SC_BK7, 7, i0, bcBase, dimsBase, rank);
+    int a1 = spec_index(SC_BK7, 7, i1, bcBase, dimsBase, rank);
+    if (f16) {
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn7.data[a0 >> 1]);
+        float v0 = unpackHalf2x16(uIn7.data[a0 >> 1])[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn7.data[a1 >> 1])[a1 & 1];
+        return vec2(v0, v1);
+    }
+    float v0 = uintBitsToFloat(uIn7.data[a0]);
+    float v1 = (a1 == a0) ? v0 : uintBitsToFloat(uIn7.data[a1]);
+    return vec2(v0, v1);
+}
+
+void main_spec() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int rank = uProg.data[3];
+    int dimsBase = 4;
+    int dtypesBase = dimsBase + rank * (1 + SC_NIN);
+    int opsBase = dtypesBase + SC_NIN;
+    int scalarsBase = opsBase + 4 * SC_NOPS;
+    int bcBase = scalarsBase + uPC.nScalars;
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = min(2 * gid + 1, uPC.total - 1);
+#else
+    if (gid >= uPC.total) return;
+    int i0 = gid;
+    int i1 = gid;
+#endif
+    vec2 reg[MAX_REGS];
+    for (int i = 0; i < MAX_REGS; ++i) reg[i] = vec2(0.0);
+    if (0 < SC_NIN) reg[0] = spec_load0(gid, i0, i1, bcBase, dimsBase, rank);
+    if (1 < SC_NIN) reg[1] = spec_load1(gid, i0, i1, bcBase, dimsBase, rank);
+    if (2 < SC_NIN) reg[2] = spec_load2(gid, i0, i1, bcBase, dimsBase, rank);
+    if (3 < SC_NIN) reg[3] = spec_load3(gid, i0, i1, bcBase, dimsBase, rank);
+    if (4 < SC_NIN) reg[4] = spec_load4(gid, i0, i1, bcBase, dimsBase, rank);
+    if (5 < SC_NIN) reg[5] = spec_load5(gid, i0, i1, bcBase, dimsBase, rank);
+    if (6 < SC_NIN) reg[6] = spec_load6(gid, i0, i1, bcBase, dimsBase, rank);
+    if (7 < SC_NIN) reg[7] = spec_load7(gid, i0, i1, bcBase, dimsBase, rank);
+    if (0 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC0, spec_operand(SC_A0, reg, scalarsBase),
+                           spec_operand(SC_B0, reg, scalarsBase));
+        if (SC_DST0 >= 0 && SC_DST0 < MAX_REGS) reg[SC_DST0] = r;
+    }
+    if (1 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC1, spec_operand(SC_A1, reg, scalarsBase),
+                           spec_operand(SC_B1, reg, scalarsBase));
+        if (SC_DST1 >= 0 && SC_DST1 < MAX_REGS) reg[SC_DST1] = r;
+    }
+    if (2 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC2, spec_operand(SC_A2, reg, scalarsBase),
+                           spec_operand(SC_B2, reg, scalarsBase));
+        if (SC_DST2 >= 0 && SC_DST2 < MAX_REGS) reg[SC_DST2] = r;
+    }
+    if (3 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC3, spec_operand(SC_A3, reg, scalarsBase),
+                           spec_operand(SC_B3, reg, scalarsBase));
+        if (SC_DST3 >= 0 && SC_DST3 < MAX_REGS) reg[SC_DST3] = r;
+    }
+    if (4 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC4, spec_operand(SC_A4, reg, scalarsBase),
+                           spec_operand(SC_B4, reg, scalarsBase));
+        if (SC_DST4 >= 0 && SC_DST4 < MAX_REGS) reg[SC_DST4] = r;
+    }
+    if (5 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC5, spec_operand(SC_A5, reg, scalarsBase),
+                           spec_operand(SC_B5, reg, scalarsBase));
+        if (SC_DST5 >= 0 && SC_DST5 < MAX_REGS) reg[SC_DST5] = r;
+    }
+    if (6 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC6, spec_operand(SC_A6, reg, scalarsBase),
+                           spec_operand(SC_B6, reg, scalarsBase));
+        if (SC_DST6 >= 0 && SC_DST6 < MAX_REGS) reg[SC_DST6] = r;
+    }
+    if (7 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC7, spec_operand(SC_A7, reg, scalarsBase),
+                           spec_operand(SC_B7, reg, scalarsBase));
+        if (SC_DST7 >= 0 && SC_DST7 < MAX_REGS) reg[SC_DST7] = r;
+    }
+    if (8 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC8, spec_operand(SC_A8, reg, scalarsBase),
+                           spec_operand(SC_B8, reg, scalarsBase));
+        if (SC_DST8 >= 0 && SC_DST8 < MAX_REGS) reg[SC_DST8] = r;
+    }
+    if (9 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC9, spec_operand(SC_A9, reg, scalarsBase),
+                           spec_operand(SC_B9, reg, scalarsBase));
+        if (SC_DST9 >= 0 && SC_DST9 < MAX_REGS) reg[SC_DST9] = r;
+    }
+    if (10 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC10, spec_operand(SC_A10, reg, scalarsBase),
+                           spec_operand(SC_B10, reg, scalarsBase));
+        if (SC_DST10 >= 0 && SC_DST10 < MAX_REGS) reg[SC_DST10] = r;
+    }
+    if (11 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC11, spec_operand(SC_A11, reg, scalarsBase),
+                           spec_operand(SC_B11, reg, scalarsBase));
+        if (SC_DST11 >= 0 && SC_DST11 < MAX_REGS) reg[SC_DST11] = r;
+    }
+    if (12 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC12, spec_operand(SC_A12, reg, scalarsBase),
+                           spec_operand(SC_B12, reg, scalarsBase));
+        if (SC_DST12 >= 0 && SC_DST12 < MAX_REGS) reg[SC_DST12] = r;
+    }
+    if (13 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC13, spec_operand(SC_A13, reg, scalarsBase),
+                           spec_operand(SC_B13, reg, scalarsBase));
+        if (SC_DST13 >= 0 && SC_DST13 < MAX_REGS) reg[SC_DST13] = r;
+    }
+    if (14 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC14, spec_operand(SC_A14, reg, scalarsBase),
+                           spec_operand(SC_B14, reg, scalarsBase));
+        if (SC_DST14 >= 0 && SC_DST14 < MAX_REGS) reg[SC_DST14] = r;
+    }
+    if (15 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC15, spec_operand(SC_A15, reg, scalarsBase),
+                           spec_operand(SC_B15, reg, scalarsBase));
+        if (SC_DST15 >= 0 && SC_DST15 < MAX_REGS) reg[SC_DST15] = r;
+    }
+    if (16 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC16, spec_operand(SC_A16, reg, scalarsBase),
+                           spec_operand(SC_B16, reg, scalarsBase));
+        if (SC_DST16 >= 0 && SC_DST16 < MAX_REGS) reg[SC_DST16] = r;
+    }
+    if (17 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC17, spec_operand(SC_A17, reg, scalarsBase),
+                           spec_operand(SC_B17, reg, scalarsBase));
+        if (SC_DST17 >= 0 && SC_DST17 < MAX_REGS) reg[SC_DST17] = r;
+    }
+    if (18 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC18, spec_operand(SC_A18, reg, scalarsBase),
+                           spec_operand(SC_B18, reg, scalarsBase));
+        if (SC_DST18 >= 0 && SC_DST18 < MAX_REGS) reg[SC_DST18] = r;
+    }
+    if (19 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC19, spec_operand(SC_A19, reg, scalarsBase),
+                           spec_operand(SC_B19, reg, scalarsBase));
+        if (SC_DST19 >= 0 && SC_DST19 < MAX_REGS) reg[SC_DST19] = r;
+    }
+    if (20 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC20, spec_operand(SC_A20, reg, scalarsBase),
+                           spec_operand(SC_B20, reg, scalarsBase));
+        if (SC_DST20 >= 0 && SC_DST20 < MAX_REGS) reg[SC_DST20] = r;
+    }
+    if (21 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC21, spec_operand(SC_A21, reg, scalarsBase),
+                           spec_operand(SC_B21, reg, scalarsBase));
+        if (SC_DST21 >= 0 && SC_DST21 < MAX_REGS) reg[SC_DST21] = r;
+    }
+    if (22 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC22, spec_operand(SC_A22, reg, scalarsBase),
+                           spec_operand(SC_B22, reg, scalarsBase));
+        if (SC_DST22 >= 0 && SC_DST22 < MAX_REGS) reg[SC_DST22] = r;
+    }
+    if (23 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC23, spec_operand(SC_A23, reg, scalarsBase),
+                           spec_operand(SC_B23, reg, scalarsBase));
+        if (SC_DST23 >= 0 && SC_DST23 < MAX_REGS) reg[SC_DST23] = r;
+    }
+    if (24 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC24, spec_operand(SC_A24, reg, scalarsBase),
+                           spec_operand(SC_B24, reg, scalarsBase));
+        if (SC_DST24 >= 0 && SC_DST24 < MAX_REGS) reg[SC_DST24] = r;
+    }
+    if (25 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC25, spec_operand(SC_A25, reg, scalarsBase),
+                           spec_operand(SC_B25, reg, scalarsBase));
+        if (SC_DST25 >= 0 && SC_DST25 < MAX_REGS) reg[SC_DST25] = r;
+    }
+    if (26 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC26, spec_operand(SC_A26, reg, scalarsBase),
+                           spec_operand(SC_B26, reg, scalarsBase));
+        if (SC_DST26 >= 0 && SC_DST26 < MAX_REGS) reg[SC_DST26] = r;
+    }
+    if (27 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC27, spec_operand(SC_A27, reg, scalarsBase),
+                           spec_operand(SC_B27, reg, scalarsBase));
+        if (SC_DST27 >= 0 && SC_DST27 < MAX_REGS) reg[SC_DST27] = r;
+    }
+    if (28 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC28, spec_operand(SC_A28, reg, scalarsBase),
+                           spec_operand(SC_B28, reg, scalarsBase));
+        if (SC_DST28 >= 0 && SC_DST28 < MAX_REGS) reg[SC_DST28] = r;
+    }
+    if (29 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC29, spec_operand(SC_A29, reg, scalarsBase),
+                           spec_operand(SC_B29, reg, scalarsBase));
+        if (SC_DST29 >= 0 && SC_DST29 < MAX_REGS) reg[SC_DST29] = r;
+    }
+    if (30 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC30, spec_operand(SC_A30, reg, scalarsBase),
+                           spec_operand(SC_B30, reg, scalarsBase));
+        if (SC_DST30 >= 0 && SC_DST30 < MAX_REGS) reg[SC_DST30] = r;
+    }
+    if (31 < SC_NOPS) {
+        vec2 r = apply_op2(SC_OC31, spec_operand(SC_A31, reg, scalarsBase),
+                           spec_operand(SC_B31, reg, scalarsBase));
+        if (SC_DST31 >= 0 && SC_DST31 < MAX_REGS) reg[SC_DST31] = r;
+    }
+#ifdef FP16
+    vec2 o = reg[0];
+    if (2 * gid + 1 >= uPC.total) o.y = 0.0;
+    uOutput.data[gid] = packHalf2x16(o);
+#else
+    uOutput.data[gid] = floatBitsToUint(reg[0].x);
+#endif
+}
+
 void main() {
+    if (SC_ON != 0) {
+        main_spec();
+        return;
+    }
     int gid = int(gl_GlobalInvocationID.x);
     int nOps     = uPC.nOps;
     int nInputs  = uPC.nInputs;

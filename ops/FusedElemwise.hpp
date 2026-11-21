@@ -6,6 +6,8 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include <algorithm>
+#include <map>
+#include <memory>
 #include <cmath>
 #include <cstdlib>
 #include <numeric>
@@ -140,6 +142,93 @@ class FusedElemwise : public BufferFactory {
     std::shared_ptr<VulkanBuffer> prog_buf_;
     std::vector<int32_t> prog_data_;
     bool prog_built_ = false;
+
+    // Specialized pipelines, one per distinct spec-constant vector (see the
+    // shader's SC_* block). The vector holds only round-invariant words --
+    // opcodes, registers, input dtypes and broadcast KINDS -- so a decode loop
+    // whose dims grow every round keeps hitting the same entry. `id` is
+    // pushed in the PC pad so the replay fingerprint tells variants apart.
+    struct SpecVariant {
+        std::unique_ptr<VulkanPipeline> pipe; // null: creation failed
+        int id = 0;
+    };
+    std::map<std::vector<int32_t>, SpecVariant> spec_variants_;
+    static constexpr int kSpecIds = 19 + 4 * kFusedMaxOps;
+
+    std::vector<int32_t> spec_vector(int nInputs) const {
+        const int nOps = static_cast<int>(ops_.size()) / 4;
+        const int rank = prog_data_[3];
+        const int dtypesBase = 4 + rank * (1 + nInputs);
+        const int bcBase = dtypesBase + nInputs + 4 * nOps +
+                           static_cast<int>(scalar_floats_.size());
+        int total = 1;
+        for (int i = 0; i < rank; ++i) total *= prog_data_[4 + i];
+        std::vector<int32_t> v(kSpecIds, 0);
+        v[0] = 1;
+        v[1] = nOps;
+        v[2] = nInputs;
+        for (int k = 0; k < nInputs; ++k) {
+            v[3 + k] = prog_data_[dtypesBase + k];
+            const int div = prog_data_[bcBase + 2 * k];
+            const int mod = prog_data_[bcBase + 2 * k + 1];
+            int kind = 3;                              // general N-d
+            if (mod == 1) kind = 1;                    // scalar
+            else if (div == 1 && mod == total) kind = 0; // same shape
+            else if (mod != 0) kind = 2;               // affine
+            v[11 + k] = kind;
+        }
+        for (int i = 0; i < kFusedMaxOps; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                v[19 + 4 * i + j] =
+                    i < nOps ? ops_[4 * i + j] : (j == 0 ? 0 : -1);
+            }
+        }
+        return v;
+    }
+
+    VulkanPipeline *spec_pipeline(const std::vector<int32_t> &v) {
+        auto it = spec_variants_.find(v);
+        if (it != spec_variants_.end()) return it->second.pipe.get();
+        SpecVariant var;
+        var.id = static_cast<int>(spec_variants_.size()) + 1;
+        std::vector<VkSpecializationMapEntry> entries(v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+            entries[i].constantID = static_cast<uint32_t>(i);
+            entries[i].offset = static_cast<uint32_t>(i * sizeof(int32_t));
+            entries[i].size = sizeof(int32_t);
+        }
+        VkSpecializationInfo info{};
+        info.mapEntryCount = static_cast<uint32_t>(entries.size());
+        info.pMapEntries = entries.data();
+        info.dataSize = v.size() * sizeof(int32_t);
+        info.pData = v.data();
+        try {
+            const bool use_uab =
+                update_after_bind_ &&
+                m_dev_->is_support_descriptor_update_after_bind();
+            var.pipe = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(), types_, pc_size_,
+                reinterpret_cast<const uint32_t *>(spv_), spv_len_, use_uab,
+                required_subgroup_size_, pipeline_cache_, &info);
+        } catch (const std::exception &e) {
+            std::fprintf(stderr,
+                         "[fused] specialized pipeline for %s failed: %s; "
+                         "using the interpreter\n",
+                         get_name().c_str(), e.what());
+            var.pipe.reset();
+        }
+        VulkanPipeline *p = var.pipe.get();
+        spec_variants_.emplace(v, std::move(var));
+        return p;
+    }
+
+    static bool spec_enabled() {
+        static const bool on = [] {
+            const char *e = std::getenv("VKOP_FE_SPEC");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        return on;
+    }
 
     // Build the program SSBO contents. Layout (mirrors the shader):
     //   [0] nOps  [1] nInputs  [2] nScalars  [3] rank
@@ -408,7 +497,29 @@ class FusedElemwise : public BufferFactory {
             // fp32: one thread per element.
             constexpr bool is_fp16 = std::is_same<T, uint16_t>::value;
             int nthreads = is_fp16 ? (total + 1) / 2 : total;
-            submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+            const int nOps = static_cast<int>(ops_.size()) / 4;
+            VulkanPipeline *sp = nullptr;
+            if (spec_enabled() && spv_ && nOps <= kFusedMaxOps &&
+                nInputs <= kFusedMaxInputs) {
+                auto v = spec_vector(nInputs);
+                sp = spec_pipeline(v);
+                if (sp) pc._pad0 = spec_variants_.at(v).id;
+            }
+            if (sp) {
+                // Descriptor sets from the base pipeline bind to the
+                // specialized one: same set layout, same push range.
+                if (!m_ds_[m_id_]) {
+                    m_ds_[m_id_] = pipeline_->allocDescriptorSets();
+                }
+                fillWriteDescriptorSets(m_ds_[m_id_]);
+                pipeline_->updateDescriptorSets(writes_);
+                m_cmd_->bind(*sp, m_ds_[m_id_]);
+                m_cmd_->push_constants(*sp, static_cast<uint32_t>(pc_size_),
+                                       &pc);
+                dispatch_and_record(UP_DIV(nthreads, 256), 1, 1, &pc);
+            } else {
+                submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+            }
         });
     }
 };

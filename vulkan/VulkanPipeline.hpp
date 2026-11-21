@@ -13,11 +13,15 @@ class VulkanPipeline : public VulkanBasePipeline {
                    size_t pushconstant_size, const uint32_t *spirv,
                    int codesize, bool update_after_bind,
                    uint32_t required_subgroup_size = 0,
-                   VkPipelineCache cache = VK_NULL_HANDLE);
+                   VkPipelineCache cache = VK_NULL_HANDLE,
+                   const VkSpecializationInfo *spec = nullptr);
 
   private:
     size_t m_pushconstant_size_;
     uint32_t required_subgroup_size_;
+    // Specialization constants for this pipeline (borrowed: read only inside
+    // the constructor's vkCreateComputePipelines call).
+    const VkSpecializationInfo *spec_ = nullptr;
 
     void createComputePipeline(VkPipelineLayout pipelineLayout,
                                VkShaderModule shaderModule,
