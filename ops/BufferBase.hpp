@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <initializer_list>
+#include <vector>
 #include <numeric>
 
 // Shared base + helpers + push-constant structs for the buffer (SSBO)
@@ -400,6 +402,84 @@ inline void fill_dims_broadcast(int (&dims)[8], const std::vector<int> &shape,
     int r = static_cast<int>(std::min<size_t>(shape.size(), 8));
     for (int i = 0; i < r; ++i)
         dims[out_rank - r + i] = shape[i];
+}
+
+// Fill the out/input dims of a broadcast op after merging adjacent output
+// dims that every input treats the same way (all kept, or all broadcast), and
+// dropping size-1 output dims. `broadcast_index` costs one div/mod per dim, so
+// [1,1024,32,128] against [1,1,32,128] runs as rank 2 ([1024, 4096] against
+// [1, 4096]) instead of rank 4. The index map is unchanged: within a merged run
+// every input either walks all the dims contiguously or holds them at 0.
+// `ins[k]` are ONNX right-aligned input shapes; `in_dims[k]` receive them.
+// Returns the rank to put in the PC. Falls back to the plain fill (and the
+// output rank) for anything that is not a valid broadcast or exceeds 8 dims.
+inline int fill_dims_coalesced(int (&out_dims)[8], const std::vector<int> &out,
+                               std::initializer_list<int (*)[8]> in_dims,
+                               std::initializer_list<const std::vector<int> *> ins) {
+    const int rank = static_cast<int>(out.size());
+    const int n = static_cast<int>(ins.size());
+    auto plain = [&]() {
+        fill_dims(out_dims, out);
+        auto d = in_dims.begin();
+        for (const std::vector<int> *in : ins)
+            fill_dims_broadcast(**d++, *in, rank);
+        return rank;
+    };
+    if (rank == 0 || rank > 8 || n == 0 || n > 4)
+        return plain();
+    // Right-align each input to the output rank; record per dim whether it is
+    // kept (== out) or broadcast (== 1, out > 1).
+    std::vector<std::vector<int>> al(n, std::vector<int>(rank, 1));
+    int k = 0;
+    for (const std::vector<int> *in : ins) {
+        if (static_cast<int>(in->size()) > rank)
+            return plain();
+        for (size_t i = 0; i < in->size(); ++i)
+            al[k][rank - in->size() + i] = (*in)[i];
+        ++k;
+    }
+    std::vector<int> od;
+    std::vector<std::vector<int>> id(n);
+    std::vector<bool> prev(n, false);
+    for (int i = 0; i < rank; ++i) {
+        if (out[i] <= 0)
+            return plain();
+        if (out[i] == 1) {
+            for (int j = 0; j < n; ++j)
+                if (al[j][i] != 1)
+                    return plain();
+            continue;
+        }
+        std::vector<bool> kept(n);
+        for (int j = 0; j < n; ++j) {
+            if (al[j][i] == out[i])
+                kept[j] = true;
+            else if (al[j][i] == 1)
+                kept[j] = false;
+            else
+                return plain();
+        }
+        if (!od.empty() && kept == prev) {
+            od.back() *= out[i];
+            for (int j = 0; j < n; ++j)
+                id[j].back() *= al[j][i];
+        } else {
+            od.push_back(out[i]);
+            for (int j = 0; j < n; ++j)
+                id[j].push_back(al[j][i]);
+            prev = kept;
+        }
+    }
+    if (od.empty()) { // every dim is 1
+        od.push_back(1);
+        for (int j = 0; j < n; ++j)
+            id[j].push_back(1);
+    }
+    fill_dims(out_dims, od);
+    auto d = in_dims.begin();
+    for (int j = 0; j < n; ++j)
+        fill_dims(**d++, id[j]);
+    return static_cast<int>(od.size());
 }
 
 // Affine broadcast descriptor: an input of shape `in` (ONNX right-aligned)

@@ -201,6 +201,11 @@ TEST(BufferBackendTest, BinaryAffineBroadcast) {
         {{3, 1, 7}, {3, 5, 7}},    // A per-outer-row: not contiguous -> N-d
         {{4, 1, 6}, {1, 5, 1}},    // both broadcast, not affine -> N-d
         {{1, 1, 33}, {1, 1, 1}},   // odd total
+        // General N-d path with coalesced dims (fill_dims_coalesced):
+        {{2, 3, 4, 5}, {2, 1, 4, 1}},        // alternating: stays rank 4
+        {{2, 1, 3, 4, 5}, {1, 1, 3, 1, 1}},  // size-1 dims dropped
+        {{2, 3, 4, 5, 6}, {2, 3, 1, 1, 6}},  // runs merge to rank 3
+        {{4, 1, 6, 2}, {1, 5, 1, 2}},        // both broadcast, mixed
     };
     auto mul = [](const torch::Tensor &a, const torch::Tensor &b) {
         return a * b;
@@ -213,6 +218,35 @@ TEST(BufferBackendTest, BinaryAffineBroadcast) {
         EXPECT_TRUE(run_binary_shapes<uint16_t>(vkop::ops::OpType::MUL, sa, sb, mul));
         EXPECT_TRUE(run_binary_shapes<uint16_t>(vkop::ops::OpType::MAX, sa, sb, mx));
     }
+}
+
+// fill_dims_coalesced merges output dims every input treats alike and drops
+// size-1 dims; anything it cannot read as a broadcast falls back unchanged.
+TEST(BufferBackendTest, CoalescedBroadcastDims) {
+    int od[8], a[8], b[8];
+    std::vector<int> out{1, 1024, 32, 128}, sa{1, 1024, 32, 128}, sb{1, 1, 32, 128};
+    int r = vkop::ops::fill_dims_coalesced(od, out, {&a, &b}, {&sa, &sb});
+    EXPECT_EQ(r, 2);
+    EXPECT_EQ(od[0], 1024); EXPECT_EQ(od[1], 4096);
+    EXPECT_EQ(a[0], 1024);  EXPECT_EQ(a[1], 4096);
+    EXPECT_EQ(b[0], 1);     EXPECT_EQ(b[1], 4096);
+
+    std::vector<int> out2{2, 3, 4, 5}, sc{3, 1};
+    std::vector<int> sd{4, 1};
+    r = vkop::ops::fill_dims_coalesced(od, out2, {&a}, {&sd});
+    EXPECT_EQ(r, 3); // {6 | 4 | 5} with input {1 | 4 | 1}
+    EXPECT_EQ(od[0], 6); EXPECT_EQ(od[1], 4); EXPECT_EQ(od[2], 5);
+    EXPECT_EQ(a[0], 1);  EXPECT_EQ(a[1], 4);  EXPECT_EQ(a[2], 1);
+
+    // Not a broadcast ({3,1} against trailing {4,5}): plain fill, full rank.
+    r = vkop::ops::fill_dims_coalesced(od, out2, {&a}, {&sc});
+    EXPECT_EQ(r, 4);
+    EXPECT_EQ(a[0], 1); EXPECT_EQ(a[1], 1); EXPECT_EQ(a[2], 3); EXPECT_EQ(a[3], 1);
+
+    // All-ones output collapses to rank 1.
+    std::vector<int> ones{1, 1, 1}, one{1};
+    r = vkop::ops::fill_dims_coalesced(od, ones, {&a}, {&one});
+    EXPECT_EQ(r, 1); EXPECT_EQ(od[0], 1); EXPECT_EQ(a[0], 1);
 }
 
 // Reshape canary: {2,3,4} -> {6,4}.

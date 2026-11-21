@@ -446,10 +446,9 @@ class BufferBinaryFactory : public BufferFactory {
         });
 
         BinaryElemPC pc{};
-        pc.rank = static_cast<int>(out_shape.size());
-        fill_dims(pc.outDims, out_shape);
-        fill_dims_broadcast(pc.in0Dims, shape_a, pc.rank);
-        fill_dims_broadcast(pc.in1Dims, shape_b, pc.rank);
+        pc.rank = fill_dims_coalesced(pc.outDims, out_shape,
+                                      {&pc.in0Dims, &pc.in1Dims},
+                                      {&shape_a, &shape_b});
         pc.activation = activation_;
         pc.broadcast = (shape_a == out_shape && shape_b == out_shape) ? 0 : 1;
         pc.total = total;
@@ -722,10 +721,9 @@ class BufferBinaryFactory : public BufferFactory {
         int total = total_elems(out_shape);
 
         BinaryElemPC pc{};
-        pc.rank = static_cast<int>(out_shape.size());
-        fill_dims(pc.outDims, out_shape);
-        fill_dims_broadcast(pc.in0Dims, shape_a, pc.rank);
-        fill_dims_broadcast(pc.in1Dims, shape_b, pc.rank);
+        pc.rank = fill_dims_coalesced(pc.outDims, out_shape,
+                                      {&pc.in0Dims, &pc.in1Dims},
+                                      {&shape_a, &shape_b});
         pc.activation = activation_;
         pc.broadcast = (shape_a == out_shape && shape_b == out_shape) ? 0 : 1;
         pc.total = total;

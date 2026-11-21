@@ -81,9 +81,8 @@ class PReluBuffer : public BufferFactory {
         });
 
         PReluPC pc{};
-        pc.rank = static_cast<int>(shape.size());
-        fill_dims(pc.outDims, shape);
-        fill_dims_broadcast(pc.in1Dims, slope_shape, pc.rank);
+        pc.rank = fill_dims_coalesced(pc.outDims, shape, {&pc.in1Dims},
+                                      {&slope_shape});
         pc.broadcast = (slope_shape == shape) ? 0 : 1;
         pc.total = total;
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
