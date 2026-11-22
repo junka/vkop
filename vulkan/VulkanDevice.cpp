@@ -16,18 +16,96 @@
 
 #include "include/logger.hpp"
 
+// Pre-1.4 headers do not define the promoted version macro; the extension
+// fallbacks below still need to compare against it.
+#ifndef VK_API_VERSION_1_4
+#define VK_API_VERSION_1_4 VK_MAKE_API_VERSION(0, 1, 4, 0)
+#endif
+
 namespace vkop {
+
+// Every Vulkan feature struct the device is asked about, in one pNext chain
+// for vkGetPhysicalDeviceFeatures2, and then -- for the ones whose `pick`
+// returns true -- in the pNext chain handed to vkCreateDevice.
+//
+// `pick(query, enable)` copies the bits the engine wants from the queried
+// struct into a zeroed enable struct of the same type and returns whether any
+// bit is set. Copying only reported bits is what keeps vkCreateDevice from
+// failing on a driver that lacks one: a capability reaches the device exactly
+// when it was supported. Picks run in insertion order, so a pick may read a
+// flag an earlier one set (descriptor buffer reads the BDA verdict).
+class FeatureChain {
+  public:
+    template <typename T, typename Pick>
+    void add(VkStructureType stype, const char *extension, Pick pick) {
+        auto query = std::make_shared<T>();
+        auto enable = std::make_shared<T>();
+        query->sType = stype;
+        enable->sType = stype;
+        entries_.push_back(Entry{extension, query, enable, [query, enable, pick] {
+                                     return pick(*query, *enable);
+                                 }});
+    }
+
+    void query(VkPhysicalDevice pd) {
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = link(&Entry::query, [](const Entry &) { return true; });
+        vkGetPhysicalDeviceFeatures2(pd, &features2);
+    }
+
+    // Runs every pick (in order) and returns the head of the enable chain;
+    // the extension of every picked entry is appended to `extensions`.
+    void *enable(std::vector<const char *> &extensions) {
+        for (auto &e : entries_) {
+            e.picked = e.pick();
+            if (e.picked && e.extension) {
+                extensions.push_back(e.extension);
+            }
+        }
+        return link(&Entry::enable, [](const Entry &e) { return e.picked; });
+    }
+
+  private:
+    struct Entry {
+        const char *extension; // nullptr for a core VkPhysicalDeviceVulkanXXFeatures
+        // shared_ptr<void> keeps the concrete type's deleter.
+        std::shared_ptr<void> query;
+        std::shared_ptr<void> enable;
+        std::function<bool()> pick;
+        bool picked = false;
+    };
+
+    template <typename Filter>
+    void *link(std::shared_ptr<void> Entry::*which, Filter keep) {
+        void *head = nullptr;
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+            if (!keep(*it)) {
+                continue;
+            }
+            auto *base = static_cast<VkBaseOutStructure *>(((*it).*which).get());
+            base->pNext = static_cast<VkBaseOutStructure *>(head);
+            head = base;
+        }
+        return head;
+    }
+
+    std::vector<Entry> entries_;
+};
 
 namespace {
 
-// The enable lambdas below copy only the bits the driver reported, so a
-// capability that reaches vkCreateDevice is enabled exactly when it was
-// supported. Recording both from the queried value keeps that invariant in one
-// place; `available` is set where the descriptor is pushed, because that is the
-// spot that knows whether the extension enumerated at all.
+// Records a probed bit: `supported` = the driver reported it, `enabled` = it
+// goes to vkCreateDevice. They are equal because every pick copies the
+// reported bit; `available` is set where the entry is added, since that is
+// the spot that knows whether the extension enumerated at all.
 void recordCap(DeviceCap &cap, VkBool32 reported) {
     cap.supported = reported != VK_FALSE;
     cap.enabled = cap.supported;
+}
+
+template <typename... B> bool any(B... bits) {
+    return ((bits != VK_FALSE) || ...);
 }
 
 // VKOP_NO_BDA is read once, before the feature chain is built, so the feature
@@ -66,6 +144,12 @@ std::mutex &device_registry_mutex() {
 std::unordered_map<VkDevice, VulkanDevice *> &device_registry() {
     static auto *r = new std::unordered_map<VkDevice, VulkanDevice *>();
     return *r;
+}
+
+// Prepends `s` (any Vulkan out-struct) to the chain starting at `head`.
+template <typename T> void chain(void *&head, T &s) {
+    s.pNext = head;
+    head = &s;
 }
 
 } // namespace
@@ -128,19 +212,12 @@ bool VulkanDevice::supports_update_after_bind(VkDescriptorType type) const {
     }
 }
 
-VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
-    physicalDevice_ = physicalDevice;
+VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
+    : physicalDevice_(physicalDevice) {
     if (physicalDevice_ == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan physical device handle.");
     }
-    if (logicalDevice_ != VK_NULL_HANDLE) {
-        throw std::runtime_error("Logical device already created.");
-    }
-    if (!computeQueues_.empty()) {
-        throw std::runtime_error("Compute queue already created.");
-    }
     checkImageFormatSupport();
-    // Before getProperties(): the UMA bit is part of the property pass.
     m_is_unified_memory_ = checkDeviceUnifiedMemoryAccess();
     auto props = getProperties();
     if (!createLogicalDevice(props)) {
@@ -153,9 +230,7 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     device_traits_ = core::device_traits_from(*this);
     const core::DeviceProfile &profile =
         core::device_profile_for(device_traits_);
-    // NDEBUG compiles LOG_INFO away to nothing, which leaves `profile` unused
-    // in a release build; the cast keeps the -Werror build clean without
-    // changing the debug path.
+    // NDEBUG compiles LOG_INFO away, which leaves `profile` unused.
     (void)profile;
     LOG_INFO("MatMul profile: %s (byte_min_m=%d fp16_min_m=%d wide_n=%d "
              "ks_target=%d)",
@@ -186,9 +261,7 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
 }
 
 VulkanDevice::~VulkanDevice() {
-    for (auto &queue : computeQueues_) {
-        queue.reset();
-    }
+    computeQueues_.clear();
     // Destroy the shared descriptor buffer while the device is still alive.
     // Pipelines normally hold the last reference; they are gone by now, so
     // this reset is what actually releases the VkBuffer.
@@ -206,53 +279,45 @@ VulkanDevice::~VulkanDevice() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
 VkPhysicalDeviceProperties VulkanDevice::getProperties() {
-    VkPhysicalDeviceProperties2 properties2 = {};
-    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    // The driver walks the chain by sType, so order is irrelevant; a struct
+    // the driver does not know is left zeroed, which reads as "absent".
+    void *head = nullptr;
 
     VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
     subgroup_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    chain(head, subgroup_properties);
 
-    // Build the pNext chain by linking each extension struct to the current
-    // head, then making it the new head. Order is irrelevant for property
-    // queries — the driver walks the chain by sType.
-    VkBaseOutStructure *head =
-        reinterpret_cast<VkBaseOutStructure *>(&subgroup_properties);
-
-    // Driver identification. The driverID is what separates MoltenVK's MSL
-    // backend from a native driver on the same vendor ID; chaining it here
-    // (before the extension structs below) keeps it populated in every build.
+    // driverID is what separates MoltenVK's MSL backend from a native driver
+    // on the same vendor ID.
     VkPhysicalDeviceDriverProperties driver_properties = {};
     driver_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-    driver_properties.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&driver_properties);
+    chain(head, driver_properties);
 
 #ifdef VK_KHR_cooperative_matrix
     VkPhysicalDeviceCooperativeMatrixPropertiesKHR coopmat_properties = {};
     coopmat_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
-    coopmat_properties.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&coopmat_properties);
+    chain(head, coopmat_properties);
 #endif
-
 #ifdef VK_NV_cuda_kernel_launch
     VkPhysicalDeviceCudaKernelLaunchPropertiesNV cuda_properties = {};
     cuda_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_PROPERTIES_NV;
-    cuda_properties.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&cuda_properties);
+    chain(head, cuda_properties);
 #endif
-
 #ifdef VK_EXT_host_image_copy
-    VkPhysicalDeviceHostImageCopyPropertiesEXT hostimagecopyproperty = {};
-    hostimagecopyproperty.sType =
+    VkPhysicalDeviceHostImageCopyPropertiesEXT host_copy_properties = {};
+    host_copy_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT;
-    hostimagecopyproperty.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&hostimagecopyproperty);
+    chain(head, host_copy_properties);
 #endif
-
 #ifdef VK_EXT_subgroup_size_control
     // Queried so the pipeline can request a fixed requiredSubgroupSize; the
     // Intel ANV driver is free to pick any subgroupSize in [min,max] when it
@@ -261,404 +326,224 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssc_properties = {};
     ssc_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
-    ssc_properties.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&ssc_properties);
+    chain(head, ssc_properties);
 #endif
-
 #ifdef VK_EXT_descriptor_buffer
     // Descriptor sizes and the set-offset alignment the descriptor-buffer
-    // backend must honour. Opening the chain even when the extension did not
-    // enumerate is harmless: unknown sTypes are ignored by the driver.
+    // backend must honour.
     VkPhysicalDeviceDescriptorBufferPropertiesEXT db_properties = {};
     db_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
-    db_properties.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&db_properties);
+    chain(head, db_properties);
 #endif
-
 #ifdef VK_KHR_shader_integer_dot_product
     // Whether dot() on a packed 4x8 vector is a hardware instruction is a
     // PROPERTY, not a feature: the feature bit only grants permission to put
-    // `OpCapability DotProduct` in a module, while this says whether the
-    // driver executes `dotPacked4x8EXT` or expands it into shifts and adds.
-    // The standalone struct's sType value is the same number in its 1.3-core
-    // and KHR spellings (both are 1000280001), so chaining it once answers
-    // either way; a driver that does not know it leaves the fields zero, which
-    // reads as "not accelerated" -- the safe answer for a routing gate.
+    // `OpCapability DotProduct` in a module. The sType is the same number in
+    // its 1.3-core and KHR spellings, so one struct answers either way.
     VkPhysicalDeviceShaderIntegerDotProductProperties dot_properties = {};
     dot_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES;
-    dot_properties.pNext = head;
-    head = reinterpret_cast<VkBaseOutStructure *>(&dot_properties);
+    chain(head, dot_properties);
+#endif
+#ifdef VK_EXT_external_memory_host
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_import_properties = {};
+    host_import_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+    chain(head, host_import_properties);
 #endif
 
+    VkPhysicalDeviceProperties2 properties2 = {};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     properties2.pNext = head;
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+    const VkPhysicalDeviceLimits &limits = properties2.properties.limits;
 
+#ifdef VK_EXT_host_image_copy
+    // Layout arrays take a second pass: counts first, then the arrays.
+    if (host_copy_properties.copySrcLayoutCount > 0 ||
+        host_copy_properties.copyDstLayoutCount > 0) {
+        copySrcLayout_.resize(host_copy_properties.copySrcLayoutCount);
+        copyDstLayout_.resize(host_copy_properties.copyDstLayoutCount);
+        host_copy_properties.pCopySrcLayouts = copySrcLayout_.data();
+        host_copy_properties.pCopyDstLayouts = copyDstLayout_.data();
+        vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+    }
+    LOG_INFO("HostImageCopy identicalMemoryTypeRequirements %s",
+             host_copy_properties.identicalMemoryTypeRequirements ? "True"
+                                                                  : "False");
+    for (auto l : copySrcLayout_) {
+        (void)l;
+        LOG_INFO("HostImageCopy support src layout %d", l);
+    }
+    for (auto l : copyDstLayout_) {
+        (void)l;
+        LOG_INFO("HostImageCopy support dst layout %d", l);
+    }
+#endif
 #ifdef VK_KHR_shader_integer_dot_product
     m_dot_product_props_ = dot_properties;
     m_dot_product_packed_signed_ =
         dot_properties.integerDotProduct4x8BitPackedSignedAccelerated !=
         VK_FALSE;
 #endif
-
 #ifdef VK_EXT_descriptor_buffer
     m_descriptor_buffer_props_ = db_properties;
 #endif
-
-#ifdef VK_EXT_host_image_copy
-    // Layout arrays are queried in two passes: the driver reports counts
-    // first, then we provide buffers and re-query to populate them.
-    if (hostimagecopyproperty.copySrcLayoutCount > 0 ||
-        hostimagecopyproperty.copyDstLayoutCount > 0) {
-        this->copySrcLayout_.resize(hostimagecopyproperty.copySrcLayoutCount);
-        this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
-        hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout_.data();
-        hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
-        vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+#ifdef VK_EXT_external_memory_host
+    // Only meaningful when the extension enumerates; createLogicalDevice()
+    // decides that. minImportedHostPointerAlignment is 4096 on MoltenVK.
+    if (host_import_properties.minImportedHostPointerAlignment > 0) {
+        m_host_import_alignment_ = static_cast<uint32_t>(
+            host_import_properties.minImportedHostPointerAlignment);
     }
 #endif
 
-    this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
-    this->maxImageArrayLayers_ =
-        properties2.properties.limits.maxImageArrayLayers;
-    this->maxImageDimension2D_ =
-        properties2.properties.limits.maxImageDimension2D;
-    this->deviceName_ = properties2.properties.deviceName;
-    LOG_INFO("GPU %s", this->deviceName_.c_str());
-
+    timestampPeriod_ = limits.timestampPeriod;
+    maxImageArrayLayers_ = limits.maxImageArrayLayers;
+    maxImageDimension2D_ = limits.maxImageDimension2D;
+    min_sb_offset_align_ =
+        std::max<VkDeviceSize>(1, limits.minStorageBufferOffsetAlignment);
+    deviceName_ = properties2.properties.deviceName;
+    LOG_INFO("GPU %s", deviceName_.c_str());
     LOG_INFO("Driver ID %d (vendor 0x%x)", driver_properties.driverID,
              properties2.properties.vendorID);
-    // The tile/GEMV crossovers this used to compute per driver now live in the
-    // ordered table in core/KernelSelect.cpp; the resolved profile is logged
-    // from the constructor once device_traits_ exists.
-    LOG_INFO("Max image array layers %d", this->maxImageArrayLayers_);
-    LOG_INFO("Max image dimension 2D %d", this->maxImageDimension2D_);
+    LOG_INFO("Max image array layers %d", maxImageArrayLayers_);
+    LOG_INFO("Max image dimension 2D %d", maxImageDimension2D_);
     LOG_INFO("Min TexelBuffer Alignment %llu",
-             properties2.properties.limits.minTexelBufferOffsetAlignment);
+             limits.minTexelBufferOffsetAlignment);
 #ifdef VK_EXT_subgroup_size_control
     minSubgroupSize_ = ssc_properties.minSubgroupSize;
     maxSubgroupSize_ = ssc_properties.maxSubgroupSize;
-    LOG_INFO("Subgroup size control min %u max %u",
-             ssc_properties.minSubgroupSize, ssc_properties.maxSubgroupSize);
+    LOG_INFO("Subgroup size control min %u max %u", minSubgroupSize_,
+             maxSubgroupSize_);
 #endif
-    // Cached for the *_sg shader variant decision (Runtime::LoadModel and
-    // Operator::resolve_primary_spv), so it must be set on every query.
+    // Feeds the *_sg shader variant decision (Runtime::LoadModel and
+    // Operator::resolve_primary_spv).
     m_support_subgroup_arithmetic_ = (subgroup_properties.supportedOperations &
                                       VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
     if (m_support_subgroup_arithmetic_) {
-        LOG_INFO("Device support subgroup arithmetic");
-        LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
+        LOG_INFO("Device support subgroup arithmetic, subgroup size %d",
+                 subgroup_properties.subgroupSize);
     }
 #ifdef VK_KHR_cooperative_matrix
     m_coopmat_supported_stages_ =
         coopmat_properties.cooperativeMatrixSupportedStages;
     LOG_INFO("Cooperative matrix supported stages 0x%x",
-             coopmat_properties.cooperativeMatrixSupportedStages);
-
-    // Enumerate every (M, N, K, type, scope) combination the device supports.
-    // RenderDoc's capture layer (up to and including 1.47) never installs a
-    // device entry point for this query: the loader trampoline tail-jumps
-    // into an empty dispatch-table slot and the process SIGSEGVs (#0 0x0,
-    // call *%r13 with r13 == NULL). The list only feeds the coopmat
-    // tile-shape selectors (supports_coopmat_*_tile), so skipping it under
-    // capture degrades routing exactly like a non-coopmat device. The env
-    // check keys on the same variable the layer's manifest enables; define
-    // VKOP_DISABLE_COOPMAT_RDOC_GUARD to compile the guard out, or set
-    // VKOP_RDOC_COOPMAT_ENUM=1 to force the enumeration at runtime (for
-    // testing a renderer build where the entry point actually works).
-#ifndef VKOP_DISABLE_COOPMAT_RDOC_GUARD
-    static const bool coopmat_enum_skipped =
-        std::getenv("ENABLE_VULKAN_RENDERDOC_CAPTURE") != nullptr &&
-        std::getenv("VKOP_RDOC_COOPMAT_ENUM") == nullptr;
-#else
-    static constexpr bool coopmat_enum_skipped = false;
-#endif
-    if (coopmat_enum_skipped) {
-        LOG_WARN("RenderDoc capture layer active: skipping "
-                 "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR "
-                 "(layer <= 1.47 lacks its device entry point); coopmat "
-                 "tile probing disabled");
-    }
-    if (coopmat_properties.cooperativeMatrixSupportedStages != 0 &&
-        !coopmat_enum_skipped) {
-        uint32_t propCount = 0;
-        auto vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
-            reinterpret_cast<
-                PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
-                vkGetInstanceProcAddr(
-                    VulkanInstance::getVulkanInstance().getInstance(),
-                    "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
-        if (vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
-            vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
-                physicalDevice_, &propCount, nullptr);
-            if (propCount > 0) {
-                this->coopmatProps_.resize(propCount);
-                vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
-                    physicalDevice_, &propCount, this->coopmatProps_.data());
-            }
-            for (uint32_t i = 0; i < propCount; i++) {
-                const auto &p = this->coopmatProps_[i];
-                (void)p;
-                LOG_INFO("CoopMat [%u]: %ux%ux%u AType=%d BType=%d CType=%d "
-                         "ResultType=%d scope=%d",
-                         i, p.MSize, p.NSize, p.KSize, p.AType, p.BType,
-                         p.CType, p.ResultType, p.scope);
-            }
-        }
-    }
-#endif
-#if VK_EXT_host_image_copy
-    LOG_INFO("HostImageCopy identicalMemoryTypeRequirements %s",
-             hostimagecopyproperty.identicalMemoryTypeRequirements == VK_TRUE
-                 ? "True"
-                 : "False");
-    for (uint32_t i = 0; i < hostimagecopyproperty.copySrcLayoutCount; i++) {
-        LOG_INFO("HostImageCopy support src layout %d",
-                 hostimagecopyproperty.pCopySrcLayouts[i]);
-    }
-    for (uint32_t i = 0; i < hostimagecopyproperty.copyDstLayoutCount; i++) {
-        LOG_INFO("HostImageCopy support dst layout %d",
-                 hostimagecopyproperty.pCopyDstLayouts[i]);
-    }
+             m_coopmat_supported_stages_);
+    queryCooperativeMatrixProperties();
 #endif
 #ifdef VK_NV_cuda_kernel_launch
     LOG_INFO("CUDA kernel launch compute capability %u.%u",
              cuda_properties.computeCapabilityMajor,
              cuda_properties.computeCapabilityMinor);
 #endif
-
     return properties2.properties;
 }
 
-VkDeviceSize VulkanDevice::minStorageBufferOffsetAlignment() {
-    if (min_sb_offset_align_ == 0) {
-        min_sb_offset_align_ =
-            getProperties().limits.minStorageBufferOffsetAlignment;
-        if (min_sb_offset_align_ == 0) {
-            min_sb_offset_align_ = 1;
-        }
+#ifdef VK_KHR_cooperative_matrix
+void VulkanDevice::queryCooperativeMatrixProperties() {
+    // Enumerate every (M, N, K, type, scope) combination the device supports.
+    // RenderDoc's capture layer (up to and including 1.47) never installs a
+    // device entry point for this query: the loader trampoline tail-jumps
+    // into an empty dispatch-table slot and the process SIGSEGVs. The list
+    // only feeds the coopmat tile-shape selectors (supports_coopmat_*_tile),
+    // so skipping it under capture degrades routing exactly like a
+    // non-coopmat device. Define VKOP_DISABLE_COOPMAT_RDOC_GUARD to compile
+    // the guard out, or set VKOP_RDOC_COOPMAT_ENUM=1 to force the enumeration
+    // at runtime.
+#ifndef VKOP_DISABLE_COOPMAT_RDOC_GUARD
+    static const bool skipped =
+        std::getenv("ENABLE_VULKAN_RENDERDOC_CAPTURE") != nullptr &&
+        std::getenv("VKOP_RDOC_COOPMAT_ENUM") == nullptr;
+#else
+    static constexpr bool skipped = false;
+#endif
+    if (skipped) {
+        LOG_WARN("RenderDoc capture layer active: skipping "
+                 "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR "
+                 "(layer <= 1.47 lacks its device entry point); coopmat "
+                 "tile probing disabled");
+        return;
     }
-    return min_sb_offset_align_;
+    if (m_coopmat_supported_stages_ == 0) {
+        return;
+    }
+    auto fn = reinterpret_cast<
+        PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+        vkGetInstanceProcAddr(
+            VulkanInstance::getVulkanInstance().getInstance(),
+            "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+    if (!fn) {
+        return;
+    }
+    uint32_t count = 0;
+    fn(physicalDevice_, &count, nullptr);
+    VkCooperativeMatrixPropertiesKHR blank = {};
+    blank.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    coopmatProps_.assign(count, blank);
+    if (count > 0) {
+        fn(physicalDevice_, &count, coopmatProps_.data());
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const auto &p = coopmatProps_[i];
+        (void)p;
+        LOG_INFO("CoopMat [%u]: %ux%ux%u AType=%d BType=%d CType=%d "
+                 "ResultType=%d scope=%d",
+                 i, p.MSize, p.NSize, p.KSize, p.AType, p.BType, p.CType,
+                 p.ResultType, p.scope);
+    }
 }
+#endif
+
+// ---------------------------------------------------------------------------
+// Queues
+// ---------------------------------------------------------------------------
 
 uint32_t VulkanDevice::findComputeQueueFamily() {
-    uint32_t queue_family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_,
-                                             &queue_family_count, nullptr);
-    std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(
-        physicalDevice_, &queue_family_count, queue_families.data());
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &count,
+                                             families.data());
 
-    const VkQueueFlags first = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
-    const VkQueueFlags second =
-        VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+    const VkQueueFlags compute = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+    const VkQueueFlags graphics = compute | VK_QUEUE_GRAPHICS_BIT;
 
-    for (uint32_t i = 0; i < queue_families.size(); i++) {
-        if (kInflight > 1 &&
-            (queue_families[i].queueFlags & (second)) == (second)) {
-            std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
-                i, queue_families[i].queueCount, queue_families[i].queueFlags};
-            computeQueueIdxs_.emplace_back(t);
-            graphicsQueueIdxs_.emplace_back(t);
+    for (uint32_t i = 0; i < count; i++) {
+        const VkQueueFlags flags = families[i].queueFlags;
+        const QueueFamily f{i, families[i].queueCount, flags};
+        if (kInflight > 1 && (flags & graphics) == graphics) {
+            computeQueueIdxs_.emplace_back(f);
+            graphicsQueueIdxs_.emplace_back(f);
             LOG_INFO("Found graphics+compute queue family %d with %d queues", i,
-                     queue_families[i].queueCount);
-        } else if ((queue_families[i].queueFlags & (first)) == (first)) {
-            std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
-                i, queue_families[i].queueCount, queue_families[i].queueFlags};
-            computeQueueIdxs_.emplace_back(t);
+                     families[i].queueCount);
+        } else if ((flags & compute) == compute) {
+            computeQueueIdxs_.emplace_back(f);
             LOG_INFO("Found compute queue family %d with %d queues", i,
-                     queue_families[i].queueCount);
+                     families[i].queueCount);
         }
     }
-
     return static_cast<uint32_t>(computeQueueIdxs_.size());
 }
 
-namespace {
-// Human-readable name for the four formats the image backend uses. (Kept in
-// one place so the probe's "which combination is missing" log names the format
-// the same way as the support log did.)
-const char *image_format_name(VkFormat format) {
-    switch (format) {
-    case VK_FORMAT_R32G32B32A32_SFLOAT:
-        return "RGBA32_SFLOAT";
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
-        return "RGBA16_SFLOAT";
-    case VK_FORMAT_R8G8B8A8_UNORM:
-        return "RGBA8_UNORM";
-    case VK_FORMAT_R8G8B8A8_SNORM:
-        return "RGBA8_SNORM";
-    default:
-        return "unknown";
-    }
-}
-} // namespace
+// ---------------------------------------------------------------------------
+// Image backend probe
+// ---------------------------------------------------------------------------
 
-// Returns whether `format` can back an OPTIMAL-tiled image that is sampled,
-// stored to, and both a transfer source and destination -- the exact
-// combination the image backend creates. This used to be a chain of bare
-// asserts; on a device with no image support those aborted the constructor
-// before the buffer backend could be used, so the answer is now returned and
-// recorded (image_unsupported_reason_) instead.
-bool VulkanDevice::probeImageConfigurationSupported(VkFormat format) {
-    const VkImageType img_type = VK_IMAGE_TYPE_2D;
-    // The image backend only ever creates OPTIMAL-tiled images
-    // (Tensor::make_vkimg -> VulkanImage). A device that cannot back an
-    // OPTIMAL-tiled sampled+storage+transfer image is exactly what this probe
-    // reports instead of asserting.
-    const VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
-    VkImageUsageFlags usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    const VkImageCreateFlags flags = 0;
-
-    VkFormatProperties format_props{};
-    vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &format_props);
-
-    const VkFormatFeatureFlags required_features =
-        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    const VkFormatFeatureFlags have = format_props.optimalTilingFeatures;
-    if ((have & required_features) != required_features) {
-        std::string why =
-            "optimalTilingFeatures 0x" + std::to_string(have) +
-            " lacks sampled|storage|transfer-src|transfer-dst (required 0x" +
-            std::to_string(required_features) + ")";
-        LOG_WARN("image backend unavailable: format %s: %s",
-                 image_format_name(format), why.c_str());
-        if (image_unsupported_reason_.empty()) {
-            image_unsupported_reason_ = std::string(image_format_name(format)) +
-                                        ": " + why;
-        }
-        return false;
-    }
-
-    VkImageFormatProperties props;
-    VkResult result = vkGetPhysicalDeviceImageFormatProperties(
-        physicalDevice_, format, img_type, tiling, usage, flags, &props);
-    if (result != VK_SUCCESS) {
-        std::string why = "vkGetPhysicalDeviceImageFormatProperties returned " +
-                          std::to_string(static_cast<int>(result)) +
-                          " for a sampled|storage|transfer image";
-        LOG_WARN("image backend unavailable: format %s: %s",
-                 image_format_name(format), why.c_str());
-        if (image_unsupported_reason_.empty()) {
-            image_unsupported_reason_ = std::string(image_format_name(format)) +
-                                        ": " + why;
-        }
-        return false;
-    }
-    LOG_INFO("format %s supports %u layers", image_format_name(format),
-             props.maxArrayLayers);
-    // The host-transfer variant stays informational: whether host image copy is
-    // usable is decided by the feature probe in createLogicalDevice(), and at
-    // constructor time that flag has not been resolved yet.
-    if (m_support_host_image_copy_) {
-        usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-    }
-    result = vkGetPhysicalDeviceImageFormatProperties(
-        physicalDevice_, format, img_type, tiling, usage, flags, &props);
-    if (result == VK_SUCCESS) {
-        LOG_INFO("format %s supports %u layers for hostImageCopy",
-                 image_format_name(format), props.maxArrayLayers);
-    } else {
-        LOG_INFO("format %s not supports hostImageCopy",
-                 image_format_name(format));
-    }
-    return true;
-}
-
-EnableResult VulkanDevice::buildFeatureEnableChain(
-    const std::vector<FeatureDescriptor> &descs,
-    const VkPhysicalDeviceFeatures2 &queryFeatures2,
-    const std::set<std::string> &supportedExtensions) {
-    // Map sType → queried struct pointer
-    std::unordered_map<VkStructureType, void *> queried_map;
-    for (const void *p = queryFeatures2.pNext; p;) {
-        auto *base = const_cast<VkBaseOutStructure *>(
-            static_cast<const VkBaseOutStructure *>(p));
-        queried_map[base->sType] = base;
-        p = base->pNext;
-    }
-
-    EnableResult result;
-    for (const auto &desc : descs) {
-        auto it = queried_map.find(desc.sType);
-        if (it == queried_map.end())
-            continue;
-
-        auto enabled_struct = desc.makeEnableStruct(it->second);
-        if (!enabled_struct)
-            continue;
-
-        result.enableChain.push_back(std::move(enabled_struct));
-        if (desc.extensionName) {
-            result.enabledExtensions.push_back(desc.extensionName);
-        }
-    }
-
-// Enable extensions without feature structrues
-#ifdef VK_EXT_tooling_info
-    if (supportedExtensions.count(VK_EXT_TOOLING_INFO_EXTENSION_NAME) > 0) {
-        result.enabledExtensions.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
-    }
-#endif
-#ifdef VK_KHR_shader_non_semantic_info
-    if (supportedExtensions.count(
-            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME) > 0) {
-        result.enabledExtensions.push_back(
-            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
-    }
-#endif
-#ifdef VK_KHR_swapchain
-    if (supportedExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) > 0) {
-        // swapchain has no feature struct — old FeatureDescriptor path
-        // incorrectly gated on geometryShader, excluding Intel ARL.
-        result.enabledExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    }
-#endif
-#ifdef VK_EXT_external_memory_host
-    // No feature struct either — just the properties struct we query
-    // separately in createLogicalDevice for the alignment. Enabled so
-    // VulkanBuffer's host-import ctor is legal on this device.
-    if (supportedExtensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) >
-        0) {
-        result.enabledExtensions.push_back(
-            VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
-    }
-#endif
-    return result;
-}
-
-QueryChainResult VulkanDevice::buildFeatureQueryChain(
-    const std::vector<FeatureDescriptor> &descs) {
-    QueryChainResult result;
-    result.features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-
-    void *pnext = nullptr;
-    // Build from back to front (Vulkan doesn't care, but consistent)
-    for (auto it = descs.rbegin(); it != descs.rend(); ++it) {
-        auto struct_ptr = it->makeQueryStruct();
-        if (!struct_ptr)
-            continue;
-        auto *base = static_cast<VkBaseOutStructure *>(struct_ptr.get());
-        base->pNext = reinterpret_cast<VkBaseOutStructure *>(pnext);
-        pnext = base;
-        result.ownedStructs.push_back(std::move(struct_ptr));
-    }
-    result.features2.pNext = pnext;
-    return result;
-}
-
+// The image backend packs tensors into four RGBA formats (Tensor::make_vkimg)
+// and creates them as OPTIMAL-tiled sampled+storage images that are uploaded
+// and read back through transfers; it also exposes them as texel buffers
+// (VulkanBufferView). Any missing combination turns the image backend off
+// (and records why) instead of asserting, so an image-less device (the
+// Alibaba PPU) still runs the buffer backend.
+//
+// Deliberately the Vulkan 1.0 vkGetPhysicalDeviceFormatProperties and not the
+// FormatProperties2/3 chain: the pNext chain is the part an unknown driver is
+// most likely to mishandle, and nothing here needs a 64-bit feature bit. Host
+// image transfer is NOT required: createLogicalDevice() probes it for real and
+// the staged path covers its absence.
 void VulkanDevice::checkImageFormatSupport() {
-    // The four formats the image backend packs tensors into (see
-    // Tensor::make_vkimg): f32, f16, and the two int8 containers. Each must be
-    // usable as an OPTIMAL-tiled sampled+storage+transfer image; on top of that
-    // the image backend's upload path wants host image transfer, which this
-    // probe only reports (createLogicalDevice() decides whether it is enabled).
     struct FormatReq {
         VkFormat format;
         const char *name;
@@ -669,1342 +554,615 @@ void VulkanDevice::checkImageFormatSupport() {
         {VK_FORMAT_R8G8B8A8_SNORM, "RGBA8_SNORM"},
         {VK_FORMAT_R8G8B8A8_UNORM, "RGBA8_UNORM"},
     };
+    const VkFormatFeatureFlags optimal_required =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlags buffer_any =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
+    const VkImageUsageFlags usage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
-    // Deliberately the Vulkan 1.0 vkGetPhysicalDeviceFormatProperties and not
-    // the FormatProperties2/3 chain the old asserts used: the pNext chain is
-    // the part a driver we know nothing about (the target PPU) is most likely
-    // to mishandle, and none of the verdict below needs a 64-bit feature bit.
-    // Host image transfer is a Properties3-only bit, but it is NOT required
-    // here: createLogicalDevice() probes hostImageCopy for real and downgrades
-    // it, and the staged path covers its absence.
+    auto fail = [this](const char *name, const std::string &why) {
+        LOG_WARN("no image support: format %s: %s", name, why.c_str());
+        image_unsupported_reason_ = std::string(name) + ": " + why;
+    };
+
     for (const FormatReq &fr : formats) {
         VkFormatProperties props{};
         vkGetPhysicalDeviceFormatProperties(physicalDevice_, fr.format,
                                             &props);
-        // bufferFeatures: the image backend also exposes these formats as
-        // texel buffers (VulkanBufferView). Absent only on a device with no
-        // image/texel support at all.
-        if ((props.bufferFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                     VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) ==
-            0) {
-            LOG_WARN("no image support: format %s: bufferFeatures 0x%x lack "
-                     "sampled-image|storage-texel-buffer",
-                     fr.name, props.bufferFeatures);
-            if (image_unsupported_reason_.empty()) {
-                image_unsupported_reason_ =
-                    std::string(fr.name) +
-                    ": bufferFeatures lack sampled-image|storage-texel-buffer";
-            }
+        if ((props.bufferFeatures & buffer_any) == 0) {
+            fail(fr.name,
+                 "bufferFeatures lack sampled-image|storage-texel-buffer");
             return;
         }
-        // optimalTilingFeatures: all four are genuinely needed -- the image
-        // backend creates sampled+storage images and uploads/reads them back
-        // through transfers. (The previous asserts only tested for ANY one of
-        // them, which a sampled-only device would have passed.)
-        const VkFormatFeatureFlags required =
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        if ((props.optimalTilingFeatures & required) != required) {
-            LOG_WARN("no image support: format %s: optimalTilingFeatures 0x%x "
-                     "lack sampled|storage|transfer-src|transfer-dst "
-                     "(required 0x%x)",
-                     fr.name, props.optimalTilingFeatures, required);
-            if (image_unsupported_reason_.empty()) {
-                image_unsupported_reason_ =
-                    std::string(fr.name) +
-                    ": optimalTilingFeatures lack "
-                    "sampled|storage|transfer-src|transfer-dst";
-            }
+        if ((props.optimalTilingFeatures & optimal_required) !=
+            optimal_required) {
+            fail(fr.name, "optimalTilingFeatures 0x" +
+                              std::to_string(props.optimalTilingFeatures) +
+                              " lack sampled|storage|transfer-src|"
+                              "transfer-dst");
             return;
         }
-        // Per-format image configuration (format/usage/tiling): the same
-        // sampled+storage+transfer matrix through the dedicated query.
-        if (!probeImageConfigurationSupported(fr.format)) {
+        VkImageFormatProperties image_props{};
+        VkResult r = vkGetPhysicalDeviceImageFormatProperties(
+            physicalDevice_, fr.format, VK_IMAGE_TYPE_2D,
+            VK_IMAGE_TILING_OPTIMAL, usage, 0, &image_props);
+        if (r != VK_SUCCESS) {
+            fail(fr.name, "vkGetPhysicalDeviceImageFormatProperties returned " +
+                              std::to_string(static_cast<int>(r)) +
+                              " for a sampled|storage|transfer image");
             return;
         }
+        LOG_INFO("format %s supports %u layers", fr.name,
+                 image_props.maxArrayLayers);
     }
     m_support_images_ = true;
-    // Say which verdict is in force: the probe passed, but VKOP_NO_IMAGES can
-    // still force the image backend off. Printing "supported" unconditionally
-    // would contradict the very next gate that refuses image work.
-    if (is_support_images()) {
-        LOG_INFO("image backend supported");
-    } else {
-        LOG_INFO("image backend disabled by VKOP_NO_IMAGES");
-    }
+    // The probe passed, but VKOP_NO_IMAGES can still force the backend off.
+    LOG_INFO("image backend %s", is_support_images()
+                                     ? "supported"
+                                     : "disabled by VKOP_NO_IMAGES");
 }
 
-std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
-    const VkPhysicalDeviceProperties &deviceProperties,
-    const std::set<std::string> &supportedExtensions) {
-    std::vector<FeatureDescriptor> descs;
-    // The version every gate below must compare against is the one the
-    // application may legally use, i.e. min(instance apiVersion, device
-    // apiVersion) — NOT the device value alone. A driver can advertise a newer
-    // apiVersion than the VkInstance was created with (NVIDIA 595 reports
-    // 1.4.329 through an instance created at 1.3.275). Gating on the device
-    // value there is wrong in both directions: `>= VK_API_VERSION_1_4` selects
-    // a core struct the promoted-in-1.4 features cannot legally be queried
-    // with (and this tree's headers do not even compile it), while
-    // `< VK_API_VERSION_1_4` silently drops the EXT path that IS valid. Using
-    // the clamped value keeps exactly one branch reachable: the EXT struct for
-    // anything the instance did not promote.
-    const uint32_t api_version =
-        std::min(deviceProperties.apiVersion,
-                 VulkanInstance::getVulkanInstance().apiVersion());
+// ---------------------------------------------------------------------------
+// Feature probes
+// ---------------------------------------------------------------------------
+
+void VulkanDevice::addFeatureProbes(FeatureChain &fc, uint32_t api_version,
+                                    const std::set<std::string> &extensions) {
+    auto has = [&](const char *name) { return extensions.count(name) > 0; };
+    ShaderCapabilities &sc = shader_caps_;
+
+    // ---- core feature structs ----------------------------------------------
+    // Each promoted feature is reached through exactly one struct: the core
+    // VkPhysicalDeviceVulkanXXFeatures when api_version covers it, otherwise
+    // the extension struct further down. Chaining both for one feature is
+    // invalid (VUID-VkDeviceCreateInfo-pNext-02829/02830/06532/...), which
+    // is why every extension fallback tests `api_version <` its promotion.
 #ifdef VK_VERSION_1_1
     if (api_version >= VK_API_VERSION_1_1) {
-        shader_caps_.storage_buffer_16bit.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-            .extensionName = nullptr,
-            .corePromotedVersion = VK_API_VERSION_1_1,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<VkPhysicalDeviceVulkan11Features>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan11Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<VkPhysicalDeviceVulkan11Features *>(q);
+        sc.storage_buffer_16bit.available = true;
+        fc.add<VkPhysicalDeviceVulkan11Features>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, nullptr,
+            [this](const auto &q, auto &e) {
                 recordCap(shader_caps_.storage_buffer_16bit,
-                          feat->storageBuffer16BitAccess);
-                if (!feat->storageBuffer16BitAccess &&
-                    !feat->storageInputOutput16 &&
-                    !feat->uniformAndStorageBuffer16BitAccess) {
-                    return nullptr;
-                }
-                auto e = std::make_unique<VkPhysicalDeviceVulkan11Features>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan11Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>();
-                e->storageBuffer16BitAccess = feat->storageBuffer16BitAccess;
-                e->storageInputOutput16 = feat->storageInputOutput16;
-                e->uniformAndStorageBuffer16BitAccess =
-                    feat->uniformAndStorageBuffer16BitAccess;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+                          q.storageBuffer16BitAccess);
+                e.storageBuffer16BitAccess = q.storageBuffer16BitAccess;
+                e.storageInputOutput16 = q.storageInputOutput16;
+                e.uniformAndStorageBuffer16BitAccess =
+                    q.uniformAndStorageBuffer16BitAccess;
+                return any(e.storageBuffer16BitAccess, e.storageInputOutput16,
+                           e.uniformAndStorageBuffer16BitAccess);
+            });
     }
 #endif
 #ifdef VK_VERSION_1_2
     if (api_version >= VK_API_VERSION_1_2) {
-        shader_caps_.shader_float16.available = true;
-        shader_caps_.shader_int8.available = true;
-        shader_caps_.storage_buffer_8bit.available = true;
-        shader_caps_.uniform_storage_8bit.available = true;
-        shader_caps_.descriptor_indexing.available = true;
-        shader_caps_.descriptor_partially_bound.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-            .extensionName = nullptr,
-            .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<VkPhysicalDeviceVulkan12Features>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan12Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<VkPhysicalDeviceVulkan12Features *>(q);
-                recordCap(shader_caps_.shader_float16, feat->shaderFloat16);
-                recordCap(shader_caps_.shader_int8, feat->shaderInt8);
-                recordCap(shader_caps_.storage_buffer_8bit,
-                          feat->storageBuffer8BitAccess);
-                recordCap(shader_caps_.uniform_storage_8bit,
-                          feat->uniformAndStorageBuffer8BitAccess);
-                // Descriptor indexing (core 1.2). The engine's UAB layouts put
-                // the binding flag on every descriptor in the set, including
-                // the image bindings SplitImage/Conv2dImage use, so enable the
-                // bit for each type the driver reports; flagging a type whose
-                // feature was not enabled is invalid usage.
-                recordCap(shader_caps_.descriptor_indexing,
-                          feat->descriptorBindingStorageBufferUpdateAfterBind);
-                recordCap(shader_caps_.descriptor_partially_bound,
-                          feat->descriptorBindingPartiallyBound);
-                m_uab_storage_buffer_ =
-                    feat->descriptorBindingStorageBufferUpdateAfterBind;
-                m_uab_storage_image_ =
-                    feat->descriptorBindingStorageImageUpdateAfterBind;
-                m_uab_sampled_image_ =
-                    feat->descriptorBindingSampledImageUpdateAfterBind;
-                m_uab_uniform_buffer_ =
-                    feat->descriptorBindingUniformBufferUpdateAfterBind;
-                m_support_descriptor_partially_bound_ =
-                    feat->descriptorBindingPartiallyBound;
-                if (!feat->shaderFloat16 && !feat->shaderInt8 &&
-                    !feat->timelineSemaphore && !feat->bufferDeviceAddress &&
-                    !feat->descriptorBindingStorageBufferUpdateAfterBind &&
-                    !feat->descriptorBindingStorageImageUpdateAfterBind &&
-                    !feat->descriptorBindingSampledImageUpdateAfterBind &&
-                    !feat->descriptorBindingUniformBufferUpdateAfterBind &&
-                    !feat->descriptorBindingPartiallyBound &&
-                    !feat->storageBuffer8BitAccess &&
-                    !feat->uniformAndStorageBuffer8BitAccess) {
-                    return nullptr;
-                }
-                auto e = std::make_unique<VkPhysicalDeviceVulkan12Features>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan12Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>();
-
-                e->shaderFloat16 = feat->shaderFloat16;
-                e->shaderInt8 = feat->shaderInt8;
-                // 8-bit loads for int8 weights/activations. Only the storage
-                // buffer forms: storagePushConstant8 would widen the push
-                // constant range nothing uses.
-                e->storageBuffer8BitAccess = feat->storageBuffer8BitAccess;
-                e->uniformAndStorageBuffer8BitAccess =
-                    feat->uniformAndStorageBuffer8BitAccess;
-                e->timelineSemaphore = feat->timelineSemaphore;
-                // Buffer device address: opt-out via VKOP_NO_BDA. Everything
-                // downstream (VMA allocator flag, per-buffer usage bit, BDA
-                // shader variants) keys on this enabled bit, so a driver that
-                // reports the feature but is known-broken has one switch.
-                const bool want_bda = feat->bufferDeviceAddress &&
-                                      !buffer_device_address_disabled();
-                e->bufferDeviceAddress = want_bda;
-                e->descriptorBindingStorageBufferUpdateAfterBind =
-                    feat->descriptorBindingStorageBufferUpdateAfterBind;
-                e->descriptorBindingStorageImageUpdateAfterBind =
-                    feat->descriptorBindingStorageImageUpdateAfterBind;
-                e->descriptorBindingSampledImageUpdateAfterBind =
-                    feat->descriptorBindingSampledImageUpdateAfterBind;
-                e->descriptorBindingUniformBufferUpdateAfterBind =
-                    feat->descriptorBindingUniformBufferUpdateAfterBind;
-                e->descriptorBindingPartiallyBound =
-                    feat->descriptorBindingPartiallyBound;
-                m_support_timeline_semaphore_ = feat->timelineSemaphore;
-                m_support_buffer_device_address_ = want_bda;
-                m_support_descriptor_update_after_bind_ =
-                    feat->descriptorBindingStorageBufferUpdateAfterBind;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+        sc.shader_float16.available = true;
+        sc.shader_int8.available = true;
+        sc.storage_buffer_8bit.available = true;
+        sc.uniform_storage_8bit.available = true;
+        sc.descriptor_indexing.available = true;
+        sc.descriptor_partially_bound.available = true;
+        fc.add<VkPhysicalDeviceVulkan12Features>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, nullptr,
+            [this](const auto &q, auto &e) {
+                auto &c = shader_caps_;
+                recordCap(c.shader_float16, q.shaderFloat16);
+                recordCap(c.shader_int8, q.shaderInt8);
+                recordCap(c.storage_buffer_8bit, q.storageBuffer8BitAccess);
+                recordCap(c.uniform_storage_8bit,
+                          q.uniformAndStorageBuffer8BitAccess);
+                e.shaderFloat16 = q.shaderFloat16;
+                e.shaderInt8 = q.shaderInt8;
+                // Only the storage-buffer 8-bit forms: storagePushConstant8
+                // would widen the push constant range nothing uses.
+                e.storageBuffer8BitAccess = q.storageBuffer8BitAccess;
+                e.uniformAndStorageBuffer8BitAccess =
+                    q.uniformAndStorageBuffer8BitAccess;
+                e.timelineSemaphore = q.timelineSemaphore;
+                m_support_timeline_semaphore_ = q.timelineSemaphore;
+                // Everything downstream (VMA allocator flag, per-buffer usage
+                // bit, BDA shader variants) keys on this enabled bit, so a
+                // known-broken driver has one switch: VKOP_NO_BDA.
+                e.bufferDeviceAddress =
+                    q.bufferDeviceAddress && !buffer_device_address_disabled();
+                m_support_buffer_device_address_ = e.bufferDeviceAddress;
+                pickDescriptorIndexing(q, e);
+                return any(e.shaderFloat16, e.shaderInt8,
+                           e.storageBuffer8BitAccess,
+                           e.uniformAndStorageBuffer8BitAccess,
+                           e.timelineSemaphore, e.bufferDeviceAddress,
+                           e.descriptorBindingStorageBufferUpdateAfterBind,
+                           e.descriptorBindingStorageImageUpdateAfterBind,
+                           e.descriptorBindingSampledImageUpdateAfterBind,
+                           e.descriptorBindingUniformBufferUpdateAfterBind,
+                           e.descriptorBindingPartiallyBound);
+            });
     }
 #endif
-#ifdef VK_KHR_16bit_storage
-    if (supportedExtensions.count(VK_KHR_16BIT_STORAGE_EXTENSION_NAME) > 0 &&
-        api_version < VK_API_VERSION_1_1) {
-        shader_caps_.storage_buffer_16bit.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR,
-            .extensionName = VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto queried =
-                    std::make_unique<VkPhysicalDevice16BitStorageFeaturesKHR>();
-                *queried = makeFeatureStruct<
-                    VkPhysicalDevice16BitStorageFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(queried));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDevice16BitStorageFeaturesKHR *>(q);
-                recordCap(shader_caps_.storage_buffer_16bit,
-                          feat->storageBuffer16BitAccess);
-                if (!feat->storageBuffer16BitAccess &&
-                    !feat->storageInputOutput16 &&
-                    !feat->uniformAndStorageBuffer16BitAccess) {
-                    return nullptr;
-                }
-                auto e =
-                    std::make_unique<VkPhysicalDevice16BitStorageFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDevice16BitStorageFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR>();
-                e->storageBuffer16BitAccess = feat->storageBuffer16BitAccess;
-                e->storageInputOutput16 = feat->storageInputOutput16;
-                e->uniformAndStorageBuffer16BitAccess =
-                    feat->uniformAndStorageBuffer16BitAccess;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_8bit_storage
-    // Same promoted/legacy split as 16bit_storage: below 1.2 the bits come from
-    // the extension struct instead of VkPhysicalDeviceVulkan12Features.
-    if (supportedExtensions.count(VK_KHR_8BIT_STORAGE_EXTENSION_NAME) > 0 &&
-        api_version < VK_API_VERSION_1_2) {
-        shader_caps_.storage_buffer_8bit.available = true;
-        shader_caps_.uniform_storage_8bit.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR,
-            .extensionName = VK_KHR_8BIT_STORAGE_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto queried =
-                    std::make_unique<VkPhysicalDevice8BitStorageFeaturesKHR>();
-                *queried = makeFeatureStruct<
-                    VkPhysicalDevice8BitStorageFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(queried));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDevice8BitStorageFeaturesKHR *>(q);
-                recordCap(shader_caps_.storage_buffer_8bit,
-                          feat->storageBuffer8BitAccess);
-                recordCap(shader_caps_.uniform_storage_8bit,
-                          feat->uniformAndStorageBuffer8BitAccess);
-                if (!feat->storageBuffer8BitAccess &&
-                    !feat->uniformAndStorageBuffer8BitAccess) {
-                    return nullptr;
-                }
-                auto e =
-                    std::make_unique<VkPhysicalDevice8BitStorageFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDevice8BitStorageFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR>();
-                e->storageBuffer8BitAccess = feat->storageBuffer8BitAccess;
-                e->uniformAndStorageBuffer8BitAccess =
-                    feat->uniformAndStorageBuffer8BitAccess;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_shader_float16_int8
-    if (supportedExtensions.count(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) >
-            0 &&
-        api_version < VK_API_VERSION_1_3) {
-        shader_caps_.shader_float16.available = true;
-        shader_caps_.shader_int8.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR,
-            .extensionName = VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto queried = std::make_unique<
-                    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR>();
-                *queried = makeFeatureStruct<
-                    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(queried));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *queried =
-                    static_cast<VkPhysicalDeviceShaderFloat16Int8FeaturesKHR *>(
-                        q);
-                recordCap(shader_caps_.shader_float16, queried->shaderFloat16);
-                recordCap(shader_caps_.shader_int8, queried->shaderInt8);
-                if (!queried->shaderFloat16 && !queried->shaderInt8)
-                    return nullptr;
-
-                auto enabled = std::make_unique<
-                    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR>();
-                *enabled = makeFeatureStruct<
-                    VkPhysicalDeviceShaderFloat16Int8FeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR>();
-                enabled->shaderFloat16 = queried->shaderFloat16;
-                enabled->shaderInt8 = queried->shaderInt8;
-                return std::shared_ptr<void>(std::move(enabled));
-            }});
-    }
-#endif
-#ifdef VK_KHR_shader_integer_dot_product
-    // Two ways to reach this feature and they are mutually exclusive on the
-    // SPIR-V side: through the KHR extension struct (pre-1.3) or through
-    // VkPhysicalDeviceVulkan13Features. The old `< 1.3` test here meant the
-    // feature was NEVER probed on a 1.3+ device, and the 1.3 core block below
-    // did not ask for it either -- so on a device whose min(instance, device)
-    // came out 1.3 (b3: instance 1.3.275, device 1.4.329) the bit stayed
-    // untaken and any module carrying OpCapability DotProduct was rejected at
-    // pipeline creation. Keep this branch for the pre-1.3 case and add the
-    // core one in the 1.3 block; the availability flag is set by whichever
-    // branch is taken.
-    if (supportedExtensions.count(
-            VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) > 0 &&
-        api_version < VK_API_VERSION_1_3) {
-        shader_caps_.integer_dot_product.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
-            .extensionName = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto queried = std::make_unique<
-                    VkPhysicalDeviceShaderIntegerDotProductFeatures>();
-                *queried = makeFeatureStruct<
-                    VkPhysicalDeviceShaderIntegerDotProductFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(queried));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *queried = static_cast<
-                    VkPhysicalDeviceShaderIntegerDotProductFeatures *>(q);
-                recordCap(shader_caps_.integer_dot_product,
-                          queried->shaderIntegerDotProduct);
-                if (!queried->shaderIntegerDotProduct)
-                    return nullptr;
-
-                auto enabled = std::make_unique<
-                    VkPhysicalDeviceShaderIntegerDotProductFeatures>();
-                *enabled = makeFeatureStruct<
-                    VkPhysicalDeviceShaderIntegerDotProductFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR>();
-                enabled->shaderIntegerDotProduct =
-                    queried->shaderIntegerDotProduct;
-                return std::shared_ptr<void>(std::move(enabled));
-            }});
-    }
-#endif
-
-    // ---- shader-level capability probes -------------------------------------
-    // Probed and enabled so the kernel selector has a truthful answer to ask
-    // about later; nothing routes on them yet. Each entry is the same
-    // query-then-copy-only-reported-bits shape as the ones above, so a driver
-    // that lacks a bit costs nothing and one that has it cannot fail
-    // vkCreateDevice.
-#ifdef VK_EXT_shader_atomic_float
-    // Never promoted to core. fp32 atomic add on a storage buffer is what would
-    // collapse the two-pass split-K (deposit partials + fold) into one pass.
-    if (supportedExtensions.count(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME) >
-        0) {
-        shader_caps_.f32_global_atomic_add.available = true;
-        shader_caps_.f32_shared_atomic_add.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
-            .extensionName = VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceShaderAtomicFloatFeaturesEXT *>(
-                        q);
-                recordCap(shader_caps_.f32_global_atomic_add,
-                          feat->shaderBufferFloat32AtomicAdd);
-                recordCap(shader_caps_.f32_shared_atomic_add,
-                          feat->shaderSharedFloat32AtomicAdd);
-                // The float64 and image/sparse variants stay off: a bit the
-                // engine never uses is a bit the driver can still refuse.
-                if (!feat->shaderBufferFloat32AtomicAdd &&
-                    !feat->shaderSharedFloat32AtomicAdd)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT>();
-                e->shaderBufferFloat32AtomicAdd =
-                    feat->shaderBufferFloat32AtomicAdd;
-                e->shaderSharedFloat32AtomicAdd =
-                    feat->shaderSharedFloat32AtomicAdd;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_NV_shader_atomic_float16_vector
-    // Half2 global atomic add. The bit is reported on hardware that also has
-    // shaderFloat16 clear (Pascal does), so the [devcaps] pair has to be read
-    // together before a kernel assumes f16x2 atomics are usable.
-    if (supportedExtensions.count(
-            VK_NV_SHADER_ATOMIC_FLOAT16_VECTOR_EXTENSION_NAME) > 0) {
-        shader_caps_.f16x2_global_atomic_add.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV,
-            .extensionName = VK_NV_SHADER_ATOMIC_FLOAT16_VECTOR_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV *>(q);
-                recordCap(shader_caps_.f16x2_global_atomic_add,
-                          feat->shaderFloat16VectorAtomics);
-                if (!feat->shaderFloat16VectorAtomics)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV>();
-                e->shaderFloat16VectorAtomics =
-                    feat->shaderFloat16VectorAtomics;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_workgroup_memory_explicit_layout
-    // Lets one shared block be declared with an explicit layout, so the tile
-    // buffers and the split-K accumulator can alias the same bytes and buy a
-    // bigger tile. The 8/16-bit sub-features only mean something on top of the
-    // matching storage features, which is why they are recorded separately.
-    if (supportedExtensions.count(
-            VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME) > 0) {
-        shader_caps_.wmem_explicit_layout.available = true;
-        shader_caps_.wmem_explicit_scalar_block.available = true;
-        shader_caps_.wmem_explicit_8bit_access.available = true;
-        shader_caps_.wmem_explicit_16bit_access.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR,
-            .extensionName =
-                VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR *>(
-                    q);
-                recordCap(shader_caps_.wmem_explicit_layout,
-                          feat->workgroupMemoryExplicitLayout);
-                recordCap(shader_caps_.wmem_explicit_scalar_block,
-                          feat->workgroupMemoryExplicitLayoutScalarBlockLayout);
-                recordCap(shader_caps_.wmem_explicit_8bit_access,
-                          feat->workgroupMemoryExplicitLayout8BitAccess);
-                recordCap(shader_caps_.wmem_explicit_16bit_access,
-                          feat->workgroupMemoryExplicitLayout16BitAccess);
-                if (!feat->workgroupMemoryExplicitLayout)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR>();
-                e->workgroupMemoryExplicitLayout =
-                    feat->workgroupMemoryExplicitLayout;
-                e->workgroupMemoryExplicitLayoutScalarBlockLayout =
-                    feat->workgroupMemoryExplicitLayoutScalarBlockLayout;
-                e->workgroupMemoryExplicitLayout8BitAccess =
-                    feat->workgroupMemoryExplicitLayout8BitAccess;
-                e->workgroupMemoryExplicitLayout16BitAccess =
-                    feat->workgroupMemoryExplicitLayout16BitAccess;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_zero_initialize_workgroup_memory
-    if (api_version < VK_API_VERSION_1_3 &&
-        supportedExtensions.count(
-            VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) > 0) {
-        shader_caps_.zero_init_wmem.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR,
-            .extensionName =
-                VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_3,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR *>(
-                    q);
-                recordCap(shader_caps_.zero_init_wmem,
-                          feat->shaderZeroInitializeWorkgroupMemory);
-                if (!feat->shaderZeroInitializeWorkgroupMemory)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR>();
-                e->shaderZeroInitializeWorkgroupMemory =
-                    feat->shaderZeroInitializeWorkgroupMemory;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_shader_subgroup_rotate
-    // VK_MAKE_API_VERSION instead of VK_API_VERSION_1_4: the promoted macro is
-    // not defined by pre-1.4 headers, and this block sits above the host_image
-    // copy block that patches it in.
-    if (api_version < VK_MAKE_API_VERSION(0, 1, 4, 0) &&
-        supportedExtensions.count(
-            VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME) > 0) {
-        shader_caps_.subgroup_rotate.available = true;
-        shader_caps_.subgroup_rotate_clustered.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR,
-            .extensionName = VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME,
-            .corePromotedVersion = VK_MAKE_API_VERSION(0, 1, 4, 0),
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR *>(q);
-                recordCap(shader_caps_.subgroup_rotate,
-                          feat->shaderSubgroupRotate);
-                recordCap(shader_caps_.subgroup_rotate_clustered,
-                          feat->shaderSubgroupRotateClustered);
-                if (!feat->shaderSubgroupRotate)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR>();
-                e->shaderSubgroupRotate = feat->shaderSubgroupRotate;
-                e->shaderSubgroupRotateClustered =
-                    feat->shaderSubgroupRotateClustered;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-    // ---- end shader-level capability probes ---------------------------------
-
-#if VK_VERSION_1_3
+#ifdef VK_VERSION_1_3
     if (api_version >= VK_API_VERSION_1_3) {
-        shader_caps_.zero_init_wmem.available = true;
-        // VK_KHR_shader_integer_dot_product is core in 1.3, so on a 1.3 (or
-        // 1.4-capable) device the bit lives in this struct, not in the KHR
-        // one -- and asking for the KHR struct while the instance advertises
-        // 1.3 is the case the extension branch above deliberately excludes.
-        // Set here rather than in an `== 1.3` test, so a 1.4 device whose
-        // instance was created at 1.3 (this box) and a real 1.4 one both land
-        // in the same branch.
-        shader_caps_.integer_dot_product.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-            .extensionName = nullptr, // Core
-            .corePromotedVersion = VK_API_VERSION_1_3,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<VkPhysicalDeviceVulkan13Features>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan13Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<VkPhysicalDeviceVulkan13Features *>(q);
+        sc.zero_init_wmem.available = true;
+        // VK_KHR_shader_integer_dot_product is core in 1.3, so on a 1.3+
+        // device the bit lives here. Without it, any module carrying
+        // OpCapability DotProduct is rejected at pipeline creation (b3:
+        // instance 1.3.275, device 1.4.329 lands in this branch).
+        sc.integer_dot_product.available = true;
+        fc.add<VkPhysicalDeviceVulkan13Features>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, nullptr,
+            [this](const auto &q, auto &e) {
                 recordCap(shader_caps_.zero_init_wmem,
-                          feat->shaderZeroInitializeWorkgroupMemory);
+                          q.shaderZeroInitializeWorkgroupMemory);
                 recordCap(shader_caps_.integer_dot_product,
-                          feat->shaderIntegerDotProduct);
-                if (!feat->robustImageAccess && !feat->maintenance4 &&
-                    !feat->subgroupSizeControl &&
-                    !feat->shaderZeroInitializeWorkgroupMemory &&
-                    !feat->shaderIntegerDotProduct)
-                    return nullptr;
-                auto e = std::make_unique<VkPhysicalDeviceVulkan13Features>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan13Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>();
-                e->robustImageAccess = feat->robustImageAccess;
-                e->subgroupSizeControl = feat->subgroupSizeControl;
-                e->maintenance4 = feat->maintenance4;
-                // Lets a workgroup's shared accumulator start at zero without
-                // the kernel clearing it first (VK_KHR_zero_initialize_
-                // workgroup_memory, 1.3 core).
-                e->shaderZeroInitializeWorkgroupMemory =
-                    feat->shaderZeroInitializeWorkgroupMemory;
-                // Only this one bit: the 4x8 forms are what the int8 GEMV
-                // uses, and asking for a bit the engine never issues is a bit
-                // the driver can still refuse.
-                e->shaderIntegerDotProduct = feat->shaderIntegerDotProduct;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+                          q.shaderIntegerDotProduct);
+                e.robustImageAccess = q.robustImageAccess;
+                e.subgroupSizeControl = q.subgroupSizeControl;
+                e.maintenance4 = q.maintenance4;
+                e.shaderZeroInitializeWorkgroupMemory =
+                    q.shaderZeroInitializeWorkgroupMemory;
+                e.shaderIntegerDotProduct = q.shaderIntegerDotProduct;
+                return any(e.robustImageAccess, e.subgroupSizeControl,
+                           e.maintenance4,
+                           e.shaderZeroInitializeWorkgroupMemory,
+                           e.shaderIntegerDotProduct);
+            });
     }
 #endif
 #ifdef VK_VERSION_1_4
     if (api_version >= VK_API_VERSION_1_4) {
-        shader_caps_.subgroup_rotate.available = true;
-        shader_caps_.subgroup_rotate_clustered.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-            .extensionName = nullptr,
-            .corePromotedVersion = VK_API_VERSION_1_4,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<VkPhysicalDeviceVulkan14Features>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan14Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<VkPhysicalDeviceVulkan14Features *>(q);
-                recordCap(shader_caps_.subgroup_rotate,
-                          feat->shaderSubgroupRotate);
+        sc.subgroup_rotate.available = true;
+        sc.subgroup_rotate_clustered.available = true;
+        fc.add<VkPhysicalDeviceVulkan14Features>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, nullptr,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.subgroup_rotate, q.shaderSubgroupRotate);
                 recordCap(shader_caps_.subgroup_rotate_clustered,
-                          feat->shaderSubgroupRotateClustered);
-                if (!feat->hostImageCopy && !feat->maintenance5 &&
-                    !feat->shaderSubgroupRotate)
-                    return nullptr;
-                auto e = std::make_unique<VkPhysicalDeviceVulkan14Features>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceVulkan14Features,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES>();
-                e->hostImageCopy = feat->hostImageCopy;
-                m_support_host_image_copy_ = feat->hostImageCopy;
-                e->maintenance5 = feat->maintenance5;
-                // subgroupRotate for in-workgroup reduction/scan (the split-K
-                // last-block fold). Deliberately NOT enabling pushDescriptor
-                // here: measured host-side only, see the [dswrite] probe notes.
-                e->shaderSubgroupRotate = feat->shaderSubgroupRotate;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_EXT_host_image_copy
-
-#ifndef VK_VERSION_1_4
-#define VK_API_VERSION_1_4 VK_MAKE_API_VERSION(0, 1, 4, 0)
-#endif
-    if (api_version < VK_API_VERSION_1_4 &&
-        supportedExtensions.count(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) > 0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT,
-            .extensionName = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceHostImageCopyFeaturesEXT>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceHostImageCopyFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT *>(q);
-                if (!feat->hostImageCopy)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceHostImageCopyFeaturesEXT>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceHostImageCopyFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT>();
-                e->hostImageCopy = feat->hostImageCopy;
-                m_support_host_image_copy_ = feat->hostImageCopy;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+                          q.shaderSubgroupRotateClustered);
+                e.hostImageCopy = q.hostImageCopy;
+                m_support_host_image_copy_ = q.hostImageCopy;
+                e.maintenance5 = q.maintenance5;
+                // Deliberately NOT pushDescriptor: measured host-side only,
+                // see the [dswrite] probe notes.
+                e.shaderSubgroupRotate = q.shaderSubgroupRotate;
+                // Same pair as the KHR fallback enables; [devcaps] already
+                // reported it as enabled on this path.
+                e.shaderSubgroupRotateClustered =
+                    q.shaderSubgroupRotateClustered;
+                return any(e.hostImageCopy, e.maintenance5,
+                           e.shaderSubgroupRotate);
+            });
     }
 #endif
 
-#ifdef VK_EXT_shader_float8
-    // VK_EXT_shader_float8 stays an EXTENSION in Vulkan 1.4: it is not one of
-    // the features promoted into VkPhysicalDeviceVulkan14Features, so there is
-    // no core branch to prefer and no api_version test to make. It is gated on
-    // the header (the 1.3.275 headers this tree used to build against have no
-    // VkPhysicalDeviceShaderFloat8FeaturesEXT at all) and on the extension
-    // being advertised by the driver.
-    //
-    // Enabling it lets an fp8 weight kernel use OpTypeFloat 8 and the hardware
-    // float<->fp8 conversions instead of reassembling the exponent/mantissa by
-    // hand. The kernel that does so is a SEPARATE module (-DFP8_HW on
-    // buffer/matmul.comp): Float8EXT is a module-wide capability, so a device
-    // without the extension rejects the entire module rather than falling back
-    // to the software decode.
-    if (supportedExtensions.count(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) > 0) {
-        shader_caps_.shader_float8.available = true;
-        shader_caps_.shader_float8_coopmat.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
-            .extensionName = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q =
-                    std::make_unique<VkPhysicalDeviceShaderFloat8FeaturesEXT>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceShaderFloat8FeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceShaderFloat8FeaturesEXT *>(q);
-                recordCap(shader_caps_.shader_float8, feat->shaderFloat8);
-                recordCap(shader_caps_.shader_float8_coopmat,
-                          feat->shaderFloat8CooperativeMatrix);
-                if (!feat->shaderFloat8 &&
-                    !feat->shaderFloat8CooperativeMatrix) {
-                    return nullptr;
-                }
-                auto e =
-                    std::make_unique<VkPhysicalDeviceShaderFloat8FeaturesEXT>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceShaderFloat8FeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT>();
-                e->shaderFloat8 = feat->shaderFloat8;
-                // Only ask for the MMA half when the device reports it: it is
-                // invalid to enable a cooperative-matrix fp8 bit whose feature
-                // is false, and no kernel uses it yet.
-                e->shaderFloat8CooperativeMatrix =
-                    feat->shaderFloat8CooperativeMatrix;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+    // ---- extension fallbacks for promoted features -------------------------
+#ifdef VK_KHR_16bit_storage
+    if (api_version < VK_API_VERSION_1_1 &&
+        has(VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
+        sc.storage_buffer_16bit.available = true;
+        fc.add<VkPhysicalDevice16BitStorageFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR,
+            VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.storage_buffer_16bit,
+                          q.storageBuffer16BitAccess);
+                e.storageBuffer16BitAccess = q.storageBuffer16BitAccess;
+                e.storageInputOutput16 = q.storageInputOutput16;
+                e.uniformAndStorageBuffer16BitAccess =
+                    q.uniformAndStorageBuffer16BitAccess;
+                return any(e.storageBuffer16BitAccess, e.storageInputOutput16,
+                           e.uniformAndStorageBuffer16BitAccess);
+            });
     }
 #endif
-
-#ifdef VK_EXT_image_robustness
-    if (api_version < VK_API_VERSION_1_3 &&
-        supportedExtensions.count(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) > 0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES,
-            .extensionName = VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_3,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q =
-                    std::make_unique<VkPhysicalDeviceImageRobustnessFeatures>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceImageRobustnessFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceImageRobustnessFeatures *>(q);
-                if (!feat->robustImageAccess)
-                    return nullptr;
-                auto e =
-                    std::make_unique<VkPhysicalDeviceImageRobustnessFeatures>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceImageRobustnessFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES>();
-                e->robustImageAccess = VK_TRUE;
-                return std::shared_ptr<void>(std::move(e));
-            },
-        });
+#ifdef VK_KHR_8bit_storage
+    if (api_version < VK_API_VERSION_1_2 &&
+        has(VK_KHR_8BIT_STORAGE_EXTENSION_NAME)) {
+        sc.storage_buffer_8bit.available = true;
+        sc.uniform_storage_8bit.available = true;
+        fc.add<VkPhysicalDevice8BitStorageFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR,
+            VK_KHR_8BIT_STORAGE_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.storage_buffer_8bit,
+                          q.storageBuffer8BitAccess);
+                recordCap(shader_caps_.uniform_storage_8bit,
+                          q.uniformAndStorageBuffer8BitAccess);
+                e.storageBuffer8BitAccess = q.storageBuffer8BitAccess;
+                e.uniformAndStorageBuffer8BitAccess =
+                    q.uniformAndStorageBuffer8BitAccess;
+                return any(e.storageBuffer8BitAccess,
+                           e.uniformAndStorageBuffer8BitAccess);
+            });
     }
 #endif
-
+#ifdef VK_KHR_shader_float16_int8
+    // Promoted in 1.2 (shaderFloat16/shaderInt8 live in Vulkan12Features).
+    // This used to be gated `< 1.3`, which on a 1.2 device chained this
+    // struct next to Vulkan12Features -- invalid per VUID 02830.
+    if (api_version < VK_API_VERSION_1_2 &&
+        has(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
+        sc.shader_float16.available = true;
+        sc.shader_int8.available = true;
+        fc.add<VkPhysicalDeviceShaderFloat16Int8FeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR,
+            VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.shader_float16, q.shaderFloat16);
+                recordCap(shader_caps_.shader_int8, q.shaderInt8);
+                e.shaderFloat16 = q.shaderFloat16;
+                e.shaderInt8 = q.shaderInt8;
+                return any(e.shaderFloat16, e.shaderInt8);
+            });
+    }
+#endif
 #ifdef VK_KHR_timeline_semaphore
     if (api_version < VK_API_VERSION_1_2 &&
-        supportedExtensions.count(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) >
-            0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-            .extensionName = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceTimelineSemaphoreFeatures>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceTimelineSemaphoreFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceTimelineSemaphoreFeatures *>(q);
-                if (!feat->timelineSemaphore)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceTimelineSemaphoreFeatures>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceTimelineSemaphoreFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>();
-                e->timelineSemaphore = VK_TRUE;
-                m_support_timeline_semaphore_ = true;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+        has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceTimelineSemaphoreFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                e.timelineSemaphore = q.timelineSemaphore;
+                m_support_timeline_semaphore_ = q.timelineSemaphore;
+                return any(e.timelineSemaphore);
+            });
     }
 #endif
-
 #ifdef VK_KHR_buffer_device_address
     if (api_version < VK_API_VERSION_1_2 &&
-        supportedExtensions.count(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) >
-            0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
-            .extensionName = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceBufferDeviceAddressFeatures>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceBufferDeviceAddressFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceBufferDeviceAddressFeatures *>(
-                        q);
-                if (!feat->bufferDeviceAddress ||
-                    buffer_device_address_disabled()) {
-                    return nullptr;
-                }
-                auto e = std::make_unique<
-                    VkPhysicalDeviceBufferDeviceAddressFeatures>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceBufferDeviceAddressFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES>();
-                e->bufferDeviceAddress = VK_TRUE;
-                m_support_buffer_device_address_ = true;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_AMD_device_coherent_memory
-    if (supportedExtensions.count(
-            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME) > 0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD,
-            .extensionName = VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceCoherentMemoryFeaturesAMD>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceCoherentMemoryFeaturesAMD,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceCoherentMemoryFeaturesAMD *>(q);
-                if (!feat->deviceCoherentMemory)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceCoherentMemoryFeaturesAMD>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceCoherentMemoryFeaturesAMD,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD>();
-                e->deviceCoherentMemory = feat->deviceCoherentMemory;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-
-#ifdef VK_KHR_performance_query
-    if (supportedExtensions.count(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME) >
-        0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR,
-            .extensionName = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDevicePerformanceQueryFeaturesKHR>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDevicePerformanceQueryFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDevicePerformanceQueryFeaturesKHR *>(
-                        q);
-                if (!feat->performanceCounterQueryPools)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDevicePerformanceQueryFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDevicePerformanceQueryFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR>();
-                e->performanceCounterQueryPools =
-                    feat->performanceCounterQueryPools;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-
-#ifdef VK_EXT_subgroup_size_control
-    if (api_version < VK_API_VERSION_1_3 &&
-        supportedExtensions.count(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) >
-            0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
-            .extensionName = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT *>(q);
-                if (!feat->subgroupSizeControl)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT>();
-                e->subgroupSizeControl = feat->subgroupSizeControl;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-
-#ifdef VK_EXT_memory_priority
-    if (supportedExtensions.count(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) > 0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
-            .extensionName = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceMemoryPriorityFeaturesEXT>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceMemoryPriorityFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceMemoryPriorityFeaturesEXT *>(q);
-                if (!feat->memoryPriority)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceMemoryPriorityFeaturesEXT>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceMemoryPriorityFeaturesEXT,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT>();
-                e->memoryPriority = feat->memoryPriority;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_cooperative_matrix
-    if (supportedExtensions.count(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) >
-        0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
-            .extensionName = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesKHR>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR *>(
-                        q);
-                // The feature bool alone is not enough: MoltenVK advertises
-                // the extension + feature but reports 0 supported stages, and
-                // any coopmat pipeline then dies in SPIR-V -> MSL conversion.
-                // Gate on the stages the device actually reported in
-                // getProperties().
-                if (!feat->cooperativeMatrix ||
-                    m_coopmat_supported_stages_ == 0)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>();
-                e->cooperativeMatrix = feat->cooperativeMatrix;
-                m_support_cooperate_matrix_ = feat->cooperativeMatrix;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#if defined VK_NV_cooperative_matrix
-    if (supportedExtensions.count(VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME) >
-        0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV,
-            .extensionName = VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesNV>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesNV,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceCooperativeMatrixFeaturesNV *>(
-                        q);
-                if (!feat->cooperativeMatrix)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesNV>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceCooperativeMatrixFeaturesNV,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV>();
-                e->cooperativeMatrix = feat->cooperativeMatrix;
-                m_support_nv_tensor_core_ = feat->cooperativeMatrix;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-
-#ifdef VK_NV_cuda_kernel_launch
-    if (supportedExtensions.count(VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME) >
-        0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV,
-            .extensionName = VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceCudaKernelLaunchFeaturesNV>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceCudaKernelLaunchFeaturesNV,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceCudaKernelLaunchFeaturesNV *>(
-                        q);
-                if (!feat->cudaKernelLaunchFeatures)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceCudaKernelLaunchFeaturesNV>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceCudaKernelLaunchFeaturesNV,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV>();
-                e->cudaKernelLaunchFeatures = VK_TRUE;
-                m_support_cuda_kernel_launch_ = true;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_external_memory_fd
-    if (supportedExtensions.count(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
-            .extensionName = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = []() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceExternalMemoryHostPropertiesEXT>();
-                q->sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
-                q->pNext = nullptr;
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceExternalMemoryHostPropertiesEXT *>(q);
-                if (!feat->minImportedHostPointerAlignment)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceExternalMemoryHostPropertiesEXT>();
-                e->sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
-                e->pNext = nullptr;
-                e->minImportedHostPointerAlignment =
-                    feat->minImportedHostPointerAlignment;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+        has(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceBufferDeviceAddressFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+            VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                e.bufferDeviceAddress =
+                    q.bufferDeviceAddress && !buffer_device_address_disabled();
+                m_support_buffer_device_address_ = e.bufferDeviceAddress;
+                return any(e.bufferDeviceAddress);
+            });
     }
 #endif
 #ifdef VK_EXT_descriptor_indexing
     if (api_version < VK_API_VERSION_1_2 &&
-        supportedExtensions.count(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
-        shader_caps_.descriptor_indexing.available = true;
-        shader_caps_.descriptor_partially_bound.available = true;
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
-            .extensionName = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q = std::make_unique<
-                    VkPhysicalDeviceDescriptorIndexingFeaturesEXT>();
-                q->sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-                q->pNext = nullptr;
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<
-                    VkPhysicalDeviceDescriptorIndexingFeaturesEXT *>(q);
-                recordCap(shader_caps_.descriptor_indexing,
-                          feat->descriptorBindingStorageBufferUpdateAfterBind);
-                recordCap(shader_caps_.descriptor_partially_bound,
-                          feat->descriptorBindingPartiallyBound);
-                m_uab_storage_buffer_ =
-                    feat->descriptorBindingStorageBufferUpdateAfterBind;
-                m_uab_storage_image_ =
-                    feat->descriptorBindingStorageImageUpdateAfterBind;
-                m_uab_sampled_image_ =
-                    feat->descriptorBindingSampledImageUpdateAfterBind;
-                m_uab_uniform_buffer_ =
-                    feat->descriptorBindingUniformBufferUpdateAfterBind;
-                m_support_descriptor_partially_bound_ =
-                    feat->descriptorBindingPartiallyBound;
-                if (!feat->descriptorBindingStorageBufferUpdateAfterBind &&
-                    !feat->descriptorBindingStorageImageUpdateAfterBind &&
-                    !feat->descriptorBindingSampledImageUpdateAfterBind &&
-                    !feat->descriptorBindingUniformBufferUpdateAfterBind &&
-                    !feat->descriptorBindingPartiallyBound)
-                    return nullptr;
-                auto e = std::make_unique<
-                    VkPhysicalDeviceDescriptorIndexingFeaturesEXT>();
-                e->sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-                e->pNext = nullptr;
-                e->descriptorBindingStorageBufferUpdateAfterBind =
-                    feat->descriptorBindingStorageBufferUpdateAfterBind;
-                e->descriptorBindingStorageImageUpdateAfterBind =
-                    feat->descriptorBindingStorageImageUpdateAfterBind;
-                e->descriptorBindingSampledImageUpdateAfterBind =
-                    feat->descriptorBindingSampledImageUpdateAfterBind;
-                e->descriptorBindingUniformBufferUpdateAfterBind =
-                    feat->descriptorBindingUniformBufferUpdateAfterBind;
-                e->descriptorBindingPartiallyBound =
-                    feat->descriptorBindingPartiallyBound;
-                m_support_descriptor_update_after_bind_ =
-                    feat->descriptorBindingStorageBufferUpdateAfterBind;
-                return std::shared_ptr<void>(std::move(e));
-            },
-        });
+        has(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+        sc.descriptor_indexing.available = true;
+        sc.descriptor_partially_bound.available = true;
+        fc.add<VkPhysicalDeviceDescriptorIndexingFeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+            VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                pickDescriptorIndexing(q, e);
+                return any(e.descriptorBindingStorageBufferUpdateAfterBind,
+                           e.descriptorBindingStorageImageUpdateAfterBind,
+                           e.descriptorBindingSampledImageUpdateAfterBind,
+                           e.descriptorBindingUniformBufferUpdateAfterBind,
+                           e.descriptorBindingPartiallyBound);
+            });
+    }
+#endif
+#ifdef VK_KHR_shader_integer_dot_product
+    if (api_version < VK_API_VERSION_1_3 &&
+        has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+        sc.integer_dot_product.available = true;
+        fc.add<VkPhysicalDeviceShaderIntegerDotProductFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
+            VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.integer_dot_product,
+                          q.shaderIntegerDotProduct);
+                e.shaderIntegerDotProduct = q.shaderIntegerDotProduct;
+                return any(e.shaderIntegerDotProduct);
+            });
+    }
+#endif
+#ifdef VK_KHR_zero_initialize_workgroup_memory
+    if (api_version < VK_API_VERSION_1_3 &&
+        has(VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME)) {
+        sc.zero_init_wmem.available = true;
+        fc.add<VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR,
+            VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.zero_init_wmem,
+                          q.shaderZeroInitializeWorkgroupMemory);
+                e.shaderZeroInitializeWorkgroupMemory =
+                    q.shaderZeroInitializeWorkgroupMemory;
+                return any(e.shaderZeroInitializeWorkgroupMemory);
+            });
+    }
+#endif
+#ifdef VK_EXT_image_robustness
+    if (api_version < VK_API_VERSION_1_3 &&
+        has(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceImageRobustnessFeatures>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES,
+            VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
+            [](const auto &q, auto &e) {
+                e.robustImageAccess = q.robustImageAccess;
+                return any(e.robustImageAccess);
+            });
+    }
+#endif
+#ifdef VK_EXT_subgroup_size_control
+    if (api_version < VK_API_VERSION_1_3 &&
+        has(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceSubgroupSizeControlFeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+            VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+            [](const auto &q, auto &e) {
+                e.subgroupSizeControl = q.subgroupSizeControl;
+                return any(e.subgroupSizeControl);
+            });
+    }
+#endif
+#ifdef VK_KHR_shader_subgroup_rotate
+    if (api_version < VK_API_VERSION_1_4 &&
+        has(VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME)) {
+        sc.subgroup_rotate.available = true;
+        sc.subgroup_rotate_clustered.available = true;
+        fc.add<VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR,
+            VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.subgroup_rotate, q.shaderSubgroupRotate);
+                recordCap(shader_caps_.subgroup_rotate_clustered,
+                          q.shaderSubgroupRotateClustered);
+                e.shaderSubgroupRotate = q.shaderSubgroupRotate;
+                e.shaderSubgroupRotateClustered =
+                    q.shaderSubgroupRotateClustered;
+                return any(e.shaderSubgroupRotate);
+            });
+    }
+#endif
+#ifdef VK_EXT_host_image_copy
+    if (api_version < VK_API_VERSION_1_4 &&
+        has(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceHostImageCopyFeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT,
+            VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                e.hostImageCopy = q.hostImageCopy;
+                m_support_host_image_copy_ = q.hostImageCopy;
+                return any(e.hostImageCopy);
+            });
     }
 #endif
 #ifdef VK_KHR_maintenance5
     if (api_version < VK_API_VERSION_1_4 &&
-        supportedExtensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) > 0) {
-        descs.push_back(FeatureDescriptor{
-            .sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
-            .extensionName = VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
-            .corePromotedVersion = VK_API_VERSION_1_4,
-            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                auto q =
-                    std::make_unique<VkPhysicalDeviceMaintenance5FeaturesKHR>();
-                *q = makeFeatureStruct<
-                    VkPhysicalDeviceMaintenance5FeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR>();
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                auto *feat =
-                    static_cast<VkPhysicalDeviceMaintenance5FeaturesKHR *>(q);
-                if (!feat->maintenance5)
-                    return nullptr;
-                auto e =
-                    std::make_unique<VkPhysicalDeviceMaintenance5FeaturesKHR>();
-                *e = makeFeatureStruct<
-                    VkPhysicalDeviceMaintenance5FeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR>();
-                e->maintenance5 = feat->maintenance5;
-                return std::shared_ptr<void>(std::move(e));
-            }});
+        has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceMaintenance5FeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
+            VK_KHR_MAINTENANCE_5_EXTENSION_NAME, [](const auto &q, auto &e) {
+                e.maintenance5 = q.maintenance5;
+                return any(e.maintenance5);
+            });
     }
 #endif
 
+    // ---- extensions never promoted -----------------------------------------
+#ifdef VK_EXT_shader_atomic_float
+    // fp32 atomic add on a storage buffer is what would collapse the two-pass
+    // split-K (deposit partials + fold) into one pass. The float64 and
+    // image/sparse variants stay off.
+    if (has(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+        sc.f32_global_atomic_add.available = true;
+        sc.f32_shared_atomic_add.available = true;
+        fc.add<VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+            VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.f32_global_atomic_add,
+                          q.shaderBufferFloat32AtomicAdd);
+                recordCap(shader_caps_.f32_shared_atomic_add,
+                          q.shaderSharedFloat32AtomicAdd);
+                e.shaderBufferFloat32AtomicAdd = q.shaderBufferFloat32AtomicAdd;
+                e.shaderSharedFloat32AtomicAdd = q.shaderSharedFloat32AtomicAdd;
+                return any(e.shaderBufferFloat32AtomicAdd,
+                           e.shaderSharedFloat32AtomicAdd);
+            });
+    }
+#endif
+#ifdef VK_NV_shader_atomic_float16_vector
+    // Half2 global atomic add. Reported on hardware that also has
+    // shaderFloat16 clear (Pascal does), so read the [devcaps] pair together.
+    if (has(VK_NV_SHADER_ATOMIC_FLOAT16_VECTOR_EXTENSION_NAME)) {
+        sc.f16x2_global_atomic_add.available = true;
+        fc.add<VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV,
+            VK_NV_SHADER_ATOMIC_FLOAT16_VECTOR_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.f16x2_global_atomic_add,
+                          q.shaderFloat16VectorAtomics);
+                e.shaderFloat16VectorAtomics = q.shaderFloat16VectorAtomics;
+                return any(e.shaderFloat16VectorAtomics);
+            });
+    }
+#endif
+#ifdef VK_KHR_workgroup_memory_explicit_layout
+    // One shared block with an explicit layout lets the tile buffers and the
+    // split-K accumulator alias the same bytes. The 8/16-bit sub-features
+    // only mean something on top of the matching storage features.
+    if (has(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
+        sc.wmem_explicit_layout.available = true;
+        sc.wmem_explicit_scalar_block.available = true;
+        sc.wmem_explicit_8bit_access.available = true;
+        sc.wmem_explicit_16bit_access.available = true;
+        fc.add<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR,
+            VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                auto &c = shader_caps_;
+                recordCap(c.wmem_explicit_layout,
+                          q.workgroupMemoryExplicitLayout);
+                recordCap(c.wmem_explicit_scalar_block,
+                          q.workgroupMemoryExplicitLayoutScalarBlockLayout);
+                recordCap(c.wmem_explicit_8bit_access,
+                          q.workgroupMemoryExplicitLayout8BitAccess);
+                recordCap(c.wmem_explicit_16bit_access,
+                          q.workgroupMemoryExplicitLayout16BitAccess);
+                e.workgroupMemoryExplicitLayout =
+                    q.workgroupMemoryExplicitLayout;
+                e.workgroupMemoryExplicitLayoutScalarBlockLayout =
+                    q.workgroupMemoryExplicitLayoutScalarBlockLayout;
+                e.workgroupMemoryExplicitLayout8BitAccess =
+                    q.workgroupMemoryExplicitLayout8BitAccess;
+                e.workgroupMemoryExplicitLayout16BitAccess =
+                    q.workgroupMemoryExplicitLayout16BitAccess;
+                return any(e.workgroupMemoryExplicitLayout);
+            });
+    }
+#endif
+#ifdef VK_EXT_shader_float8
+    // Not promoted into Vulkan 1.4, so there is no core branch; gated on the
+    // header (1.3.275 headers lack the struct) and on the extension. Float8EXT
+    // is a module-wide capability, so the hardware fp8 kernel is a separate
+    // module (-DFP8_HW on buffer/matmul.comp). The coopmat bit is separate
+    // because a device can decode fp8 without an fp8 MMA.
+    if (has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+        sc.shader_float8.available = true;
+        sc.shader_float8_coopmat.available = true;
+        fc.add<VkPhysicalDeviceShaderFloat8FeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
+            VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                recordCap(shader_caps_.shader_float8, q.shaderFloat8);
+                recordCap(shader_caps_.shader_float8_coopmat,
+                          q.shaderFloat8CooperativeMatrix);
+                e.shaderFloat8 = q.shaderFloat8;
+                e.shaderFloat8CooperativeMatrix =
+                    q.shaderFloat8CooperativeMatrix;
+                return any(e.shaderFloat8, e.shaderFloat8CooperativeMatrix);
+            });
+    }
+#endif
+#ifdef VK_AMD_device_coherent_memory
+    if (has(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceCoherentMemoryFeaturesAMD>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD,
+            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME,
+            [](const auto &q, auto &e) {
+                e.deviceCoherentMemory = q.deviceCoherentMemory;
+                return any(e.deviceCoherentMemory);
+            });
+    }
+#endif
+#ifdef VK_KHR_performance_query
+    if (has(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDevicePerformanceQueryFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR,
+            VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME,
+            [](const auto &q, auto &e) {
+                e.performanceCounterQueryPools = q.performanceCounterQueryPools;
+                return any(e.performanceCounterQueryPools);
+            });
+    }
+#endif
+#ifdef VK_EXT_memory_priority
+    if (has(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceMemoryPriorityFeaturesEXT>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
+            VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME, [](const auto &q, auto &e) {
+                e.memoryPriority = q.memoryPriority;
+                return any(e.memoryPriority);
+            });
+    }
+#endif
+#ifdef VK_KHR_cooperative_matrix
+    if (has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                // MoltenVK advertises the extension + feature but reports 0
+                // supported stages, and any coopmat pipeline then dies in
+                // SPIR-V -> MSL conversion; gate on the reported stages too.
+                e.cooperativeMatrix =
+                    q.cooperativeMatrix && m_coopmat_supported_stages_ != 0;
+                m_support_cooperate_matrix_ = e.cooperativeMatrix;
+                return any(e.cooperativeMatrix);
+            });
+    }
+#endif
+#ifdef VK_NV_cooperative_matrix
+    if (has(VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceCooperativeMatrixFeaturesNV>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV,
+            VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                e.cooperativeMatrix = q.cooperativeMatrix;
+                m_support_nv_tensor_core_ = q.cooperativeMatrix;
+                return any(e.cooperativeMatrix);
+            });
+    }
+#endif
+#ifdef VK_NV_cuda_kernel_launch
+    if (has(VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME)) {
+        fc.add<VkPhysicalDeviceCudaKernelLaunchFeaturesNV>(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV,
+            VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME,
+            [this](const auto &q, auto &e) {
+                e.cudaKernelLaunchFeatures = q.cudaKernelLaunchFeatures;
+                m_support_cuda_kernel_launch_ = q.cudaKernelLaunchFeatures;
+                return any(e.cudaKernelLaunchFeatures);
+            });
+    }
+#endif
 #ifdef VK_EXT_descriptor_buffer
     // Descriptor buffers remove descriptor pools, vkAllocateDescriptorSets and
-    // vkUpdateDescriptorSets from the per-dispatch path: each pipeline owns a
-    // host-visible, device-addressable buffer and a dispatch only records
-    // vkCmdSetDescriptorBufferOffsetsEXT. Gated on BDA because the binding info
-    // addresses the buffer by VkDeviceAddress. VKOP_NO_DESCRIPTOR_BUFFER keeps
-    // the feature out of vkCreateDevice entirely.
-    if (supportedExtensions.count(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) >
-        0) {
-        shader_caps_.descriptor_buffer.available = true;
+    // vkUpdateDescriptorSets from the per-dispatch path. Added LAST: its pick
+    // reads the BDA verdict the 1.2 / KHR-BDA picks above set, because the
+    // binding info addresses the buffer by VkDeviceAddress.
+    // VKOP_NO_DESCRIPTOR_BUFFER keeps the feature out of vkCreateDevice.
+    if (has(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)) {
+        sc.descriptor_buffer.available = true;
         if (!descriptor_buffer_disabled()) {
-            descs.push_back(FeatureDescriptor{
-                .sType =
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
-                .extensionName = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
-                .corePromotedVersion = 0,
-                .makeQueryStruct = [this]() -> std::shared_ptr<void> {
-                    auto q = std::make_unique<
-                        VkPhysicalDeviceDescriptorBufferFeaturesEXT>();
-                    *q = makeFeatureStruct<
-                        VkPhysicalDeviceDescriptorBufferFeaturesEXT,
-                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT>();
-                    return std::shared_ptr<void>(std::move(q));
-                },
-                .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
-                    auto *feat = static_cast<
-                        VkPhysicalDeviceDescriptorBufferFeaturesEXT *>(q);
+            fc.add<VkPhysicalDeviceDescriptorBufferFeaturesEXT>(
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
+                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+                [this](const auto &q, auto &e) {
                     shader_caps_.descriptor_buffer.supported =
-                        feat->descriptorBuffer != VK_FALSE;
-                    const bool enable = feat->descriptorBuffer != VK_FALSE &&
-                                        m_support_buffer_device_address_;
-                    shader_caps_.descriptor_buffer.enabled = enable;
-                    if (!enable)
-                        return nullptr;
-                    auto e = std::make_unique<
-                        VkPhysicalDeviceDescriptorBufferFeaturesEXT>();
-                    *e = makeFeatureStruct<
-                        VkPhysicalDeviceDescriptorBufferFeaturesEXT,
-                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT>();
-                    e->descriptorBuffer = VK_TRUE;
-                    m_support_descriptor_buffer_ = true;
-                    return std::shared_ptr<void>(std::move(e));
-                }});
+                        q.descriptorBuffer != VK_FALSE;
+                    e.descriptorBuffer =
+                        q.descriptorBuffer && m_support_buffer_device_address_;
+                    shader_caps_.descriptor_buffer.enabled = e.descriptorBuffer;
+                    m_support_descriptor_buffer_ = e.descriptorBuffer;
+                    return any(e.descriptorBuffer);
+                });
         }
     }
 #endif
+}
 
-    for (size_t i = 0; i < descs.size(); ++i) {
-        const std::unordered_map<int, std::string> desc_names = {
-            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-             "VULKAN_1_1_FEATURES"},
-            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-             "VULKAN_1_2_FEATURES"},
-            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-             "VULKAN_1_3_FEATURES"},
-#ifdef VK_VERSION_1_4
-            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-             "VULKAN_1_4_FEATURES"},
-#endif
-        };
-        const auto &desc = descs[i];
-        (void)desc;
-        LOG_INFO("Descriptor %zu: sType=%s, extensionName=%s, coreVersion=%u",
-                 i,
-                 desc_names.find(desc.sType) != desc_names.end()
-                     ? desc_names.find(desc.sType)->second.c_str()
-                     : std::to_string(desc.sType).c_str(),
-                 desc.extensionName ? desc.extensionName : "nullptr",
-                 desc.corePromotedVersion);
-    }
-
-    return descs;
+// Shared by the 1.2 core struct and the pre-1.2 EXT struct: same field names.
+// The engine's UAB layouts put the binding flag on every descriptor in the
+// set, including the image bindings SplitImage/Conv2dImage use, so the bit is
+// enabled per type the driver reports; flagging a type whose feature was not
+// enabled is invalid usage.
+template <typename T>
+void VulkanDevice::pickDescriptorIndexing(const T &q, T &e) {
+    recordCap(shader_caps_.descriptor_indexing,
+              q.descriptorBindingStorageBufferUpdateAfterBind);
+    recordCap(shader_caps_.descriptor_partially_bound,
+              q.descriptorBindingPartiallyBound);
+    e.descriptorBindingStorageBufferUpdateAfterBind =
+        q.descriptorBindingStorageBufferUpdateAfterBind;
+    e.descriptorBindingStorageImageUpdateAfterBind =
+        q.descriptorBindingStorageImageUpdateAfterBind;
+    e.descriptorBindingSampledImageUpdateAfterBind =
+        q.descriptorBindingSampledImageUpdateAfterBind;
+    e.descriptorBindingUniformBufferUpdateAfterBind =
+        q.descriptorBindingUniformBufferUpdateAfterBind;
+    e.descriptorBindingPartiallyBound = q.descriptorBindingPartiallyBound;
+    m_uab_storage_buffer_ = q.descriptorBindingStorageBufferUpdateAfterBind;
+    m_uab_storage_image_ = q.descriptorBindingStorageImageUpdateAfterBind;
+    m_uab_sampled_image_ = q.descriptorBindingSampledImageUpdateAfterBind;
+    m_uab_uniform_buffer_ = q.descriptorBindingUniformBufferUpdateAfterBind;
+    m_support_descriptor_update_after_bind_ = m_uab_storage_buffer_;
+    m_support_descriptor_partially_bound_ = q.descriptorBindingPartiallyBound;
 }
 
 void VulkanDevice::dumpShaderCapabilities() const {
@@ -2015,8 +1173,8 @@ void VulkanDevice::dumpShaderCapabilities() const {
     auto yes_no = [](bool b) { return b ? "yes" : "no"; };
     auto pr = [&](const char *name, const DeviceCap &c) {
         if (!c.available) {
-            // Nothing was queried, so "no" would be a lie: this says the
-            // extension did not enumerate (and the feature is not core here).
+            // Nothing was queried: the extension did not enumerate and the
+            // feature is not core here, so "no" would be a lie.
             std::fprintf(stderr, "[devcaps] %-30s %s\n", name, "not queried");
             return;
         }
@@ -2024,19 +1182,17 @@ void VulkanDevice::dumpShaderCapabilities() const {
                      yes_no(c.supported), yes_no(c.enabled));
     };
     const ShaderCapabilities &c = shader_caps_;
+    const core::DeviceTraits &t = device_traits_;
     std::fprintf(stderr, "[devcaps] device=%s\n", deviceName_.c_str());
     std::fprintf(stderr, "[devcaps] vendor=0x%x device=0x%x driver_id=%u\n",
-                 device_traits_.vendor_id, device_traits_.device_id,
-                 device_traits_.driver_id);
+                 t.vendor_id, t.device_id, t.driver_id);
     std::fprintf(stderr,
                  "[devcaps] coopmat=%s fp16_8x8x16=%s fp16_16x16x16=%s "
                  "sint8_8x8x32=%s subgroup_arith=%s subgroup_size=%u\n",
-                 yes_no(device_traits_.coopmat),
-                 yes_no(device_traits_.coopmat_fp16_8x8x16),
-                 yes_no(device_traits_.coopmat_fp16_16x16x16),
-                 yes_no(device_traits_.coopmat_sint8_8x8x32),
-                 yes_no(device_traits_.subgroup_arithmetic),
-                 device_traits_.subgroup_size);
+                 yes_no(t.coopmat), yes_no(t.coopmat_fp16_8x8x16),
+                 yes_no(t.coopmat_fp16_16x16x16),
+                 yes_no(t.coopmat_sint8_8x8x32), yes_no(t.subgroup_arithmetic),
+                 t.subgroup_size);
     pr("shader_float16", c.shader_float16);
     pr("shader_int8", c.shader_int8);
     pr("storage_buffer_16bit", c.storage_buffer_16bit);
@@ -2060,28 +1216,19 @@ void VulkanDevice::dumpShaderCapabilities() const {
     pr("integer_dot_product", c.integer_dot_product);
     // The packed 4x8 answer is a property, and it is the one that decides
     // whether a dot() route is worth taking -- a feature bit alone would say
-    // "yes" to a kernel the driver expands into shifts. Printed on its own
-    // line so "feature on / accuracy false" cannot read as a green light.
+    // "yes" to a kernel the driver expands into shifts.
 #ifdef VK_KHR_shader_integer_dot_product
     std::fprintf(
-        stderr,
-        "[devcaps] %-30s packed_signed=%s (8bit_signed=%s) "
-        "feature=%s\n",
+        stderr, "[devcaps] %-30s packed_signed=%s (8bit_signed=%s) feature=%s\n",
         "dot_product_accel", yes_no(m_dot_product_packed_signed_),
         yes_no(m_dot_product_props_.integerDotProduct8BitSignedAccelerated !=
                VK_FALSE),
         yes_no(c.integer_dot_product.enabled));
 #else
-    // Built against headers without the extension: no property struct exists,
-    // so there is nothing to report beyond the (never-queried) cap above.
     std::fprintf(stderr, "[devcaps] %-30s packed_signed=no (headers lack "
                          "VK_KHR_shader_integer_dot_product)\n",
                  "dot_product_accel");
 #endif
-    // The image probe runs on the physical device before the feature chain
-    // exists, so it reports is_support_images() (the probed + VKOP_NO_IMAGES
-    // answer) and the recorded reason; print it here so a headless box with
-    // only this env switch set can still read the outcome.
     const bool images = is_support_images();
     if (images || image_unsupported_reason_.empty()) {
         std::fprintf(stderr, "[devcaps] %-30s %s\n", "images", yes_no(images));
@@ -2092,6 +1239,10 @@ void VulkanDevice::dumpShaderCapabilities() const {
     std::fflush(stderr);
 }
 
+// ---------------------------------------------------------------------------
+// Logical device
+// ---------------------------------------------------------------------------
+
 bool VulkanDevice::createLogicalDevice(
     const VkPhysicalDeviceProperties &deviceProperties) {
     if (findComputeQueueFamily() == 0) {
@@ -2099,98 +1250,99 @@ bool VulkanDevice::createLogicalDevice(
         return false;
     }
 
-    std::vector<VkExtensionProperties> ext_properties;
-
-    uint32_t p_property_count = 0;
-    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr,
-                                         &p_property_count, nullptr);
-    ext_properties.resize(p_property_count);
-    vkEnumerateDeviceExtensionProperties(
-        physicalDevice_, nullptr, &p_property_count, ext_properties.data());
-    std::set<std::string> supported_extensions;
-    for (auto ext : ext_properties) {
-        supported_extensions.insert(ext.extensionName);
+    uint32_t ext_count = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &ext_count,
+                                         nullptr);
+    std::vector<VkExtensionProperties> ext_properties(ext_count);
+    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &ext_count,
+                                         ext_properties.data());
+    std::set<std::string> extensions;
+    for (const auto &ext : ext_properties) {
+        extensions.insert(ext.extensionName);
         LOG_INFO("device extension %s", ext.extensionName);
     }
 
+    // shaderInt64 lives in the Vulkan 1.0 core feature set, not in any
+    // feature2 struct, so it goes through pEnabledFeatures. Needed by kernels
+    // that do 64-bit integer ARITHMETIC; byte movers over ivec2 do not.
     VkPhysicalDeviceFeatures device_features = {};
     vkGetPhysicalDeviceFeatures(physicalDevice_, &device_features);
-
-    // shaderInt64 lives in the Vulkan 1.0 core feature set, not in any of the
-    // feature2 structs the descriptor chain below covers, so it has to be
-    // enabled through pEnabledFeatures. Only features that were actually
-    // reported are requested (the same invariant the chain keeps).
     VkPhysicalDeviceFeatures enabled_core_features = {};
+    enabled_core_features.shaderInt64 = device_features.shaderInt64;
     shader_caps_.shader_int64.available = true;
-    if (device_features.shaderInt64) {
-        enabled_core_features.shaderInt64 = VK_TRUE;
-        recordCap(shader_caps_.shader_int64, VK_TRUE);
-    } else {
-        recordCap(shader_caps_.shader_int64, VK_FALSE);
+    recordCap(shader_caps_.shader_int64, device_features.shaderInt64);
+
+    // The version every gate compares against is the one the application may
+    // legally use, min(instance apiVersion, device apiVersion). A driver can
+    // advertise a newer apiVersion than the VkInstance was created with
+    // (NVIDIA 595 reports 1.4.329 through an instance created at 1.3.275);
+    // gating on the device value there would pick a core struct that cannot
+    // legally be used and drop the EXT path that can.
+    const uint32_t api_version =
+        std::min(deviceProperties.apiVersion,
+                 VulkanInstance::getVulkanInstance().apiVersion());
+
+    FeatureChain features;
+    addFeatureProbes(features, api_version, extensions);
+    features.query(physicalDevice_);
+    std::vector<const char *> enabled_extensions;
+    void *enable_chain = features.enable(enabled_extensions);
+
+    // Extensions with no feature struct of their own.
+    // - swapchain: an old path gated it on geometryShader, excluding Intel ARL.
+    // - external_memory_host: makes VulkanBuffer's host-import ctor legal;
+    //   the alignment comes from getProperties().
+    const char *plain_extensions[] = {
+#ifdef VK_EXT_tooling_info
+        VK_EXT_TOOLING_INFO_EXTENSION_NAME,
+#endif
+#ifdef VK_KHR_shader_non_semantic_info
+        VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME,
+#endif
+#ifdef VK_KHR_swapchain
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+#endif
+#ifdef VK_EXT_external_memory_host
+        VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
+#endif
+    };
+    for (const char *name : plain_extensions) {
+        if (extensions.count(name) > 0) {
+            enabled_extensions.push_back(name);
+        }
     }
-
-    auto feature_descs =
-        createFeatureDescriptors(deviceProperties, supported_extensions);
-
-    auto query_result = buildFeatureQueryChain(feature_descs);
-    vkGetPhysicalDeviceFeatures2(physicalDevice_, &query_result.features2);
-    auto enable_result = buildFeatureEnableChain(
-        feature_descs, query_result.features2, supported_extensions);
+#ifdef VK_EXT_external_memory_host
+    m_support_host_import_ =
+        extensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) > 0;
+    if (m_support_host_import_) {
+        LOG_INFO("host import alignment %u", m_host_import_alignment_);
+    }
+#endif
     LOG_INFO("timeline semaphore %s supported",
              (m_support_timeline_semaphore_ ? "is" : "not"));
     LOG_INFO("host image copy %s supported",
              (m_support_host_image_copy_ ? "is" : "not"));
     LOG_INFO("update after bind %s supported",
              (m_support_descriptor_update_after_bind_ ? "is" : "not"));
-#ifdef VK_EXT_external_memory_host
-    if (supported_extensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) >
-        0) {
-        m_support_host_import_ = true;
-        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {};
-        host_props.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
-        VkPhysicalDeviceProperties2 props2 = {};
-        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-        props2.pNext = &host_props;
-        vkGetPhysicalDeviceProperties2(physicalDevice_, &props2);
-        if (host_props.minImportedHostPointerAlignment > 0) {
-            m_host_import_alignment_ =
-                host_props.minImportedHostPointerAlignment;
-        }
-        LOG_INFO("host import alignment %u", m_host_import_alignment_);
-    }
-#endif
-
-    std::vector<std::vector<float>> queue_priority(computeQueueIdxs_.size());
-    auto queue_create_info = setupQueueCreateInfo(queue_priority);
-    VkDeviceCreateInfo create_info = {};
-    create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    create_info.pEnabledFeatures = &enabled_core_features;
-    create_info.queueCreateInfoCount =
-        static_cast<uint32_t>(queue_create_info.size());
-    create_info.pQueueCreateInfos = queue_create_info.data();
-    create_info.enabledLayerCount = 0;
-    create_info.ppEnabledLayerNames = nullptr;
-    create_info.enabledExtensionCount =
-        static_cast<uint32_t>(enable_result.enabledExtensions.size());
-    create_info.ppEnabledExtensionNames =
-        enable_result.enabledExtensions.data();
-    void *pnext = nullptr;
-    for (auto it = enable_result.enableChain.rbegin();
-         it != enable_result.enableChain.rend(); ++it) {
-        auto *base = static_cast<VkBaseOutStructure *>(it->get());
-        base->pNext = reinterpret_cast<VkBaseOutStructure *>(pnext);
-        pnext = base;
-    }
-    create_info.pNext = pnext;
-    LOG_INFO("enabled extensions count %d",
-             enable_result.enabledExtensions.size());
-    for (const auto &e : enable_result.enabledExtensions) {
+    for (const char *e : enabled_extensions) {
         (void)e;
         LOG_INFO("enabled extension: %s", e);
     }
 
-    auto ret =
+    std::vector<std::vector<float>> queue_priority;
+    auto queue_create_info = setupQueueCreateInfo(queue_priority);
+    VkDeviceCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    create_info.pNext = enable_chain;
+    create_info.pEnabledFeatures = &enabled_core_features;
+    create_info.queueCreateInfoCount =
+        static_cast<uint32_t>(queue_create_info.size());
+    create_info.pQueueCreateInfos = queue_create_info.data();
+    create_info.enabledExtensionCount =
+        static_cast<uint32_t>(enabled_extensions.size());
+    create_info.ppEnabledExtensionNames = enabled_extensions.data();
+
+    VkResult ret =
         vkCreateDevice(physicalDevice_, &create_info, nullptr, &logicalDevice_);
     if (ret != VK_SUCCESS) {
         LOG_ERROR("Failed to create logical device! ret=%d", ret);
@@ -2198,118 +1350,112 @@ bool VulkanDevice::createLogicalDevice(
     }
     VulkanDebug::set_device(logicalDevice_);
 
-    // Some drivers advertise host image copy yet report an empty memory-type
-    // mask for OPTIMAL-tiling images created with HOST_TRANSFER usage (seen on
-    // Windows with NVIDIA Pascal), which makes every such image unallocatable.
-    // Probe one representative configuration and fall back to staged copies.
-    if (m_support_host_image_copy_) {
-        VkImageCreateInfo probe_info = {};
-        probe_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        probe_info.imageType = VK_IMAGE_TYPE_2D;
-        probe_info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        probe_info.extent = {64, 640, 1};
-        probe_info.mipLevels = 1;
-        probe_info.arrayLayers = 2;
-        probe_info.samples = VK_SAMPLE_COUNT_1_BIT;
-        probe_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        probe_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
-                           VK_IMAGE_USAGE_STORAGE_BIT |
-                           VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-        probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        probe_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VkImage probe_image = VK_NULL_HANDLE;
-        VkResult probe_result =
-            vkCreateImage(logicalDevice_, &probe_info, nullptr, &probe_image);
-        bool host_copy_usable = false;
-        if (probe_result == VK_SUCCESS) {
-            VkImageMemoryRequirementsInfo2 req_info = {};
-            req_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
-            req_info.image = probe_image;
-            VkMemoryRequirements2 req = {};
-            req.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
-            vkGetImageMemoryRequirements2(logicalDevice_, &req_info, &req);
-            host_copy_usable = req.memoryRequirements.memoryTypeBits != 0;
+    if (m_support_host_image_copy_ && !probeHostImageCopy()) {
+        m_support_host_image_copy_ = false;
+        LOG_WARN("host image copy unusable for OPTIMAL images on this "
+                 "driver, falling back to staged copies");
+    }
 
-            // A non-empty memory-type mask is necessary but not sufficient:
-            // the entry point itself can still refuse the call. NVIDIA 595 on
-            // Ada answers VK_ERROR_EXTENSION_NOT_PRESENT to
-            // vkTransitionImageLayout when the device was created through this
-            // engine, even though the extension and feature are both enabled
-            // and a standalone program on the same host succeeds. VulkanImage
-            // had no handling for a failing transition (it only asserted), so
-            // a device that advertises the feature but rejects the call
-            // aborted the process. Probe the real call once here and downgrade
-            // rather than trusting the advertised bit.
-            if (host_copy_usable) {
-#ifdef VK_EXT_host_image_copy
-                auto instance =
-                    VulkanInstance::getVulkanInstance().getInstance();
-                auto transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
-                    vkGetInstanceProcAddr(instance, "vkTransitionImageLayout"));
-                if (!transition) {
-                    transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
-                        vkGetInstanceProcAddr(instance,
-                                              "vkTransitionImageLayoutEXT"));
-                }
-                if (!transition) {
-                    host_copy_usable = false;
-                } else {
-                    VkHostImageLayoutTransitionInfoEXT probe_transition = {};
-                    probe_transition.sType =
-                        VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT;
-                    probe_transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    probe_transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    probe_transition.image = probe_image;
-                    probe_transition.subresourceRange.aspectMask =
-                        VK_IMAGE_ASPECT_COLOR_BIT;
-                    probe_transition.subresourceRange.levelCount = 1;
-                    probe_transition.subresourceRange.layerCount = 2;
-                    if (transition(logicalDevice_, 1, &probe_transition) !=
-                        VK_SUCCESS) {
-                        host_copy_usable = false;
-                    }
-                }
-#endif
+    auto get_queues = [this](const std::vector<QueueFamily> &families,
+                             std::vector<std::shared_ptr<VulkanQueue>> &out) {
+        for (const auto &[qidx, count, flags] : families) {
+            (void)flags;
+            for (uint32_t i = 0; i < queuesPerFamily(count); i++) {
+                VkQueue queue;
+                vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
+                out.emplace_back(std::make_shared<VulkanQueue>(qidx, queue));
             }
-            vkDestroyImage(logicalDevice_, probe_image, nullptr);
         }
-        if (!host_copy_usable) {
-            m_support_host_image_copy_ = false;
-            LOG_WARN("host image copy unusable for OPTIMAL images on this "
-                     "driver, falling back to staged copies");
-        }
-    }
+    };
+    get_queues(computeQueueIdxs_, computeQueues_);
+    get_queues(graphicsQueueIdxs_, graphicsQueues_);
 
-    for (auto [qidx, queue_count, queueflags] : computeQueueIdxs_) {
-        queue_count = std::min<
-            std::tuple_element<1, class std::tuple<unsigned int, unsigned int,
-                                                   unsigned int>>::type>(
-            queue_count, (kInflight + 1) / 2);
-        for (uint32_t i = 0; i < queue_count; i++) {
-            VkQueue queue;
-            vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
-            computeQueues_.emplace_back(
-                std::make_shared<VulkanQueue>(qidx, queue));
-        }
-    }
-    for (auto [qidx, queue_count, queueflags] : graphicsQueueIdxs_) {
-        queue_count = std::min<
-            std::tuple_element<1, class std::tuple<unsigned int, unsigned int,
-                                                   unsigned int>>::type>(
-            queue_count, (kInflight + 1) / 2);
-        for (uint32_t i = 0; i < queue_count; i++) {
-            VkQueue queue;
-            vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
-            graphicsQueues_.emplace_back(
-                std::make_shared<VulkanQueue>(qidx, queue));
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(device_registry_mutex());
-        device_registry()[logicalDevice_] = this;
-    }
+    std::lock_guard<std::mutex> lock(device_registry_mutex());
+    device_registry()[logicalDevice_] = this;
     return true;
 }
+
+// Some drivers advertise host image copy yet cannot use it:
+// - an empty memory-type mask for OPTIMAL images with HOST_TRANSFER usage
+//   (Windows, NVIDIA Pascal), which makes every such image unallocatable;
+// - NVIDIA 595 on Ada answers VK_ERROR_EXTENSION_NOT_PRESENT to
+//   vkTransitionImageLayout on a device created through this engine, though
+//   the extension and feature are both enabled.
+// Probe one representative image through both steps instead of trusting the
+// advertised bit; VulkanImage only asserts on a failing transition.
+bool VulkanDevice::probeHostImageCopy() {
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    info.extent = {64, 640, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 2;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImage(logicalDevice_, &info, nullptr, &image) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkImageMemoryRequirementsInfo2 req_info = {};
+    req_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+    req_info.image = image;
+    VkMemoryRequirements2 req = {};
+    req.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+    vkGetImageMemoryRequirements2(logicalDevice_, &req_info, &req);
+    bool usable = req.memoryRequirements.memoryTypeBits != 0;
+
+#ifdef VK_EXT_host_image_copy
+    if (usable) {
+        auto instance = VulkanInstance::getVulkanInstance().getInstance();
+        auto transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
+            vkGetInstanceProcAddr(instance, "vkTransitionImageLayout"));
+        if (!transition) {
+            transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
+                vkGetInstanceProcAddr(instance, "vkTransitionImageLayoutEXT"));
+        }
+        VkHostImageLayoutTransitionInfoEXT t = {};
+        t.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT;
+        t.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        t.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        t.image = image;
+        t.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        t.subresourceRange.levelCount = 1;
+        t.subresourceRange.layerCount = 2;
+        usable = transition != nullptr &&
+                 transition(logicalDevice_, 1, &t) == VK_SUCCESS;
+    }
+#endif
+    vkDestroyImage(logicalDevice_, image, nullptr);
+    return usable;
+}
+
+std::vector<VkDeviceQueueCreateInfo> VulkanDevice::setupQueueCreateInfo(
+    std::vector<std::vector<float>> &queue_priority) {
+    std::vector<VkDeviceQueueCreateInfo> infos(computeQueueIdxs_.size());
+    queue_priority.resize(computeQueueIdxs_.size());
+    for (size_t i = 0; i < computeQueueIdxs_.size(); i++) {
+        const auto &[qidx, count, flags] = computeQueueIdxs_[i];
+        (void)flags;
+        LOG_INFO("queue count %d", count);
+        // Multiple queues per family for pipeline parallelism.
+        queue_priority[i].assign(queuesPerFamily(count), 1.0F);
+        infos[i].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        infos[i].queueFamilyIndex = qidx;
+        infos[i].queueCount = static_cast<uint32_t>(queue_priority[i].size());
+        infos[i].pQueuePriorities = queue_priority[i].data();
+    }
+    return infos;
+}
+
+// ---------------------------------------------------------------------------
+// Buffer device address / descriptor buffer
+// ---------------------------------------------------------------------------
 
 void VulkanDevice::initBufferDeviceAddress() {
     if (!m_support_buffer_device_address_) {
@@ -2317,8 +1463,7 @@ void VulkanDevice::initBufferDeviceAddress() {
     }
     // The core symbol is the 1.2 entry point; a 1.1 driver with only
     // VK_KHR_buffer_device_address exports the KHR alias instead. Neither is
-    // in VulkanLib's assert-all list, so a missing one is a normal fallback,
-    // not a startup abort.
+    // in VulkanLib's assert-all list, so a missing one is a normal fallback.
     auto &lib = VulkanLib::getVulkanLib();
     auto fn = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
         lib.get_proc_address("vkGetBufferDeviceAddress"));
@@ -2341,19 +1486,93 @@ void VulkanDevice::initBufferDeviceAddress() {
     }
 }
 
+bool VulkanDevice::probeBufferDeviceAddress() {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = 64;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(logicalDevice_, &buffer_info, nullptr, &buffer) !=
+        VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(logicalDevice_, buffer, &requirements);
+    // Prefer DEVICE_LOCAL, but any type that accepts the allocation proves the
+    // flag/usage combination is valid on this driver.
+    int32_t type = findMemoryType(requirements.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type < 0) {
+        type = findMemoryType(requirements.memoryTypeBits, 0);
+    }
+    if (type < 0) {
+        vkDestroyBuffer(logicalDevice_, buffer, nullptr);
+        return false;
+    }
+
+    VkMemoryAllocateFlagsInfo flags_info{};
+    flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.pNext = &flags_info;
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = static_cast<uint32_t>(type);
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    bool ok = vkAllocateMemory(logicalDevice_, &allocate_info, nullptr,
+                               &memory) == VK_SUCCESS &&
+              vkBindBufferMemory(logicalDevice_, buffer, memory, 0) ==
+                  VK_SUCCESS;
+    if (ok) {
+        VkBufferDeviceAddressInfo address_info{};
+        address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        address_info.buffer = buffer;
+        // Nonzero is the compatibility gate. Concrete alignment is a
+        // per-shader buffer_reference_align contract, checked where a BDA
+        // variant is selected.
+        ok = get_buffer_device_address_fn_(logicalDevice_, &address_info) != 0;
+    }
+    if (memory != VK_NULL_HANDLE) {
+        vkFreeMemory(logicalDevice_, memory, nullptr);
+    }
+    vkDestroyBuffer(logicalDevice_, buffer, nullptr);
+    return ok;
+}
+
+VkDeviceAddress VulkanDevice::getBufferDeviceAddress(VkBuffer buffer) const {
+    if (!m_support_buffer_device_address_ ||
+        get_buffer_device_address_fn_ == nullptr) {
+        throw std::runtime_error(
+            "vkop: buffer device address requested but the device does not "
+            "support it (feature disabled, probe failed, or VKOP_NO_BDA)");
+    }
+    VkBufferDeviceAddressInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    info.buffer = buffer;
+    return get_buffer_device_address_fn_(logicalDevice_, &info);
+}
+
 void VulkanDevice::initDescriptorBuffer() {
 #ifdef VK_EXT_descriptor_buffer
     if (!m_support_descriptor_buffer_) {
         return;
     }
-    if (descriptor_buffer_disabled() || !is_support_buffer_device_address()) {
+    auto disable = [this](const char *why) {
         m_support_descriptor_buffer_ = false;
         shader_caps_.descriptor_buffer.enabled = false;
-        LOG_WARN("VK_EXT_descriptor_buffer enabled but BDA is unusable; "
-                 "falling back to descriptor pools");
+        LOG_WARN("VK_EXT_descriptor_buffer %s; falling back to descriptor "
+                 "pools",
+                 why);
+    };
+    if (descriptor_buffer_disabled() || !is_support_buffer_device_address()) {
+        disable("enabled but BDA is unusable");
         return;
     }
-    auto load = [this](const char *name) -> PFN_vkVoidFunction {
+    auto load = [this](const char *name) {
         return vkGetDeviceProcAddr(logicalDevice_, name);
     };
     auto &info = m_descriptor_buffer_info_;
@@ -2383,27 +1602,16 @@ void VulkanDevice::initDescriptorBuffer() {
     info.uniformTexelBufferSize = props.uniformTexelBufferDescriptorSize;
 
     if (!info.valid()) {
-        m_support_descriptor_buffer_ = false;
-        shader_caps_.descriptor_buffer.enabled = false;
-        LOG_WARN("VK_EXT_descriptor_buffer entry points or descriptor sizes "
-                 "missing; falling back to descriptor pools");
+        disable("entry points or descriptor sizes missing");
         return;
     }
     // Whether the shared descriptor buffer can live in device-local memory
     // (UMA on an iGPU, BAR on a discrete GPU). This decides both the memory
     // flags and whether discrete devices enable the backend by default.
-    VkPhysicalDeviceMemoryProperties mem_props{};
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &mem_props);
-    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    m_descriptor_buffer_device_local_memory_ = false;
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
-        if ((mem_props.memoryTypes[i].propertyFlags & want) == want) {
-            m_descriptor_buffer_device_local_memory_ = true;
-            break;
-        }
-    }
+    m_descriptor_buffer_device_local_memory_ =
+        findMemoryType(~0U, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) >= 0;
     LOG_INFO("descriptor buffer: offsetAlign %llu sb %llu ubo %llu img %llu "
              "sampled %llu cimg %llu",
              static_cast<unsigned long long>(info.offsetAlignment),
@@ -2412,7 +1620,6 @@ void VulkanDevice::initDescriptorBuffer() {
              static_cast<unsigned long long>(info.storageImageSize),
              static_cast<unsigned long long>(info.sampledImageSize),
              static_cast<unsigned long long>(info.combinedImageSamplerSize));
-    shader_caps_.descriptor_buffer.enabled = m_support_descriptor_buffer_;
 #else
     m_support_descriptor_buffer_ = false;
 #endif
@@ -2431,7 +1638,6 @@ std::shared_ptr<DescriptorBufferPool> VulkanDevice::descriptor_buffer_pool() {
     // DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type (the UMA memory type on an
     // iGPU, BAR on a discrete GPU); b3's decode lost ~2.4 ms/round (~8.6%)
     // when the descriptors lived in system RAM and were fetched over PCIe.
-    // Fall back to plain host-visible where no such type exists.
     VkMemoryPropertyFlags memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if (m_descriptor_buffer_device_local_memory_) {
@@ -2466,152 +1672,35 @@ std::shared_ptr<DescriptorBufferPool> VulkanDevice::descriptor_buffer_pool() {
     return descriptor_buffer_pool_;
 }
 
-bool VulkanDevice::probeBufferDeviceAddress() {
-    VkBufferCreateInfo buffer_info{};
-    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = 64;
-    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkBuffer buffer = VK_NULL_HANDLE;
-    if (vkCreateBuffer(logicalDevice_, &buffer_info, nullptr, &buffer) !=
-        VK_SUCCESS) {
-        return false;
-    }
+// ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
 
-    VkMemoryRequirements requirements{};
-    vkGetBufferMemoryRequirements(logicalDevice_, buffer, &requirements);
-    VkPhysicalDeviceMemoryProperties memory_properties{};
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memory_properties);
-
-    // Prefer DEVICE_LOCAL, but any type that accepts the allocation proves the
-    // flag/usage combination is valid on this driver.
-    int32_t type = -1;
-    for (int pass = 0; pass < 2 && type < 0; ++pass) {
-        for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
-            if (!(requirements.memoryTypeBits & (1u << i))) {
-                continue;
-            }
-            const bool device_local =
-                (memory_properties.memoryTypes[i].propertyFlags &
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-            if (pass == 0 && !device_local) {
-                continue;
-            }
-            type = static_cast<int32_t>(i);
-            break;
+int32_t VulkanDevice::findMemoryType(uint32_t type_bits,
+                                     VkMemoryPropertyFlags want) const {
+    VkPhysicalDeviceMemoryProperties mem{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &mem);
+    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+        if ((type_bits & (1U << i)) &&
+            (mem.memoryTypes[i].propertyFlags & want) == want) {
+            return static_cast<int32_t>(i);
         }
     }
-    if (type < 0) {
-        vkDestroyBuffer(logicalDevice_, buffer, nullptr);
-        return false;
-    }
-
-    VkMemoryAllocateFlagsInfo flags_info{};
-    flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    VkMemoryAllocateInfo allocate_info{};
-    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocate_info.pNext = &flags_info;
-    allocate_info.allocationSize = requirements.size;
-    allocate_info.memoryTypeIndex = static_cast<uint32_t>(type);
-
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    bool ok = vkAllocateMemory(logicalDevice_, &allocate_info, nullptr,
-                               &memory) == VK_SUCCESS;
-    if (ok) {
-        ok =
-            vkBindBufferMemory(logicalDevice_, buffer, memory, 0) == VK_SUCCESS;
-    }
-    if (ok) {
-        VkBufferDeviceAddressInfo address_info{};
-        address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-        address_info.buffer = buffer;
-        // Nonzero is the compatibility gate. Concrete alignment is a
-        // per-shader buffer_reference_align contract, checked where a BDA
-        // variant is selected.
-        ok = get_buffer_device_address_fn_(logicalDevice_, &address_info) != 0;
-    }
-    if (memory != VK_NULL_HANDLE) {
-        vkFreeMemory(logicalDevice_, memory, nullptr);
-    }
-    vkDestroyBuffer(logicalDevice_, buffer, nullptr);
-    return ok;
-}
-
-VkDeviceAddress VulkanDevice::getBufferDeviceAddress(VkBuffer buffer) const {
-    if (!m_support_buffer_device_address_ ||
-        get_buffer_device_address_fn_ == nullptr) {
-        throw std::runtime_error(
-            "vkop: buffer device address requested but the device does not "
-            "support it (feature disabled, probe failed, or VKOP_NO_BDA)");
-    }
-    VkBufferDeviceAddressInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-    info.buffer = buffer;
-    return get_buffer_device_address_fn_(logicalDevice_, &info);
-}
-
-std::vector<VkDeviceQueueCreateInfo> VulkanDevice::setupQueueCreateInfo(
-    std::vector<std::vector<float>> &queue_priority) {
-    std::vector<VkDeviceQueueCreateInfo> queue_create_info(
-        computeQueueIdxs_.size());
-
-    for (size_t i = 0; i < computeQueueIdxs_.size(); i++) {
-        auto [qidx, queue_count, queueflags] = computeQueueIdxs_[i];
-        LOG_INFO("queue count %d", queue_count);
-        queue_count = std::min<std::tuple_element<
-            1, std::tuple<unsigned int, unsigned int, unsigned int>>::type>(
-            queue_count, (kInflight + 1) / 2);
-        queue_priority[i].resize(queue_count);
-        std::fill(queue_priority[i].begin(), queue_priority[i].end(), 1.0F);
-        queue_create_info[i].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queue_create_info[i].queueFamilyIndex = qidx;
-        // multiqueue for pipeline parallelism
-        queue_create_info[i].queueCount = queue_count;
-        queue_create_info[i].pQueuePriorities = queue_priority[i].data();
-    }
-
-    return queue_create_info;
-}
-
-bool VulkanDevice::checkDeviceExtensionFeature(
-    const std::vector<VkExtensionProperties> &ext_properties,
-    const char *name) {
-    for (auto ext : ext_properties) {
-        if (std::string(ext.extensionName) == name) {
-            return true;
-        }
-    }
-    return false;
+    return -1;
 }
 
 bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
-    VkPhysicalDeviceMemoryProperties memory_properties;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memory_properties);
-
+    VkPhysicalDeviceMemoryProperties mem{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &mem);
     // A HOST_VISIBLE|DEVICE_LOCAL memory type is NOT sufficient: discrete
     // NVIDIA/AMD expose their BAR as exactly that combination (a 256 MB window
     // of VRAM mapped to the host), which would tag every dGPU as UMA. The
     // reliable discriminator is the heap layout: an iGPU exposes a single
     // DEVICE_LOCAL heap, a dGPU always has a separate non-local system heap.
-    bool is_unified_memory = memory_properties.memoryHeapCount == 1;
-
-    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
-        const VkMemoryType &mem_type = memory_properties.memoryTypes[i];
-
-        if ((mem_type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-            (mem_type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            LOG_INFO("Host-visible device-local memory type at index: %d", i);
-        }
-    }
-
-    if (is_unified_memory) {
-        LOG_INFO("This device supports Unified Memory Architecture (UMA).");
-    } else {
-        LOG_INFO("This device does not support Unified Memory Architecture.");
-    }
-    return is_unified_memory;
+    const bool uma = mem.memoryHeapCount == 1;
+    LOG_INFO("This device %s Unified Memory Architecture (UMA).",
+             uma ? "supports" : "does not support");
+    return uma;
 }
 
 void VulkanDevice::wait_all_done() { vkDeviceWaitIdle(logicalDevice_); }

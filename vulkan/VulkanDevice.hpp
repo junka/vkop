@@ -2,11 +2,15 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
+#include <tuple>
+#include <vector>
 
 #include "core/KernelSelect.hpp"
 #include "vulkan/VMA.hpp"
@@ -40,15 +44,6 @@ class VulkanQueue {
     uint64_t submit_count_ = 0;
 };
 
-struct FeatureDescriptor {
-    VkStructureType sType = {};
-    const char *extensionName = nullptr;
-    uint32_t corePromotedVersion = 0;
-
-    std::function<std::shared_ptr<void>()> makeQueryStruct;
-
-    std::function<std::shared_ptr<void>(void *queried)> makeEnableStruct;
-};
 // One probed shader capability, split into the three questions that actually
 // differ: `available` = the extension enumerated (or the feature is core in
 // this apiVersion), `supported` = the driver reported the bit, `enabled` = the
@@ -155,68 +150,49 @@ struct DescriptorBufferInfo {
     VkDeviceSize sizeFor(VkDescriptorType type) const;
 };
 
-struct QueryChainResult {
-    VkPhysicalDeviceFeatures2 features2{};
-    // shared_ptr<void> (not unique_ptr<VkBaseOutStructure>): the type-erased
-    // deleter remembers the concrete struct type allocated by the
-    // makeQueryStruct/makeEnableStruct lambdas, so destruction frees the
-    // derived object correctly. unique_ptr<VkBaseOutStructure> would delete a
-    // plain C struct through the base pointer (new/delete type mismatch —
-    // caught by ASan, UB regardless).
-    std::vector<std::shared_ptr<void>> ownedStructs;
-};
-struct EnableResult {
-    std::vector<std::shared_ptr<void>> enableChain;
-    std::vector<const char *> enabledExtensions;
-};
+class FeatureChain;
+
 class VulkanDevice {
 
   private:
-    // Helper functions
+    using QueueFamily = std::tuple<uint32_t, uint32_t, VkQueueFlags>;
+
+    // Fills every cached property (limits, subgroup, coopmat, dot product,
+    // descriptor buffer, host image copy, host import alignment).
     VkPhysicalDeviceProperties getProperties();
+#ifdef VK_KHR_cooperative_matrix
+    void queryCooperativeMatrixProperties();
+#endif
 
     bool
     createLogicalDevice(const VkPhysicalDeviceProperties &deviceProperties);
 
     uint32_t findComputeQueueFamily();
 
-    static bool checkDeviceExtensionFeature(
-        const std::vector<VkExtensionProperties> &properties, const char *name);
-
-    // False when the device cannot provide the four RGBA formats the image
-    // backend uses; records the first missing combination in
-    // image_unsupported_reason_ and never aborts. Called from the constructor;
-    // see is_support_images().
-    bool probeImageConfigurationSupported(VkFormat format);
-
     std::vector<VkDeviceQueueCreateInfo>
     setupQueueCreateInfo(std::vector<std::vector<float>> &queue_priority);
 
-    template <typename T, VkStructureType ST>
-    static constexpr T makeFeatureStruct() {
-        T f{};
-        f.sType = ST;
-        f.pNext = nullptr;
-        return f;
+    // Queues created per family: enough for kInflight, never more than the
+    // family offers.
+    static uint32_t queuesPerFamily(uint32_t family_count) {
+        return std::min<uint32_t>(family_count, (kInflight + 1) / 2);
     }
 
-    static QueryChainResult
-    buildFeatureQueryChain(const std::vector<FeatureDescriptor> &descs);
-
-    static EnableResult
-    buildFeatureEnableChain(const std::vector<FeatureDescriptor> &descs,
-                            const VkPhysicalDeviceFeatures2 &queryFeatures2,
-                            const std::set<std::string> &supportedExtensions);
-
-    // Probe (not assert) the image backend's format/usage matrix. Logs each
-    // missing combination and leaves m_support_images_ false instead of
-    // aborting, so a device with no image support still yields a usable
-    // VulkanDevice for the buffer backend.
+    // Probe (not assert) the image backend's format/usage matrix. Logs the
+    // first missing combination into image_unsupported_reason_ and leaves
+    // m_support_images_ false instead of aborting, so a device with no image
+    // support still yields a usable VulkanDevice for the buffer backend.
     void checkImageFormatSupport();
 
-    std::vector<FeatureDescriptor>
-    createFeatureDescriptors(const VkPhysicalDeviceProperties &deviceProperties,
-                             const std::set<std::string> &supportedExtensions);
+    // Registers every feature struct this engine may enable, each gated on
+    // the extension list and on `api_version` (min of instance and device).
+    void addFeatureProbes(FeatureChain &chain, uint32_t api_version,
+                          const std::set<std::string> &extensions);
+    template <typename T> void pickDescriptorIndexing(const T &q, T &e);
+
+    // Creates a HOST_TRANSFER image and transitions it on the host; false
+    // when the advertised host image copy cannot actually be used.
+    bool probeHostImageCopy();
 
     // Resolve vkGetBufferDeviceAddress (or its KHR alias on pre-1.2 devices)
     // and run a one-shot create/allocate/get-address probe. Any failure
@@ -230,6 +206,17 @@ class VulkanDevice {
     // downgrades the feature so pipelines keep using descriptor sets.
     void initDescriptorBuffer();
 
+    // First memory type in `type_bits` whose flags include `want`, or -1.
+    int32_t findMemoryType(uint32_t type_bits,
+                           VkMemoryPropertyFlags want) const;
+
+    static std::shared_ptr<VulkanQueue>
+    pickQueue(const std::vector<std::shared_ptr<VulkanQueue>> &queues,
+              uint32_t idx) {
+        const uint32_t slot = (idx % 2) * kInflight / 2 + idx / 2;
+        return queues[slot % queues.size()];
+    }
+
   public:
     explicit VulkanDevice(VkPhysicalDevice physicalDevice_);
     ~VulkanDevice();
@@ -239,37 +226,29 @@ class VulkanDevice {
     VkPhysicalDevice getPhysicalDevice() const { return physicalDevice_; }
     size_t getNumComputeQueues() const { return computeQueues_.size(); }
 
-    // minStorageBufferOffsetAlignment, cached on first use. A binding that
-    // points an SSBO at a non-zero byte offset (the Slice/Split zero-copy
-    // range-view fast path) must keep that offset a multiple of this, so the
-    // op gates on it before aliasing.
-    VkDeviceSize minStorageBufferOffsetAlignment();
+    // minStorageBufferOffsetAlignment (>= 1). A binding that points an SSBO
+    // at a non-zero byte offset (the Slice/Split zero-copy range-view fast
+    // path) must keep that offset a multiple of this, so the op gates on it
+    // before aliasing.
+    VkDeviceSize minStorageBufferOffsetAlignment() const {
+        return min_sb_offset_align_;
+    }
 
     std::shared_ptr<VulkanQueue> getComputeQueue(uint32_t idx = 0) const {
-        int offset = idx / 2;
-        int cat = idx % 2;
-        cat = cat * kInflight / 2;
-        cat += offset;
-        return computeQueues_[(cat) % computeQueues_.size()];
+        return pickQueue(computeQueues_, idx);
     }
 
     std::string getDeviceName() const { return deviceName_; }
 
-    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
-    getComputeQueueFamilyIndex() const {
+    std::vector<QueueFamily> getComputeQueueFamilyIndex() const {
         return computeQueueIdxs_;
     }
-    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
-    getGraphicsQueueFamilyIndex() const {
+    std::vector<QueueFamily> getGraphicsQueueFamilyIndex() const {
         return graphicsQueueIdxs_;
     }
 
     std::shared_ptr<VulkanQueue> getGraphicsQueues(uint32_t idx = 0) const {
-        int offset = idx / 2;
-        int cat = idx % 2;
-        cat = cat * kInflight / 2;
-        cat += offset;
-        return graphicsQueues_[(cat) % graphicsQueues_.size()];
+        return pickQueue(graphicsQueues_, idx);
     }
 
     float getTimestampPeriod() const { return timestampPeriod_; }
@@ -585,14 +564,12 @@ class VulkanDevice {
     uint32_t maxSubgroupSize_ = 0;
 #endif
 
-    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
-    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
-        graphicsQueueIdxs_;
+    std::vector<QueueFamily> computeQueueIdxs_;
+    std::vector<QueueFamily> graphicsQueueIdxs_;
 
-    float timestampPeriod_;
-    uint32_t maxImageArrayLayers_;
-    // Cached minStorageBufferOffsetAlignment (0 = not yet queried).
-    VkDeviceSize min_sb_offset_align_ = 0;
+    float timestampPeriod_ = 0;
+    uint32_t maxImageArrayLayers_ = 0;
+    VkDeviceSize min_sb_offset_align_ = 1;
     // Packed NCHW images address along width, so a tensor whose W*C4 exceeds
     // this cannot be represented as one image at all.
     uint32_t maxImageDimension2D_ = 0;
