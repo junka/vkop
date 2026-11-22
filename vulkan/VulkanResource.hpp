@@ -41,17 +41,58 @@ class VulkanResource {
     findMemoryTypeFromProperties(uint32_t memoryTypeBits,
                                  VkPhysicalDeviceMemoryProperties properties,
                                  VkMemoryPropertyFlags requiredProperties) {
-        // printf("memoryTypeBits: %x vs %x\n", memoryTypeBits,
-        //        requiredProperties);
+        // Among the types that satisfy the requirement, pick the best one
+        // instead of the first: type order is the driver's, and on a ReBAR
+        // dGPU the first HOST_VISIBLE|HOST_COHERENT type can be the
+        // DEVICE_LOCAL BAR window -- uncached VRAM that is slow to read back
+        // and eats video memory for what is only a staging buffer.
+        //   - host-visible but not asked to be device-local (staging): prefer
+        //     HOST_CACHED (readback memcpy), avoid DEVICE_LOCAL.
+        //   - device-local and not asked to be host-visible: avoid
+        //     HOST_VISIBLE (the BAR heap is the small one on a dGPU).
+        //   - never pick exotic types the caller did not ask for.
+        // On UMA every type is DEVICE_LOCAL, so the penalties tie and the
+        // driver's order decides, exactly as before.
+        constexpr VkMemoryPropertyFlags kExotic =
+            VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
+            VK_MEMORY_PROPERTY_PROTECTED_BIT
+#ifdef VK_AMD_device_coherent_memory
+            | VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD |
+            VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD
+#endif
+            ;
+        const bool want_host =
+            (requiredProperties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        const bool want_local =
+            (requiredProperties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        int32_t best = -1;
+        int best_score = 0;
         for (uint32_t index = 0; index < properties.memoryTypeCount; ++index) {
-            if (((memoryTypeBits & (1 << index))) &&
-                ((properties.memoryTypes[index].propertyFlags &
-                  requiredProperties) == requiredProperties)) {
-                return static_cast<int32_t>(index);
+            const VkMemoryPropertyFlags f =
+                properties.memoryTypes[index].propertyFlags;
+            if (!(memoryTypeBits & (1u << index)) ||
+                (f & requiredProperties) != requiredProperties ||
+                (f & kExotic & ~requiredProperties) != 0) {
+                continue;
+            }
+            int score = 100;
+            if (want_host && !want_local) {
+                if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+                    score += 10;
+                if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                    score -= 20;
+            }
+            if (want_local && !want_host &&
+                (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                score -= 20;
+            }
+            if (score > best_score) {
+                best_score = score;
+                best = static_cast<int32_t>(index);
             }
         }
-        assert(false && "Did not find a suitable memory type");
-        return -1;
+        assert(best >= 0 && "Did not find a suitable memory type");
+        return best;
     }
     bool allocMemory(VkMemoryRequirements memoryRequirements,
                      VkMemoryPropertyFlags requiredProperties, int ext_fd = -1,
@@ -63,6 +104,9 @@ class VulkanResource {
         auto memory_type_index =
             findMemoryTypeFromProperties(memoryRequirements.memoryTypeBits,
                                          memory_properties, requiredProperties);
+        if (memory_type_index < 0) {
+            return false;
+        }
         VkMemoryAllocateInfo allocate_info = {};
         allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocate_info.allocationSize = memoryRequirements.size;

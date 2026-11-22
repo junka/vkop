@@ -35,7 +35,7 @@ std::atomic<VkDevice> s_vma_device{VK_NULL_HANDLE};
 } // namespace
 
 VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device,
-         bool useBufferDeviceAddress) {
+         bool useBufferDeviceAddress, bool useMemoryBudget) {
     VmaVulkanFunctions vulkan_functions = {};
     vulkan_functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     vulkan_functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
@@ -45,104 +45,33 @@ VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device,
     allocator_info.device = device;
     allocator_info.instance = VulkanInstance::getVulkanInstance().getInstance();
     allocator_info.vulkanApiVersion = VK_API_VERSION_1_2;
-    allocator_info.flags = VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT |
-                           VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT |
+    // Dedicated allocation / bind_memory2 are core in 1.1+. DEVICE_COHERENT
+    // only lets VMA consider the AMD device-coherent types, which exist only
+    // when VulkanDevice enabled VK_AMD_device_coherent_memory.
+    allocator_info.flags = VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT |
                            VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT |
                            VMA_ALLOCATOR_CREATE_AMD_DEVICE_COHERENT_MEMORY_BIT;
+    // Only legal once VK_EXT_memory_budget is enabled on the device.
+    if (useMemoryBudget) {
+        allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
     if (useBufferDeviceAddress) {
         allocator_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
+    // VMA's default block on a large heap is 256 MB: a partly used block (plus
+    // the one empty block VMA keeps cached) is resident slack. Inference
+    // tensors are either tiny (sub-allocated well by 64 MB blocks) or big
+    // (dedicated, see kDedicatedThreshold), so a smaller block costs nothing.
+    allocator_info.preferredLargeHeapBlockSize = kBlockSize;
     allocator_info.pVulkanFunctions = &vulkan_functions;
 
     if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create VMA allocator");
     }
     s_vma_device.store(device);
-    // createPools();
 }
 
-VMA::~VMA() {
-    // vmaDestroyPool(allocator_, device_pool_);
-    // vmaDestroyPool(allocator_, storage_pool_);
-    // vmaDestroyPool(allocator_, staging_pool_);
-    vmaDestroyAllocator(allocator_);
-}
-
-void VMA::createPools() {
-    uint32_t mem_type_idx = 0;
-    VkImageCreateInfo img_info{};
-    img_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    img_info.imageType = VK_IMAGE_TYPE_2D;
-    img_info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    img_info.extent = {256, 256, 1};
-    img_info.mipLevels = 1;
-    img_info.arrayLayers = 64;
-    img_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    img_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    img_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    img_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VmaAllocationCreateInfo alloc_info = {};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-    vmaFindMemoryTypeIndexForImageInfo(allocator_, &img_info, &alloc_info,
-                                       &mem_type_idx);
-    printf("Device pool memory type index: %d\n", mem_type_idx);
-    VmaPoolCreateInfo device_pool_info = {};
-    device_pool_info.memoryTypeIndex = mem_type_idx;
-    device_pool_info.blockSize = 32 * 1024 * 1024; // 16MB per block
-    device_pool_info.minBlockCount = 0;
-    device_pool_info.maxBlockCount = 128; // up to 16 * n
-    vmaCreatePool(allocator_, &device_pool_info, &device_pool_);
-
-    VkBufferCreateInfo devbuf_info{};
-    memset(&alloc_info, 0, sizeof(alloc_info));
-    devbuf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    devbuf_info.size = 4096;
-    devbuf_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    devbuf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-    vmaFindMemoryTypeIndexForBufferInfo(allocator_, &devbuf_info, &alloc_info,
-                                        &mem_type_idx);
-    printf("device local pool memory type index: %d\n", mem_type_idx);
-    VmaPoolCreateInfo devicelocal_pool_info = {};
-    devicelocal_pool_info.memoryTypeIndex = mem_type_idx;
-    devicelocal_pool_info.flags = VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT;
-    devicelocal_pool_info.blockSize = 16 * 1024 * 1024;
-    devicelocal_pool_info.minBlockCount = 1;
-    devicelocal_pool_info.maxBlockCount = 16;
-    vmaCreatePool(allocator_, &devicelocal_pool_info, &storage_pool_);
-
-    // Staging pool (linear, for uploads/downloads)
-    VkBufferCreateInfo buf_info{};
-    memset(&alloc_info, 0, sizeof(alloc_info));
-    buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buf_info.size = 4096;
-    buf_info.usage =
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-    alloc_info.flags =
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
-        VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    vmaFindMemoryTypeIndexForBufferInfo(allocator_, &buf_info, &alloc_info,
-                                        &mem_type_idx);
-    printf("staing pool memory type index: %d\n", mem_type_idx);
-    VmaPoolCreateInfo staging_pool_info = {};
-    staging_pool_info.memoryTypeIndex = mem_type_idx;
-    staging_pool_info.flags = VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT;
-    staging_pool_info.blockSize = 16 * 1024 * 1024;
-    staging_pool_info.minBlockCount = 0;
-    staging_pool_info.maxBlockCount = 1;
-    vmaCreatePool(allocator_, &staging_pool_info, &staging_pool_);
-}
+VMA::~VMA() { vmaDestroyAllocator(allocator_); }
 
 VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
                            struct VmaBuffer *buf, bool local,
@@ -153,9 +82,21 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
     // through the mapped pointer (scratch headers, staging), so a type
     // without coherence silently loses host<->device stores.
     alloc_info.requiredFlags = requiredFlags;
+    // A big buffer gets its own VkDeviceMemory: it would otherwise pin a
+    // whole block that stays resident after it is freed, and a weight or KV
+    // cache of this size gains nothing from sub-allocation.
+    if (bufferInfo->size >= kDedicatedThreshold) {
+        alloc_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    }
     if (local) {
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-        // alloc_info.pool = storage_pool_;
+        // DEVICE_LOCAL|HOST_VISIBLE (UMA weights written in place): VMA
+        // must hand back a persistently mapped allocation.
+        if (requiredFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            alloc_info.flags |=
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        }
     } else {
         // Staging pool serves BOTH directions: H2D upload writes and D2H
         // readback reads (memcpy out of the mapped pointer in
@@ -167,9 +108,8 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
         // was also invalid here: VMA may hand back non-host-visible memory,
         // which this pool maps and dereferences directly.
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        // alloc_info.pool = staging_pool_;
+        alloc_info.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                            VMA_ALLOCATION_CREATE_MAPPED_BIT;
     }
     buf->allocator = allocator_;
     return vmaCreateBuffer(allocator_, bufferInfo, &alloc_info, &buf->buffer,
@@ -179,7 +119,8 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
 VkResult VMA::createImage(VkImageCreateInfo *imageInfo, struct VmaImage *img) {
     VmaAllocationCreateInfo alloc_info = {};
     alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    // alloc_info.pool = device_pool_;
+    // No explicit dedicated threshold: VMA already gives an image above half
+    // a block (32 MB) or one the driver prefers dedicated its own memory.
     img->allocator = allocator_;
     return vmaCreateImage(allocator_, imageInfo, &alloc_info, &img->image,
                           &img->allocation, nullptr);

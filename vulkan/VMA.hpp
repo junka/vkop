@@ -10,11 +10,9 @@
 struct VmaAllocation_T;
 struct VmaAllocator_T;
 struct VmaAllocationInfo;
-struct VmaPool_T;
 
 using VmaAllocator = struct VmaAllocator_T *;
 using VmaAllocation = struct VmaAllocation_T *;
-using VmaPool = struct VmaPool_T *;
 
 namespace vkop {
 
@@ -36,8 +34,15 @@ class VMA {
     // bufferDeviceAddress feature. VMA attaches
     // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT to every allocation when this is
     // true, which is invalid on a device that did not enable the feature.
+    // useMemoryBudget must mirror VK_EXT_memory_budget being enabled.
     VMA(VkPhysicalDevice physicalDevice, VkDevice device,
-        bool useBufferDeviceAddress = false);
+        bool useBufferDeviceAddress = false, bool useMemoryBudget = false);
+
+    // Block size for sub-allocation, and the size from which a resource gets
+    // a dedicated VkDeviceMemory instead (freed back to the driver the moment
+    // the resource dies).
+    static constexpr VkDeviceSize kBlockSize = VkDeviceSize{64} << 20;
+    static constexpr VkDeviceSize kDedicatedThreshold = VkDeviceSize{16} << 20;
     ~VMA();
 
     // Allocate a Vulkan buffer with memory
@@ -87,11 +92,6 @@ class VMA {
 
   private:
     VmaAllocator allocator_;
-    VmaPool device_pool_ = VK_NULL_HANDLE;
-    VmaPool storage_pool_ = VK_NULL_HANDLE;
-    VmaPool staging_pool_ = VK_NULL_HANDLE;
-
-    void createPools();
 };
 
 } // namespace vkop

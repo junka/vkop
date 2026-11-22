@@ -10,6 +10,10 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
                            VkDeviceSize size, VkBufferUsageFlags usage,
                            VkMemoryPropertyFlags requireProperties, int ext_fd)
     : VulkanResource(vdev), m_size_(size) {
+    constexpr VkMemoryPropertyFlags kHostRW =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    host_visible_ = (requireProperties & kHostRW) == kHostRW;
     createBuffer(usage, requireProperties);
 #ifndef USE_VMA
 #ifdef VK_KHR_get_memory_requirements2
@@ -193,6 +197,7 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
                                  "failed vkret=" + std::to_string(ret));
     }
     host_imported_ = true;
+    host_visible_ = true;
 }
 
 VulkanBuffer::~VulkanBuffer() {
@@ -573,12 +578,46 @@ void VulkanBuffer::flushMappedRange(VkDeviceSize offset, VkDeviceSize size) {
 #ifdef USE_VMA
     VMA::flushAllocation(getVmaBuffer(), offset, size);
 #else
-    VkMappedMemoryRange range = {};
-    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.memory = getMemory();
-    range.offset = getOffset() + offset;
-    range.size = size;
+    VkMappedMemoryRange range = alignedMappedRange(offset, size);
     vkFlushMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
 #endif
 }
+
+void VulkanBuffer::invalidateMappedRange(VkDeviceSize offset,
+                                         VkDeviceSize size) {
+    if (parent_) {
+        parent_->invalidateMappedRange(offset + range_offset_, size);
+        return;
+    }
+    if (host_imported_) {
+        return;
+    }
+#ifdef USE_VMA
+    VMA::invalidateAllocation(getVmaBuffer(), offset, size);
+#else
+    VkMappedMemoryRange range = alignedMappedRange(offset, size);
+    vkInvalidateMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
+#endif
+}
+
+#ifndef USE_VMA
+// vkFlush/InvalidateMappedMemoryRanges require offset to be a multiple of
+// nonCoherentAtomSize and size to be one too or to reach the end of the
+// allocation (VUID-VkMappedMemoryRange-offset-00687 / -size-01390), whether
+// or not the memory is coherent. Widen [offset, offset+size) outward; the
+// allocation is this buffer's own, so VK_WHOLE_SIZE covers the tail.
+VkMappedMemoryRange VulkanBuffer::alignedMappedRange(VkDeviceSize offset,
+                                                     VkDeviceSize size) const {
+    const VkDeviceSize atom = m_vdev_->non_coherent_atom_size();
+    const VkDeviceSize begin = getOffset() + offset;
+    const VkDeviceSize lo = begin / atom * atom;
+    const VkDeviceSize hi = (begin + size + atom - 1) / atom * atom;
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = getMemory();
+    range.offset = lo;
+    range.size = (hi >= getOffset() + m_size_) ? VK_WHOLE_SIZE : hi - lo;
+    return range;
+}
+#endif
 } // namespace vkop

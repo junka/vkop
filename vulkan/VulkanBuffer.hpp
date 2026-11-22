@@ -59,6 +59,11 @@ class VulkanBuffer : public VulkanResource {
     // True for a borrowed sub-range view (see the ctor above). Not the owner of
     // the VkBuffer; never map/free it.
     bool is_view_range() const { return parent_ != nullptr; }
+    // Memory is HOST_VISIBLE|HOST_COHERENT and persistently mappable: the
+    // host may write it in place (no staging copy), with no flush needed.
+    bool is_host_visible() const {
+        return parent_ ? parent_->is_host_visible() : host_visible_;
+    }
     // True for a host-imported buffer (host-import ctor): m_buffer_/m_memory_
     // (and the VMA slot) are unused; ext_buffer_/ext_memory_ carry the buffer.
     bool is_host_imported() const { return host_imported_; }
@@ -200,6 +205,9 @@ class VulkanBuffer : public VulkanResource {
     // header). No-op semantics on the device; cheap enough to call
     // unconditionally.
     void flushMappedRange(VkDeviceSize offset, VkDeviceSize size);
+    // Device -> host counterpart of flushMappedRange, for the same range
+    // after a D2H copy's wait and before host reads of the mapping.
+    void invalidateMappedRange(VkDeviceSize offset, VkDeviceSize size);
 
     void *getMappedMemory() {
         if (parent_)
@@ -266,6 +274,9 @@ class VulkanBuffer : public VulkanResource {
     // True when this owning buffer was created with the device-address usage
     // bit. False for host-imported buffers (see the ctor comment).
     bool bda_capable_ = false;
+    // Allocated with HOST_VISIBLE|HOST_COHERENT required (staging, UMA
+    // weights, host-imported); see is_host_visible().
+    bool host_visible_ = false;
     VkAccessFlags m_access_ = 0;
     bool view_aliased_ = false;
     int32_t view_writer_ = -1;
@@ -292,6 +303,10 @@ class VulkanBuffer : public VulkanResource {
     void createBuffer(VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags requireProperties);
     void createBufferView(VkFormat format, VkDeviceSize offset);
+#ifndef USE_VMA
+    VkMappedMemoryRange alignedMappedRange(VkDeviceSize offset,
+                                           VkDeviceSize size) const;
+#endif
 };
 } // namespace vkop
 #endif // SRC_VULKANBUFFER_HPP_

@@ -256,7 +256,8 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
     // carry VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, which is invalid when the
     // device feature was not enabled.
     m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_,
-                                   is_support_buffer_device_address());
+                                   is_support_buffer_device_address(),
+                                   m_support_memory_budget_);
 #endif
 }
 
@@ -404,6 +405,8 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     maxImageDimension2D_ = limits.maxImageDimension2D;
     min_sb_offset_align_ =
         std::max<VkDeviceSize>(1, limits.minStorageBufferOffsetAlignment);
+    non_coherent_atom_size_ =
+        std::max<VkDeviceSize>(1, limits.nonCoherentAtomSize);
     deviceName_ = properties2.properties.deviceName;
     LOG_INFO("GPU %s", deviceName_.c_str());
     LOG_INFO("Driver ID %d (vendor 0x%x)", driver_properties.driverID,
@@ -1305,12 +1308,21 @@ bool VulkanDevice::createLogicalDevice(
 #ifdef VK_EXT_external_memory_host
         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
 #endif
+#ifdef VK_EXT_memory_budget
+        // Lets VMA track real heap usage/budget (it is only legal to ask VMA
+        // for that once the extension is enabled on the device).
+        VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
+#endif
     };
     for (const char *name : plain_extensions) {
         if (extensions.count(name) > 0) {
             enabled_extensions.push_back(name);
         }
     }
+#ifdef VK_EXT_memory_budget
+    m_support_memory_budget_ =
+        extensions.count(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) > 0;
+#endif
 #ifdef VK_EXT_external_memory_host
     m_support_host_import_ =
         extensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) > 0;

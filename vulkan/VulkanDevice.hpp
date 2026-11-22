@@ -294,6 +294,14 @@ class VulkanDevice {
     // device memory; see VulkanBuffer's host-import ctor and
     // Tensor::as_host_imported_buffer.
     bool is_support_host_import() const { return m_support_host_import_; }
+    // VK_EXT_memory_budget enabled on the logical device.
+    bool is_support_memory_budget() const { return m_support_memory_budget_; }
+    // limits.nonCoherentAtomSize: vkFlush/InvalidateMappedMemoryRanges ranges
+    // must start at a multiple of it and span a multiple of it (or reach the
+    // end of the allocation).
+    VkDeviceSize non_coherent_atom_size() const {
+        return non_coherent_atom_size_;
+    }
     // shaderInt64 enabled at device creation. Kernels that do 64-bit integer
     // ARITHMETIC gate on this; byte movers over ivec2 do not.
     // VKOP_NO_SHADER_INT64=1 forces the CPU fallback paths, for A/B.
@@ -303,9 +311,11 @@ class VulkanDevice {
         return shader_caps_.shader_int64.enabled && !disabled;
     }
     uint32_t host_import_alignment() const { return m_host_import_alignment_; }
-    // UMA: a memory type that is both HOST_VISIBLE and DEVICE_LOCAL. iGPU
-    // (Intel/AMD APU) report it; discrete cards do not. Ops use this to pick
-    // routing thresholds measured on the matching device class.
+    // UMA: the device exposes a single memory heap (Apple, Intel/AMD iGPU),
+    // so DEVICE_LOCAL memory is system RAM. A HOST_VISIBLE|DEVICE_LOCAL type
+    // alone does not qualify -- a dGPU BAR (ReBAR or not) has one too, with a
+    // separate system heap. Ops use this to pick routing thresholds measured
+    // on the matching device class; uploads use it to skip staging.
     bool is_unified_memory() const { return m_is_unified_memory_; }
     // VK_KHR_buffer_device_address / Vulkan 1.2 core. True only when the
     // feature was handed to vkCreateDevice, the entry point resolved, and the
@@ -518,6 +528,8 @@ class VulkanDevice {
     // MoltenVK); imported host blocks must start at a multiple of it.
     bool m_support_host_import_ = false;
     uint32_t m_host_import_alignment_ = 4096;
+    bool m_support_memory_budget_ = false;
+    VkDeviceSize non_coherent_atom_size_ = 256;
     bool m_support_buffer_device_address_ = false;
     // Resolved in initBufferDeviceAddress(); null unless the feature is
     // usable. Kept out of VulkanLib's assert-all function list because that
