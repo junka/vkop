@@ -112,7 +112,14 @@ cycles, token streams md5-identical in every arm (means, min-max over cycles):
 `rsec` is the point of the whole exercise: the correct one-level-per-segment
 split, 375/375 segments replayed, record 0.0ms and submit ~1ms per round,
 +28% over graph mode. The barrier between segments is free on this driver
-(`rsec` == `rsec_nb`), so it stays for portability. Script:
-`tools/perf/run_sec_ab.sh`.
+(`rsec` == `rsec_nb`), so it stays for portability. Reproduce with:
+
+```sh
+M=model.vkopbin
+tools/perf/ab_decode.sh graph=$M sec=$M,VKOP_SEC_CMD=1 \
+  rsec=$M,VKOP_SEC_CMD=1,VKOP_SEGMENT_REPLAY=1 \
+  rsec_nb=$M,VKOP_SEC_CMD=1,VKOP_SEGMENT_REPLAY=1,VKOP_GRAPH_NO_BARRIER=1 \
+  replay=$M,VKOP_SEGMENT_REPLAY=1
+```
 
 

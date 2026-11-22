@@ -128,8 +128,8 @@ Add, Concat, Div, Gather, LayerNormalization, MatMul, Mul, Neg, Pow, Reshape, Si
 | Final `decoded` | 6.41e-05 | 7.79e-07 | 1.000000 |
 | 20 stage boundaries* | <= 8e-05 | - | ~1.0 |
 
-*`gen_vae_ref_intermediates.py` promotes 20 boundary tensors to ORT outputs (every `Resize`, each
-`up_blocks.*.resnets.2`/`Add`, `norm_out`, `nonlinearity`, `conv_out`); `compare_vae_node_dump.py`
+*`gen_ort_intermediates.py` promotes 20 boundary tensors to ORT outputs (every `Resize`, each
+`up_blocks.*.resnets.2`/`Add`, `norm_out`, `nonlinearity`, `conv_out`; recipe in its docstring); `compare_node_dump.py`
 matches them against `VKOP_NODE_DUMP` files **by node name** — the dump's `#idx` is not the runtime
 `n` index, so matching by index silently compares the wrong tensors.
 
@@ -180,7 +180,7 @@ copies the queue, so the pool never drained and every node output allocated its 
 by reference makes the pool recycle tensor objects for the first time, and the decoder then breaks
 at the first node whose output buffer lands on bytes a live operand still reads.
 
-`VKOP_NODE_DUMP` + `compare_vae_node_dump.py` (per-node, matched by name) pin where:
+`VKOP_NODE_DUMP` + `compare_node_dump.py` (per-node, matched by name) pin where:
 
 | Node | rms(ref) | rms(err) | relative |
 |------|----------|----------|----------|

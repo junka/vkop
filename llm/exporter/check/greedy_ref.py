@@ -12,6 +12,11 @@ vkop GPU 的输出逐 token 对齐。
     ONNX=text_glm_edge/llm.onnx EMBED=text_glm_edge/embed_tokens.bin \
     MODEL_PATH=~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
       python3 check/greedy_ref.py "你好"
+
+HF=1 改用 HF transformers 的 model.generate(do_sample=False) 出参考（同一套 chat
+template / 分词 / 步数），用来区分「导出图错」还是「vkop 错」：
+    HF=1 MODEL_PATH=~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct \
+      python3 check/greedy_ref.py "hi"
 """
 import os
 import sys
@@ -35,6 +40,26 @@ text = tok.apply_chat_template([{"role": "user", "content": prompt}],
                                tokenize=False, add_generation_prompt=True)
 ids = tok(text, add_special_tokens=False)["input_ids"]
 print(f"[prompt] {len(ids)} tokens: {ids}")
+
+if os.environ.get("HF") == "1":
+    import torch
+    import transformers
+    for cls in ("AutoModelForCausalLM", "AutoModelForImageTextToText"):
+        try:
+            model = getattr(transformers, cls).from_pretrained(
+                MODEL_PATH, torch_dtype=torch.float16)
+            break
+        except (ValueError, KeyError):
+            continue
+    else:
+        sys.exit(f"[!] 不认识的模型类型: {MODEL_PATH}")
+    model.eval()
+    out = model.generate(input_ids=torch.tensor([ids]), max_new_tokens=N,
+                         do_sample=False)
+    gen = out[0][len(ids):].tolist()
+    print("generated ids:", gen)
+    print("decoded:", repr(tok.decode(gen, skip_special_tokens=False)))
+    sys.exit(0)
 
 # ---- 架构参数：从图输入形状读 ----
 sess = ort.InferenceSession(ONNX, providers=["CPUExecutionProvider"])
