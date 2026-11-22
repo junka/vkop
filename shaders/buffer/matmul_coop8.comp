@@ -54,6 +54,12 @@ layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) writeonly buffer Out {
     uvec4 data[];
 } uOutput;
+// SwiGLU gate/up fold (uPC.wide == 2): the epilogue lane's eight columns are
+// four gate and four up columns (B interleaves Wg/Wu by four), so it stores
+// four silu(g) * u halves into the [rows, N/2] output.
+layout(set = 0, binding = 0) writeonly buffer Out2 {
+    uvec2 data[];
+} uOut2;
 layout(set = 0, binding = 1) readonly buffer InA {
     uvec4 data[];
 } uInputA;
@@ -259,7 +265,13 @@ void main() {
     { \
         int grow = row0 + int(sgm) * (WM * 8) + i * 8 + int(lr); \
         uint s = c_base + lr * LDC + lq * 8u; \
-        if (grow < M) { \
+        if (grow < M && uPC.wide == 2) { \
+            vec4 g = uintBitsToFloat(shA[s / 4]); \
+            vec4 u = uintBitsToFloat(shA[s / 4 + 1]); \
+            vec4 hv = g / (1.0 + exp(-g)) * u; \
+            int o = (b * M + grow) * (N >> 1) + ocol8 * 4; \
+            uOut2.data[o >> 2] = uvec2(packHalf2x16(hv.xy), packHalf2x16(hv.zw)); \
+        } else if (grow < M) { \
             uvec4 w; \
             vec4 f0 = uintBitsToFloat(shA[s / 4]); \
             vec4 f1 = uintBitsToFloat(shA[s / 4 + 1]); \

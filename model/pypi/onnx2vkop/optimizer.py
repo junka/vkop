@@ -1847,6 +1847,25 @@ class FusionOptimizer:
             )
         )
 
+        # SwiGLU gate/up fold: the gate and up GEMMs plus silu(g) * u become
+        # ONE MatMul over Wg/Wu interleaved four columns at a time, and the
+        # down projection stays a plain MatMul. Runs before the down fold
+        # (63 > 62), so by default the MLP is folded this way; pass
+        # --no-fusions=fuse_swiglu_gate_up to get the three-GEMM down fold
+        # back. The down fold reads Wd once per 16-row tile and serializes
+        # the up half per row block, which at prefill sizes (M ~ 1400) was
+        # 2.7x slower than three plain GEMMs; this form keeps every GEMM on
+        # the normal kernels and only removes the activation's traffic and
+        # dispatches.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_swiglu_gate_up",
+                FusionOptimizer.match_swiglu_gate_up,
+                FusionOptimizer.fold_swiglu_gate_up,
+                priority=63,
+            )
+        )
+
         # Elemwise chain fusion (kernel-fusion engine): collapse single-
         # consumer pointwise chains (Add/Sub/Mul/Div/Pow/Sqrt/Sigmoid/Neg/
         # Exp/Tanh) into one FusedElemwise dispatch. Runs late (after all
@@ -5970,6 +5989,162 @@ class FusionOptimizer:
         dag_model.nodes[fused.name] = fused
         return True
 
+    # ---- SwiGLU gate/up fold (silu(x . Wg) * (x . Wu)) ----
+    # Matches
+    #     gate = MatMul(x, Wg)     read by the Sigmoid and m1 only
+    #     up   = MatMul(x, Wu)     one consumer
+    #     s    = Sigmoid(gate)     one consumer
+    #     m1   = Mul(gate, s)      one consumer
+    #     m2   = Mul(m1, up)
+    # and replaces all five with MatMul(x, Wgu) swiglu=1 producing m2. Wgu is
+    # [K, 2*N] with Wg and Wu interleaved four columns at a time
+    # (g0..g3 u0..u3 g4..), so a kernel lane that owns eight consecutive
+    # columns holds a gate quartet and its up quartet and can apply the
+    # activation in its own epilogue (ops/Matmul.hpp, swiglu). fp16 weights
+    # only: a quantized pair keeps the unfused graph.
+    @staticmethod
+    def match_swiglu_gate_up(dag_model):
+        producer = {}
+        consumers = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+            for i in n.inputs:
+                consumers[i["name"]].append(n)
+        inits = dag_model.initializers
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
+
+        def _single(name):
+            cs = consumers.get(name, [])
+            return cs[0] if len(cs) == 1 else None
+
+        def _plain_fp16(name):
+            t = inits.get(name)
+            if t is None or len(t.dims) != 2:
+                return False
+            e = deferred.get(name)
+            if e is not None:
+                return (e.get("quant") is None and e.get("lane_major") is None
+                        and e.get("transpose_payload") is None
+                        and e.get("interleave") is None
+                        and e.get("data_type") == TensorProto.FLOAT16
+                        and t.data_type == TensorProto.FLOAT16)
+            return t.data_type in (TensorProto.FLOAT16, TensorProto.FLOAT)
+
+        matches = []
+        for m2 in dag_model.nodes.values():
+            if m2.op_type != "Mul" or len(m2.inputs) != 2:
+                continue
+            m1 = up = None
+            for a, b in ((m2.inputs[0], m2.inputs[1]),
+                         (m2.inputs[1], m2.inputs[0])):
+                p = producer.get(b["name"])
+                q = producer.get(a["name"])
+                if (p is not None and p.op_type == "Mul" and q is not None
+                        and q.op_type == "MatMul"):
+                    m1, up = p, q
+                    break
+            if m1 is None or len(m1.inputs) != 2 or len(up.inputs) != 2:
+                continue
+            gate = sig = None
+            for a, b in ((m1.inputs[0], m1.inputs[1]),
+                         (m1.inputs[1], m1.inputs[0])):
+                p = producer.get(b["name"])
+                if p is not None and p.op_type == "Sigmoid":
+                    cand = producer.get(a["name"])
+                    if (cand is not None and cand.op_type == "MatMul"
+                            and p.inputs[0]["name"] == a["name"]):
+                        gate, sig = cand, p
+                        break
+            if gate is None or len(gate.inputs) != 2 or gate is up:
+                continue
+            if gate.attributes.get("transB", 0) or up.attributes.get("transB", 0):
+                continue
+            if any(k != "transB" for k in list(gate.attributes) + list(up.attributes)):
+                continue
+            x, wg = gate.inputs
+            xu, wu = up.inputs
+            if x["name"] != xu["name"] or wg["name"] == wu["name"]:
+                continue
+            if not (_plain_fp16(wg["name"]) and _plain_fp16(wu["name"])):
+                continue
+            if (wg["name"] in deferred) != (wu["name"] in deferred):
+                continue
+            tg, tu = inits[wg["name"]], inits[wu["name"]]
+            if list(tg.dims) != list(tu.dims) or tg.data_type != tu.data_type:
+                continue
+            k_dim, n_dim = int(tg.dims[0]), int(tg.dims[1])
+            if n_dim % 4 != 0:
+                continue
+            if any(_single(t) is None for t in (up.outputs[0]["name"],
+                                               sig.outputs[0]["name"],
+                                               m1.outputs[0]["name"])):
+                continue
+            greaders = consumers.get(gate.outputs[0]["name"], [])
+            if not (len(greaders) == 2 and sig in greaders and m1 in greaders):
+                continue
+            # Both weights must be read by this pair alone: the fold replaces
+            # them with the interleaved one.
+            if (len(consumers.get(wg["name"], [])) != 1
+                    or len(consumers.get(wu["name"], [])) != 1):
+                continue
+            matches.append({"gate": gate, "up": up, "sigmoid": sig, "m1": m1,
+                            "m2": m2, "x": x, "wg": wg["name"],
+                            "wu": wu["name"], "k": k_dim, "n": n_dim})
+        return matches
+
+    @staticmethod
+    def fold_swiglu_gate_up(dag_model, match) -> bool:
+        wg, wu = match["wg"], match["wu"]
+        k_dim, n_dim = match["k"], match["n"]
+        name = wg + "__swiglu_gu"
+        inits = dag_model.initializers
+        deferred = getattr(dag_model, "deferred_weights", None)
+        tg = inits[wg]
+        if deferred is not None and wg in deferred:
+            eg, eu = deferred[wg], deferred[wu]
+            t = TensorProto()
+            t.CopyFrom(tg)
+            t.name = name
+            del t.dims[:]
+            t.dims.extend([k_dim, 2 * n_dim])
+            for kv in t.external_data:
+                if kv.key == "length":
+                    kv.value = str(2 * int(eg["length"]))
+            entry = dict(eg)
+            entry["name"] = name
+            entry["length"] = 2 * int(eg["length"])
+            entry["dims"] = (k_dim, 2 * n_dim)
+            entry["consumers"] = 1
+            entry["interleave"] = {"g": dict(eg), "u": dict(eu),
+                                   "k": k_dim, "n": n_dim}
+            deferred[name] = entry
+            deferred.pop(wg, None)
+            deferred.pop(wu, None)
+        else:
+            g = numpy_helper.to_array(tg)
+            u = numpy_helper.to_array(inits[wu])
+            gu = np.concatenate([g.reshape(k_dim, n_dim // 4, 4),
+                                 u.reshape(k_dim, n_dim // 4, 4)], axis=2)
+            t = numpy_helper.from_array(
+                np.ascontiguousarray(gu.reshape(k_dim, 2 * n_dim)), name)
+        inits[name] = t
+        del inits[wg]
+        del inits[wu]
+        fused = Node(
+            op_type="MatMul",
+            name=match["gate"].name + "_swiglu",
+            attributes={"swiglu": [1]},
+            inputs=[match["x"], {"name": name}],
+            outputs=match["m2"].outputs[:],
+        )
+        for key in ("gate", "up", "sigmoid", "m1", "m2"):
+            n = match[key]
+            if n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
     # ---- QDQ weight-into-MatMul (weight-only int8) fusion ----
     # An externally-quantized model carries its weights as a QDQ triple:
     #     DequantizeLinear(u8_const, scalar_fp32_scale, scalar_u8_zero_point)
@@ -8264,6 +8439,10 @@ class Quantizer:
             if node.attributes.get("down_act") and len(node.inputs) >= 4:
                 down_act_weight_names.update(
                     inp["name"] for inp in node.inputs[1:4])
+            # The SwiGLU gate/up fold's interleaved weight stays fp16: the
+            # runtime's swiglu epilogue exists only on the fp16 kernels.
+            if node.attributes.get("swiglu") and len(node.inputs) >= 2:
+                down_act_weight_names.add(node.inputs[1]["name"])
 
         for name in initializers_keys:
             if Quantizer._is_excluded(name, exclude):

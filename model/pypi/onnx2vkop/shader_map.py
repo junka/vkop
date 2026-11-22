@@ -133,6 +133,9 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_matmul_coop",
         # Apple 8x8x8 coopmat GEMM; only the MoltenVK driver builds it.
         "buffer_matmul_coop8",
+        # Pack pass of the SwiGLU gate/up fold (swiglu=1) on routes without
+        # the swiglu epilogue.
+        "buffer_matmul_swiglu_pack",
         "buffer_matmul_coop16",
         # Larger 16x16x16 workgroups of the same coop16 source (-DACC_M/-DACC_N):
         # 64x64 and 64x128 output footprints. Which one a MatMul dispatches is a

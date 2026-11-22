@@ -464,10 +464,24 @@ Qwen3-VL-2B fp16，第二轮 prefill 的 wall 时间：
 | 以上全部换回 SIMT（MatMul 与 attention 都不走 coopmat） | 657 ms |
 | 同一模型保留 `fuse_swiglu_down_proj` 融合（coopmat 全开） | 1462 ms |
 
-SwiGLU 融合 kernel 是为 decode 的小 M 写的，到 prefill 的 M≈1400 时比不融合慢 2.7 倍（第一轮 1556 → 570 ms），
-而 decode 不受影响（第 20 个 token 17.4–17.6 ms，两种模型相同），所以长 prompt 场景应当用
-`--no-fusions=fuse_swiglu_down_proj` 转换，和 DiT 一样。prefill 还会对全部位置算 lm_head 和 TopK，只有最后一个
-位置有用。注意：2026-11-19 转换的 `llm.vkopbin` 配现在的 runtime 第一个 token 就错（输出 "!"），要重新转换。
+SwiGLU 的旧融合 `fuse_swiglu_down_proj` 把 gate、up、down 三个 GEMM 并成一个 kernel，是为 decode 的小 M 写的，
+到 prefill 的 M≈1400 时比不融合慢 2.7 倍（第一轮 1556 → 570 ms），decode 上也不比不融合快。
+
+**SwiGLU gate/up 融合（2026-11-22，转换器默认）。** `fuse_swiglu_gate_up` 只融合前两段：gate、up 两个 GEMM 和
+silu(g)·u 合成一个 MatMul（`swiglu=1`），权重 Wg、Wu 按 4 列交错拼成 [K, 2N]，down 仍是普通 MatMul。fp16 WIDE
+split-K GEMV（decode）和 Apple coopmat GEMM（prefill）在自己的收尾里算 silu(g)·u，其余路由先写 [M, 2N] 暂存再跑一个
+pack pass（`matmul_swiglu_pack.comp`）。量化权重不做这个融合。同一台机器交替测 3 次：
+
+| 转换方式 | decode（64 token 均值） | 第二轮 prefill |
+|---|---|---|
+| 旧 down 融合（`--no-fusions=fuse_swiglu_gate_up`） | 13.9–14.1 ms | 1470–1481 ms |
+| 不融合 | 14.0–14.1 ms | 545 ms |
+| **gate/up 融合** | **13.3–13.4 ms** | **539–540 ms** |
+
+decode 每 token 少 2 次 dispatch，gate/up 合成一个更宽的 GEMV 也更接近带宽上限；输出与不融合的模型前 48 个 token
+一致。Qwen-Image 文本塔（M=78）的前向 0.62–0.68 s → 0.25 s（旧 down 融合的 `down_act_gemv` 在这个 M 上最慢），
+DiT（M=1024）每步不变。prefill 还会对全部位置算 lm_head 和 TopK，只有最后一个位置有用。注意：2026-11-19 转换的
+`llm.vkopbin` 配现在的 runtime 第一个 token 就错（输出 "!"），要重新转换。
 
 复现（脚本只是把下面两条包起来串行跑，并比较输出）：
 
@@ -478,8 +492,7 @@ printf 'Explain in detail how a transformer language model works.\n' | VKOP_PROF
   ./build/llm_chat llm/exporter/llm.vkopbin llm/exporter/embed_tokens.bin llm/tokenizer/qwen3_vl.bin 64
 # 转换（每个模型约 10–30 s，权重流式读取，峰值内存约 0.2 GB）
 cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
-  -o ../../llm/exporter/llm.vkopbin -q fp16 --extra-shaders TopK --no-fusions=fuse_swiglu_down_proj \
-  --master-archive ../../build/vkop_shaders.bin
+  -o ../../llm/exporter/llm.vkopbin -q fp16 --extra-shaders TopK --master-archive ../../build/vkop_shaders.bin
 ```
 
 ### 文生图：Qwen-Image-2.1，512×512，40 步
@@ -488,7 +501,7 @@ cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
 
 | 阶段 | 时间 | 说明 |
 |---|---|---|
-| 文本塔 加载 / 前向 | 2.24 s / 0.45 s | 13.9 GB，用完即释放 |
+| 文本塔 加载 / 前向 | 2.24 s / 0.25 s | 13.9 GB，用完即释放；SwiGLU 走 gate/up 融合 |
 | DiT prefill 加载 / 前向 | 2.5 s / 0.19 s | 13.8 GB，32 层 KV |
 | DiT decode 加载 | 1.87 s | 14.2 GB |
 | **去噪 40 步** | **53.3 s（约 1.33 s/步，随芯片温度变化）** | m = 1024 图像 token；MatMul 占每步约 90%；在 MoltenVK 上 MatMul 和 flash attention 都走 8×8 coopmat（simdgroup_matrix） |

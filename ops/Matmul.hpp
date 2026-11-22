@@ -664,6 +664,16 @@ class MatMulBuffer : public BufferFactory {
             auto list = parse_attr_list<int>(raw);
             down_act_ = !list.empty() ? list[0] != 0 : std::stol(raw) != 0;
         }
+        // SwiGLU gate/up fold (fuse_swiglu_gate_up): B is Wg and Wu
+        // interleaved four columns at a time, [K, 2*N_up] as
+        // g0 g1 g2 g3 u0 u1 u2 u3 g4 ..., and the output is
+        // silu(x . Wg) * (x . Wu), [.., N_up]. Same bare-int spelling as
+        // down_act.
+        auto sw = attributes.find("swiglu");
+        if (sw != attributes.end() && !sw->second.empty()) {
+            auto list = parse_attr_list<int>(sw->second);
+            swiglu_ = !list.empty() ? list[0] != 0 : std::stol(sw->second) != 0;
+        }
     }
 
   private:
@@ -685,6 +695,19 @@ class MatMulBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        swiglu_pack_ = false;
+        execute_core(inputs, outputs);
+        // A swiglu op whose route has no swiglu epilogue wrote the plain
+        // interleaved product to swiglu_scratch_; finish it here.
+        if (swiglu_pack_) {
+            objs_[0] = swiglu_out_;
+            submit_swiglu_pack();
+        }
+    }
+
+    void execute_core(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
         // Host work here is only the split-K / down-act control header written
         // through a HOST_COHERENT mapping, and even that is suppressed unless
         // the cut actually changed. Default to "no host work" and flip it at
@@ -991,12 +1014,21 @@ class MatMulBuffer : public BufferFactory {
         std::vector<int> out_shape = lead_shape;
         if (rank_a >= 2)
             out_shape.push_back(m);
+        if (swiglu_ && (fp16_ == 0 || transB_ || rank_b < 2 || (n % 8) != 0 ||
+                        !core::is_float_elem(inputs[1]->elem_kind()) ||
+                        inputs.size() != 2)) {
+            throw std::runtime_error(
+                "vkop: MatMul swiglu needs fp16, a plain [K, 2*N_up] fp16 B "
+                "with N_up % 4 == 0 and no transB (got N = " +
+                std::to_string(n) + ")");
+        }
+        const int n_out = swiglu_ ? n / 2 : n;
         if (rank_b >= 2)
-            out_shape.push_back(n);
+            out_shape.push_back(n_out);
         if (out_shape.empty())
             out_shape = {1};
 
-        int total = batch * m * n;
+        int total = batch * m * n_out;
 
         if (weight_byte && !down_act_byte) {
             // The scale indexes output columns, so its length IS N. A mismatch
@@ -1681,6 +1713,38 @@ class MatMulBuffer : public BufferFactory {
         para_.ks_part = 0;
         para_.wide = plan.wide ? 1 : 0;
         para_.ksplit_q = plan.ksplit_q;
+        // SwiGLU gate/up fold. Two kernels apply silu(g) * u in their own
+        // epilogue (uPC.wide == 2): the fp16 WIDE split-K GEMV, whose lane
+        // owns eight columns = one g/u quartet pair, and the Apple coopmat
+        // GEMM, whose epilogue lane holds eight consecutive columns of a row.
+        // Every other route computes the plain [.., 2*N_up] product into a
+        // scratch buffer and a pack pass applies the activation afterwards.
+        swiglu_pack_ = false;
+        swiglu_coop8_ = false;
+        if (swiglu_) {
+            const bool gemv = plan.route == core::MatmulRoute::kKsplitWide ||
+                              plan.route == core::MatmulRoute::kKsplitWide512;
+            if (gemv) {
+                para_.wide = 2;
+            } else if (plan.route == core::MatmulRoute::kTiled &&
+                       coop8_eligible(m, n, k) && coop8_pipeline() != nullptr) {
+                swiglu_coop8_ = true;
+            } else {
+                const VkDeviceSize bytes = static_cast<VkDeviceSize>(batch) *
+                                           m * n * sizeof(uint16_t);
+                if (!swiglu_scratch_ || swiglu_scratch_bytes_ < bytes) {
+                    swiglu_scratch_ = std::make_shared<VulkanBuffer>(
+                        m_dev_, bytes, STORAGE,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    swiglu_scratch_bytes_ = bytes;
+                }
+                swiglu_out_ = objs_[0];
+                objs_[0] = swiglu_scratch_;
+                swiglu_pack_ = true;
+                swiglu_rows_ = batch * m;
+                swiglu_nup_ = n / 2;
+            }
+        }
         // Mirrored for the route log. set_route runs later, at the dispatch
         // site, and the split-K launch geometry is exactly what a route line
         // needs in order to explain an occupancy shortfall.
@@ -2579,13 +2643,12 @@ class MatMulBuffer : public BufferFactory {
             }();
             // Apple: the same plain fp16 shape on 8x8x8 simdgroup matrices
             // (64x64 workgroup tile, 16-deep K step).
-            if (fp16_ != 0 && para_.transB == 0 && para_.weight_int8 == 0 &&
-                para_.epi_bias == 0 && para_.attn_softmax == 0 &&
-                para_.w4 == 0 &&
-                n % 64 == 0 && k % 16 == 0 && m >= 64) {
+            if (coop8_eligible(m, n, k)) {
                 if (VulkanPipeline *c8 = coop8_pipeline()) {
-                    set_route("coop8", batch, m, n, k, rep);
+                    set_route(swiglu_coop8_ ? "coop8_swiglu" : "coop8", batch,
+                              m, n, k, rep);
                     para_.tile = 2;
+                    para_.wide = swiglu_coop8_ ? 2 : 0;
                     ks_submit(c8, coop8_ds_[m_id_], n / 64, UP_DIV(m, 64),
                               batch);
                     return;
@@ -3647,6 +3710,60 @@ class MatMulBuffer : public BufferFactory {
     // That is off-spec, so it is enabled by device, not by feature query:
     // only on the MoltenVK driver, and a pipeline the driver refuses just
     // leaves the SIMT tile in charge. VKOP_COOP8=0 turns it off.
+    // The plain fp16 shape matmul_coop8.comp serves (see the tile route).
+    bool coop8_eligible(int m, int n, int k) const {
+        return fp16_ != 0 && para_.transB == 0 && para_.weight_int8 == 0 &&
+               para_.epi_bias == 0 && para_.attn_softmax == 0 &&
+               para_.w4 == 0 && n % 64 == 0 && k % 16 == 0 && m >= 64;
+    }
+
+    // The SwiGLU fold's pack pass (matmul_swiglu_pack.comp) for routes whose
+    // kernel has no swiglu epilogue: reads the [rows, 2*N_up] interleaved
+    // product from swiglu_scratch_, writes silu(g) * u to the real output.
+    struct alignas(16) SwigluPackPC {
+        int rows;
+        int n_up;
+        int pad0;
+        int pad1;
+    };
+    void submit_swiglu_pack() {
+        if (!swiglu_pack_pipe_) {
+            auto spv = resolve_spv("buffer_matmul_swiglu_pack");
+            swiglu_pack_pipe_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE,
+                                              DESCRIPTOR_TYPE_STORAGE},
+                sizeof(SwigluPackPC), spv.first,
+                static_cast<int>(spv.second), false, 0, nullptr);
+            for (auto &ds : swiglu_pack_ds_) {
+                ds = swiglu_pack_pipe_->allocDescriptorSets();
+            }
+        }
+        swiglu_scratch_->shaderWriteBarrier(m_cmd_->get());
+        VkDescriptorSet ds = swiglu_pack_ds_[m_id_];
+        std::vector<VkWriteDescriptorSet> w(2);
+        const std::shared_ptr<VulkanResource> res[2] = {swiglu_out_,
+                                                         swiglu_scratch_};
+        for (int i = 0; i < 2; ++i) {
+            w[i] = {};
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = ds;
+            w[i].dstBinding = static_cast<uint32_t>(i);
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = DESCRIPTOR_TYPE_STORAGE;
+            w[i].pBufferInfo = std::get<VkDescriptorBufferInfo *>(
+                res[i]->getDescriptorInfo());
+        }
+        swiglu_pack_pipe_->updateDescriptorSets(w);
+        m_cmd_->bind(*swiglu_pack_pipe_, ds);
+        swiglu_pc_ = {swiglu_rows_, swiglu_nup_, 0, 0};
+        m_cmd_->push_constants(*swiglu_pack_pipe_, sizeof(SwigluPackPC),
+                               &swiglu_pc_);
+        const int groups = swiglu_rows_ * (swiglu_nup_ / 4);
+        dispatch_and_record(UP_DIV(groups, 256), 1, 1, &swiglu_pc_,
+                            sizeof(SwigluPackPC));
+    }
+
     VulkanPipeline *coop8_pipeline() {
         if (coop8_state_ != 0 && coop8_nbind_ == objs_.size()) {
             return coop8_state_ > 0 ? coop8_pipeline_.get() : nullptr;
@@ -3775,6 +3892,18 @@ class MatMulBuffer : public BufferFactory {
     // not tried, 1 = built, -1 = unavailable (not MoltenVK, disabled, no
     // archive bytes, or the driver refused the pipeline).
     std::unique_ptr<VulkanPipeline> coop8_pipeline_;
+    // SwiGLU gate/up fold state (see the swiglu attribute and execute()).
+    bool swiglu_ = false;
+    bool swiglu_pack_ = false;
+    bool swiglu_coop8_ = false;
+    int swiglu_rows_ = 0;
+    int swiglu_nup_ = 0;
+    std::shared_ptr<VulkanBuffer> swiglu_scratch_;
+    VkDeviceSize swiglu_scratch_bytes_ = 0;
+    std::shared_ptr<VulkanResource> swiglu_out_;
+    std::unique_ptr<VulkanPipeline> swiglu_pack_pipe_;
+    VkDescriptorSet swiglu_pack_ds_[vkop::kInflight] = {nullptr};
+    SwigluPackPC swiglu_pc_{};
     VkDescriptorSet coop8_ds_[vkop::kInflight] = {nullptr};
     int coop8_state_ = 0;
     size_t coop8_nbind_ = 0;

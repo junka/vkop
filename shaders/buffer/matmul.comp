@@ -1439,6 +1439,16 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
         v1 += ks_w[KS_LANES + t * q + oct];
     }
     if (c >= uPC.N) return;
+    if (uPC.wide == 2) {
+        // SwiGLU gate/up fold: B interleaves Wg and Wu four columns at a time,
+        // so this lane's octet is gate columns c/2 .. c/2+3 (v0) and the same
+        // up columns (v1). The output is [rows, N/2].
+        vec4 h = v0 / (1.0 + exp(-v0)) * v1;
+        int o = row * (uPC.N >> 1) + (c >> 1);
+        uOutput.data[o >> 1] = packHalf2x16(h.xy);
+        uOutput.data[(o >> 1) + 1] = packHalf2x16(h.zw);
+        return;
+    }
     int out_idx = row * uPC.N + c;
     uOutput.data[out_idx >> 1] = packHalf2x16(v0.xy);
     uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v0.zw);

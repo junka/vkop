@@ -844,6 +844,8 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
         return _write_quantized(entry, out_f, base_dir, dag_model)
     if entry.get("lane_major") is not None:
         return _write_lane_major(entry, out_f, base_dir)
+    if entry.get("interleave") is not None:
+        return _write_interleave(entry, out_f, base_dir)
     path = entry["location"]
     if not os.path.isabs(path):
         path = os.path.join(base_dir, path)
@@ -870,6 +872,50 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
             out_f.write(block)
             remaining -= len(block)
     return entry["length"] - remaining
+
+
+def _read_rows(src_entry: dict, base_dir: str, row0: int, rows: int,
+               n_dim: int) -> np.ndarray:
+    """Rows [row0, row0+rows) of a [K, N] 16-bit deferred source, as fp16 bits."""
+    path = src_entry["location"]
+    if not os.path.isabs(path):
+        path = os.path.join(src_entry.get("base_dir") or base_dir, path)
+    want = rows * n_dim * 2
+    with open(path, "rb") as f:
+        f.seek(int(src_entry["offset"]) + row0 * n_dim * 2)
+        block = f.read(want)
+    if len(block) != want:
+        raise DeferredWeightError(
+            f"deferred weight '{src_entry['name']}' runs out of source bytes "
+            f"while interleaving for the SwiGLU gate/up fold")
+    u16 = np.frombuffer(block, dtype=np.uint16)
+    if src_entry.get("src_dtype") == TensorProto.BFLOAT16:
+        f32 = (u16.astype(np.uint32) << 16).view(np.float32)
+        with np.errstate(over="ignore"):
+            u16 = f32.astype(np.float16).view(np.uint16)
+    return u16.reshape(rows, n_dim)
+
+
+def _write_interleave(entry: dict, out_f, base_dir: str) -> int:
+    """Stream the SwiGLU gate/up fold's weight: Wg and Wu ([K, N] each) as one
+    [K, 2N] payload interleaved four columns at a time (g0..g3 u0..u3 g4 ..),
+    see FusionOptimizer.fold_swiglu_gate_up. Read in row bands from both
+    sources, so neither is ever held whole."""
+    spec = entry["interleave"]
+    k_dim, n_dim = int(spec["k"]), int(spec["n"])
+    band = max(1, _CHUNK_BYTES // max(1, n_dim * 2))
+    written = 0
+    row = 0
+    while row < k_dim:
+        take = min(band, k_dim - row)
+        g = _read_rows(spec["g"], base_dir, row, take, n_dim)
+        u = _read_rows(spec["u"], base_dir, row, take, n_dim)
+        gu = np.concatenate([g.reshape(take, n_dim // 4, 4),
+                             u.reshape(take, n_dim // 4, 4)], axis=2)
+        out_f.write(np.ascontiguousarray(gu).tobytes())
+        written += take * 2 * n_dim * 2
+        row += take
+    return written
 
 
 def _write_lane_major(entry: dict, out_f, base_dir: str) -> int:

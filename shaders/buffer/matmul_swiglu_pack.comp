@@ -1,0 +1,33 @@
+#version 450 core
+
+// Pack pass of the SwiGLU gate/up fold (MatMul swiglu=1) for the routes whose
+// kernel has no swiglu epilogue: the MatMul wrote the plain product of x and
+// the interleaved [K, 2*N_up] weight, so every 8 halves of a row are four gate
+// columns then the same four up columns. One lane turns one such octet into
+// four silu(g) * u halves of the [rows, N_up] output.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uvec2 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer In {
+    uvec4 data[];
+} uInput;
+
+layout(push_constant) uniform PC {
+    int rows;
+    int n_up;
+    int pad0;
+    int pad1;
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.rows * (uPC.n_up >> 2)) return;
+    uvec4 w = uInput.data[gid];
+    vec4 g = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+    vec4 u = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
+    vec4 h = g / (1.0 + exp(-g)) * u;
+    uOutput.data[gid] = uvec2(packHalf2x16(h.xy), packHalf2x16(h.zw));
+}

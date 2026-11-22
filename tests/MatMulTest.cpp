@@ -232,6 +232,60 @@ TEST(MatMulTest, MatMulCoop8) {
     EXPECT_TRUE(bw.run_test({bw.inputa, bw.inputb}, {bw.output}));
 }
 
+// SwiGLU gate/up fold (MatMul swiglu=1, converter fuse_swiglu_gate_up): B is
+// Wg and Wu interleaved four columns at a time, [K, 2*N_up], and the output is
+// silu(x . Wg) * (x . Wu). Three routes apply it: the fp16 WIDE split-K GEMV
+// (decode rows) and the Apple coopmat GEMM (M >= 64) in their own epilogue,
+// and every other route (here M = 20 on the tile) through the scratch + pack
+// pass.
+namespace {
+template <typename T>
+class MatMulSwigluTest : public TestCase<T> {
+public:
+    std::shared_ptr<Tensor<T>> inputa, inputb, output;
+
+    MatMulSwigluTest(int batch, int m, int k, int n_up) : TestCase<T>("MatMul") {
+        inputa = std::make_shared<Tensor<T>>(std::vector<int>{batch, m, k});
+        inputb = std::make_shared<Tensor<T>>(std::vector<int>{k, 2 * n_up});
+        output = std::make_shared<Tensor<T>>(std::vector<int>{batch, m, n_up});
+        auto x = torch::randn({batch, m, k}, this->getTorchConf()) * 0.5;
+        auto wg = torch::randn({k, n_up}, this->getTorchConf()) * 0.1;
+        auto wu = torch::randn({k, n_up}, this->getTorchConf()) * 0.1;
+        auto g = torch::matmul(x.to(torch::kFloat), wg.to(torch::kFloat));
+        auto u = torch::matmul(x.to(torch::kFloat), wu.to(torch::kFloat));
+        auto ref = (g * torch::sigmoid(g) * u).to(x.dtype());
+        auto gu = torch::cat({wg.reshape({k, n_up / 4, 4}),
+                              wu.reshape({k, n_up / 4, 4})}, 2)
+                      .reshape({k, 2 * n_up}).contiguous();
+        this->fillTensorFromTorch(inputa, x);
+        this->fillTensorFromTorch(inputb, gu);
+        this->fillTensorFromTorch(output, ref);
+    }
+};
+} // namespace
+
+TEST(MatMulTest, MatMulSwigluGateUp) {
+    vkop::tests::ScopedBufferBackend buffer;
+    struct Case {
+        int batch, m, k, n_up;
+    };
+    const std::vector<Case> cases = {
+        {1, 1, 512, 2048},  // decode, wide N: WIDE split-K GEMV epilogue
+        {2, 1, 128, 64},    // narrow decode rows: scratch + pack pass
+        {1, 20, 128, 96},   // tile route: scratch + pack pass
+        {1, 130, 128, 128}, // M >= 64: coopmat epilogue on MoltenVK
+    };
+    for (const auto &c : cases) {
+        MatMulSwigluTest<uint16_t> t(c.batch, c.m, c.k, c.n_up);
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb}, {t.output},
+            [](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute({{"swiglu", "1"}});
+            }))
+            << "batch=" << c.batch << " m=" << c.m << " k=" << c.k
+            << " n_up=" << c.n_up;
+    }
+}
+
 // ONNX MatMul with a 1-D operand: a rank-1 A is a single row [K] (promoted to
 // [1,K]), a rank-1 B a single column [K] (promoted to [K,1]), and the promoted
 // dim is dropped from the output again — {K}x{K,N} -> {N}, {M,K}x{K} -> {M}.
