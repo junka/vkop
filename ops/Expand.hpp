@@ -354,9 +354,22 @@ class Expand : public Operator {
         // shader reads output dims from the push constant — NOT from the
         // (int64, possibly- mismatched) shape buffer — so broadcasting is
         // computed on the host where the dtypes are known.
-        param_.rank = static_cast<int>(out_shape.size());
-        fill_dims(param_.outDims, out_shape);
-        fill_dims_broadcast(param_.inDims, inshape, param_.rank);
+        // Coalesced: size-1 axes dropped and neighbours that broadcast the
+        // same way merged (the VAE's [1,C,1,1,H,W] -> [1,C,r,1,H,W] channel
+        // repeat is [C,1,HW] -> [C,r,HW]), so the shader's index decode has
+        // fewer div/mod steps.
+        param_.rank = fill_dims_coalesced(param_.outDims, out_shape,
+                                          {&param_.inDims}, {&inshape});
+        // fp16 word copy (_pad0): when the innermost axis is copied, not
+        // broadcast, and even, every output word is one whole input word.
+        param_._pad0 = 0;
+        if (fp16_ != 0 && param_.rank > 0) {
+            const int last = param_.rank - 1;
+            if (param_.inDims[last] == param_.outDims[last] &&
+                param_.outDims[last] % 2 == 0) {
+                param_._pad0 = 1;
+            }
+        }
         // fp16 packs two elements per uint word; dispatch one thread per word
         // (the shader writes each word once — no read-modify-write race).
         int nthreads = (fp16_ != 0) ? (total_size + 1) / 2 : total_size;

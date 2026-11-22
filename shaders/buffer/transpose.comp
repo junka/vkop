@@ -84,6 +84,18 @@ void main() {
     if (gid >= nwords) return;
     int e0 = 2 * gid;
     int e1 = 2 * gid + 1;
+    const int last = rank - 1;
+    if ((uTrans.outDims.v[last] & 1) == 0) {
+        // Even output rows: e1 is e0's neighbour along the last output axis,
+        // one input stride of that axis further -- decode once.
+        int ax = uTrans.perm.v[last];
+        int stride = 1;
+        for (int i = ax + 1; i < rank; ++i) stride *= uTrans.inDims.v[i];
+        int i0 = transpose_elem(e0);
+        uOutput.data[gid] = packHalf2x16(vec2(BUF_LOAD(uInput.data, i0),
+                                              BUF_LOAD(uInput.data, i0 + stride)));
+        return;
+    }
     float v0 = float(BUF_LOAD(uInput.data, transpose_elem(e0)));
     if (e1 >= out_total) {
         uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));

@@ -617,8 +617,25 @@ class ResizeBuffer : public BufferFactory {
         pc.mode = mode_;
         pc.nearest_mode = nearest_mode_;
         pc.coord_mode = coordinate_transformation_mode_;
-        fill_dims(pc.inDims, inshape);
-        fill_dims(pc.outDims, outshape);
+        // Leading axes that are not resized are one flat axis to the shader
+        // ([1, C, H, W] -> [C, H, W]): fewer div/mod steps per element. The
+        // linear path still sees its two spatial axes last.
+        {
+            std::vector<int> ci = inshape, co = outshape;
+            int k = 0;
+            while (k + 2 < static_cast<int>(ci.size()) && ci[k] == co[k]) ++k;
+            if (k >= 2) {
+                int lead = 1;
+                for (int i = 0; i < k; ++i) lead *= ci[i];
+                ci.erase(ci.begin(), ci.begin() + k);
+                co.erase(co.begin(), co.begin() + k);
+                ci.insert(ci.begin(), lead);
+                co.insert(co.begin(), lead);
+            }
+            pc.rank = static_cast<int>(ci.size());
+            fill_dims(pc.inDims, ci);
+            fill_dims(pc.outDims, co);
+        }
         // fp16 packs two elements per uint word; dispatch one thread per word
         // (the fp16 shader writes each word once — no RMW race).
         int total = total_elems(outshape);

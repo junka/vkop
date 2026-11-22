@@ -203,6 +203,28 @@ void main() {
     if (gid >= nwords) return;
     int e0 = 2 * gid;
     int e1 = 2 * gid + 1;
+    const int last = uParam.rank - 1;
+    const int ow_dim = uParam.outDims.v[last];
+    if (uParam.mode == MODE_NEAREST && (ow_dim & 1) == 0) {
+        // Even output rows: both elements of the word share every coordinate
+        // but the last, so decode once and step the column (an integer
+        // upscale maps both to the same source and loads it once).
+        const int iw_dim = uParam.inDims.v[last];
+        int i0 = resize_elem(e0);
+        int ow0 = e0 % ow_dim;
+        int w0 = (ow_dim == iw_dim)
+                     ? ow0
+                     : nearest_index(transform_coord(ow0, iw_dim, ow_dim), iw_dim);
+        int w1 = (ow_dim == iw_dim)
+                     ? ow0 + 1
+                     : nearest_index(transform_coord(ow0 + 1, iw_dim, ow_dim),
+                                     iw_dim);
+        int i1 = i0 + (w1 - w0);
+        float v0 = BUF_LOAD(uInput.data, i0);
+        float v1 = (i1 == i0) ? v0 : BUF_LOAD(uInput.data, i1);
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        return;
+    }
     float v0 = one(e0);
     float v1 = (e1 < out_total) ? one(e1) : 0.0;
     uOutput.data[gid] = packHalf2x16(vec2(v0, v1));

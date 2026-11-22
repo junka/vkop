@@ -84,6 +84,12 @@ void main() {
     int nwords = (out_total + 1) / 2;
     if (gid >= nwords) return;
     int e0 = 2 * gid;
+    if (uParam._pad0 == 1) {
+        // Innermost axis copied and even (host-checked): the word's two
+        // elements are one input word.
+        uOutput.data[gid] = uInput.data[expand_elem(e0) >> 1];
+        return;
+    }
     int e1 = 2 * gid + 1;
     float v0 = BUF_LOAD(uInput.data, expand_elem(e0));
     if (e1 >= out_total) {

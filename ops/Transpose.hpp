@@ -88,6 +88,54 @@ struct GpuTransposeParam {
     ivec4 reverse_perms;
 };
 
+// The same data movement on fewer axes: size-1 axes dropped, and input axes
+// that stay adjacent and in order in the output merged into one. The VAE's
+// pixel shuffle [1,C,2,2,2,1,H,W] perm (0,1,5,2,6,3,7,4) becomes
+// [2C,2,2,H,W] perm (0,3,1,4,2). Returns the coalesced input shape and perm.
+inline void coalesce(const std::vector<int> &in, const std::vector<int> &perm,
+                     std::vector<int> &cin, std::vector<int> &cperm) {
+    // Output order of the kept (non-unit) input axes.
+    std::vector<int> order;
+    for (int p : perm) {
+        if (in[p] != 1) order.push_back(p);
+    }
+    cin.clear();
+    cperm.clear();
+    if (order.empty()) {
+        cin = {1};
+        cperm = {0};
+        return;
+    }
+    // Runs of consecutive input axes (skipping unit axes) along the output.
+    auto next_kept = [&](int a) {
+        for (int b = a + 1; b < static_cast<int>(in.size()); ++b)
+            if (in[b] != 1) return b;
+        return -1;
+    };
+    std::vector<std::vector<int>> groups;
+    for (int a : order) {
+        if (!groups.empty() && next_kept(groups.back().back()) == a) {
+            groups.back().push_back(a);
+        } else {
+            groups.push_back({a});
+        }
+    }
+    // Input order of the groups = order of their first axis.
+    std::vector<int> idx(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g) idx[g] = static_cast<int>(g);
+    std::sort(idx.begin(), idx.end(), [&](int x, int y) {
+        return groups[x][0] < groups[y][0];
+    });
+    std::vector<int> rank_of(groups.size());
+    for (size_t r = 0; r < idx.size(); ++r) {
+        int g = idx[r];
+        rank_of[g] = static_cast<int>(r);
+        int d = 1;
+        for (int a : groups[g]) d *= in[a];
+        cin.push_back(d);
+    }
+    for (size_t g = 0; g < groups.size(); ++g) cperm.push_back(rank_of[g]);
+}
 } // namespace transpose
 
 class TransposeImage : public Operator {
@@ -380,12 +428,20 @@ class TransposeBuffer : public BufferFactory {
             in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
+        // The shader works on the coalesced problem (see transpose::coalesce):
+        // fewer axes to decode per element, and a kept innermost run as long
+        // as it really is.
+        std::vector<int> cin, cperm;
+        transpose::coalesce(inshape, perm, cin, cperm);
+        const int crank = static_cast<int>(cin.size());
+        std::vector<int> cout(crank);
+        for (int i = 0; i < crank; ++i) cout[i] = cin[cperm[i]];
         TransposePC pc{};
-        pc.rank = rank;
-        fill_dims(pc.inDims, inshape);
-        fill_dims(pc.outDims, outshape);
+        pc.rank = crank;
+        fill_dims(pc.inDims, cin);
+        fill_dims(pc.outDims, cout);
         for (int i = 0; i < 8; ++i) {
-            pc.perm[i] = (i < rank) ? perm[i] : i;
+            pc.perm[i] = (i < crank) ? cperm[i] : i;
         }
         // fp16 packs two elements per uint word; dispatch one thread per output
         // word (the fp16 shader writes each word once — no RMW race), or one
@@ -393,8 +449,8 @@ class TransposeBuffer : public BufferFactory {
         int total = total_elems(outshape);
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
         pc.chunk = 1;
-        if (fp16_ != 0 && rank > 0 && perm[rank - 1] == rank - 1 &&
-            outshape[rank - 1] % 8 == 0) {
+        if (fp16_ != 0 && crank > 0 && cperm[crank - 1] == crank - 1 &&
+            cout[crank - 1] % 8 == 0) {
             pc.chunk = 4;
             nthreads = total / 8;
         }

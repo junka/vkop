@@ -704,7 +704,8 @@ With the coopmat flash attention as well (`attention_flash_coop8.comp`, below): 
 | fp32 graph (before) | ~630 ms | Conv2d ~575 ms (SIMT implicit GEMM, ~7.4 TFLOPS) |
 | `drop_broadcast_expand` + `transpose_unit_axes_to_reshape` | ~590 ms | the RMS norm's [1,C,1,H,W] Expand (36 of 40) gone: Expand 53 -> 16 ms, FE 27 -> 20 ms; 10 size-1-axis Transposes become aliased Reshapes |
 | Reduce over one contiguous axis run as a strided loop | ~568 ms | ReduceL2 over C: 32 -> 10 ms (fp16: 54 -> 8 ms) |
-| fp16 graph (`-q fp16`) + `conv_coop8.comp` | **~534 ms** | Conv2d 547 -> 478 ms; decode 0.76 -> 0.66 s in `image_gen` |
+| fp16 graph (`-q fp16`) + `conv_coop8.comp` | ~534 ms | Conv2d 547 -> 478 ms; decode 0.76 -> 0.66 s in `image_gen` |
+| fp16 Transpose / Expand / Resize: coalesced dims, one index decode per word | **~466 ms** | Transpose 35 -> 12, Expand 29 -> 4, Resize 22 -> 12 ms; decode 0.62 s |
 
 `conv_coop8.comp` is the 3x3 / stride 1 / pad 1 implicit GEMM on 8x8x8 coopmats (MoltenVK
 only, `VKOP_CONV_COOP8=0` off): 64 channels x one 256/128/64-pixel row segment per workgroup,
@@ -712,8 +713,12 @@ K walked 8 input channels at a time, the 9 taps read as shifted B fragments out 
 [ic][3][TP+2] patch. A 64x64 tile was slower than the SIMT kernel (762 vs 547 ms): the weight
 slice has to be reused over more pixels. The fp16 VAE matches the fp32 one to max 4/255 per pixel
 (mean 0.04) on the 40-step image; against ORT on a random latent, maxabs 1.8e-2 (fp32: 7.7e-5).
-What is still slower in fp16 than in fp32: Transpose (pixel shuffle, 35 vs 21 ms), Expand (the
-avg_shortcut channel repeat, 29 vs 16 ms) and Resize (22 vs 9 ms).
+The fp16 builds of Transpose, Expand and Resize were slower than their fp32 builds (35 / 29 / 22
+vs 21 / 16 / 9 ms): one thread per packed word ran the full N-d index decode once per half and
+read each half through its own word load. The host now hands the shader coalesced dims (size-1
+axes dropped, axes that stay adjacent merged: the pixel shuffle's 8-D transpose is 5-D, the
+avg_shortcut repeat [C,1,HW] -> [C,r,HW]), Expand copies whole words when the innermost axis is
+copied, Resize (nearest) and Transpose decode once per word and step to the second half.
 
 **Cooperative-matrix flash attention.** `attention_flash_coop8.comp` is the tiled kernel on the
 same 8×8×8 matrices, with the same bindings, push constant, grid and host gates, so
