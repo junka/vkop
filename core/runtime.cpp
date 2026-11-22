@@ -3653,7 +3653,7 @@ double Runtime::Run() {
         }
     };
     if (graph_mode) {
-        VulkanCommandBuffer::pre_readback_hook = [&](core::ITensor &) {
+        VulkanCommandBuffer::pre_readback_hook = [&](core::ITensor &rb_t) {
             graph_readbacks++;
             // Attribute this readback to the op whose onExecute is currently
             // running (graph_op_idx). Counting here is exact; the
@@ -3662,6 +3662,17 @@ double Runtime::Run() {
             if (opprof && graph_op_idx >= 0) {
                 op_type_readback_count[convert_optype_to_string(
                     node_ops_[graph_op_idx]->get_type())]++;
+            }
+            // VKOP_RB_NAMES=1: name the op that forced each readback.
+            static const bool rb_names = std::getenv("VKOP_RB_NAMES") != nullptr;
+            if (rb_names && graph_op_idx >= 0) {
+                int which = -1;
+                const auto &ins = node_input_tensors_[graph_op_idx];
+                for (size_t q = 0; q < ins.size(); ++q) {
+                    if (ins[q].get() == &rb_t) which = static_cast<int>(q);
+                }
+                fprintf(stderr, "[rb] %s input %d\n",
+                        node_ops_[graph_op_idx]->get_name().c_str(), which);
             }
             // Close+submit everything recorded so far (this op's producers plus
             // its own pre-readback commands), then reopen a segment and repoint

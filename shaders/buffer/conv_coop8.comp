@@ -1,0 +1,231 @@
+#version 450 core
+
+// fp16 3x3 / stride 1 / pad 1 convolution on 8x8x8 cooperative matrices, for
+// Apple GPUs through MoltenVK (simdgroup_matrix; see matmul_coop8.comp for why
+// it is enabled by device). Same bindings and push constant as conv2d.comp,
+// so Conv2dBuffer swaps the module on its implicit-GEMM route.
+//
+// The GEMM is the same as conv2d.comp's implicit one,
+//   Y[oc, p] = sum_{ic, tap} W[oc, ic, tap] * X[ic, oh + ky - 1, ow + kx - 1],
+// with K walked 16 input channels at a time. Per group of 16 channels the
+// workgroup stages
+//   sW  the 64 x (9 taps x 16 ic) weight slice, [oc][tap * 16 + ic], and
+//   sX  the 16 x 3 x 66 input patch (one output row's 64 pixels plus a
+//       one-pixel halo, zero outside the image),
+// and then every tap reads its B fragments straight out of the patch at a
+// (ky, kx) shift: no im2col, and each staged input value feeds 9 taps.
+//
+// Workgroup = 4 subgroups (2 x 2) of 32 lanes over a 64-channel x 64-pixel
+// tile (one output row segment); each subgroup owns 32 x 32 as 4 x 4 named
+// fp32 accumulators (SPIRV-Cross cannot lower an array of coopmats).
+// Grid: x = OH * OW / 64, y = ceil(OC / 64), z = N.
+// Host gates: fp16, groups 1, 3x3, stride 1, pad 1, dilation 1, 2-D (KD == 1),
+// IC % 16 == 0, OW % 64 == 0, float weights.
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+#ifndef SG_N
+#define SG_N 4          // subgroups along the pixels (2 along the channels)
+#endif
+#ifndef WN
+#define WN 8            // 8-pixel fragments per subgroup
+#endif
+#ifndef ICB
+#define ICB 8           // input channels per K step
+#endif
+#define NSG (2 * SG_N)
+#define NT (NSG * 32)
+layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uvec4 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InX {
+    uint data[];
+} uInputX;
+layout(set = 0, binding = 2) readonly buffer InW {
+    uint data[];
+} uInputW;
+layout(set = 0, binding = 4) readonly buffer Bias {
+    uint data[];
+} uBias;
+
+layout(push_constant) uniform PC {
+    int N, IC, ID, IH, IW;
+    int OC, OD, OH, OW;
+    int KD, KH, KW;
+    int stride_d, stride_h, stride_w;
+    int pad_d, pad_h, pad_w;
+    int dil_d, dil_h, dil_w;
+    int groups;
+    int has_bias;
+    int fp32;
+    int activation;
+    int weight_int8;
+    int fp8;
+    int fp8_e5m2;
+    int ow_blk;
+    int igemm;
+} uPC;
+
+#define FLOAT  float
+#define FLOAT2 vec2
+#define FLOAT4 vec4
+#include "../common/activation.comp"
+
+#define TM 64
+#define TP (SG_N * WN * 8)      // output pixels per workgroup (one row segment)
+#define WP (9 * ICB + 8)        // halves per staged weight row
+#define XR (TP + 8)             // halves per staged patch row (>= TP + 2)
+#define XC (3 * XR)             // halves per staged channel
+
+shared float16_t sW[TM * WP];
+shared float16_t sX[ICB * XC];
+shared float sC[NSG * 8 * 32];  // epilogue: one 8 x 32 strip per subgroup
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>
+#define FRA coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>
+#define FRB coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB>
+
+float16_t ldx(int e) {
+    return float16_t(unpackHalf2x16(uInputX.data[e >> 1])[e & 1]);
+}
+
+void main() {
+    const int tid = int(gl_LocalInvocationIndex);
+    const int sg = int(gl_SubgroupID);
+    const int sgm = sg / SG_N;
+    const int sgn = sg % SG_N;
+    const int IC = uPC.IC, OC = uPC.OC, OH = uPC.OH, OW = uPC.OW;
+    const int IH = uPC.IH, IW = uPC.IW;
+    const int tiles_w = OW / TP;
+    const int oh = int(gl_WorkGroupID.x) / tiles_w;
+    const int ow0 = (int(gl_WorkGroupID.x) % tiles_w) * TP;
+    const int oc0 = int(gl_WorkGroupID.y) * TM;
+    const int n = int(gl_WorkGroupID.z);
+    const int x_n = n * IC * IH * IW;
+
+#if WN == 8
+#define DECL(i) ACC c##i##0 = ACC(0.0), c##i##1 = ACC(0.0), c##i##2 = ACC(0.0), \
+    c##i##3 = ACC(0.0), c##i##4 = ACC(0.0), c##i##5 = ACC(0.0), \
+    c##i##6 = ACC(0.0), c##i##7 = ACC(0.0);
+#else
+#define DECL(i) ACC c##i##0 = ACC(0.0), c##i##1 = ACC(0.0), c##i##2 = ACC(0.0), \
+    c##i##3 = ACC(0.0);
+#endif
+    DECL(0) DECL(1) DECL(2) DECL(3)
+
+    const uint a_row = uint(sgm * 32);
+    const uint b_col = uint(sgn * WN * 8);
+    for (int ic0 = 0; ic0 < IC; ic0 += ICB) {
+        barrier();
+        // Weights: rows oc0.., each row's 16 channels x 9 taps are 144
+        // consecutive halves of the [OC][IC][3][3] tensor, moved as words.
+        for (int e = tid; e < TM * (9 * ICB / 2); e += NT) {
+            int r = e / (9 * ICB / 2);
+            int w = e - r * (9 * ICB / 2);
+            int oc = oc0 + r;
+            vec2 v = vec2(0.0);
+            if (oc < OC) {
+                v = unpackHalf2x16(uInputW.data[((oc * IC + ic0) * 9 >> 1) + w]);
+            }
+            int h = 2 * w; // ic-major, tap-minor within the row
+            int i0 = h / 9, t0 = h - i0 * 9;
+            int i1 = (h + 1) / 9, t1 = (h + 1) - i1 * 9;
+            sW[r * WP + t0 * ICB + i0] = float16_t(v.x);
+            sW[r * WP + t1 * ICB + i1] = float16_t(v.y);
+        }
+        // Input patch: 16 channels x rows oh-1..oh+1 x cols ow0-1..ow0+64.
+        for (int e = tid; e < ICB * 3 * (TP + 2); e += NT) {
+            int c = e / (3 * (TP + 2));
+            int rem = e - c * (3 * (TP + 2));
+            int ry = rem / (TP + 2);
+            int cx = rem - ry * (TP + 2);
+            int iy = oh + ry - 1;
+            int ix = ow0 + cx - 1;
+            float16_t v = float16_t(0.0);
+            if (iy >= 0 && iy < IH && ix >= 0 && ix < IW) {
+                v = ldx(x_n + ((ic0 + c) * IH + iy) * IW + ix);
+            }
+            sX[c * XC + ry * XR + cx] = v;
+        }
+        barrier();
+        for (int tap = 0; tap < 9; ++tap) {
+            const int ky = tap / 3;
+            const int kx = tap - ky * 3;
+            for (int icb = 0; icb < ICB; icb += 8) {
+                FRA a0, a1, a2, a3;
+                const uint ao = uint(tap * ICB + icb);
+                coopMatLoad(a0, sW, (a_row + 0) * WP + ao, WP,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(a1, sW, (a_row + 8) * WP + ao, WP,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(a2, sW, (a_row + 16) * WP + ao, WP,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(a3, sW, (a_row + 24) * WP + ao, WP,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                const uint bo = uint(icb * XC + ky * XR + kx) + b_col;
+#define MMA_COL(j) { FRB bj; coopMatLoad(bj, sX, bo + j * 8, XC, \
+                        gl_CooperativeMatrixLayoutRowMajor); \
+                     c0##j = coopMatMulAdd(a0, bj, c0##j); \
+                     c1##j = coopMatMulAdd(a1, bj, c1##j); \
+                     c2##j = coopMatMulAdd(a2, bj, c2##j); \
+                     c3##j = coopMatMulAdd(a3, bj, c3##j); }
+                MMA_COL(0) MMA_COL(1) MMA_COL(2) MMA_COL(3)
+#if WN == 8
+                MMA_COL(4) MMA_COL(5) MMA_COL(6) MMA_COL(7)
+#endif
+            }
+        }
+    }
+
+    // Epilogue, one 8-channel x 32-pixel strip at a time through the
+    // subgroup's own sC slot: lane (row = lane / 4, quarter = lane % 4) adds
+    // the bias, applies the activation and stores 8 consecutive pixels as one
+    // uvec4.
+    const uint lane = gl_SubgroupInvocationID;
+    const int lr = int(lane >> 2);
+    const int lq = int(lane & 3u);
+    const uint cb = uint(sg * 256);
+#define ST4(i, j0, j1, j2, j3, h) \
+    coopMatStore(c##i##j0, sC, cb + 0, 32, gl_CooperativeMatrixLayoutRowMajor); \
+    coopMatStore(c##i##j1, sC, cb + 8, 32, gl_CooperativeMatrixLayoutRowMajor); \
+    coopMatStore(c##i##j2, sC, cb + 16, 32, gl_CooperativeMatrixLayoutRowMajor); \
+    coopMatStore(c##i##j3, sC, cb + 24, 32, gl_CooperativeMatrixLayoutRowMajor); \
+    subgroupMemoryBarrierShared(); \
+    subgroupBarrier(); \
+    { \
+        int oc = oc0 + sgm * 32 + i * 8 + lr; \
+        int px = ow0 + sgn * WN * 8 + h * 32 + lq * 8; \
+        if (oc < OC) { \
+            float b = 0.0; \
+            if (uPC.has_bias != 0) \
+                b = unpackHalf2x16(uBias.data[oc >> 1])[oc & 1]; \
+            uint s = cb + uint(lr * 32 + lq * 8); \
+            uint w[4]; \
+            for (int q = 0; q < 4; ++q) { \
+                vec2 v = vec2(sC[s + 2 * q], sC[s + 2 * q + 1]) + b; \
+                v.x = activation(v.x, uPC.activation); \
+                v.y = activation(v.y, uPC.activation); \
+                w[q] = packHalf2x16(v); \
+            } \
+            uOutput.data[(((n * OC + oc) * OH + oh) * OW + px) >> 3] = \
+                uvec4(w[0], w[1], w[2], w[3]); \
+        } \
+    } \
+    subgroupMemoryBarrierShared(); \
+    subgroupBarrier();
+#if WN == 8
+#define ST_ROW(i) ST4(i, 0, 1, 2, 3, 0) ST4(i, 4, 5, 6, 7, 1)
+#else
+#define ST_ROW(i) ST4(i, 0, 1, 2, 3, 0)
+#endif
+    ST_ROW(0)
+    ST_ROW(1)
+    ST_ROW(2)
+    ST_ROW(3)
+}

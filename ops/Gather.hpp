@@ -507,8 +507,21 @@ class Gather : public Operator {
                         if (!src_buff) {
                             return;
                         }
+                        // A tensor's buffer is sized to its element count
+                        // rounded up to four (Tensor::make_vkbuff), and a view
+                        // narrower than that is dropped for a fresh, zeroed
+                        // allocation the first time a reader binds it -- the
+                        // reader then sees zeros. Take the padded window, or
+                        // no alias when the source ends before it.
+                        const VkDeviceSize padded =
+                            sizeof(T) *
+                            static_cast<VkDeviceSize>(
+                                UP_DIV(total_elems(out_shape), 4) * 4);
+                        if (bo + padded > src_buff->getSize()) {
+                            return;
+                        }
                         objs_.emplace_back(output->alias_storage_buffer_range(
-                            src_buff, bo, bl, m_cmd_));
+                            src_buff, bo, std::max(bl, padded), m_cmd_));
                         aliased = true;
                     });
                     if (aliased) {

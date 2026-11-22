@@ -1847,6 +1847,30 @@ class FusionOptimizer:
             )
         )
 
+        # An Expand whose every reader is a broadcasting binary op is a full
+        # materialization of a value the reader would broadcast anyway (the
+        # VAE's RMS norm expands its [1,1,1,H,W] norm to [1,C,1,H,W] just to
+        # divide by it). Read the small tensor directly.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "drop_broadcast_expand",
+                FusionOptimizer.match_broadcast_expand,
+                FusionOptimizer.fold_broadcast_expand,
+                priority=89,
+            )
+        )
+        # A Transpose that only moves size-1 axes does not move a byte: the
+        # non-unit axes keep their order, so the output is a view of the
+        # input. The runtime aliases a Reshape, so become one.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "transpose_unit_axes_to_reshape",
+                FusionOptimizer.match_unit_axis_transpose,
+                FusionOptimizer.fold_unit_axis_transpose,
+                priority=89,
+            )
+        )
+
         # SwiGLU gate/up fold: the gate and up GEMMs plus silu(g) * u become
         # ONE MatMul over Wg/Wu interleaved four columns at a time, and the
         # down projection stays a plain MatMul. Runs before the down fold
@@ -5987,6 +6011,122 @@ class FusionOptimizer:
             if n is not None and n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
         dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- Expand feeding only broadcasting binary ops ----
+    _BROADCAST_BINARY = ("Add", "Sub", "Mul", "Div", "Max", "Min", "Pow")
+
+    @staticmethod
+    def match_broadcast_expand(dag_model):
+        consumers = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                consumers[i["name"]].append(n)
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])
+                         if isinstance(o, dict)}
+
+        def static(shape):
+            return (shape is not None and len(shape) > 0
+                    and all(isinstance(d, int) and d > 0 for d in shape))
+
+        matches = []
+        for ex in dag_model.nodes.values():
+            if ex.op_type != "Expand" or len(ex.outputs) != 1:
+                continue
+            src, out = ex.inputs[0], ex.outputs[0]
+            if out["name"] in graph_outputs:
+                continue
+            s_in, s_out = src.get("shape"), out.get("shape")
+            if not (static(s_in) and static(s_out)):
+                continue
+            readers = consumers.get(out["name"], [])
+            if not readers:
+                continue
+            ok = True
+            for r in readers:
+                if (r.op_type not in FusionOptimizer._BROADCAST_BINARY
+                        or len(r.inputs) != 2 or len(r.outputs) != 1):
+                    ok = False
+                    break
+                if r.inputs[0]["name"] == r.inputs[1]["name"]:
+                    ok = False
+                    break
+                other = r.inputs[1] if r.inputs[0]["name"] == out["name"] \
+                    else r.inputs[0]
+                s_other, s_r = other.get("shape"), r.outputs[0].get("shape")
+                if not (static(s_other) and static(s_r)):
+                    ok = False
+                    break
+                # Dropping the Expand must not change what the reader
+                # produces: the broadcast of its two operands without the
+                # Expand still has to be the reader's output shape.
+                try:
+                    b = list(np.broadcast_shapes(tuple(s_other), tuple(s_in)))
+                except ValueError:
+                    ok = False
+                    break
+                if b != list(s_r):
+                    ok = False
+                    break
+            if ok:
+                matches.append({"expand": ex, "readers": readers})
+        return matches
+
+    @staticmethod
+    def fold_broadcast_expand(dag_model, match) -> bool:
+        ex = match["expand"]
+        if ex.name not in dag_model.nodes:
+            return False
+        src, out_name = ex.inputs[0], ex.outputs[0]["name"]
+        for r in match["readers"]:
+            r.inputs = [dict(src) if i["name"] == out_name else i
+                        for i in r.inputs]
+        del dag_model.nodes[ex.name]
+        return True
+
+    # ---- Transpose that only moves size-1 axes -> Reshape ----
+    @staticmethod
+    def match_unit_axis_transpose(dag_model):
+        matches = []
+        for t in dag_model.nodes.values():
+            if t.op_type != "Transpose" or len(t.inputs) != 1:
+                continue
+            shape = t.inputs[0].get("shape")
+            out_shape = t.outputs[0].get("shape")
+            perm = t.attributes.get("perm")
+            if not shape or not out_shape or perm is None:
+                continue
+            if not all(isinstance(d, int) and d > 0 for d in shape):
+                continue
+            perm = [int(p) for p in perm]
+            if sorted(perm) != list(range(len(shape))) or perm == sorted(perm):
+                continue
+            moved = [p for p in perm if shape[p] != 1]
+            if moved != sorted(moved):
+                continue
+            if [shape[p] for p in perm] != list(out_shape):
+                continue
+            matches.append({"node": t})
+        return matches
+
+    @staticmethod
+    def fold_unit_axis_transpose(dag_model, match) -> bool:
+        t = match["node"]
+        if t.name not in dag_model.nodes:
+            return False
+        out = t.outputs[0]
+        shape_name = f"{t.name}_unit_reshape_shape"
+        dag_model.initializers[shape_name] = numpy_helper.from_array(
+            np.array(out["shape"], dtype=np.int64), shape_name)
+        dag_model.nodes[t.name] = Node(
+            op_type="Reshape",
+            name=t.name,
+            attributes={},
+            inputs=[t.inputs[0], {"name": shape_name,
+                                  "shape": [len(out["shape"])],
+                                  "dtype": TensorProto.INT64}],
+            outputs=t.outputs[:],
+        )
         return True
 
     # ---- SwiGLU gate/up fold (silu(x . Wg) * (x . Wu)) ----

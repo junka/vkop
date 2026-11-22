@@ -788,6 +788,36 @@ class Conv2dBuffer : public BufferFactory {
         pc.ow_blk = ow_blk;
         pc.igemm = igemm;
 
+        // Apple: the 3x3 fp16 shape on 8x8x8 cooperative matrices
+        // (conv_coop8.comp, MoltenVK only), 64 channels x 64 pixels of one
+        // output row per workgroup. Needs whole 16-channel K groups and
+        // whole 64-pixel row segments; anything else keeps the SIMT tile.
+        if (igemm != 0 && fp16_ != 0 && kernel_h == 3 && kernel_w == 3 &&
+            pad_h == 1 && pad_w == 1 && depth % 16 == 0 &&
+            out_width % 64 == 0 && in_width == out_width &&
+            in_height == out_height) {
+            // Widest row segment that tiles OW: 256, 128 or 64 pixels.
+            const int c8v = out_width % 256 == 0 ? 0
+                            : out_width % 128 == 0 ? 1 : 2;
+            const int c8px = 256 >> c8v;
+            if (VulkanPipeline *c8 = coop8_pipeline(c8v)) {
+                if (std::getenv("VKOP_CONV_DEBUG")) {
+                    std::fprintf(stderr, "[conv] %s -> coop8\n", name_.c_str());
+                }
+                VkDescriptorSet &c8ds = coop8_ds_[c8v][m_id_];
+                if (!c8ds) {
+                    c8ds = c8->allocDescriptorSets();
+                }
+                fillWriteDescriptorSets(c8ds);
+                c8->updateDescriptorSets(writes_);
+                m_cmd_->bind(*c8, c8ds);
+                m_cmd_->push_constants(*c8, static_cast<uint32_t>(pc_size_),
+                                       &pc);
+                dispatch_and_record(out_height * (out_width / c8px),
+                                    UP_DIV(out_depth, 64), batch, &pc);
+                return;
+            }
+        }
         if (igemm != 0) {
             // One workgroup per (ig_tm channels x ig_tn pixels) tile; single
             // pass.
@@ -939,6 +969,51 @@ class Conv2dBuffer : public BufferFactory {
                          e.what());
         }
     }
+
+    // The coopmat implicit-GEMM module (conv_coop8.comp). Off-spec on
+    // MoltenVK (the driver does not list VK_KHR_cooperative_matrix but lowers
+    // 8x8 coopmats to simdgroup_matrix), so it is built only on that driver;
+    // a missing archive key or a refused pipeline keeps the SIMT kernels.
+    // VKOP_CONV_COOP8=0 turns it off.
+    // v: 0 = 256-pixel rows (buffer_conv_coop8), 1 = 128, 2 = 64.
+    VulkanPipeline *coop8_pipeline(int v) {
+        if (coop8_pipeline_[v] || coop8_tried_[v]) {
+            return coop8_pipeline_[v].get();
+        }
+        coop8_tried_[v] = true;
+        static const char *const kKeys[3] = {"buffer_conv_coop8",
+                                             "buffer_conv_coop8_p128",
+                                             "buffer_conv_coop8_p64"};
+        const char *env = std::getenv("VKOP_CONV_COOP8");
+        if ((env && std::atoi(env) == 0) ||
+            m_dev_->device_traits().driver_id !=
+                static_cast<uint32_t>(VK_DRIVER_ID_MOLTENVK)) {
+            return nullptr;
+        }
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(kKeys[v]);
+        } catch (const std::exception &) {
+            return nullptr;
+        }
+        try {
+            bool use_uab = update_after_bind_ &&
+                           m_dev_->is_support_descriptor_update_after_bind();
+            coop8_pipeline_[v] = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(), types_, pc_size_, spv.first,
+                static_cast<int>(spv.second), use_uab, 0, VK_NULL_HANDLE);
+        } catch (const std::exception &e) {
+            coop8_pipeline_[v].reset();
+            std::fprintf(stderr,
+                         "[vkop] coop8 Conv2d module rejected (%s); keeping "
+                         "the SIMT implicit GEMM\n",
+                         e.what());
+        }
+        return coop8_pipeline_[v].get();
+    }
+    std::unique_ptr<VulkanPipeline> coop8_pipeline_[3];
+    VkDescriptorSet coop8_ds_[3][vkop::kInflight] = {};
+    bool coop8_tried_[3] = {false, false, false};
 
     // Same body as Operator::submit, but binds the fp8 module when one was
     // built. Kept as an override rather than a branch inside the base class so

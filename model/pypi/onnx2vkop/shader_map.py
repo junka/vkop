@@ -343,6 +343,10 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_conv2d_bda_fp16",
         "buffer_conv2d_fp8_hw",
         "buffer_conv2d_fp8_hw_fp16",
+        # Apple coopmat 3x3 implicit GEMM; only MoltenVK builds it.
+        "buffer_conv_coop8",
+        "buffer_conv_coop8_p128",
+        "buffer_conv_coop8_p64",
     ],
     ("Conv", "buffer"): [
         "buffer_matmul_pack",
@@ -351,6 +355,10 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_conv2d_bda_fp16",
         "buffer_conv2d_fp8_hw",
         "buffer_conv2d_fp8_hw_fp16",
+        # Apple coopmat 3x3 implicit GEMM; only MoltenVK builds it.
+        "buffer_conv_coop8",
+        "buffer_conv_coop8_p128",
+        "buffer_conv_coop8_p64",
     ],
     # int64 shape-meta chains built by Expand/Concat/Gather/Equal/Where on
     # an int64 input; their set_runtime_device() creates a second pipeline

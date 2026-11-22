@@ -230,6 +230,16 @@ TEST(MatMulTest, MatMulCoop8) {
     }
     MatMulBroadcastWeightTest<uint16_t> bw(3, 70, 128, 64, false);
     EXPECT_TRUE(bw.run_test({bw.inputa, bw.inputb}, {bw.output}));
+    // transB: a [N, K] weight (the ViT's lowered Gemm), batched and shared.
+    for (auto [batch, m, k, n] : std::vector<std::tuple<int, int, int, int>>{
+             {1, 130, 256, 192}, {3, 70, 128, 64}}) {
+        MatMulBroadcastWeightTest<uint16_t> tw(batch, m, k, n, true);
+        EXPECT_TRUE(tw.run_test({tw.inputa, tw.inputb}, {tw.output},
+            [](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute({{"transB", "1"}});
+            }))
+            << "transB batch=" << batch << " m=" << m;
+    }
 }
 
 // SwiGLU gate/up fold (MatMul swiglu=1, converter fuse_swiglu_gate_up): B is

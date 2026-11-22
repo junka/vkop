@@ -844,6 +844,10 @@ vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm64bn8_bda buffer/matmul_coo
 # shape, the base build stays the 32x64 module, and an archive converted before
 # a key existed just keeps the base (resolve_spv throws by name, the op records
 # the miss and falls back).
+# Narrower-row builds of the Apple coopmat 3x3 conv (conv_coop8.comp, default
+# 256 output pixels per workgroup): 128 and 64 pixels for 128/64-wide maps.
+vkop_shader_variant(buffer_conv_coop8_p128 buffer/conv_coop8 -DSG_N=2)
+vkop_shader_variant(buffer_conv_coop8_p64 buffer/conv_coop8 -DSG_N=1)
 vkop_shader_variant(buffer_matmul_coop16_2x1 buffer/matmul_coop16
                     -DACC_M=2 -DACC_N=1)
 vkop_shader_variant(buffer_matmul_coop16_2x2 buffer/matmul_coop16

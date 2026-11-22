@@ -483,6 +483,13 @@ decode 每 token 少 2 次 dispatch，gate/up 合成一个更宽的 GEMV 也更�
 DiT（M=1024）每步不变。prefill 还会对全部位置算 lm_head 和 TopK，只有最后一个位置有用。注意：2026-11-19 转换的
 `llm.vkopbin` 配现在的 runtime 第一个 token 就错（输出 "!"），要重新转换。
 
+**视觉塔（2026-11-22，672×672 图，seq 1764，同一进程第二张图）**：201.7 ms → **164 ms**。
+GEMM 全是 transB=1（导出时保留 [N, K] 权重），以前只能走 64×64 SIMT tile，现在 coop8 MatMul 直接读 [N, K]
+（201.7 → 168 ms）；位置编码的 int64 索引链改在 host 端算（输入都已在 host 有效时，int64 二元运算和 Range 不再
+上 GPU），图里的 readback 从 6 次降到 0（168 → 164 ms，冷启动 243 → 238 ms）。顺带修了 Gather 零拷贝视图的
+一个错：视图只截到元素个数，而读者按 4 元素对齐分配，第一次绑定就把视图换成了全 0 的新缓冲区。
+2026-11-19 转换的 `visual.vkopbin` 配现在的 runtime 也是错的（输出 "!!!!"），已重新转换。
+
 复现（脚本只是把下面两条包起来串行跑，并比较输出）：
 
 ```bash
@@ -505,8 +512,8 @@ cd model/pypi && python3 -m onnx2vkop.cli -i ../../llm/exporter/llm.onnx \
 | DiT prefill 加载 / 前向 | 2.5 s / 0.19 s | 13.8 GB，32 层 KV |
 | DiT decode 加载 | 1.87 s | 14.2 GB |
 | **去噪 40 步** | **53.3 s（约 1.33 s/步，随芯片温度变化）** | m = 1024 图像 token；MatMul 占每步约 90%；在 MoltenVK 上 MatMul 和 flash attention 都走 8×8 coopmat（simdgroup_matrix） |
-| VAE 加载 / 解码 | 0.36 s / 0.80 s | Conv2d 走 implicit GEMM |
-| **端到端** | **61.2 s** | 机器较热时测得 |
+| VAE 加载 / 解码 | 0.3 s / 0.66 s | fp16 图（`-q fp16`），3×3 卷积在 MoltenVK 上走 coopmat implicit GEMM |
+| **端到端** | **60.9 s** | 机器较热时测得 |
 
 2026-11-21 测量。之前是去噪 94.0 s（2.3 s/步）、VAE 解码 4.1 s、端到端 104.4 s；加 coopmat 之前是去噪 62.9 s、端到端 71.2 s；只有 MatMul 走 coopmat 时是 55.3 s / 62.7 s。逐项改动和每步算子拆分见
 `image/exporter/BASELINE.md` 的 2026-11-21 一节。

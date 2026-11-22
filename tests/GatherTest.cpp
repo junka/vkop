@@ -198,6 +198,30 @@ TEST(GatherTest, GatherContiguousBufferAlias) {
               before + 1);
 }
 
+// A contiguous run whose length is not a multiple of four (the ViT's 42-entry
+// position-table rows). The alias window used to be exactly the run, but a
+// tensor's buffer is sized to its element count rounded up to four, so the
+// first READER that bound the output (Tensor::make_vkbuff via
+// as_storage_buffer) found the view too small, dropped it and allocated a
+// fresh, zeroed buffer: every consumer read zeros while a readback of the
+// view itself still looked right. Bind the output the way a reader does and
+// check it is still the view.
+TEST(GatherTest, GatherAliasSurvivesReaderBind) {
+    vkop::tests::ScopedBufferBackend buffer;
+    auto dev = vkop::tests::TestEnv::get_device();
+    auto src = std::make_shared<vkop::VulkanBuffer>(
+        dev, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // What Gather now asks for: the padded window (44 halves = 88 bytes).
+    vkop::core::Tensor<uint16_t> padded(std::vector<int>{42});
+    padded.alias_storage_buffer_range(src, 16, 88, nullptr);
+    EXPECT_TRUE(padded.as_storage_buffer(dev)->is_view_range());
+    // What it used to ask for: exactly the run. A reader's bind replaces it.
+    vkop::core::Tensor<uint16_t> exact(std::vector<int>{42});
+    exact.alias_storage_buffer_range(src, 16, 84, nullptr);
+    EXPECT_FALSE(exact.as_storage_buffer(dev)->is_view_range());
+}
+
 // The complement: non-consecutive indices must NOT alias — they fall through to
 // the real gather dispatch and still produce correct numbers. Guards against a
 // fast path that fires too eagerly and binds the wrong block.

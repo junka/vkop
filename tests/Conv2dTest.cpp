@@ -654,6 +654,12 @@ TEST(Conv2dTest, Conv2dImplicitGemmBuffer) {
             {{1, 1, 5, 33}, 3, 1, 1, 1, 1, 33},      // IC 1
             {{1, 15, 7, 7}, 3, 1, 0, 1, 1, 34},      // odd IC, pad 0, OW 5
             {{1, 21, 5, 9}, 1, 1, 0, 1, 1, 34},      // 1x1 odd IC, odd P
+            // Apple coopmat route (conv_coop8.comp, fp16 on MoltenVK): 3x3
+            // pad 1, IC % 16, OW % 64 -- 256/128/64-pixel rows, OC tiles
+            // partial, batch 2. Elsewhere they run the implicit GEMM above.
+            {{1, 16, 3, 64}, 3, 1, 1, 1, 1, 64},      // 64-pixel rows
+            {{1, 32, 2, 128}, 3, 1, 1, 1, 1, 96},     // 128-pixel rows
+            {{2, 48, 3, 256}, 3, 1, 1, 1, 1, 144},    // 256 rows, batch 2
         };
     for (const auto &tc : cases) {
         auto [input_shape, kernel_size, stride, pad, group, dilation,

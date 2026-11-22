@@ -168,9 +168,87 @@ float reduce_one(int out_gid, int rank) {
     return result;
 }
 
+// Fast path: the reduced axes are ONE contiguous run [a, b] (a channel norm
+// over [N, C, ..., H, W] is the common case). Then with inner = prod(dims
+// after b) and R = prod(dims[a..b]) an output o / inner, o % inner reads
+// in[(o / inner) * R * inner + o % inner + r * inner], r < R: a single strided
+// loop instead of an N-d decode per element. Not for LogSumExp (two passes).
+bool contiguous_run(int rank, out int R, out int inner) {
+    int a = -1, b = -1;
+    for (int i = 0; i < rank; ++i) {
+        if ((uReduce.axes_mask & (1 << i)) != 0) {
+            if (a < 0) a = i;
+            else if (b != i - 1) return false;
+            b = i;
+        }
+    }
+    if (a < 0 || uReduce.reduce_op == REDUCE_LOGSUMEXP) return false;
+    R = 1;
+    inner = 1;
+    for (int i = a; i <= b; ++i) R *= uReduce.inDims.v[i];
+    for (int i = b + 1; i < rank; ++i) inner *= uReduce.inDims.v[i];
+    return true;
+}
+
+float finish(float acc, int R) {
+    if (uReduce.reduce_op == REDUCE_MEAN) return R > 0 ? acc / float(R) : 0.0;
+    if (uReduce.reduce_op == REDUCE_L2) return sqrt(acc);
+    if (uReduce.reduce_op == REDUCE_LOGSUM) return log(max(acc, 1e-12f));
+    return acc;
+}
+
 void main() {
     int out_gid = int(gl_GlobalInvocationID.x);
     int rank = uReduce.rank;
+    int R, inner;
+    if (contiguous_run(rank, R, inner)) {
+        int out_total = 1;
+        for (int i = 0; i < rank; ++i) out_total *= uReduce.outDims.v[i];
+#ifdef FP16
+        int nwords = (out_total + 1) / 2;
+        if (out_gid >= nwords) return;
+        int o0 = 2 * out_gid;
+        if ((inner & 1) == 0) {
+            // Both outputs of this word share every input word: one load,
+            // two accumulators.
+            int base = ((o0 / inner) * R * inner + o0 % inner) >> 1;
+            int step = inner >> 1;
+            float a0 = init_acc(), a1 = init_acc();
+            for (int r = 0; r < R; ++r) {
+                vec2 v = unpackHalf2x16(uInput.data[base + r * step]);
+                a0 = combine(a0, transform_val(v.x));
+                a1 = combine(a1, transform_val(v.y));
+            }
+            uOutput.data[out_gid] = packHalf2x16(vec2(finish(a0, R), finish(a1, R)));
+            return;
+        }
+        vec2 res = vec2(0.0);
+        for (int h = 0; h < 2; ++h) {
+            int o = o0 + h;
+            if (o >= out_total) {
+                res[h] = unpackHalf2x16(uOutput.data[out_gid])[1];
+                continue;
+            }
+            int base = (o / inner) * R * inner + o % inner;
+            float acc = init_acc();
+            for (int r = 0; r < R; ++r) {
+                acc = combine(acc, transform_val(BUF_LOAD(uInput.data, base + r * inner)));
+            }
+            res[h] = finish(acc, R);
+        }
+        uOutput.data[out_gid] = packHalf2x16(res);
+        return;
+#else
+        if (out_gid >= out_total) return;
+        int base = (out_gid / inner) * R * inner + out_gid % inner;
+        float acc = init_acc();
+        for (int r = 0; r < R; ++r) {
+            acc = combine(acc, transform_val(uintBitsToFloat(uInput.data[base + r * inner])));
+        }
+        uOutput.data[out_gid] = floatBitsToUint(finish(acc, R));
+        return;
+#endif
+    }
 #ifdef FP16
     // fp16 packs two output elements per uint word; one thread per word,
     // computing both reductions and writing a single packed half2 (avoids

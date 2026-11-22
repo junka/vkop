@@ -243,7 +243,17 @@ class Range : public Operator {
         //
         // An empty range has nothing to dispatch; the output still has to be
         // resized so a downstream consumer sees [0].
-        if (range_gpu_eligible(inputs, outputs) && build_int64_pipeline()) {
+        // Parameters that were already valid on the host (the vision tower's
+        // grid math, int64 initializers) mean a host reader downstream would
+        // only read a device result back: keep a short host-param arange on
+        // the host, where its output stays authoritative.
+        bool host_params = host_shape_enabled() && inums <= 65536;
+        for (const auto &in : inputs) {
+            auto v = in ? core::as_tensor<int64_t>(in) : nullptr;
+            if (!v || !v->get_host_authoritative()) host_params = false;
+        }
+        if (!host_params && range_gpu_eligible(inputs, outputs) &&
+            build_int64_pipeline()) {
             if (inums <= 0) {
                 auto output = core::as_tensor<int64_t>(outputs[0]);
                 if (output->num_elements() != 0) output->resize(out_shape);

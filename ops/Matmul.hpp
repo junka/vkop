@@ -3712,7 +3712,7 @@ class MatMulBuffer : public BufferFactory {
     // leaves the SIMT tile in charge. VKOP_COOP8=0 turns it off.
     // The plain fp16 shape matmul_coop8.comp serves (see the tile route).
     bool coop8_eligible(int m, int n, int k) const {
-        return fp16_ != 0 && para_.transB == 0 && para_.weight_int8 == 0 &&
+        return fp16_ != 0 && para_.weight_int8 == 0 &&
                para_.epi_bias == 0 && para_.attn_softmax == 0 &&
                para_.w4 == 0 && n % 64 == 0 && k % 16 == 0 && m >= 64;
     }

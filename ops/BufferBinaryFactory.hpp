@@ -367,6 +367,11 @@ class BufferBinaryFactory : public BufferFactory {
         }
     }
 
+    static bool host_valid_int64(const std::shared_ptr<core::ITensor> &t) {
+        auto v = core::as_tensor<int64_t>(t);
+        return v && v->get_host_authoritative() && v->num_elements() <= 65536;
+    }
+
     bool supports_bda_variant() const override { return true; }
     size_t bda_pc_size() const override { return sizeof(BinaryBdaPC); }
 
@@ -378,7 +383,17 @@ class BufferBinaryFactory : public BufferFactory {
         // and so is the int64 path once the device has shaderInt64 and the
         // archive carries this op's int64 kernel.
         const bool i64 = inputs[0]->dtype() == typeid(int64_t);
-        const bool i64_gpu = i64 && int64_gpu_ok() && !int64_shader_key().empty();
+        // Both operands already valid on the host (int64 initializers, driver
+        // inputs, other host-computed shape math): computing on the GPU would
+        // only make every host reader downstream (Range, Gather indices,
+        // Reshape shapes) read the result back -- one forced graph segment
+        // and submit+wait each. The vision tower's position-index chain paid
+        // six of those per image. Keep small host-valid math on the host.
+        const bool i64_host_inputs =
+            i64 && host_shape_enabled() && inputs.size() == 2 &&
+            host_valid_int64(inputs[0]) && host_valid_int64(inputs[1]);
+        const bool i64_gpu = i64 && !i64_host_inputs && int64_gpu_ok() &&
+                             !int64_shader_key().empty();
         // Reported before the early returns so every path states its answer.
         // A device-computed int64 result is not host work: the recording is
         // self-contained and replays like any other dispatch. The first

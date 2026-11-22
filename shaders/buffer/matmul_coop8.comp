@@ -10,7 +10,8 @@
 // treats a failed pipeline as "not available" (MatMulBuffer::coop8_pipeline).
 //
 // Same plain fp16 shape as matmul.comp's 128x128 tile (uPC.tile == 2):
-//   A [batch, M, K], B [batch', K, N] (transB == 0), C [batch, M, N], packed
+//   A [batch, M, K], B [batch', K, N] (or [batch', N, K] under transB),
+//   C [batch, M, N], packed
 //   half2 words, no byte weight, no epilogue.
 // Host gates: K % BK == 0, N % BN == 0 (whole-tile columns), any M (rows past
 // M are zero-filled on load and skipped on store).
@@ -122,7 +123,12 @@ int bmap(int n) {
 #define SHA_EPI (SG_M * SG_N * 8 * WN * 8 / 4)
 #define SHA_SZ (SHA_STAGE > SHA_EPI ? SHA_STAGE : SHA_EPI)
 shared uvec4 shA[SHA_SZ];
-shared uvec4 shB[BK * LDB / 8];
+// transB (B is [N, K]): the B stage is [BN rows of n][BK + 8 halves of k]
+// and its fragments are read column-major (column = n, contiguous k).
+#define LDBT (BK + PAD)
+#define SHB_N (BK * LDB / 8)
+#define SHB_T (BN * LDBT / 8)
+shared uvec4 shB[SHB_N > SHB_T ? SHB_N : SHB_T];
 
 // uvec4 = 8 halves. Per K step each thread moves A_V / B_V of them.
 #define A_V (BM * BK / 8 / NT)
@@ -152,7 +158,8 @@ void main() {
     const int k8 = K >> 3;
     const int n8 = N >> 3;
     const int a_off = (b * M) * k8;
-    const int b_off = (bmap(b) * K) * n8;
+    const bool tb = uPC.transB != 0;
+    const int b_off = (bmap(b) * K) * n8; // same extent either way (K*N)
 
     // A: BM rows x (BK/8) uvec4 per K step.
     int a_idx[A_V];
@@ -171,10 +178,18 @@ void main() {
     uint b_sh[B_V];
     for (int i = 0; i < B_V; ++i) {
         int e = int(tid) + i * NT;
-        int r = e / (BN / 8);
-        int c = e % (BN / 8);
-        b_idx[i] = b_off + r * n8 + (col0 >> 3) + c;
-        b_sh[i] = uint(r * LDB + c * 8);
+        if (tb) {
+            // BN rows of n x (BK/8) uvec4 of k per K step.
+            int r = e / (BK / 8);
+            int c = e % (BK / 8);
+            b_idx[i] = b_off + (col0 + r) * k8 + c;
+            b_sh[i] = uint(r * LDBT + c * 8);
+        } else {
+            int r = e / (BN / 8);
+            int c = e % (BN / 8);
+            b_idx[i] = b_off + r * n8 + (col0 >> 3) + c;
+            b_sh[i] = uint(r * LDB + c * 8);
+        }
     }
 
     uvec4 ra[A_V];
@@ -196,7 +211,7 @@ void main() {
     const uint a_base = sgm * (WM * 8) * LDA;
     const uint b_base = sgn * (WN * 8);
     const int nk = K / BK;
-    const int bstep = BK * n8;
+    const int bstep = tb ? (BK / 8) : BK * n8;
     const int astep = BK / 8;
     for (int t = 0; t < nk; ++t) {
         barrier();
@@ -223,14 +238,25 @@ void main() {
                         gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(a3, shA, (a_base + 3 * 8 * LDA + kk) / 8, LDA / 8,
                         gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b0, shB, (kk * LDB + b_base + 0) / 8, LDB / 8,
-                        gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b1, shB, (kk * LDB + b_base + 8) / 8, LDB / 8,
-                        gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b2, shB, (kk * LDB + b_base + 16) / 8, LDB / 8,
-                        gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b3, shB, (kk * LDB + b_base + 24) / 8, LDB / 8,
-                        gl_CooperativeMatrixLayoutRowMajor);
+            if (tb) {
+                coopMatLoad(b0, shB, ((b_base + 0) * LDBT + kk) / 8, LDBT / 8,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(b1, shB, ((b_base + 8) * LDBT + kk) / 8, LDBT / 8,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(b2, shB, ((b_base + 16) * LDBT + kk) / 8, LDBT / 8,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(b3, shB, ((b_base + 24) * LDBT + kk) / 8, LDBT / 8,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+            } else {
+                coopMatLoad(b0, shB, (kk * LDB + b_base + 0) / 8, LDB / 8,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b1, shB, (kk * LDB + b_base + 8) / 8, LDB / 8,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b2, shB, (kk * LDB + b_base + 16) / 8, LDB / 8,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(b3, shB, (kk * LDB + b_base + 24) / 8, LDB / 8,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
 #define MMA_ROW(i) c##i##0 = coopMatMulAdd(a##i, b0, c##i##0); \
                    c##i##1 = coopMatMulAdd(a##i, b1, c##i##1); \
                    c##i##2 = coopMatMulAdd(a##i, b2, c##i##2); \

@@ -1462,11 +1462,23 @@ int main(int argc, char** argv) {
         return 1;
     }
     // Resize and fill the VAE's input tensor.
-    auto vae_latent_tensor = vkop::core::as_tensor<float>(vae_input);
-    vae_latent_tensor->resize(
-        std::vector<int>{1, latent_c, 1, vae_latent_h, vae_latent_w});
-    vae_latent_tensor->fillToCPU(latent_ncdhw.data());
-    vae_latent_tensor->copyToGPU(cmdpool);
+    // An fp16-converted VAE (onnx2vkop -q fp16) takes and returns fp16.
+    const std::vector<int> latent_shape{1, latent_c, 1, vae_latent_h,
+                                        vae_latent_w};
+    if (vae_input->dtype() == typeid(float)) {
+        auto vae_latent_tensor = vkop::core::as_tensor<float>(vae_input);
+        vae_latent_tensor->resize(latent_shape);
+        vae_latent_tensor->fillToCPU(latent_ncdhw.data());
+        vae_latent_tensor->copyToGPU(cmdpool);
+    } else {
+        std::vector<uint16_t> h(latent_ncdhw.size());
+        for (size_t i = 0; i < h.size(); ++i)
+            h[i] = vkop::core::ITensor::fp32_to_fp16(latent_ncdhw[i]);
+        auto vae_latent_tensor = vkop::core::as_tensor<uint16_t>(vae_input);
+        vae_latent_tensor->resize(latent_shape);
+        vae_latent_tensor->fillToCPU(h);
+        vae_latent_tensor->copyToGPU(cmdpool);
+    }
 
     // Run VAE decode.
     printf("[vae] Running decode...\n");
@@ -1483,9 +1495,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[vae] no 'decoded' output\n");
         return 1;
     }
-    auto decoded_tensor = vkop::core::as_tensor<float>(vae_output);
-    decoded_tensor->copyToCPU(cmdpool);
-    const auto& decoded_shape = decoded_tensor->getShape();
+    const std::vector<int> decoded_shape = vae_output->getShape();
+    std::vector<float> decoded_data;
+    if (vae_output->dtype() == typeid(float)) {
+        auto t = vkop::core::as_tensor<float>(vae_output);
+        t->copyToCPU(cmdpool);
+        decoded_data.assign(t->data().begin(), t->data().end());
+    } else {
+        auto t = vkop::core::as_tensor<uint16_t>(vae_output);
+        t->copyToCPU(cmdpool);
+        decoded_data.resize(t->num_elements());
+        for (size_t i = 0; i < decoded_data.size(); ++i)
+            decoded_data[i] = vkop::core::ITensor::fp16_to_fp32(t->data()[i]);
+    }
     if (decoded_shape.size() < 4) {
         fprintf(stderr, "[vae] unexpected output rank %zu\n",
                 decoded_shape.size());
@@ -1499,9 +1521,6 @@ int main(int argc, char** argv) {
            (int)decoded_shape[0], (int)decoded_shape[1],
            (int)decoded_shape[2], img_h, img_w, img_h, img_w, img_c);
 
-    std::vector<float> decoded_data(decoded_tensor->num_elements());
-    memcpy(decoded_data.data(), decoded_tensor->data().data(),
-           decoded_data.size() * sizeof(float));
 
     char png_path[256];
     snprintf(png_path, sizeof(png_path), "output_%dx%d.png", img_h, img_w);
