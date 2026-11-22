@@ -532,6 +532,50 @@ cd model/pypi && python3 -m onnx2vkop.cli -i ../../image/exporter/dit_decode_sta
 36 GB 机器上一次只跑一个这类任务：文生图单次峰值 21 GB。实测过一次 OOM 重启：模型转换、fp32 的
 Phi-4 ORT 参考（约 15 GB）和 8 GB 的 llm_chat 同时在跑。
 
+## coop8 的设备适用性（2026-11-22，AMD / Intel Mac 实测）
+
+Apple 的 8×8×8 coopmat 三个模块（`matmul_coop8.comp`、`attention_flash_coop8.comp`、
+`conv_coop8.comp`）依赖 MoltenVK 把 8×8 coopmat 降成 Metal `simdgroup_matrix`。这个降级只在
+Apple GPU 上成立；同一份 MoltenVK 在 AMD / Intel Mac 上会让 `vkCreateComputePipelines` 返回
+`VK_ERROR_INITIALIZATION_FAILED`（-3）。路由现在按 **驱动 + 厂商** 一起判定
+（`core::device_supports_apple_coop8()`：MoltenVK 且 vendorID `0x106B`），AMD / Intel Mac 首次
+dispatch 直接走 SIMT 内核，不再尝试建一条不存在的管线；Apple Silicon 上仍使用本文上面的 M5 Max
+实测值。M5 是标定点，不是能力边界：`simdgroup_matrix` 从 Apple7 起就有，判定没有绑死某个 M 系列 SKU。
+
+实测环境：iMac 2019，AMD Radeon Pro 560X / Intel UHD Graphics 630，MoltenVK 1.4，
+`main@62ecd78` + 本判定，`VKOP_NO_COOP=1`（KHR coopmat 探针在这两块卡上会失败）。判定前，
+MatMul / Attention / Conv2d 三个 coop8 模块都会打印 `-3` 后回退；判定后不再出现拒绝日志，路由分别
+落到 `tiled`、SIMT tiled、SIMT implicit GEMM。
+
+**128×128 fp16 tile（`18b3406`，通用）**，M=256、K=2048、N=4096，reps=5，同块交替 3 轮取最小值：
+
+| GPU | `VKOP_TILE128=1` | `VKOP_TILE128=0` | 提升 |
+|---|---|---|---|
+| AMD Radeon Pro 560X | 4.18 ms | 5.64 ms | 1.35x |
+| Intel UHD Graphics 630 | 47.3 ms | 91.3 ms | 1.93x |
+
+**implicit-GEMM Conv2d（`7234a5c`，通用）**，3×3 288→288 @512，reps=1，两轮：
+
+| GPU | igemm fp32 / fp16 | direct fp32 / fp16 | 提升 |
+|---|---|---|---|
+| AMD Radeon Pro 560X | 535 / 493 ms | 7366 / 6980 ms | 13.8x / 14.2x |
+
+Intel UHD 630 上 `bench_conv` 的第一个形状（约 391 GFLOP）会触发 device lost，疑似 iGPU 看门狗
+超时，未拿到 direct / igemm 的完整对比；MatMul 的 tile128 对比已完成。
+
+复现：
+
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib \
+       VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json \
+       VKOP_NO_COOP=1
+BENCH_M=256 BENCH_DEV=0 ./build/benchmark/bench_matmul 2048 4096 5
+VKOP_TILE128=0 BENCH_M=256 BENCH_DEV=0 ./build/benchmark/bench_matmul 2048 4096 5
+VKOP_CONV_NO_IGEMM=1 BENCH_DEV=0 ./build/benchmark/bench_conv 1
+```
+
+Apple coop8 的实测时间仍以上面的 M5 Max 表格为准；这两块卡只验证了通用优化与正确回退。
+
 ## 跨 GPU 参考数据（resnet，100 轮平均）
 
 | GPU | Model | Operators |Precision | latency (ms) |

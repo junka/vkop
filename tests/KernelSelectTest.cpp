@@ -154,6 +154,19 @@ MatmulShape sh(int batch, int m, int k, int n) {
     return s;
 }
 
+void test_apple_coop8_gate() {
+    const DeviceTraits apple = traits_mvk_apple();
+    CHECK(device_supports_apple_coop8(apple));
+    const DeviceTraits amd = traits_mvk_amd();
+    const DeviceTraits intel = traits_mvk_intel();
+    CHECK(!device_supports_apple_coop8(amd));
+    CHECK(!device_supports_apple_coop8(intel));
+    // Apple vendor on a non-MoltenVK driver is not the off-spec path either.
+    DeviceTraits native_apple = traits_mvk_apple();
+    native_apple.driver_id = 0;
+    CHECK(!device_supports_apple_coop8(native_apple));
+}
+
 void test_profiles() {
     // The traits are bound to named locals: device_profile_for returns a
     // reference into the static table, and GCC's -Wdangling-reference cannot
@@ -763,6 +776,7 @@ void test_mvk_apple_routes() {
 
 int main() {
     test_profiles();
+    test_apple_coop8_gate();
     test_mvk_apple_routes();
     test_decode_shapes_native();
     test_tiled_band_native();

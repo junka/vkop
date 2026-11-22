@@ -1050,6 +1050,10 @@ const DeviceProfile &device_profile_for(const DeviceTraits &traits) {
     return kProfiles[static_cast<int>(DeviceClass::kGeneric)];
 }
 
+bool device_supports_apple_coop8(const DeviceTraits &traits) {
+    return match_mvk_apple(traits);
+}
+
 DeviceTraits device_traits_from(VulkanDevice &dev) {
     DeviceTraits t;
     // Query the driver/subgroup chain directly instead of going through

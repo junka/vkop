@@ -57,6 +57,15 @@ Other ops use capability booleans directly (`is_support_cooperate_matrix()`,
 crossover table today. That is correct as long as their route is a hardware
 feature, and becomes a table row only when a *performance* threshold appears.
 
+The off-spec Apple `coop8` modules stay outside the table too: they replace
+the SIMT tile / attention / conv kernel wholesale, so the only decision is
+whether the module can exist. `device_supports_apple_coop8(traits)` answers
+that from `(driverID == MoltenVK, vendorID == 0x106B)`. Gating on the driver
+alone made the AMD/Intel MoltenVK builds pay a failed
+`vkCreateComputePipelines` (`-3`) on first use; those now go straight to the
+SIMT path. The M5 Max numbers are the calibration, not the capability
+boundary (`simdgroup_matrix` is Apple7+).
+
 ## 2. Target architecture
 
 Three layers, one direction of dependency:
@@ -102,7 +111,7 @@ Adding a thing:
 `core/KernelSelect.hpp`
 
 - `DeviceTraits`, `DeviceClass`, `DeviceProfile`, `device_profile_for()`,
-  `device_traits_from(VulkanDevice&)`
+  `device_traits_from(VulkanDevice&)`, `device_supports_apple_coop8()`
 - `MatmulShape`, `MatmulFeatures`, `MatmulAvailability`, `MatmulKnobs`,
   `MatmulPlan`, `MatmulRoute`, `select_matmul()`
 

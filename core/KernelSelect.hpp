@@ -155,6 +155,18 @@ const DeviceProfile &device_profile_for(const DeviceTraits &traits);
 // the result, do not call it per dispatch.
 DeviceTraits device_traits_from(VulkanDevice &dev);
 
+// The 8x8x8 coopmat kernels (matmul_coop8 / attention_flash_coop8 /
+// conv_coop8) are an off-spec Apple path: MoltenVK does not list
+// VK_KHR_cooperative_matrix, but SPIRV-Cross lowers an 8x8 coopmat to Metal
+// simdgroup_matrix. That lowering is an Apple-silicon capability - the
+// MoltenVK builds running on AMD/Intel Macs reject the pipeline with
+// VK_ERROR_INITIALIZATION_FAILED. Gate on driver and vendor together so those
+// machines go straight to the SIMT kernels instead of paying a failed
+// vkCreateComputePipelines (and printing a rejection) on first use.
+// Calibrated on an M5 Max; the capability is Apple7+, so it is deliberately
+// not pinned to one M-series SKU.
+bool device_supports_apple_coop8(const DeviceTraits &traits);
+
 // ---------------------------------------------------------------------------
 // MatMul routing
 // ---------------------------------------------------------------------------

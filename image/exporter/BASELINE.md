@@ -4,6 +4,10 @@
 - **Hardware**: Apple M5 Max (ARM64), 36 GB RAM
 - **Software**: macOS, Python 3.12, ONNX Runtime CPUExecutionProvider
 - **Model**: Qwen-Image-2.1 DiT (7.12B parameters, fp16)
+- **Device applicability**: the `coop8` timings below need an Apple GPU
+  (MoltenVK + vendor `0x106B`). AMD/Intel Macs behind MoltenVK reject those
+  pipelines and take the SIMT fallback; their measured generic-path numbers
+  are in `benchmark/README.md` ("coop8 的设备适用性").
 
 ## Model Statistics
 
@@ -707,9 +711,9 @@ With the coopmat flash attention as well (`attention_flash_coop8.comp`, below): 
 | fp16 graph (`-q fp16`) + `conv_coop8.comp` | ~534 ms | Conv2d 547 -> 478 ms; decode 0.76 -> 0.66 s in `image_gen` |
 | fp16 Transpose / Expand / Resize: coalesced dims, one index decode per word | **~466 ms** | Transpose 35 -> 12, Expand 29 -> 4, Resize 22 -> 12 ms; decode 0.62 s |
 
-`conv_coop8.comp` is the 3x3 / stride 1 / pad 1 implicit GEMM on 8x8x8 coopmats (MoltenVK
-only, `VKOP_CONV_COOP8=0` off): 64 channels x one 256/128/64-pixel row segment per workgroup,
-K walked 8 input channels at a time, the 9 taps read as shifted B fragments out of one staged
+`conv_coop8.comp` is the 3x3 / stride 1 / pad 1 implicit GEMM on 8x8x8 coopmats (Apple GPU
+behind MoltenVK only, `VKOP_CONV_COOP8=0` off): 64 channels x one 256/128/64-pixel row segment
+per workgroup, K walked 8 input channels at a time, the 9 taps read as shifted B fragments out of one staged
 [ic][3][TP+2] patch. A 64x64 tile was slower than the SIMT kernel (762 vs 547 ms): the weight
 slice has to be reused over more pixels. The fp16 VAE matches the fp32 one to max 4/255 per pixel
 (mean 0.04) on the 40-step image; against ORT on a random latent, maxabs 1.8e-2 (fp32: 7.7e-5).
@@ -722,9 +726,10 @@ copied, Resize (nearest) and Transpose decode once per word and step to the seco
 
 **Cooperative-matrix flash attention.** `attention_flash_coop8.comp` is the tiled kernel on the
 same 8×8×8 matrices, with the same bindings, push constant, grid and host gates, so
-`AttentionBuffer::flash_pipeline` just picks it on MoltenVK (`VKOP_ATTN_COOP8=0` keeps the SIMT
-one; a model converted before the key existed falls back quietly). Each of the 8 subgroups owns
-8 query rows, so a row's softmax stays in its subgroup; Q lives in registers as D/8 A fragments,
+`AttentionBuffer::flash_pipeline` just picks it on an Apple GPU behind MoltenVK (`VKOP_ATTN_COOP8=0`
+keeps the SIMT one; AMD/Intel Macs skip it; a model converted before the key existed falls back
+quietly). Each of the 8 subgroups owns 8 query rows, so a row's softmax stays in its subgroup; Q
+lives in registers as D/8 A fragments,
 S (8×32 per subgroup and KV tile) and O (8×D) are accumulators. Accumulator elements cannot be
 addressed (SPIRV-Cross emits `.x` on a `simdgroup_matrix`, which Metal rejects), so S is spilled
 to a per-subgroup scratch for the softmax, P goes back as fp16 A fragments, and O is rescaled
@@ -741,8 +746,10 @@ epilogue, N % 64 == 0, K % 16 == 0, M ≥ 64): 4 subgroups per 128-thread workgr
 tile, each subgroup holding 4×4 fp32 accumulators as named variables (SPIRV-Cross mis-declares
 an array of coopmats), A/B staged through shared memory as `uvec4`, and the epilogue reusing the A
 stage to spill one 8-row strip at a time. Because it is off-spec, the module is enabled by
-device rather than by a feature query: only when `driverID == VK_DRIVER_ID_MOLTENVK`, and a
-pipeline the driver rejects leaves the SIMT tile in charge. `VKOP_COOP8=0` turns it off.
+device rather than by a feature query: only on an Apple GPU behind MoltenVK (`driverID ==
+VK_DRIVER_ID_MOLTENVK` and vendorID `0x106B`), and a pipeline the driver rejects leaves the
+SIMT tile in charge. The same MoltenVK build on AMD/Intel Macs refuses it (`-3`), so those skip
+the attempt. `VKOP_COOP8=0` turns it off.
 
 `bench_matmul`, wall clock, fp16, before → after:
 

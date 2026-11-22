@@ -3708,8 +3708,10 @@ class MatMulBuffer : public BufferFactory {
     // set_runtime_device never builds coop_pipeline_ there), yet SPIRV-Cross
     // lowers an 8x8 coopmat to Metal simdgroup_matrix and the module runs.
     // That is off-spec, so it is enabled by device, not by feature query:
-    // only on the MoltenVK driver, and a pipeline the driver refuses just
-    // leaves the SIMT tile in charge. VKOP_COOP8=0 turns it off.
+    // only on the Apple GPU (MoltenVK + vendor 0x106B, see
+    // core::device_supports_apple_coop8; the AMD/Intel MoltenVK builds reject
+    // the pipeline), and a pipeline the driver refuses just leaves the SIMT
+    // tile in charge. VKOP_COOP8=0 turns it off.
     // The plain fp16 shape matmul_coop8.comp serves (see the tile route).
     bool coop8_eligible(int m, int n, int k) const {
         return fp16_ != 0 && para_.weight_int8 == 0 &&
@@ -3776,8 +3778,8 @@ class MatMulBuffer : public BufferFactory {
             return e == nullptr || std::atoi(e) != 0;
         }();
         coop8_state_ = -1;
-        if (!env_on || m_dev_->device_traits().driver_id !=
-                           static_cast<uint32_t>(VK_DRIVER_ID_MOLTENVK)) {
+        if (!env_on ||
+            !core::device_supports_apple_coop8(m_dev_->device_traits())) {
             return nullptr;
         }
         std::pair<const uint32_t *, uint32_t> spv;

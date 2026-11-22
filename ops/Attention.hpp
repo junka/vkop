@@ -921,11 +921,12 @@ class AttentionBuffer : public BufferFactory {
         const bool use_uab = update_after_bind_ &&
                              m_dev_->is_support_descriptor_update_after_bind();
         // MoltenVK does not advertise VK_KHR_cooperative_matrix but lowers an
-        // 8x8 coopmat to simdgroup_matrix (see matmul_coop8.comp), so the
-        // coopmat build is chosen by driver; a missing key or a refused
-        // pipeline falls through to the SIMT tiled kernel.
-        if (flash_coop8_ && m_dev_->device_traits().driver_id ==
-                                static_cast<uint32_t>(VK_DRIVER_ID_MOLTENVK)) {
+        // 8x8 coopmat to simdgroup_matrix (see matmul_coop8.comp). That is an
+        // Apple-GPU capability, so the coopmat build is chosen by device
+        // (MoltenVK + vendor 0x106B); a missing key or a refused pipeline
+        // falls through to the SIMT tiled kernel.
+        if (flash_coop8_ &&
+            core::device_supports_apple_coop8(m_dev_->device_traits())) {
             std::pair<const uint32_t *, uint32_t> c8{nullptr, 0};
             try {
                 c8 = resolve_spv("buffer_attention_flash_coop8");

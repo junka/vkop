@@ -972,8 +972,9 @@ class Conv2dBuffer : public BufferFactory {
 
     // The coopmat implicit-GEMM module (conv_coop8.comp). Off-spec on
     // MoltenVK (the driver does not list VK_KHR_cooperative_matrix but lowers
-    // 8x8 coopmats to simdgroup_matrix), so it is built only on that driver;
-    // a missing archive key or a refused pipeline keeps the SIMT kernels.
+    // 8x8 coopmats to simdgroup_matrix). That lowering is Apple-GPU only, so
+    // it is built on MoltenVK + vendor 0x106B; a missing archive key or a
+    // refused pipeline keeps the SIMT kernels.
     // VKOP_CONV_COOP8=0 turns it off.
     // v: 0 = 256-pixel rows (buffer_conv_coop8), 1 = 128, 2 = 64.
     VulkanPipeline *coop8_pipeline(int v) {
@@ -986,8 +987,7 @@ class Conv2dBuffer : public BufferFactory {
                                              "buffer_conv_coop8_p64"};
         const char *env = std::getenv("VKOP_CONV_COOP8");
         if ((env && std::atoi(env) == 0) ||
-            m_dev_->device_traits().driver_id !=
-                static_cast<uint32_t>(VK_DRIVER_ID_MOLTENVK)) {
+            !core::device_supports_apple_coop8(m_dev_->device_traits())) {
             return nullptr;
         }
         std::pair<const uint32_t *, uint32_t> spv;
