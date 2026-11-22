@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <thread>
@@ -637,7 +638,10 @@ void Runtime::LoadModel() {
             batch_cmd = std::make_shared<VulkanCommandBuffer>(m_cmdpool_);
             batch_cmd->begin();
         }
-        batched_bytes += bytes;
+        // Count what the pool really hands out: every allocation is padded to
+        // its 256-byte alignment, so thousands of tiny entries take far more
+        // staging than their payload.
+        batched_bytes += (bytes + 255) & ~static_cast<size_t>(255);
         batched_uploads++;
         return batch_cmd;
     };
@@ -1005,6 +1009,12 @@ void Runtime::LoadModel() {
         initializers_[init.name] = tensor;
     };
 
+    // From here to the final batch_flush only initializers are created: on a
+    // UMA device their buffers are host-visible and written in place (see
+    // ITensor::InitializerUploadScope).
+    std::optional<ITensor::InitializerUploadScope> init_upload_scope;
+    init_upload_scope.emplace();
+
     if (model.unified && !model.unified_meta.empty()) {
         // Unified-tensor sub-allocation: one shared GPU uniform buffer holds
         // the whole unified region of the blob; each tensor is a BufferView at
@@ -1219,6 +1229,11 @@ void Runtime::LoadModel() {
     }
 
     batch_flush();
+    init_upload_scope.reset();
+    // Load is over: drop the staging pool back to its initial size. It may
+    // have grown to its 64 MB cap streaming big weights, and would otherwise
+    // keep that pinned for the life of the process.
+    m_cmdpool_->getStagingBufferPool()->trim();
     printf("Initializers: %zu loaded, %zu uploads batched\n",
            ordered_inits.size(), batched_uploads);
 

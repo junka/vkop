@@ -129,6 +129,36 @@ class ITensor {
     // to survive a view: a byte-preserving alias of a leaf is still a leaf.
     bool is_read_only_leaf() const { return read_only_leaf_; }
     void set_read_only_leaf() { read_only_leaf_ = true; }
+
+    // UMA in-place weight upload. While an InitializerUploadScope is alive on
+    // this thread (Runtime::LoadModel's initializer section), a read-only
+    // leaf's buffer is allocated DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT on a
+    // unified-memory device and copyToGPU writes it through the mapping:
+    // no staging buffer, no GPU copy, and no second resident copy of the
+    // weight while it loads. Scoped rather than keyed on read_only_leaf
+    // alone because graph inputs are leaves too, and some of them (KV cache)
+    // are written in place by the GPU every round. VKOP_UMA_STAGING=1 keeps
+    // the staged path for A/B.
+    class InitializerUploadScope {
+      public:
+        InitializerUploadScope() : prev_(flag()) { flag() = true; }
+        ~InitializerUploadScope() { flag() = prev_; }
+        InitializerUploadScope(const InitializerUploadScope &) = delete;
+        InitializerUploadScope &
+        operator=(const InitializerUploadScope &) = delete;
+
+      private:
+        bool prev_;
+    };
+    static bool in_initializer_upload_scope() { return flag(); }
+
+  private:
+    static bool &flag() {
+        static thread_local bool on = false;
+        return on;
+    }
+
+  public:
     void set_transpose() { transpose_ = true; }
     bool get_transpose() const { return transpose_; }
     void set_pack() { pack_ = true; }
@@ -1296,9 +1326,14 @@ template <typename T> class Tensor : public ITensor {
         }
         std::shared_ptr<VulkanBuffer> vbuffer;
         if (!buffer) {
+            VkMemoryPropertyFlags props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            if (upload_in_place_eligible(vd)) {
+                props |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            }
             vbuffer = std::make_shared<VulkanBuffer>(
                 vd, aligned, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                props);
         } else {
             vbuffer = buffer;
         }
@@ -1789,8 +1824,20 @@ template <typename T> class Tensor : public ITensor {
             vkobj_.reset();
             view_range_.reset();
         }
-        vkobj_ = std::make_shared<VulkanBuffer>(
-            vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkMemoryPropertyFlags props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (upload_in_place_eligible(vd)) {
+            props |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        }
+        vkobj_ = std::make_shared<VulkanBuffer>(vd, aligned, flags, props);
+    }
+    bool upload_in_place_eligible(const std::shared_ptr<VulkanDevice> &vd) {
+        static const bool force_staging =
+            std::getenv("VKOP_UMA_STAGING") != nullptr &&
+            std::getenv("VKOP_UMA_STAGING")[0] != '0';
+        return !force_staging && read_only_leaf_ &&
+               ITensor::in_initializer_upload_scope() &&
+               vd->is_unified_memory();
     }
     void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags,
                     bool unorm = false) {
@@ -1861,7 +1908,50 @@ template <typename T> class Tensor : public ITensor {
             toGPU();
             return;
         }
+        std::shared_ptr<VulkanBuffer> buffer;
+        size_t offset = 0;
+        if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
+            buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        } else {
+            auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            buffer = view->getBuffer();
+            offset = view->getOffset();
+        }
+        if (buffer->is_host_visible() && upload_in_place_eligible(dev)) {
+            // UMA weight (see InitializerUploadScope): write straight into
+            // the buffer's own mapping. Nothing on the GPU has touched it yet
+            // (it was allocated by this load), and the queue submit that
+            // first reads it makes host writes visible, so no copy, barrier
+            // or wait is needed. The re-check of eligibility keeps any other
+            // host-visible buffer on the ordered, staged path.
+            char *dst = static_cast<char *>(buffer->getMappedMemory());
+            if (dst == nullptr) {
+                throw std::runtime_error(
+                    "copyToGPUBuffer: host-visible buffer failed to map");
+            }
+            write_upload_payload(dst + offset, aligned, 0, src, fill);
+            buffer->flushMappedRange(offset, aligned);
+            toGPU();
+            return;
+        }
+        if (!batch && aligned > VulkanStagingBufferPool::chunkSize()) {
+            // Past one staging chunk: stream it through the pool chunk by
+            // chunk so staging peaks at one chunk, not at the whole weight.
+            // Not in batch mode: the chunked loop submits and resets the pool
+            // per chunk, which would recycle the staging of copies already
+            // recorded into the caller's open batch. A batched upload takes
+            // one (possibly one-shot) allocation, released by the caller's
+            // reset() after its wait.
+            upload_buffer_chunked(cmdpool, aligned, src, fill);
+            return;
+        }
         auto b = stpool->allocate(aligned);
+        if (!b && batch) {
+            throw std::runtime_error(
+                "copyToGPUBuffer: a " + std::to_string(aligned) +
+                "-byte batched upload exceeds the staging per-allocation "
+                "limit; upload it without a batch so it can be chunked");
+        }
         if (!b) {
             // The tensor is larger than one staging range: Phi-4-style
             // tie_word_embeddings models make lm_head the [vocab, hidden]
@@ -1873,41 +1963,12 @@ template <typename T> class Tensor : public ITensor {
             upload_buffer_chunked(cmdpool, aligned, src, fill);
             return;
         }
-        const auto payload = static_cast<size_t>(size_ > 0 ? size_ : 0);
-        if (fill) {
-            fill(b->ptr, payload, 0);
-            // Only the up-to-3-element tail that rounds the buffer to a vector
-            // boundary is padding; the memcpy path used to zero the whole
-            // region and then overwrite all but that tail.
-            if (aligned > payload) {
-                memset(static_cast<char *>(b->ptr) + payload, 0,
-                       aligned - payload);
-            }
-        } else {
-            memset(b->ptr, 0, aligned);
-            // size_ may be 0 (empty tensor); src/data_ may be null then, and
-            // memcpy(dst, nullptr, 0) is UB under the optimized memmove.
-            if (payload > 0) {
-                if (src) {
-                    memcpy(b->ptr, src, payload);
-                } else {
-                    memcpy(b->ptr, data_->data(), payload);
-                }
-            }
-        }
-        // Staging may be cached-but-non-coherent: the GPU copy must observe
-        // these bytes. In batch mode the caller submits later — flushing at
-        // write time is still correct (every flush precedes that submit).
+        write_upload_payload(static_cast<char *>(b->ptr), aligned, 0, src,
+                             fill);
+        // The GPU copy must observe these bytes. In batch mode the caller
+        // submits later — flushing at write time is still correct (every
+        // flush precedes that submit).
         stpool->flush(*b);
-        std::shared_ptr<VulkanBuffer> buffer;
-        size_t offset = 0;
-        if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
-            buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-        } else {
-            auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
-            buffer = view->getBuffer();
-            offset = view->getOffset();
-        }
 
         if (!batch) {
             cmd->begin();
@@ -1926,6 +1987,29 @@ template <typename T> class Tensor : public ITensor {
         toGPU();
     }
 
+    // Fill dst with bytes [done, done+n) of the upload: the payload from
+    // fill/src/data_, then zeroes for the vector-rounding tail past size_.
+    void write_upload_payload(char *dst, size_t n, size_t done, T *src,
+                              const StagingFillFn &fill) {
+        const size_t have = size_ > 0 ? static_cast<size_t>(size_) : 0;
+        const size_t payload = done < have ? std::min(n, have - done) : 0;
+        if (payload > 0) {
+            if (fill) {
+                fill(dst, payload, done);
+            } else {
+                const char *bytes = reinterpret_cast<const char *>(
+                    src ? static_cast<const void *>(src)
+                        : static_cast<const void *>(data_->data()));
+                memcpy(dst, bytes + done, payload);
+            }
+        }
+        // Only the up-to-3-element tail that rounds the buffer to a vector
+        // boundary is padding.
+        if (n > payload) {
+            memset(dst + payload, 0, n - payload);
+        }
+    }
+
     // 超过 staging pool 单次分配上限的大张量：按 pool 的上限分块，分配→拷贝→
     // 提交→等待→复位，峰值只占一个块。常规尺寸仍走 copyToGPUBuffer 的单次快速路径。
     void
@@ -1938,8 +2022,7 @@ template <typename T> class Tensor : public ITensor {
         // the two limits cannot disagree. The chunks that will not fit are
         // streamed through the same buffer one at a time, so peak staging is
         // one chunk regardless of the tensor's size.
-        const size_t kChunkBytes =
-            VulkanStagingBufferPool::maxAllocationSize();
+        const size_t kChunkBytes = VulkanStagingBufferPool::chunkSize();
 
         std::shared_ptr<VulkanBuffer> buffer;
         size_t base_offset = 0;
@@ -1951,13 +2034,6 @@ template <typename T> class Tensor : public ITensor {
             base_offset = view->getOffset();
         }
 
-        const char *bytes = nullptr;
-        if (!fill) {
-            bytes = reinterpret_cast<const char *>(
-                src ? static_cast<const void *>(src)
-                    : static_cast<const void *>(data_->data()));
-        }
-        const size_t have = size_ > 0 ? static_cast<size_t>(size_) : 0;
         for (size_t done = 0; done < aligned; done += kChunkBytes) {
             size_t n = std::min(kChunkBytes, aligned - done);
             VulkanCommandBuffer cmd(cmdpool);
@@ -1971,19 +2047,8 @@ template <typename T> class Tensor : public ITensor {
                     std::to_string(done) + " of " + std::to_string(aligned) +
                     ")");
             }
-            size_t payload = done < have ? std::min(n, have - done) : 0;
-            if (fill) {
-                fill(part->ptr, payload, done);
-                if (n > payload) {
-                    memset(static_cast<char *>(part->ptr) + payload, 0,
-                           n - payload);
-                }
-            } else {
-                memset(part->ptr, 0, n);
-                if (payload > 0) {
-                    memcpy(part->ptr, bytes + done, payload);
-                }
-            }
+            write_upload_payload(static_cast<char *>(part->ptr), n, done, src,
+                                 fill);
             stpool->flush(*part);
             cmd.begin();
             buffer->copyStageBufferToBuffer(
@@ -1992,10 +2057,8 @@ template <typename T> class Tensor : public ITensor {
             cmd.end();
             cmd.submit(dev->getComputeQueue());
             cmd.wait();
-            // Same reason as the readback path: every chunk asks for the same
-            // size, so keep the grown buffer instead of shrinking and
-            // re-growing it per chunk.
-            stpool->reset_keep_size();
+            // The chunk has been consumed; rewind (the pool keeps its size).
+            stpool->reset();
         }
         toGPU();
     }
@@ -2076,7 +2139,7 @@ template <typename T> class Tensor : public ITensor {
         // Chunk boundaries are row-aligned when the buffer carries per-row
         // padding, because the compaction below rewrites whole rows. Otherwise
         // one chunk is exactly what the pool will hand out in one allocation.
-        const size_t max_chunk = VulkanStagingBufferPool::maxAllocationSize();
+        const size_t max_chunk = VulkanStagingBufferPool::chunkSize();
         const size_t packed_stride_bytes =
             need_compact
                 ? static_cast<size_t>(logical_cols + row_pad) * sizeof(T)
@@ -2152,10 +2215,8 @@ template <typename T> class Tensor : public ITensor {
                 std::memcpy(reinterpret_cast<char *>(data_->data()) + done,
                             b->ptr, n);
             }
-            // Rewind the allocator WITHOUT shrinking the pool: the next chunk
-            // wants the same size again, and reset() would drop the buffer back
-            // to 16 MB and then re-grow (and rezero) it for every chunk.
-            stpool->reset_keep_size();
+            // The chunk has been consumed; rewind (the pool keeps its size).
+            stpool->reset();
         }
         // Padding is consumed; drop the marker so subsequent copies use the
         // plain contiguous path.

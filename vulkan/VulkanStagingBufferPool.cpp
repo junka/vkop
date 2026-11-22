@@ -1,6 +1,8 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanStagingBufferPool.hpp"
-#include <cmath>
+
+#include <algorithm>
+#include <cassert>
 
 #include "include/logger.hpp"
 
@@ -8,212 +10,114 @@ namespace vkop {
 #define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
 
 namespace {
-constexpr int kInitialStagingBufferSize = 1024 * 1024 * 16; // 16MB initial
-constexpr int kGrowthFactor = 2;                          // Double when needed
+constexpr size_t kInitialStagingBufferSize = static_cast<size_t>(16) << 20;
+// Growth granularity: a 40 MB request gets 48 MB, not the 64 MB a doubling
+// policy would pick (and a 300 MB one used to get 512 MB).
+constexpr size_t kGrowthStep = static_cast<size_t>(16) << 20;
 } // namespace
 
 VulkanStagingBufferPool::VulkanStagingBufferPool(
     std::shared_ptr<VulkanDevice> &vdev)
-    : m_vdev_(vdev), m_poolSize_(0) {
-
-    resizeBuffer(kInitialStagingBufferSize);
-
-    if (!m_buffer_) {
-        throw std::runtime_error("Failed to create staging buffer");
-    }
+    : m_vdev_(vdev) {
+    // Allocated lazily on first use: a run that never stages (UMA weights are
+    // written in place) never pays for the buffer.
 }
 
-VulkanStagingBufferPool::~VulkanStagingBufferPool() {
-    if (m_buffer_) {
-        m_buffer_.reset();
-    }
-}
+VulkanStagingBufferPool::~VulkanStagingBufferPool() = default;
 
-bool VulkanStagingBufferPool::resizeBuffer(size_t newSize) {
-    if (newSize <= m_poolSize_) {
-        return true;
-    }
-
-    auto new_buffer = std::make_unique<VulkanBuffer>(
-        m_vdev_, newSize,
+std::unique_ptr<VulkanBuffer>
+VulkanStagingBufferPool::createBuffer(size_t size) {
+    // COHERENT stays a hard requirement: on devices where HOST_CACHED comes
+    // without it (Intel exposes exactly such a split), a required-CACHED mask
+    // would match no type at all. The cached preference is made inside
+    // VMA::createBuffer (HOST_ACCESS_RANDOM) or the non-VMA type scorer.
+    return std::make_unique<VulkanBuffer>(
+        m_vdev_, size,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        // COHERENT stays a hard requirement: on devices where HOST_CACHED
-        // comes without it (e.g. Intel exposes exactly such a split), a
-        // required-CACHED mask would match no type at all. The cached
-        // preference is made inside VMA::createBuffer (HOST_ACCESS_RANDOM),
-        // and the lost coherence is made up for with the pool's
-        // flush()/invalidate() around every mapped staging access.
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    if (!new_buffer) {
-        return false;
-    }
-
-    if (m_buffer_ && m_readPos_ != m_writePos_) {
-        auto *mapped_memory = m_buffer_->getMappedMemory();
-        void *new_mapped = new_buffer->getMappedMemory();
-
-        size_t data_size = (m_writePos_ >= m_readPos_)
-                               ? (m_writePos_ - m_readPos_)
-                               : (m_poolSize_ - m_readPos_ + m_writePos_);
-
-        if (m_writePos_ >= m_readPos_) {
-            memcpy(static_cast<char *>(new_mapped),
-                   static_cast<char *>(mapped_memory) + m_readPos_, data_size);
-        } else {
-            size_t first_part_size = m_poolSize_ - m_readPos_;
-            memcpy(static_cast<char *>(new_mapped),
-                   static_cast<char *>(mapped_memory) + m_readPos_,
-                   first_part_size);
-            memcpy(static_cast<char *>(new_mapped) + first_part_size,
-                   static_cast<char *>(mapped_memory), m_writePos_);
-        }
-
-        m_writePos_ = data_size;
-        m_readPos_ = 0;
-        m_buffer_->unmapMemory();
-        new_buffer->unmapMemory();
-    } else {
-        m_writePos_ = 0;
-        m_readPos_ = 0;
-    }
-
-    if (m_buffer_) {
-        m_buffer_.reset();
-    }
-
-    m_buffer_ = std::move(new_buffer);
-    m_poolSize_ = newSize;
-
-    return true;
 }
 
 std::optional<StagingAllocation>
 VulkanStagingBufferPool::allocate(size_t size, size_t alignment) {
     assert(size != 0);
+    assert(alignment != 0 && (alignment & (alignment - 1)) == 0);
 
-    if (size > m_poolSize_) {
-        if (size > kMaxAllocation) {
-            // Too big for one staging range by contract: the caller has to
-            // chunk. Checked before the growth loop so an enormous request
-            // cannot overflow the doubling either.
-            LOG_ERROR("staging request %zu exceeds the %zu-byte per-transfer "
-                      "limit; caller must chunk\n",
-                      size, kMaxAllocation);
-            return std::nullopt;
-        }
-        size_t new_size = kInitialStagingBufferSize;
-        while (new_size < size) {
-            new_size *= kGrowthFactor;
-        }
+    if (size > kMaxAllocation) {
+        LOG_ERROR("staging request %zu exceeds the %zu-byte per-transfer "
+                  "limit; caller must chunk\n",
+                  size, kMaxAllocation);
+        return std::nullopt;
+    }
 
-        if (!resizeBuffer(new_size)) {
-            LOG_ERROR("fail to resize\n");
-            return std::nullopt;
-        }
+    auto make = [](VulkanBuffer *buf, VkDeviceSize offset, size_t size) {
+        StagingAllocation alloc;
+        alloc.buffer = buf->getBuffer();
+        alloc.ptr = static_cast<char *>(buf->getMappedMemory()) + offset;
+        alloc.offset = offset;
+        alloc.size = size;
+        alloc.owner = buf;
+        return alloc;
+    };
+
+    // Oversize: a one-shot buffer, released at the next reset(). Never
+    // becomes the resident buffer, so the pool does not stay at this size.
+    if (size > kMaxPooledSize) {
+        m_retired_.push_back(createBuffer(size));
+        return make(m_retired_.back().get(), 0, size);
     }
 
     VkDeviceSize aligned_write = ALIGN_UP(m_writePos_, alignment);
-    VkDeviceSize next_write = aligned_write + size;
-    auto *mapped_memory = m_buffer_->getMappedMemory();
-
-    if (next_write <= m_poolSize_) {
-        StagingAllocation alloc;
-        alloc.ptr = static_cast<char *>(mapped_memory) + aligned_write;
-        alloc.offset = aligned_write;
-        alloc.size = size;
-        alloc.buffer = m_buffer_->getBuffer();
-        m_writePos_ = next_write;
-        return alloc;
+    if (m_buffer_ && aligned_write + size <= m_poolSize_) {
+        m_writePos_ = aligned_write + size;
+        return make(m_buffer_.get(), aligned_write, size);
     }
 
-    VkDeviceSize wrapped_start = ALIGN_UP(0, alignment);
-    VkDeviceSize wrapped_end = wrapped_start + size;
-
-    if (wrapped_end <= m_readPos_ || m_readPos_ == 0) {
-        m_writePos_ = 0;
-        aligned_write = wrapped_start;
-        next_write = wrapped_end;
-
-        StagingAllocation alloc;
-        alloc.ptr = static_cast<char *>(mapped_memory) + aligned_write;
-        alloc.offset = aligned_write;
-        alloc.size = size;
-        alloc.buffer = m_buffer_->getBuffer();
-        m_writePos_ = next_write;
-
-        return alloc;
+    // Does not fit. Earlier allocations from the current buffer may still be
+    // referenced by recorded copies, so it is retired (kept alive until
+    // reset()) rather than reused or resized in place.
+    size_t new_size =
+        std::max(static_cast<size_t>(m_poolSize_), kInitialStagingBufferSize);
+    if (new_size < size) {
+        new_size = std::min(ALIGN_UP(size, kGrowthStep), kMaxPooledSize);
     }
-
-    if (m_readPos_ > 0 && m_readPos_ < m_writePos_) {
-        size_t remaining_datasize = m_writePos_ - m_readPos_;
-
-        if (remaining_datasize + size <= m_poolSize_) {
-            std::memmove(mapped_memory,
-                         static_cast<char *>(mapped_memory) + m_readPos_,
-                         remaining_datasize);
-            m_writePos_ = remaining_datasize;
-            m_readPos_ = 0;
-
-            VkDeviceSize final_aligned_write = ALIGN_UP(m_writePos_, alignment);
-            VkDeviceSize final_next_write = final_aligned_write + size;
-
-            if (final_next_write <= m_poolSize_) {
-                StagingAllocation alloc;
-                alloc.ptr =
-                    static_cast<char *>(mapped_memory) + final_aligned_write;
-                alloc.offset = final_aligned_write;
-                alloc.size = size;
-                alloc.buffer = m_buffer_->getBuffer();
-                m_writePos_ = final_next_write;
-
-                return alloc;
-            }
-        }
+    if (m_buffer_ && m_writePos_ > 0) {
+        m_retired_.push_back(std::move(m_buffer_));
     }
-    m_buffer_->unmapMemory();
-
-    return std::nullopt;
+    m_buffer_.reset();
+    m_buffer_ = createBuffer(new_size);
+    m_poolSize_ = new_size;
+    m_writePos_ = size;
+    return make(m_buffer_.get(), 0, size);
 }
 
 void VulkanStagingBufferPool::flush(const StagingAllocation &alloc) {
-#ifdef USE_VMA
-    VMA::flushAllocation(m_buffer_->getVmaBuffer(),
-                         static_cast<VkDeviceSize>(alloc.offset),
-                         static_cast<VkDeviceSize>(alloc.size));
-#else
-    VkMappedMemoryRange range = {};
-    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.memory = m_buffer_->getMemory();
-    range.offset = alloc.offset;
-    range.size = alloc.size;
-    vkFlushMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
-#endif
+    alloc.owner->flushMappedRange(alloc.offset, alloc.size);
 }
 
 void VulkanStagingBufferPool::invalidate(const StagingAllocation &alloc) {
-#ifdef USE_VMA
-    VMA::invalidateAllocation(m_buffer_->getVmaBuffer(),
-                              static_cast<VkDeviceSize>(alloc.offset),
-                              static_cast<VkDeviceSize>(alloc.size));
-#else
-    VkMappedMemoryRange range = {};
-    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.memory = m_buffer_->getMemory();
-    range.offset = alloc.offset;
-    range.size = alloc.size;
-    vkInvalidateMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
-#endif
+    alloc.owner->invalidateMappedRange(alloc.offset, alloc.size);
 }
 
 void VulkanStagingBufferPool::reset() {
     m_writePos_ = 0;
-    m_readPos_ = 0;
+    m_retired_.clear();
+}
 
-    if (m_poolSize_ > kInitialStagingBufferSize * 2) {
-        resizeBuffer(kInitialStagingBufferSize);
+void VulkanStagingBufferPool::trim() {
+    reset();
+    if (m_poolSize_ > kInitialStagingBufferSize) {
+        m_buffer_.reset();
+        m_poolSize_ = 0;
     }
+}
+
+size_t VulkanStagingBufferPool::residentBytes() const {
+    size_t total = m_buffer_ ? static_cast<size_t>(m_poolSize_) : 0;
+    for (const auto &b : m_retired_) {
+        total += static_cast<size_t>(b->getSize());
+    }
+    return total;
 }
 
 } // namespace vkop
