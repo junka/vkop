@@ -34,6 +34,29 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
                    const ITensor *output, int precision);
 
 class Runtime {
+  public:
+    // Longest live PREFIX of `levels`, given which nodes must run.
+    //
+    // Split out of Runtime so the policy is testable without a GPU or a
+    // converted model (tests/UnusedOutputsTest.cpp): the inputs are plain
+    // vectors, which is also what makes the two rules explicit --
+    //
+    //   * a level is kept if ANY of its nodes is live or has a side effect
+    //     (`side_effect` carries has_host_side_effects() ||
+    //     recording_changes_per_round(), which the caller folds together so
+    //     this stays a pure function of data);
+    //   * the answer is a PREFIX, never an arbitrary subset, because the
+    //     scheduler splits levels into replayable segments by ordinal and a
+    //     hole would shift every later ordinal (see the corruption note in
+    //     Runtime::Run).
+    //
+    // `live` is filled in by the caller from the graph outputs it must
+    // produce; this function only does the prefix scan. Returns the number of
+    // levels to execute (== levels.size() when nothing can be dropped).
+    static size_t live_level_prefix(const std::vector<std::vector<size_t>> &levels,
+                                   const std::vector<bool> &live,
+                                   const std::vector<bool> &side_effect);
+
   private:
     // Graph precision for the tensors this Runtime allocates (outputs at load
     // time, plus the fallback for ops whose own dtypes are not informative).
@@ -187,6 +210,22 @@ class Runtime {
     // difference (learning-state convergence, phase boundary) discards every
     // cached recording and restarts the warm-up.
     std::vector<std::pair<size_t, size_t>> seg_level_ranges_prev_;
+
+    // set_unused_outputs() declaration, consumed (and cleared) by the next
+    // Run(). See that method for what the skip does and why it is derived from
+    // the dependency graph rather than from op types.
+    std::vector<std::string> unused_outputs_;
+    int last_run_skipped_nodes_ = 0;
+    // How many leading levels of level_node_indices_ this round must execute.
+    // level_node_indices_.size() normally, and smaller only when the trailing
+    // levels are provably dead (see compute_live_levels). Every consumer of the
+    // level table inside Run() uses this instead of the vector's size, so the
+    // scheduler's segment split stays a prefix of the full one and cached
+    // recordings keep describing the same levels.
+    size_t live_levels_ = 0;
+    // Resolve the unused-output declaration into live_levels_. Returns the
+    // number of trailing nodes skipped. Declared here, defined in runtime.cpp.
+    int compute_live_levels();
     bool seg_replay_rounds_valid_ = false;
     // 本轮每 segment 是 hit (true) 还是 miss/重录 (false). Run() 开头填,
     // 末尾 reset 循环据此决定是保留 buffer 内容还是 reset.
@@ -468,6 +507,33 @@ class Runtime {
         const std::unordered_map<std::string, std::string> &attributes,
         const std::vector<std::shared_ptr<ITensor>> &inputs,
         const std::vector<std::shared_ptr<ITensor>> &outputs);
+
+    // Declare graph outputs whose value THIS round's caller will not read, so
+    // Run() can skip the nodes that exist only to produce them.
+    //
+    // The motivating case: a chunked prefill runs the whole graph N times and
+    // needs `logits` (plus the TopK registered on it) only for the LAST chunk,
+    // yet every chunk pays for the LM head (~39 ms at m=256) and for TopK
+    // (~27 ms). Those are the largest single ops in a prefill chunk.
+    //
+    // What is skipped is derived from the graph, never assumed: a node is
+    // skippable only when (a) it is not needed, transitively, by ANY output
+    // that is still live, and (b) it does no host work and its recording does
+    // not change per round -- i.e. it is a pure GPU producer of dead bytes.
+    // That keeps the rule honest for ops with side effects (in-place KV writes,
+    // host-readback shape chains) which must run even if nobody reads them.
+    //
+    // The declaration applies to the next Run() only; Run() clears it, so a
+    // caller must re-declare every round it wants the skip. Empty (the default)
+    // means "everything is live", which is the behaviour every existing driver
+    // already gets.
+    void set_unused_outputs(const std::vector<std::string> &names) {
+        unused_outputs_.assign(names.begin(), names.end());
+    }
+    // Whether the last Run() actually skipped anything (and how many nodes).
+    // Diagnostic only: lets a driver/tests assert the declaration took effect
+    // instead of trusting that the shapes were what the policy expected.
+    int last_run_skipped_nodes() const { return last_run_skipped_nodes_; }
 };
 
 } // namespace core

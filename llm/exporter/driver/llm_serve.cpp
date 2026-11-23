@@ -1187,6 +1187,24 @@ class InferenceServer {
             if (arch_.has_image_pad_mask)
                 upload_input(cmdpool_, rt_->GetInput("image_pad_mask"));
 
+            // Only the LAST chunk's logits are read (the first generated token
+            // comes from it; every earlier chunk writes KV rows nobody samples
+            // from). Declaring that lets Run() drop the LM head and the GPU
+            // TopK on this chunk -- together the two largest single ops in a
+            // prefill chunk (~39 ms + ~27 ms at q=256), so a 28-chunk 8k prompt
+            // stops paying them 27 times. The skip is derived from the graph's
+            // own dependencies in Runtime::compute_live_levels, so an output
+            // this model does not have is simply not skipped.
+            //
+            // VKOP_SKIP_DEAD_LOGITS=0 is the A/B arm and the escape hatch: it
+            // restores the old "every chunk computes logits" behaviour.
+            static const bool skip_dead_logits = [] {
+                const char *e = std::getenv("VKOP_SKIP_DEAD_LOGITS");
+                return !(e && e[0] == '0');
+            }();
+            if (skip_dead_logits && blk + 1 < n_chunks) {
+                rt_->set_unused_outputs({"logits", "post_TopK0", "post_TopK1"});
+            }
             last_run_ms = rt_->Run();
             rt_->invalidate_replay();
             dev_->wait_all_done();

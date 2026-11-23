@@ -485,6 +485,14 @@ add_executable(KernelSelectTest KernelSelectTest.cpp)
 target_link_libraries(KernelSelectTest PRIVATE vkop vload)
 add_test(NAME KernelSelectTest COMMAND KernelSelectTest)
 
+# Skipping the dead tail of a round (Runtime::set_unused_outputs). Pure: the
+# policy is a plain function over level/node vectors, so it runs without a GPU
+# or a converted model.
+# Run:  ./UnusedOutputsTest
+add_executable(UnusedOutputsTest UnusedOutputsTest.cpp)
+target_link_libraries(UnusedOutputsTest PRIVATE vkop vload)
+add_test(NAME UnusedOutputsTest COMMAND UnusedOutputsTest)
+
 # Image layout accounting probe (not a gtest): reports driver rowPitch /
 # arrayPitch padding for the image2DArray (NCHW->RGBA) layout vs a folded
 # single image2D, plus the real per-tensor gap for a given .vkopbin.

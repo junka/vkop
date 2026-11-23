@@ -2232,6 +2232,156 @@ Runtime::node_outputs_checksum(int node_idx) const {
     return out;
 }
 
+size_t Runtime::live_level_prefix(const std::vector<std::vector<size_t>> &levels,
+                                  const std::vector<bool> &live,
+                                  const std::vector<bool> &side_effect) {
+    auto level_needed = [&](size_t li) {
+        for (size_t ni : levels[li]) {
+            if (ni >= live.size()) return true;      // unknown: keep it
+            if (live[ni]) return true;
+            if (ni < side_effect.size() && side_effect[ni]) return true;
+        }
+        return false;
+    };
+    // The count of levels to execute = one past the LAST level that must run.
+    // A level before that one is executed even if it is itself dead: the
+    // scheduler numbers replayable segments by level ordinal, so the answer has
+    // to be a prefix and a hole has to be filled by running the dead level.
+    size_t keep = 0;
+    for (size_t li = 0; li < levels.size(); ++li) {
+        if (level_needed(li)) keep = li + 1;
+    }
+    return keep;
+}
+
+// Resolve set_unused_outputs() into live_levels_.
+//
+// The question Run() asks is "which nodes must execute this round", and the
+// graph already answers it: a node must run if it feeds, transitively, any
+// output the caller will read. Everything else is dead bytes.
+//
+// Three things keep this from being a naive DCE:
+//
+//   1. Node identity is not a DAG in this table -- node_dependency_indices_ is
+//      the converter's list, while execution order is level_node_indices_. The
+//      analysis therefore walks the DEPENDENCY edges and then intersects with
+//      the level order.
+//
+//   2. The result must be a PREFIX of the level table, not an arbitrary subset.
+//      The scheduler splits levels into replayable segments by ordinal; a hole
+//      in the middle would shift every later ordinal and the cached recordings
+//      would describe the wrong levels (the corruption note in Run() records
+//      exactly that failure). So the answer is the longest prefix of levels
+//      whose nodes are all live. For the shape this exists to serve -- an LM
+//      head and the TopK on it, both at the tail -- that is the whole win.
+//
+//   3. An op that does host work or whose recording changes per round has a
+//      side effect beyond its output bytes, so it is never skipped. This is the
+//      same predicate segment replay uses, and it is what keeps in-place KV
+//      writes and host-readback shape chains running.
+int Runtime::compute_live_levels() {
+    const size_t n = node_ops_.size();
+    live_levels_ = level_node_indices_.size();
+    last_run_skipped_nodes_ = 0;
+    if (unused_outputs_.empty() || n == 0 || level_node_indices_.empty()) {
+        return 0;
+    }
+
+    // Roots that are still live: every graph output the caller did not
+    // declare unused. A name that does not resolve is ignored rather than
+    // fatal -- a driver may declare an output this model does not have.
+    std::vector<bool> live(n, false);
+    std::vector<int> stack;
+    for (const auto &kv : outputs_) {
+        const auto &name = kv.first;
+        bool unused = false;
+        for (const auto &u : unused_outputs_) {
+            if (u == name) { unused = true; break; }
+        }
+        if (unused) continue;
+        // Find the node that produces this output tensor, by pointer identity:
+        // the graph output tensor is the same object the producer wrote.
+        const ITensor *want = kv.second.get();
+        for (size_t i = 0; i < node_output_tensors_.size(); ++i) {
+            bool hit = false;
+            for (const auto &t : node_output_tensors_[i]) {
+                if (t.get() == want) { hit = true; break; }
+            }
+            if (hit) {
+                if (!live[i]) { live[i] = true; stack.push_back((int)i); }
+                break;
+            }
+        }
+    }
+    // Post-process outputs (TopK on logits) published only in real_outputs_.
+    // They are registered as their own node with the producing levels as
+    // dependencies, so they join the same walk. A caller that reads one keeps
+    // it live by NOT declaring it unused.
+    for (const auto &kv : real_outputs_) {
+        bool unused = false;
+        for (const auto &u : unused_outputs_) {
+            if (u == kv.first) { unused = true; break; }
+        }
+        if (unused) continue;
+        const ITensor *want = kv.second.get();
+        for (size_t i = 0; i < node_output_tensors_.size(); ++i) {
+            bool hit = false;
+            for (const auto &t : node_output_tensors_[i]) {
+                if (t.get() == want) { hit = true; break; }
+            }
+            if (hit) {
+                if (!live[i]) { live[i] = true; stack.push_back((int)i); }
+                break;
+            }
+        }
+    }
+
+    // Backward reachability over the dependency edges.
+    while (!stack.empty()) {
+        const int ni = stack.back();
+        stack.pop_back();
+        if (ni < 0 || static_cast<size_t>(ni) >= node_dependency_indices_.size())
+            continue;
+        for (int dep : node_dependency_indices_[ni]) {
+            if (dep < 0 || static_cast<size_t>(dep) >= n) continue;
+            if (!live[dep]) { live[dep] = true; stack.push_back(dep); }
+        }
+    }
+
+    // Fold the op predicates into a plain vector so the prefix scan can be a
+    // pure function (and therefore testable without a GPU).
+    std::vector<std::vector<size_t>> levels(level_node_indices_.size());
+    for (size_t li = 0; li < level_node_indices_.size(); ++li) {
+        for (int ni : level_node_indices_[li]) {
+            levels[li].push_back(ni < 0 ? n : static_cast<size_t>(ni));
+        }
+    }
+    std::vector<bool> side_effect(n, false);
+    for (size_t i = 0; i < n; ++i) {
+        // did_host_work_last_round() is the precise answer (it defaults to the
+        // type-level has_host_side_effects() until an op reports otherwise),
+        // so a plain dense MatMul -- which reports "no host work" every round
+        // -- is skippable, while a split-K one that rewrote its control header
+        // is not. recording_changes_per_round() is orthogonal: it says the
+        // recording itself bakes a per-round host value.
+        side_effect[i] = node_ops_[i]->did_host_work_last_round() ||
+                         node_ops_[i]->recording_changes_per_round();
+    }
+    const size_t exec_levels = live_level_prefix(levels, live, side_effect);
+
+    // Count what the truncated tail would have run, for the trace line and for
+    // last_run_skipped_nodes(): only nodes that are dead AND side-effect free.
+    int skipped = 0;
+    for (size_t lj = exec_levels; lj < levels.size(); ++lj) {
+        for (size_t ni : levels[lj]) {
+            if (ni < n && !live[ni] && !side_effect[ni]) ++skipped;
+        }
+    }
+    last_run_skipped_nodes_ = skipped;
+    live_levels_ = exec_levels;
+    return skipped;
+}
+
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
@@ -2240,6 +2390,31 @@ double Runtime::Run() {
     // that compilation has to stay separable from the load-phase one.
     pipeline_prof_set_phase("run");
     ds_prof_set_phase("run");
+    // Resolve this round's dead-output declaration into a level count. Done
+    // first, before any scheduler state is touched, and the declaration is
+    // consumed here so it applies to exactly one Run(). With no declaration
+    // (every existing driver) this restores the full level count and costs two
+    // branches.
+    {
+        if (!unused_outputs_.empty()) {
+            const int skipped = compute_live_levels();
+            if (skipped > 0 && std::getenv("VKOP_UNUSED_OUTPUTS_TRACE")) {
+                std::fprintf(stderr,
+                             "[unused] skipping %d dead node(s): levels %zu -> "
+                             "%zu\n",
+                             skipped, level_node_indices_.size(), live_levels_);
+            }
+        } else {
+            live_levels_ = level_node_indices_.size();
+            last_run_skipped_nodes_ = 0;
+        }
+        unused_outputs_.clear();
+    }
+    // Every scheduling use of the level table goes through `n_levels` so a
+    // truncated round keeps the segment split a PREFIX of the full one -- a
+    // hole would shift every later ordinal, and the consequence is the
+    // corruption documented in the segment-split block below.
+    const size_t n_levels = live_levels_;
     // One [dswrite] line per dispatch round, on whichever path Run() returns
     // through: the guard spans the whole round, so its percentages line up with
     // the round time the driver reports. Prints nothing when the gate is off.
@@ -3765,7 +3940,7 @@ double Runtime::Run() {
         // froze the KV cache.
         seg_level_ranges_.clear();
         {
-            const size_t nlev = level_node_indices_.size();
+            const size_t nlev = n_levels;
             // ONE LEVEL PER SEGMENT. Packing several static levels into one
             // segment corrupts decode: with graph_segment >= 2 the model emits
             // "The capital capital of France is Paris Paris", with
@@ -3887,7 +4062,7 @@ double Runtime::Run() {
         }
     }
 
-    for (size_t level_idx = 0; level_idx < level_node_indices_.size();
+    for (size_t level_idx = 0; level_idx < n_levels;
          level_idx++) {
         graph_cur_level = level_idx;
         // --- Host-side reshape_view pre-pass ---
@@ -4711,14 +4886,31 @@ double Runtime::Run() {
     // attribution of the ~515ms submit floor by op-type (opprof is
     // record-side).
     if (submit_prof_ && submit_prof_pool_ != VK_NULL_HANDLE) {
-        uint32_t nq = static_cast<uint32_t>(node_ops_.size()) * 2;
+        // Only nodes that actually executed wrote their timestamps: a round
+        // that skipped a dead tail (set_unused_outputs) leaves those queries
+        // with no result, and VK_QUERY_RESULT_WAIT_BIT would block forever on
+        // one that is never written. Query the executed range only.
+        uint32_t executed = 0;
+        for (size_t li = 0; li < n_levels && li < level_node_indices_.size();
+             ++li) {
+            for (int ni : level_node_indices_[li]) {
+                if (ni >= 0 && static_cast<uint32_t>(ni) + 1 > executed) {
+                    executed = static_cast<uint32_t>(ni) + 1;
+                }
+            }
+        }
+        const uint32_t nq = executed * 2;
         std::vector<uint64_t> ts(nq, 0);
         // VK_QUERY_RESULT_WAIT_BIT blocks until each query is available; since
         // the final-level wait above already drained the queue, all are ready.
-        VkResult r = vkGetQueryPoolResults(
-            dev->getLogicalDevice(), submit_prof_pool_, 0, nq,
-            nq * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
-            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        VkResult r = nq == 0
+                         ? VK_SUCCESS
+                         : vkGetQueryPoolResults(
+                               dev->getLogicalDevice(), submit_prof_pool_, 0, nq,
+                               nq * sizeof(uint64_t), ts.data(),
+                               sizeof(uint64_t),
+                               VK_QUERY_RESULT_64_BIT |
+                                   VK_QUERY_RESULT_WAIT_BIT);
         if (r == VK_SUCCESS) {
             // Aggregate per op-type. Sum the per-op GPU ms.
             std::map<std::string, std::pair<double, int>>
@@ -4730,7 +4922,7 @@ double Runtime::Run() {
                 std::string name;
             };
             std::vector<PerOp> per_op_ms;
-            for (size_t i = 0; i < node_ops_.size(); ++i) {
+            for (size_t i = 0; i < executed; ++i) {
                 uint64_t b = ts[i * 2];
                 uint64_t e = ts[i * 2 + 1];
                 if (e < b)
@@ -4765,7 +4957,7 @@ double Runtime::Run() {
                 // order they were pushed -- same iteration order as the
                 // query readback above.
                 size_t oi = 0;
-                for (size_t i = 0; i < node_ops_.size(); ++i) {
+                for (size_t i = 0; i < executed; ++i) {
                     uint64_t b = ts[i * 2];
                     uint64_t e = ts[i * 2 + 1];
                     if (e < b)
