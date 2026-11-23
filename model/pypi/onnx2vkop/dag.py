@@ -1349,7 +1349,14 @@ class DAGBasedModel:
         root = Model.End(builder)
         builder.Finish(root, file_identifier=b"VKOP")
 
-        with open(file_path, "wb") as f:
+        # An in-place reconversion (`-i m.onnx -o m.vkopbin` whose deferred
+        # weights already live in that .vkopbin) would have the "wb" below
+        # truncate the file every payload is then read from. The guard has to be
+        # taken BEFORE this open, and must stay held for the whole write; see
+        # weight_stream.InPlaceSourceGuard.
+        guard = weight_stream.InPlaceSourceGuard.open(self.deferred_weights,
+                                                      file_path)
+        with guard, open(file_path, "wb") as f:
             f.write(builder.Output())
             if external:
                 # 外部数据：blob（含 unified 区域）以 64 字节对齐追加在 FlatBuffer

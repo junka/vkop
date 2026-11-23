@@ -37,6 +37,8 @@ Fail-closed points:
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
@@ -824,6 +826,113 @@ def restore_paging_slots(model, base_dir: str, deferred: Dict[str, dict],
     return added, freed
 
 
+class InPlaceSourceGuard:
+    """Keeps a deferred weight's source readable when the output is that file.
+
+    `onnx2vkop -i m.onnx -o m.vkopbin` whose deferred weights already point at
+    that .vkopbin is a real re-conversion: the writer opens the destination with
+    "wb", which truncates the very file every payload is read from.
+
+    Keeping a read fd open does NOT help -- `open(..., "wb")` truncates the
+    inode itself, so every descriptor on it sees zero bytes. The source is
+    copied aside instead, and reads are redirected there. The copy is only made
+    when the source and the destination really are the same file, so an ordinary
+    conversion pays nothing.
+
+    This has to be established BEFORE the destination is opened for writing --
+    by the time a payload writer runs, the truncation has already happened.
+
+    Usage::
+
+        with InPlaceSourceGuard.open(deferred, out_path) as guard:
+            with open(out_path, "wb") as f:
+                ... write_payload(entry, f, base_dir) ...
+    """
+
+    def __init__(self):
+        self._tmpdir = None
+        self.paths = {}     # resolved source path -> the private copy
+
+    @classmethod
+    def open(cls, deferred: dict, out_path: str) -> "InPlaceSourceGuard":
+        """Copy aside every deferred source that names `out_path` itself."""
+        guard = cls()
+        try:
+            out_real = os.path.realpath(out_path)
+        except OSError:
+            return guard
+        base = os.path.dirname(out_real)
+        for entry in deferred.values():
+            src = entry.get("location")
+            if not src:
+                continue
+            if not os.path.isabs(src):
+                src = os.path.join(entry.get("base_dir") or base, src)
+            try:
+                src_real = os.path.realpath(src)
+            except OSError:
+                continue
+            if src_real != out_real or src_real in guard.paths:
+                continue
+            if guard._tmpdir is None:
+                guard._tmpdir = tempfile.mkdtemp(prefix="vkop-inplace-")
+            dst = os.path.join(guard._tmpdir, "src%d" % len(guard.paths))
+            try:
+                shutil.copyfile(src_real, dst)
+            except OSError:
+                continue
+            guard.paths[src_real] = dst
+        return guard
+
+    @property
+    def active(self) -> bool:
+        return bool(self.paths)
+
+    def __enter__(self):
+        global _active_guard
+        _active_guard = self
+        return self
+
+    def __exit__(self, *exc):
+        global _active_guard
+        _active_guard = None
+        if self._tmpdir is not None:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+        self.paths = {}
+        return False
+
+
+# The guard in force while save_to_binary writes its blob. Module-level because
+# every payload writer resolves its source through source_read_path, and
+# threading a parameter through all of them would only add a way to forget it.
+_active_guard = None
+
+
+def source_read_path(entry: dict, out_f, base_dir: str,
+                     guard: "InPlaceSourceGuard" = None) -> str:
+    """The path a payload writer should read `entry`'s source bytes from.
+
+    Normally that is just entry["location"] resolved against base_dir. The
+    exception is an in-place reconversion, handled by InPlaceSourceGuard: this
+    returns the guard's private copy for a source it took aside, so the read
+    lands on the old bytes rather than the truncated destination. A guard that
+    copied nothing (the common case) leaves the plain path alone.
+    """
+    path = entry["location"]
+    if not os.path.isabs(path):
+        path = os.path.join(entry.get("base_dir") or base_dir, path)
+    g = guard if guard is not None else _active_guard
+    if g is not None and g.paths:
+        try:
+            real = os.path.realpath(path)
+            if real in g.paths:
+                return g.paths[real]
+        except OSError:
+            pass
+    return path
+
+
 def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
     """Copy one deferred tensor from its source file into the output.
 
@@ -846,9 +955,7 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
         return _write_lane_major(entry, out_f, base_dir)
     if entry.get("interleave") is not None:
         return _write_interleave(entry, out_f, base_dir)
-    path = entry["location"]
-    if not os.path.isabs(path):
-        path = os.path.join(base_dir, path)
+    path = source_read_path(entry, out_f, base_dir)
     remaining = entry["length"]
     to_fp16 = entry.get("src_dtype") == TensorProto.BFLOAT16
     with open(path, "rb") as src:
@@ -875,11 +982,14 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
 
 
 def _read_rows(src_entry: dict, base_dir: str, row0: int, rows: int,
-               n_dim: int) -> np.ndarray:
-    """Rows [row0, row0+rows) of a [K, N] 16-bit deferred source, as fp16 bits."""
-    path = src_entry["location"]
-    if not os.path.isabs(path):
-        path = os.path.join(src_entry.get("base_dir") or base_dir, path)
+               n_dim: int, out_f=None) -> np.ndarray:
+    """Rows [row0, row0+rows) of a [K, N] 16-bit deferred source, as fp16 bits.
+
+    `out_f` is the file being written; when the source and that file are the
+    same one (an in-place reconversion) it is what redirects this read to the
+    guard's copy -- see source_read_path.
+    """
+    path = source_read_path(src_entry, out_f, base_dir)
     want = rows * n_dim * 2
     with open(path, "rb") as f:
         f.seek(int(src_entry["offset"]) + row0 * n_dim * 2)
@@ -908,8 +1018,8 @@ def _write_interleave(entry: dict, out_f, base_dir: str) -> int:
     row = 0
     while row < k_dim:
         take = min(band, k_dim - row)
-        g = _read_rows(spec["g"], base_dir, row, take, n_dim)
-        u = _read_rows(spec["u"], base_dir, row, take, n_dim)
+        g = _read_rows(spec["g"], base_dir, row, take, n_dim, out_f)
+        u = _read_rows(spec["u"], base_dir, row, take, n_dim, out_f)
         gu = np.concatenate([g.reshape(take, n_dim // 4, 4),
                              u.reshape(take, n_dim // 4, 4)], axis=2)
         out_f.write(np.ascontiguousarray(gu).tobytes())
@@ -937,9 +1047,7 @@ def _write_lane_major(entry: dict, out_f, base_dir: str) -> int:
     The source is read in row bands so a wide weight never materializes more
     than a few hundred MiB.
     """
-    path = entry["location"]
-    if not os.path.isabs(path):
-        path = os.path.join(base_dir, path)
+    path = source_read_path(entry, out_f, base_dir)
     k_dim, n_dim, padded = entry["lane_major"]
     rows = entry["length"] // max(1, n_dim * 2)   # fp16 source: 2 bytes/element
     written = 0
@@ -1012,12 +1120,14 @@ def _write_quantized(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
     from . import quant_payload
 
     if entry.get("quant") == "int4":
-        return _write_int4(entry, out_f, dag_model)
+        return _write_int4(entry, out_f, dag_model, base_dir)
 
     if entry.get("transpose_payload"):
         return _write_quantized_transposed(entry, out_f, base_dir, dag_model)
 
-    reader = quant_payload.WeightReader(entry, entry["name"])
+    reader = quant_payload.WeightReader(
+        entry, entry["name"],
+        path_for=lambda e: source_read_path(e, out_f, base_dir))
     # Which stored axis holds the output columns -- recorded by prepare while
     # the Transpose was still in the graph, because it decides both the scale's
     # axis and how the scale broadcasts over a band.
@@ -1058,7 +1168,8 @@ def _pack_nibbles(codes) -> np.ndarray:
     return np.ascontiguousarray(nib[..., 0::2] | (nib[..., 1::2] << 4))
 
 
-def _write_int4(entry: dict, out_f, dag_model=None) -> int:
+def _write_int4(entry: dict, out_f, dag_model=None,
+                base_dir: str = "") -> int:
     """Stream an int4 entry's source, write packed nibbles (two per byte).
 
     Two layouts, one payload:
@@ -1081,7 +1192,9 @@ def _write_int4(entry: dict, out_f, dag_model=None) -> int:
     """
     from . import quant_payload
 
-    reader = quant_payload.WeightReader(entry, entry["name"])
+    reader = quant_payload.WeightReader(
+        entry, entry["name"],
+        path_for=lambda e: source_read_path(e, out_f, base_dir))
     transposed = bool(entry.get("transposed"))
     group = int(entry.get("group") or 0)
     if group <= 0:
@@ -1191,7 +1304,9 @@ def _write_quantized_transposed(entry: dict, out_f, base_dir: str,
     """
     from . import quant_payload
 
-    reader = quant_payload.WeightReader(entry, entry["name"])
+    reader = quant_payload.WeightReader(
+        entry, entry["name"],
+        path_for=lambda e: source_read_path(e, out_f, base_dir))
     transposed = bool(entry.get("transposed"))
     if not transposed:
         raise DeferredWeightError(

@@ -20,6 +20,8 @@ Measured on this repo's own models: llm.onnx (197 of 310 initializers streamed,
 10.332 GiB.
 """
 
+import os
+
 import numpy
 import onnx
 import pytest
@@ -649,6 +651,65 @@ def test_payload_copy_is_byte_faithful(tmp_path):
     with open(out, "wb") as f:
         assert ws.write_payload(entry, f, str(tmp_path)) == len(payload)
     assert out.read_bytes() == payload
+
+
+def test_source_read_path_is_the_plain_location_when_the_files_differ(
+        tmp_path):
+    entry = {"name": "W", "location": "w.bin", "offset": 0, "length": 8,
+             "data_type": TensorProto.FLOAT16, "dims": (4, 1), "consumers": 1}
+    (tmp_path / "w.bin").write_bytes(b"\x00" * 8)
+    with open(tmp_path / "out.bin", "wb") as f:
+        assert ws.source_read_path(entry, f, str(tmp_path)) == str(
+            tmp_path / "w.bin")
+
+
+def test_in_place_guard_copies_only_a_source_that_is_the_destination(tmp_path):
+    target = tmp_path / "m.vkopbin"
+    target.write_bytes(b"\x00" * 16)
+    (tmp_path / "other.bin").write_bytes(b"\x00" * 8)
+    deferred = {
+        "A": {"name": "A", "location": "m.vkopbin", "offset": 0, "length": 8},
+        "B": {"name": "B", "location": "other.bin", "offset": 0, "length": 8},
+    }
+    with ws.InPlaceSourceGuard.open(deferred, str(target)) as g:
+        assert g.active
+        assert len(g.paths) == 1        # other.bin is not the destination
+        assert not os.path.exists(g.paths[str(target.resolve())]) is False
+    assert not g.active
+
+
+def test_source_read_path_keeps_an_in_place_reconversion_readable(tmp_path):
+    """`onnx2vkop -i m.onnx -o m.vkopbin` whose weights already live in that
+    .vkopbin: the writer would truncate the file the reader is seeking in."""
+    payload = numpy.arange(4096, dtype=numpy.float16).tobytes()
+    target = tmp_path / "m.vkopbin"
+    target.write_bytes(b"pad!" + payload)
+    entry = {"name": "W", "location": "m.vkopbin", "offset": 4,
+             "length": len(payload), "data_type": TensorProto.FLOAT16,
+             "dims": (1, len(payload) // 2), "consumers": 1}
+    # The guard must be taken before the truncating open -- exactly the order
+    # save_to_binary uses.
+    with ws.InPlaceSourceGuard.open({"W": entry}, str(target)):
+        with open(target, "wb") as f:      # truncates to 0 -- the hazard
+            assert ws.write_payload(entry, f, str(tmp_path)) == len(payload)
+    assert target.read_bytes() == payload  # the read side saw the old bytes
+
+
+def test_in_place_reconversion_of_a_quantizing_entry_survives(tmp_path):
+    """Same hazard on the WeightReader path (_write_quantized -> bands())."""
+    src = numpy.arange(64, dtype=numpy.float32).reshape(8, 8)
+    payload = src.tobytes()
+    target = tmp_path / "m.vkopbin"
+    target.write_bytes(payload)
+    entry = {"name": "W", "location": "m.vkopbin", "offset": 0,
+             "length": len(payload), "data_type": TensorProto.FLOAT,
+             "dims": (8, 8), "consumers": 1, "quant": "int8",
+             "scale_values": numpy.ones(8, dtype=numpy.float32)}
+    with ws.InPlaceSourceGuard.open({"W": entry}, str(target)):
+        with open(target, "wb") as f:
+            written = ws.write_payload(entry, f, str(tmp_path))
+    assert written == 64                    # one byte per element, 8x8
+    assert len(target.read_bytes()) == 64
 
 
 if __name__ == "__main__":

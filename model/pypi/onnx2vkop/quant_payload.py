@@ -51,9 +51,14 @@ def _np_dtype_of(dtype):
 class WeightReader:
     """Streams a 2-D deferred weight, one band of rows at a time."""
 
-    def __init__(self, entry, name):
+    def __init__(self, entry, name, path_for=None):
         self.entry = entry
         self.name = name
+        # Resolves the source path. weight_stream passes its source_read_path so
+        # an in-place reconversion (source and output are one file) reads the
+        # guard's copy instead of the truncated destination; a caller that does
+        # not care gets the plain location resolution.
+        self._path_for = path_for
         # `dims` is the LOGICAL shape the side table records, which is what the
         # kernel indexes: [N, K] for a transB=1 weight, and [K, N] once
         # KnWeightLayout has flipped it. `src_dims` is how the SOURCE FILE is
@@ -75,7 +80,8 @@ class WeightReader:
         a hard error for the same reason it is in write_payload: the entry
         already promised those bytes.
         """
-        path = self.entry["location"]
+        path = (self._path_for(self.entry) if self._path_for is not None
+                else self.entry["location"])
         if not os.path.isabs(path):
             path = os.path.join(self.entry["base_dir"], path)
         row_bytes = self.n * self.dtype.itemsize
