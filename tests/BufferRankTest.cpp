@@ -1604,6 +1604,71 @@ TEST(BufferRankTest, MatMulDownAct) {
     EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 2048, 6144, 2048, true, 0.02f));
 }
 
+// The fold's Wg/Wu are LANE-MAJOR: [K_out, ceil(N_up/8), 8], the layout the
+// converter's fold_swiglu_down_proj emits so one lane's eight columns are a
+// single 16-byte word. When N_up is a multiple of 8 that rounding is a no-op,
+// so the 3-D form is the SAME bytes as the plain [K_out, N_up] one -- which is
+// why every case above (all with N_up % 8 == 0) passes while feeding the 2-D
+// shapes. This pins that equivalence instead of leaving it implied: a fold that
+// started reading the group index differently would still pass the 2-D cases
+// but fail here.
+TEST(BufferRankTest, MatMulDownActLaneMajorLayoutIsEquivalent) {
+    // Same operand values, two declared shapes, one payload.
+    for (int n_up : {64, 128, 512}) {
+        const int k_out = 32, n = 64, m = 1;
+        auto pat = [&](int rows, int cols) {
+            auto t = torch::arange(rows * cols,
+                                   torch::TensorOptions().dtype(torch::kInt));
+            return (((t * 37) % 29 - 14).to(torch::kFloat) * 0.125f)
+                .to(torch::kHalf)
+                .reshape({rows, cols});
+        };
+        auto torch_x = torch::ones({m, k_out}, torch::kHalf);
+        auto torch_wg = pat(k_out, n_up);
+        auto torch_wu = pat(k_out, n_up);
+        auto torch_wd = pat(n_up, n);
+        auto torch_out = brt_ref_down_act(torch_x, torch_wg, torch_wu,
+                                          torch_wd);
+
+        auto run_with = [&](const std::vector<int> &gated_shape) -> bool {
+            Dev d;
+            auto in_x =
+                std::make_shared<Tensor<uint16_t>>(std::vector<int>{m, k_out});
+            auto in_wd =
+                std::make_shared<Tensor<uint16_t>>(std::vector<int>{n_up, n});
+            auto in_wg =
+                std::make_shared<Tensor<uint16_t>>(gated_shape);
+            auto in_wu =
+                std::make_shared<Tensor<uint16_t>>(gated_shape);
+            brt_fill(in_x, torch_x);
+            brt_fill(in_wd, torch_wd);
+            // Same values either way; only the DECLARED shape differs, and
+            // reshape is a pure view over the flattened bytes.
+            std::vector<int64_t> gshape(gated_shape.begin(),
+                                        gated_shape.end());
+            brt_fill(in_wg, torch_wg.reshape(gshape));
+            brt_fill(in_wu, torch_wu.reshape(gshape));
+            brt_upload(in_x, d);
+            brt_upload(in_wd, d);
+            brt_upload(in_wg, d);
+            brt_upload(in_wu, d);
+            auto output = brt_make_out<uint16_t>(std::vector<int>{m, n}, d);
+            auto op = brt_make_op(vkop::ops::OpType::MATMUL, 1,
+                                  {{"down_act", "1"}}, d);
+            if (!op) return false;
+            op->onExecute({in_x, in_wd, in_wg, in_wu}, {output}, 0);
+            brt_run_op(op.get(), d);
+            output->copyToCPU(d.cmdpool);
+            return brt_close_to_torch(output, torch_out, 0.03f, 0.05f);
+        };
+
+        const std::vector<int> plain{k_out, n_up};
+        const std::vector<int> lane{k_out, n_up / 8, 8};
+        EXPECT_TRUE(run_with(plain)) << "plain layout, n_up=" << n_up;
+        EXPECT_TRUE(run_with(lane)) << "lane-major layout, n_up=" << n_up;
+    }
+}
+
 // =========================================================================
 // FusedElemwise — register-machine chain in ONE dispatch.
 // Tests Add -> Sqrt -> Mul: out = sqrt(A + B) * A.
