@@ -83,6 +83,7 @@ set(TEST_SOURCES
     ScatterNDTest.cpp
     BufferRankTest.cpp
     WhereTest.cpp
+    PadTest.cpp
     SqueezeUnsqueezeTest.cpp
     RobustnessTest.cpp
     BackendCoverageTest.cpp

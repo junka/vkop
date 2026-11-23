@@ -35,6 +35,7 @@
 #include "Concat.hpp"
 #include "GlobalAveragePool.hpp"
 #include "Nms.hpp"
+#include "Pad.hpp"
 #include "Reshape.hpp"
 #include "Slice.hpp"
 #include "Split.hpp"
@@ -153,6 +154,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<Softmax>(fp16, backend_buffer);
     case OpType::NMS:
         return std::make_unique<Nms>(fp16, backend_buffer);
+    case OpType::PAD:
+        return std::make_unique<Pad>(fp16);
     case OpType::GATHER:
         return std::make_unique<Gather>(fp16);
     case OpType::RANGE:

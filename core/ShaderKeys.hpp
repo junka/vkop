@@ -94,6 +94,11 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {"nms", "nms", false, true};
         case T::NONZERO:
             return {nullptr, "nonzero", false, false};
+        case T::PAD:
+            // Buffer-only (no image twin). The buffer kernel reads through
+            // BUF_LOAD and ships a packed half2 build, so an fp16 tensor gets
+            // buffer_pad_fp16 rather than the fp32 module over half bytes.
+            return {nullptr, "pad", false, true};
         case T::POW:
             return {"pow", "pow", false, true};
         case T::PRELU:

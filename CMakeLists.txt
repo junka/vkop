@@ -360,6 +360,10 @@ set(DUAL_FP16_SHADERS
     # the image format; this is the buffer side of that, and without it an
     # fp16 tensor would be walked as fp32 words.
     buffer/nms
+    # buffer/pad.comp is a word mover over BUF_LOAD; the -DFP16 build reads and
+    # writes packed half2 words (one thread per output word), and without it an
+    # fp16 VAE activation would be padded as fp32 words.
+    buffer/pad
     # Image kernels accumulate in fp32 (ACC types in the .comp), so the fp16
     # variant only changes the load/store width. The op picks the module from
     # the tensor dtype; a fp32 graph must never land on the fp16 module.

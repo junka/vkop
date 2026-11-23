@@ -87,6 +87,7 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "Neg": ("neg", "neg", False, True),
     "Nms": ("nms", "nms", False, True),
     "NonZero": (None, "nonzero", False, False),
+    "Pad": (None, "pad", False, True),
     "Pow": ("pow", "pow", False, True),
     "PRelu": ("prelu", "prelu", False, True),
     "QuantizeLinear": (None, "quantize_linear", False, False),
@@ -831,8 +832,8 @@ _FP16_DTYPE_DRIVEN: Set[str] = {
     "Add", "Atan", "Attention", "Concat", "Conv", "Conv2d", "Cos", "Div",
     "Erf", "Expand", "Floor", "FusedElemwise", "Gather", "GlobalAveragePool",
     "LayerNorm", "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d",
-    "Maxpool2d", "Min", "Mod", "Mul", "Neg", "Nms", "PRelu", "Pow", "Reduce",
-    "ReduceMean", "Relu", "Reshape", "Resize", "RMSNorm", "RotaryEmbedding",
+    "Maxpool2d", "Min", "Mod", "Mul", "Neg", "Nms", "Pad", "PRelu", "Pow",
+    "Reduce", "ReduceMean", "Relu", "Reshape", "Resize", "RMSNorm", "RotaryEmbedding",
     "ScatterElements", "Sigmoid", "Sin", "Slice", "Softmax", "Softplus",
     "Split", "Sqrt", "Sub", "Tanh", "TopK", "Topk", "Transpose",
     # The qwen3_5 linear-attention ops: their data tensors follow the dtype

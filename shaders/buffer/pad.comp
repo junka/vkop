@@ -1,0 +1,166 @@
+#version 450 core
+
+// Pad SSBO op: ONNX Pad over an arbitrary-rank (<= 8-D) row-major tensor.
+//
+// One thread per OUTPUT element (fp32) or per output WORD (fp16, two packed
+// halfs — the same word-per-thread pattern concat/fp16 uses, since a pad is a
+// gather and two neighbouring output elements can read far-apart input
+// elements). For each output coordinate the per-axis map is:
+//
+//     c <  p        : begin pad           (p = padBegin[d])
+//     c >= p + D    : end pad             (D = inDims[d], out_len = outDims[d])
+//     otherwise     : interior, in = c - p
+//
+// and the pad region maps to an input coordinate according to `mode`:
+//
+//   constant (0)  : no input read; the output word is `constant_word`
+//   edge (1)      : the first / last interior element, repeated
+//   reflect (2)   : mirrored WITHOUT repeating the edge element — the ONNX /
+//                   PyTorch `reflect` semantics. For a width-5 input padded by
+//                   2 this yields 2 1 0 1 2 3 4 3 2. Left: in = p - c;
+//                   right (j = c - (p + D)): in = D - 2 - j.
+//   symmetric (3) : like reflect but the edge IS repeated. Left: in = p-c-1;
+//                   right: in = D - 1 - j.
+//
+// `reflect` is the mode the target models need; constant and edge are the
+// other two ONNX modes a graph actually uses. The mapping is clamped to
+// [0, D-1] as a last line of defence: ONNX forbids pad >= D for reflect and
+// the host rejects it, but a malformed model must not become an OOB read.
+//
+// Push-constant budget: rank + inDims + outDims + padBegin = 100 B, plus mode
+// and constant_word = 108 B, inside the 128 B limit. There is deliberately no
+// padEnd array — the end pad is out_len - D - p, derivable from the three
+// shape arrays, which is what keeps the block under the limit at rank 8.
+//
+// The constant is carried as an already-ENCODED word rather than a float: this
+// kernel moves uint words, so a constant pad must write exactly the bits the
+// data's element format uses. fp32 writes float bits, int32 writes integer
+// bits, and fp16 writes the packed half in the low 16 bits — encoding it on
+// the host is the only place that knows which of those the tensor is.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+#define PAD_MODE_CONSTANT  0
+#define PAD_MODE_EDGE      1
+#define PAD_MODE_REFLECT   2
+#define PAD_MODE_SYMMETRIC 3
+
+layout(push_constant) uniform PC_uPad {
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    IArr8 padBegin;
+    int mode;
+    uint constant_word; // element bits to write in a constant-pad region
+} uPad;
+
+// Map output coordinate `c` on axis `d` to an input coordinate, reporting
+// through `in_pad` whether the element belongs to a constant-pad region.
+int pad_axis(int c, int d, out bool in_pad) {
+    const int D = uPad.inDims.v[d];
+    const int p = uPad.padBegin.v[d];
+    in_pad = false;
+    if (c < p) {
+        // Begin pad. A negative p was already rejected on the host for the
+        // mirror modes; for `constant` the coordinate simply shifts (crop).
+        if (uPad.mode == PAD_MODE_CONSTANT) {
+            in_pad = true;
+            return 0;
+        }
+        if (uPad.mode == PAD_MODE_EDGE) {
+            return 0;
+        }
+        if (uPad.mode == PAD_MODE_REFLECT) {
+            return clamp(p - c, 0, D - 1);
+        }
+        // Symmetric: mirror about the edge, repeating it.
+        return clamp(p - c - 1, 0, D - 1);
+    }
+    if (c >= p + D) {
+        const int j = c - p - D;
+        if (uPad.mode == PAD_MODE_CONSTANT) {
+            in_pad = true;
+            return 0;
+        }
+        if (uPad.mode == PAD_MODE_EDGE) {
+            return D - 1;
+        }
+        if (uPad.mode == PAD_MODE_REFLECT) {
+            // Mirror about the LAST interior element: j == 0 (immediately past
+            // the last element) lands on D-2, not D-1.
+            return clamp(D - 2 - j, 0, D - 1);
+        }
+        return clamp(D - 1 - j, 0, D - 1);
+    }
+    return c - p;
+}
+
+// Row-major linear input index of output element `e`. When any axis lands in a
+// constant-pad region the returned index is still in range (the padded axes
+// contribute 0); the caller must honour `in_pad` and write constant_word.
+int in_linear_of(int e, out bool in_pad) {
+    IArr8 oc = linear_to_nd8(e, uPad.outDims, uPad.rank);
+    in_pad = false;
+    int in_linear = 0;
+    int stride = 1;
+    for (int i = uPad.rank - 1; i >= 0; --i) {
+        bool axis_padded;
+        const int c = pad_axis(oc.v[i], i, axis_padded);
+        if (axis_padded) in_pad = true;
+        in_linear += c * stride;
+        stride *= uPad.inDims.v[i];
+    }
+    return in_linear;
+}
+
+#ifdef FP16
+// Raw 16 bits of input element `e`, or the constant's half when padded.
+uint in_half(int e) {
+    bool in_pad;
+    const int lin = in_linear_of(e, in_pad);
+    if (in_pad) {
+        return uPad.constant_word & 0xFFFFu;
+    }
+    const uint w = uInput.data[lin >> 1];
+    return (lin & 1) == 0 ? (w & 0xFFFFu) : (w >> 16);
+}
+#endif
+
+void main() {
+    const int gid = int(gl_GlobalInvocationID.x);
+    int total = 1;
+    for (int i = 0; i < uPad.rank; ++i) total *= uPad.outDims.v[i];
+
+#ifdef FP16
+    // fp16 packs two halfs per uint word: one thread owns a whole OUTPUT word
+    // (elements 2*gid, 2*gid+1) and writes it once, so no read-modify-write
+    // race even though the two elements gather from unrelated input positions.
+    const int nwords = (total + 1) / 2;
+    if (gid >= nwords) return;
+    const uint lo = in_half(2 * gid);
+    // Odd total: the last word's high half is past the tensor, so it stays 0
+    // rather than being decomposed into a wrapped-around coordinate.
+    const uint hi = (2 * gid + 1 < total) ? in_half(2 * gid + 1) : 0u;
+    uOutput.data[gid] = lo | (hi << 16);
+#else
+    if (gid >= total) return;
+    bool in_pad;
+    const int lin = in_linear_of(gid, in_pad);
+    if (in_pad) {
+        uOutput.data[gid] = uPad.constant_word;
+    } else {
+        // Raw word copy: a pad moves bit patterns, it must not round-trip
+        // through float() (which would reinterpret the bits numerically).
+        uOutput.data[gid] = uInput.data[lin];
+    }
+#endif
+}
