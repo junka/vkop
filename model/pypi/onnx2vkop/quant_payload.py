@@ -41,11 +41,26 @@ ROW_BLOCK = 2048
 
 
 def _np_dtype_of(dtype):
+    """The numpy dtype that decodes this source file's element type.
+
+    BFLOAT16 has no numpy dtype, so it is read as its 2-byte storage and
+    widened in `WeightReader.bands` -- the same `u16 << 16` the converter's
+    `_bf16_bytes_to_fp16` and `write_payload` use, which is exact (bf16 is fp32
+    with the low mantissa half dropped, so shifting the storage into the high
+    half IS the value).
+    """
     if dtype == TensorProto.FLOAT16:
         return np.dtype(np.float16)
     if dtype == TensorProto.FLOAT:
         return np.dtype(np.float32)
+    if dtype == TensorProto.BFLOAT16:
+        return np.dtype(np.uint16)
     raise ValueError(f"deferred weight dtype {dtype} is not a float")
+
+
+def _bf16_band_to_f32(band: np.ndarray) -> np.ndarray:
+    """Widen a uint16 view of bf16 storage to float32 (exact, bit-shift only)."""
+    return (band.astype(np.uint32) << 16).view(np.float32)
 
 
 class WeightReader:
@@ -70,7 +85,9 @@ class WeightReader:
             raise ValueError(
                 f"'{name}': a byte-format weight must be 2-D, got {dims}")
         self.k, self.n = int(dims[0]), int(dims[1])
-        self.dtype = _np_dtype_of(entry.get("src_dtype", entry["data_type"]))
+        src = entry.get("src_dtype", entry["data_type"])
+        self.is_bf16 = src == TensorProto.BFLOAT16
+        self.dtype = _np_dtype_of(src)
 
     def bands(self, block=ROW_BLOCK):
         """Yield (row_offset, float32 [rows, N]) for the whole weight.
@@ -100,7 +117,10 @@ class WeightReader:
                 if rows:
                     band = np.frombuffer(raw[:rows * row_bytes],
                                          dtype=self.dtype).reshape(rows, self.n)
-                    yield offset, band.astype(np.float32)
+                    if self.is_bf16:
+                        yield offset, _bf16_band_to_f32(band)
+                    else:
+                        yield offset, band.astype(np.float32)
                 offset += rows
                 remaining -= rows * row_bytes
 

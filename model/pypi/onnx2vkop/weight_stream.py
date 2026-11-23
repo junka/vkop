@@ -429,6 +429,12 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
         if not uses_external_data(init):
             continue  # inline already: the bytes are in the proto
         location, offset, length = _external_fields(init)
+        # Captured before `_stream_entry` runs: for a bfloat16 tensor that
+        # helper flips `init.data_type` to FLOAT16 in place (so the tensor's
+        # empty raw_data is not handed to `_downcast_bfloat16` as if it held
+        # bytes), and the file's own element type is what the payload reader
+        # must seek by.
+        src_dtype = init.data_type
         is_slot = init.name in declared
         if is_slot and not transcribe_slots:
             # A slot is paged from the file the exporter named, never from the
@@ -439,16 +445,26 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
         keep_in_file_gates = (refusal is None
                               and seen_names[init.name] == 1
                               and length >= cap)
-        # A value-free format quantizes every float weight it can see, whether
-        # the source is fp32 or fp16. The fp16 case is the common one for an LLM
-        # export and used to fall through as a plain pass-through, which was
-        # wrong twice over: the payload shipped as fp16 (silently unquantized)
-        # and the down_act fold, which reads its three weights as one
-        # concatenated tensor, died demanding bytes a deferred row does not
-        # have. Both are fixed by recording such a weight as a *quantizing*
-        # deferred entry, exactly like the fp32 case below.
+        # A value-free format quantizes every float weight it can see, whatever
+        # float the source file holds. The fp16 case used to fall through as a
+        # plain pass-through, which was wrong twice over: the payload shipped as
+        # fp16 (silently unquantized) and the down_act fold, which reads its
+        # three weights as one concatenated tensor, died demanding bytes a
+        # deferred row does not have. Both are fixed by recording such a weight
+        # as a *quantizing* deferred entry, exactly like the fp32 case below.
+        #
+        # BFLOAT16 belongs here for the same reason and was the bug that made a
+        # bf16 checkpoint convert to an int4 artifact byte-identical to its fp16
+        # twin: every MiniMax-H3 tensor is bf16, so `quantizes` was False for
+        # all 706 of them, each took the plain pass-through branch, and the
+        # quantizer then skipped every deferred weight (optimizer's "left in its
+        # source file, weight_stream builds the nibbles") -- both sides assuming
+        # the other would encode it. The source dtype is recorded separately, so
+        # the reader still seeks the file in 2-byte bf16 rows and the encoder
+        # converts each band to fp32 before the absmax/round.
         quantizes = (init.data_type in (TensorProto.FLOAT,
-                                        TensorProto.FLOAT16)
+                                        TensorProto.FLOAT16,
+                                        TensorProto.BFLOAT16)
                      and not exports_weight_values(quant, unify, rgba))
         if keep_in_file_gates and not is_slot:
             keep_in_file_gates = (
@@ -483,7 +499,13 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 # latter, while the tensor keeps the float type so no pass
                 # believes 1-byte values sit in a 2- or 4-byte payload.
                 # quant_payload fills in the scale.
-                entry["src_dtype"] = init.data_type
+                #
+                # `src_dtype` is the dtype captured before `_stream_entry` ran,
+                # not `init.data_type` (which that helper has just flipped to
+                # FLOAT16 for a bf16 source). The reader seeks the file by this
+                # and decodes with it, so overwriting bf16 with fp16 would make
+                # every band decode as a half-typed bit pattern.
+                entry["src_dtype"] = src_dtype
                 entry["data_type"] = _PAYLOAD_DTYPES[quant]
                 entry["quant"] = quant
                 # Which stored axis holds the output columns, decided by the

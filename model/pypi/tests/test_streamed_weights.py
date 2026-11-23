@@ -498,6 +498,98 @@ def test_int8_streams_a_float16_weight_too(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# bfloat16 -- the dtype a bf16 checkpoint ships, and the one that silently
+# took the pass-through branch until `quantizes` learned to accept it
+# --------------------------------------------------------------------------
+
+def _bf16_storage(values):
+    """The uint16 storage a bfloat16 file holds for these floats.
+
+    numpy has no bfloat16, so the value is built the way every bf16 checkpoint
+    stores it: fp32 with the low mantissa half dropped, i.e. its high 16 bits.
+    """
+    f32 = numpy.asarray(values, dtype=numpy.float32)
+    return (f32.view(numpy.uint32) >> 16).astype(numpy.uint16)
+
+
+def _model_with_external_bf16_weights(tmp_path):
+    """Same chain with bfloat16 weights -- what a bf16 checkpoint ships.
+
+    The ONNX tensor is declared BFLOAT16 and its payload is the uint16 storage,
+    so the converter sees exactly what it sees on a real MiniMax-H3 export.
+    """
+    rng = numpy.random.RandomState(0)
+    weights = [rng.randn(64, ELEMS // 64).astype(numpy.float32)
+               for _ in range(N_WEIGHTS)]
+    x = helper.make_tensor_value_info("X", TensorProto.BFLOAT16, [1, 64])
+    y = helper.make_tensor_value_info("Y", TensorProto.BFLOAT16, [1, 64])
+    nodes, inits, prev = [], [], "X"
+    for i, w in enumerate(weights):
+        name = "W%d" % i
+        inits.append(helper.make_tensor(name, TensorProto.BFLOAT16,
+                                        list(w.shape),
+                                        _bf16_storage(w).tobytes(), raw=True))
+        out = "M%d" % i if i < N_WEIGHTS - 1 else "Y"
+        nodes.append(helper.make_node("MatMul", [prev, name], [out], name="mm%d" % i))
+        prev = out
+    graph = helper.make_graph(nodes, "g", [x], [y], inits)
+    model = helper.make_model(graph, producer_name="test")
+    model.opset_import[0].version = 17
+    model.ir_version = 8
+    external_data_helper.convert_model_to_external_data(
+        model, all_tensors_to_one_file=True, location="wbf.bin", size_threshold=0)
+    onnx.save_model(model, str(tmp_path / "mbf.onnx"))
+    return tmp_path / "mbf.onnx", weights
+
+
+@pytest.mark.parametrize("fmt", ["int8", "int4"])
+def test_a_bfloat16_weight_is_quantized_on_the_way_out(tmp_path, monkeypatch, fmt):
+    """Every weight in a bf16 checkpoint used to ride through unquantized.
+
+    `prepare`'s `quantizes` predicate accepted FLOAT and FLOAT16 only, so a
+    bf16 source took the pass-through branch: the row was written with
+    `data_type=FLOAT16` and no `quant` key, the quantizer then skipped every
+    deferred weight ("left in its source file, weight_stream builds the
+    nibbles"), and both sides assumed the other would encode it. On the real
+    MiniMax-H3 text encoder that produced an int4 artifact byte-identical to
+    the fp16 one, reporting "Converted 0 tensors to int4 weight-only".
+
+    The source dtype has to survive `_stream_entry`'s in-place FLOAT16 flip, or
+    the reader would decode 2-byte bf16 rows as fp16 bit patterns.
+    """
+    src, weights = _model_with_external_bf16_weights(tmp_path)
+    monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "1")
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1")
+    converter = ModelConverter()
+    dag = converter.parse_onnx_model(
+        str(src), 1, quant=fmt, group_size=64)
+    converter.apply_optimizations(dag, _opts(quant=fmt))
+
+    streamed = {n: e for n, e in dag.deferred_weights.items() if e.get("quant")}
+    assert sorted(streamed) == ["W0", "W1", "W2"], sorted(dag.deferred_weights)
+    for name, entry in streamed.items():
+        # The row must describe the FILE (bf16, two bytes per element), not the
+        # FLOAT16 the tensor was relabelled to.
+        assert entry["src_dtype"] == TensorProto.BFLOAT16, name
+        assert entry["length"] == 64 * (ELEMS // 64) * 2, name
+        assert entry["scale"] == name + "_scale", name
+
+    # And the codes must be the ones the exact bf16 values quantize to -- a
+    # reader that treated the storage as fp16 would produce noise here. The
+    # file holds bf16, so the reference is the source rounded to bf16 (the
+    # low mantissa half dropped), not the fp32 random draw.
+    from onnx2vkop import quant_payload
+    w32 = {n: numpy.asarray(w, dtype=numpy.float32)
+           for n, w in zip(("W0", "W1", "W2"), weights)}
+    for name, entry in streamed.items():
+        reader = quant_payload.WeightReader(entry, name)
+        got = numpy.concatenate([b for _, b in reader.bands()], axis=0)
+        want = ((w32[name].view(numpy.uint32) >> 16) << 16).view(numpy.float32)
+        numpy.testing.assert_array_equal(got, want, name)
+
+
+# --------------------------------------------------------------------------
 # the failure modes, each of which has to be loud
 # --------------------------------------------------------------------------
 
@@ -663,7 +755,7 @@ def test_source_read_path_is_the_plain_location_when_the_files_differ(
             tmp_path / "w.bin")
 
 
-def test_in_place_guard_copies_only_a_source_that_is_the_destination(tmp_path):
+def test_in_place_guard_pins_only_a_source_that_is_the_destination(tmp_path):
     target = tmp_path / "m.vkopbin"
     target.write_bytes(b"\x00" * 16)
     (tmp_path / "other.bin").write_bytes(b"\x00" * 8)
@@ -673,8 +765,8 @@ def test_in_place_guard_copies_only_a_source_that_is_the_destination(tmp_path):
     }
     with ws.InPlaceSourceGuard.open(deferred, str(target)) as g:
         assert g.active
+        assert str(target.resolve()) in g.paths
         assert len(g.paths) == 1        # other.bin is not the destination
-        assert not os.path.exists(g.paths[str(target.resolve())]) is False
     assert not g.active
 
 
@@ -692,7 +784,7 @@ def test_source_read_path_keeps_an_in_place_reconversion_readable(tmp_path):
     with ws.InPlaceSourceGuard.open({"W": entry}, str(target)):
         with open(target, "wb") as f:      # truncates to 0 -- the hazard
             assert ws.write_payload(entry, f, str(tmp_path)) == len(payload)
-    assert target.read_bytes() == payload  # the read side saw the old bytes
+    assert target.read_bytes() == payload  # read side still saw the old bytes
 
 
 def test_in_place_reconversion_of_a_quantizing_entry_survives(tmp_path):

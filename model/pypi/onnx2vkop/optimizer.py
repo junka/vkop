@@ -9486,6 +9486,15 @@ class Quantizer:
 
         converted_count = 0
         skipped_count = 0
+        # Weights whose payload is produced by weight_stream on the way into
+        # the trailer are encoded by this format exactly like the in-memory
+        # ones, but the loop below skips them before the counter can see them.
+        # Counting them here is what makes the summary line honest: a fully
+        # streamed `-q int4` conversion used to report "Converted 0 tensors",
+        # which reads as "nothing was quantized" when in fact every weight was.
+        streamed_count = sum(
+            1 for e in (getattr(dag_model, "deferred_weights", {}) or {}).values()
+            if e.get("quant") == fmt)
 
         initializer_consumers = defaultdict(list)
         for node in dag_model.nodes.values():
@@ -9540,7 +9549,13 @@ class Quantizer:
             )
             converted_count += 1
 
-        print(f"Converted {converted_count} tensors to {fmt} weight-only")
+        total = converted_count + streamed_count
+        if streamed_count:
+            print(f"Converted {total} tensors to {fmt} weight-only "
+                  f"({converted_count} in memory, {streamed_count} streamed "
+                  f"and encoded on the way into the trailer)")
+        else:
+            print(f"Converted {total} tensors to {fmt} weight-only")
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
@@ -10214,7 +10229,45 @@ class KnWeightLayout:
         return k if k > 0 else None
 
     @staticmethod
-    def classify(node, weight_name, weight_dims, activation_k):
+    def _output_n(node):
+        """The MatMul's output last dim (N), or None when it is symbolic.
+
+        The second witness to the orientation, for the case `_activation_k`
+        cannot answer: under transB=1 the MatMul computes A @ B^T, so its
+        output is [.., M, N] and the last dim is the weight's leading (N) dim.
+        An o_proj weight arrives with A as `Reshape(..)` whose last dim the
+        parser leaves symbolic (`[-1, -1, -1]`), so `_activation_k` returns None
+        there while this still resolves -- the 50 weights MiniMax-H3's text
+        encoder otherwise loses.
+
+        What this does and does not prove. `fold_transpose_into_matmul` built
+        transB=1 from `MatMul(A, Transpose(W))`, so shape inference had already
+        derived the output's last dim from W's leading dim; a match is therefore
+        NOT independent proof that `dims[0]` is N. It is still a real
+        discriminator against the failure that matters -- a payload actually
+        stored [K, N] under a spurious transB -- because then the output's last
+        dim would be derived from `dims[1]` and the two would not line up. It
+        cannot catch a graph whose shape inference is itself wrong, which is why
+        the caller keeps the flip fail-closed (weight_stream._write_int4 raises
+        rather than writing an orientation it was not told to produce).
+
+        Read from the node's own output declaration.
+        """
+        outs = getattr(node, "outputs", None) or []
+        if not outs:
+            return None
+        dims = list(outs[0].get("shape") or [])
+        if not dims:
+            return None
+        n = dims[-1]
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+
+    @staticmethod
+    def classify(node, weight_name, weight_dims, activation_k, output_n=None):
         """Should this weight be flipped? Returns (action, reason).
 
         action is one of
@@ -10226,7 +10279,9 @@ class KnWeightLayout:
         The decision reads the CONSUMER, never the source shape: the question
         is "what matrix does this MatMul want", and only the MatMul can say.
         `activation_k` is A's last dim (KnWeightLayout._activation_k), or None
-        when the graph does not pin it.
+        when the graph does not pin it. `output_n` is the MatMul's own output
+        last dim, consulted only when `activation_k` is unknown -- see the
+        transB=1 branch and `_output_n` for what it does and does not prove.
         """
         attrs = node.attributes or {}
         tb = int(attrs.get("transB", 0) or 0)
@@ -10245,6 +10300,23 @@ class KnWeightLayout:
             return "skip", f"{dims} is not a plain 2-D matrix"
         k = activation_k
         if k is None:
+            # A's K is symbolic (a Reshape/Mul chain whose last dim the parser
+            # could not resolve), so the [dim == A.K] check cannot run. The
+            # ORIENTATION is still decidable from the other side of the same
+            # MatMul: under transB=1 the output is A @ B^T, so its last dim is
+            # B's N, i.e. the weight's FIRST dim. That is the same "the *other*
+            # dim is the one the MatMul uses as N" confirmation the class
+            # docstring describes, and it is what lets an o_proj weight -- whose
+            # A comes from a fully symbolic Reshape -- be flipped at all.
+            #
+            # Only transB=1 is answered this way. transB=0 would mean the
+            # payload is already [K, N] and needs no flip, so an unverifiable K
+            # there changes nothing; it stays "skip" rather than "keep" so the
+            # pass never reports a layout it did not check.
+            if tb == 1 and output_n is not None and dims[0] == output_n:
+                return "transpose", (
+                    f"[N, K]={dims} -> [K, N] with transB=0 (A's K symbolic; "
+                    f"confirmed by output N={output_n} == {dims[0]})")
             return "skip", "A's K is not statically known"
         if tb == 0:
             # Already [K, N]; the transB=0 kernels index it that way. Confirm
@@ -10309,7 +10381,8 @@ class KnWeightLayout:
                 continue
             action, reason = KnWeightLayout.classify(
                 node, name, init.dims,
-                KnWeightLayout._activation_k(dag_model, node, producer))
+                KnWeightLayout._activation_k(dag_model, node, producer),
+                KnWeightLayout._output_n(node))
             if action == "skip":
                 skipped[reason] += 1
                 continue

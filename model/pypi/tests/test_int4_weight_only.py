@@ -311,6 +311,32 @@ def test_odd_group_size_is_rejected_before_any_work():
     print("  PASS (odd/zero group_size and an unknown format raise)")
 
 
+def test_the_summary_counts_streamed_weights_it_did_not_encode():
+    """A fully streamed conversion must not report "Converted 0 tensors".
+
+    On a bf16 checkpoint every weight is deferred and encoded by
+    weight_stream/quant_payload on the way into the trailer, so the loop here
+    sees only `continue`s. Reporting 0 read as "int4 did nothing" -- which was
+    literally true before the bf16 gate was opened, so the number was believed.
+    The counter must include the deferred entries carrying this format.
+    """
+    m = build("W", numpy.random.randn(64, 64).astype(numpy.float32),
+              [("MatMul", "mm", {"transB": 0}, ["x", "W"])])
+    # Model what prepare records for a streamed int4 weight: the tensor has a
+    # payload the writer will produce, and the pass must leave it alone.
+    m.deferred_weights = {
+        "W": {"quant": "int4", "data_type": TensorProto.INT4,
+              "src_dtype": TensorProto.FLOAT, "dims": (64, 64)}}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        Quantizer.quantize_to_4bit_weight_only(m, 64, "int4")
+    out = buf.getvalue()
+    assert "Converted 1 tensors to int4 weight-only" in out, out
+    assert "1 streamed" in out, out
+    # And the streamed weight really was left for the writer.
+    assert m.initializers["W"].data_type == TensorProto.FLOAT
+
+
 def test_writer_records_the_packed_size_and_name():
     """The C++ loader cross-checks the recorded byte count against
     elem_bytes(dtype, prod(dims)) and refuses a mismatch, so the writer's size,

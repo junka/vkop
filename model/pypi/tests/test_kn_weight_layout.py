@@ -284,7 +284,7 @@ def test_a_weight_in_the_activation_slot_is_not_touched():
 
 
 def test_an_unpinned_k_keeps_the_exported_layout():
-    """A symbolic K has nothing to check the orientation against."""
+    """A symbolic K, with no other witness, has nothing to check against."""
     from onnx2vkop.dag import DAGBasedModel, Node
     from onnx2vkop.optimizer import KnWeightLayout
 
@@ -295,9 +295,73 @@ def test_an_unpinned_k_keeps_the_exported_layout():
         "MatMul", "mm", {"transB": 1},
         [{"name": "X", "shape": [-1, -1]},
          {"name": "W", "shape": [N, K]}],
-        [{"name": "Y", "shape": [-1, N]}])
+        [{"name": "Y", "shape": [-1, -1]}])
     assert KnWeightLayout.apply(m, verbose=False) == 0
     assert tuple(m.initializers["W"].dims) == (N, K)
+
+
+def test_a_symbolic_activation_k_flips_when_the_output_pins_n():
+    """The MiniMax-H3 text-encoder case: A is a Reshape whose K the parser
+    cannot resolve, but the MatMul's own output declares N.
+
+    Under transB=1 the output is A @ B^T = [.., M, N], so its last dim IS the
+    weight's leading dim. Without this fallback all 50 o_proj weights are
+    declined, and the conversion aborts (the writer refuses a [N, K] payload
+    under -q int4). `_output_n`'s docstring is explicit about the strength of
+    the check: it is a discriminator against a payload genuinely stored [K, N]
+    under a spurious transB (whose output would then derive N from dims[1]),
+    not independent proof of the layout.
+    """
+    from onnx2vkop.dag import DAGBasedModel, Node
+    from onnx2vkop.optimizer import KnWeightLayout
+
+    m = DAGBasedModel()
+    m.initializers["W"] = numpy_helper.from_array(
+        np.zeros((N, K), dtype=np.int8), "W")
+    m.nodes["mm"] = Node(
+        "MatMul", "mm", {"transB": 1},
+        [{"name": "X", "shape": [-1, -1, -1]},
+         {"name": "W", "shape": [N, K]}],
+        [{"name": "Y", "shape": [-1, -1, N]}])
+    assert KnWeightLayout.apply(m, verbose=False) == 1
+    assert tuple(m.initializers["W"].dims) == (K, N)
+    assert "transB" not in m.nodes["mm"].attributes
+
+
+def test_the_output_witness_must_agree_with_the_weight():
+    """The fallback must not flip on a graph whose output says a different N:
+    then the payload really is [K, N] and a flip would ship it transposed."""
+    from onnx2vkop.dag import DAGBasedModel, Node
+    from onnx2vkop.optimizer import KnWeightLayout
+
+    m = DAGBasedModel()
+    m.initializers["W"] = numpy_helper.from_array(
+        np.zeros((N, K), dtype=np.int8), "W")
+    m.nodes["mm"] = Node(
+        "MatMul", "mm", {"transB": 1},
+        [{"name": "X", "shape": [-1, -1, -1]},
+         {"name": "W", "shape": [N, K]}],
+        [{"name": "Y", "shape": [-1, -1, K]}])   # output says N == K != dims[0]
+    assert KnWeightLayout.apply(m, verbose=False) == 0
+    assert tuple(m.initializers["W"].dims) == (N, K)
+
+
+def test_the_output_witness_does_not_touch_a_transb_zero_weight():
+    """transB=0 means no flip is needed, so an unresolvable K changes nothing;
+    it must stay 'skip', never become a flip."""
+    from onnx2vkop.dag import DAGBasedModel, Node
+    from onnx2vkop.optimizer import KnWeightLayout
+
+    m = DAGBasedModel()
+    m.initializers["W"] = numpy_helper.from_array(
+        np.zeros((K, N), dtype=np.int8), "W")
+    m.nodes["mm"] = Node(
+        "MatMul", "mm", {},
+        [{"name": "X", "shape": [-1, -1, -1]},
+         {"name": "W", "shape": [K, N]}],
+        [{"name": "Y", "shape": [-1, -1, N]}])
+    assert KnWeightLayout.apply(m, verbose=False) == 0
+    assert tuple(m.initializers["W"].dims) == (K, N)
 
 
 def test_a_transb_zero_weight_whose_dims_contradict_k_is_left_alone():
