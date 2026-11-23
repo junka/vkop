@@ -97,8 +97,16 @@ TEST(TopkTest, TopkComprehensiveTest) {
         {{1, 600}, 7, -1},
         {{3, 2000}, 7, -1},
         {{1, 2000}, 6, -1},
-        // k == 1 boundary (single winner per row).
+        // k == 1 boundary (single winner per row). Also the byte/element
+        // sizing regression: fp16 rounds k up to 2, so the op needs
+        // 2*rows elements while the pre-shaped fp16 output holds 2*rows
+        // BYTES -- equal numbers, so a size()-based resize check skipped
+        // and the kernel wrote past the placeholder buffer. The last row
+        // read back as 0. fp32 (sizeof 4) never collided.
         {{5, 1024}, 1, -1},
+        // Same collision with a wider overrun (needs 2*16 elements, holds
+        // 32 bytes): without the fix this one corrupts far more than a row.
+        {{16, 1024}, 1, -1},
     };
 
     for (const auto &test_case : test_cases) {
