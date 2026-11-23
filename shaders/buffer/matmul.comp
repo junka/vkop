@@ -1420,7 +1420,17 @@ void matmul16_ksplit() {
 //   oct   = lane % ksplit_q      (which 8-column group this lane owns)
 //   slice = lane / ksplit_q      (which slice of K it accumulates)
 // so a block covers ksplit_q * 8 columns and 256 / ksplit_q K slices.
+#ifdef W8_WIDE
+// The -DW8_WIDE module's one entry reaches both this store (the int4 WIDE
+// GEMV) and ks_store_wide_w8, and Metal sums every threadgroup array the entry
+// can reach: separate arrays were 16 + 32 KB at 512 lanes, over Apple's 32 KB,
+// so MoltenVK refused the -DKSPLIT512 build. A dispatch runs only one of the
+// two kernels, so they share the int8 scratch (4 * KS_LANES >= 2 * KS_LANES).
+shared vec4 ks_w_w8[4 * KS_LANES];
+#define ks_w ks_w_w8
+#else
 shared vec4 ks_w[2 * KS_LANES];
+#endif
 
 void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
     int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
@@ -1670,7 +1680,9 @@ void matmul16_ksplit_wide() {
 //   s3 = cols [ja+12 .. ja+15](w.w)
 // The host picks this only when N % 16 == 0 and dispatches UP_DIV(n/16, q)
 // blocks. ks_store_wide_w8 applies the per-column int8 scale before packing.
+#ifndef W8_WIDE  // declared next to ks_w in that build
 shared vec4 ks_w_w8[4 * KS_LANES];
+#endif
 
 void ks_store_wide_w8(vec4 s0, vec4 s1, vec4 s2, vec4 s3, int row, int c) {
     int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
