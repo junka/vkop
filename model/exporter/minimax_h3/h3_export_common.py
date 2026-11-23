@@ -390,6 +390,371 @@ def check_transformers() -> None:
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# streaming export: real weights, bounded memory
+# ---------------------------------------------------------------------------
+#
+# The eager path above (`export_graph` with `dry_run=False`) cannot export these
+# components at all, for two independent reasons:
+#
+#   * it never loads a checkpoint. `build_*` constructs the module from
+#     `config.json`, so the "weights" it exports are whatever `nn.Linear`
+#     initialized. The graph is right; the bytes are not the model's.
+#   * even with a loader bolted on, `torch.onnx.export` needs every parameter
+#     resident AND a second copy inside the protobuf. The transformer is
+#     61.7 GiB on a 62 GB box.
+#
+# `onnx2vkop.stream_export` exists for exactly this, but its stage-1 entry
+# (`build_graph_without_weights`) is not usable for a real export: it leaves the
+# parameter inputs with the exporter's generated names (`onnx::MatMul_43`), so
+# nothing can be matched against a checkpoint's tensor names. `trace_weightless`
+# below drives the same primitives and then renames every parameter input after
+# its module attribute, which is what the splice stage needs.
+#
+# Measured on the real 61.7 GiB transformer: 55 s and 0.9 GiB peak RSS.
+
+def _peak_rss_gib() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        pass
+    return 0.0
+
+
+def _apply_io_names(proto, input_names, output_names, dynamic_axes) -> None:
+    """Set the user-facing input/output names and symbolic axes on the proto.
+
+    The internal `_optimize_graph`/`_export_onnx` pair does not reliably apply
+    either: measured on the denoiser it renamed only part of the inputs, left
+    every output as a node number, and therefore matched no `dynamic_axes` key,
+    so every symbolic dim came out as `<something>_dim_<i>`. Doing it on the
+    finished proto is deterministic. Positional pairing is sound because input
+    and output order are preserved through the export.
+    """
+    for vi, name in zip(proto.graph.input[:len(input_names)], input_names):
+        if vi.name != name:
+            _rename_value(proto, vi.name, name)
+    for vi, name in zip(proto.graph.output, output_names):
+        if vi.name != name:
+            _rename_value(proto, vi.name, name)
+
+    by_name = {vi.name: vi for vi in proto.graph.input}
+    by_name.update({vi.name: vi for vi in proto.graph.output})
+    for tensor_name, axes in dynamic_axes.items():
+        vi = by_name.get(tensor_name)
+        if vi is None:
+            print(f"[stream] dynamic_axes: no tensor {tensor_name!r}")
+            continue
+        dims = vi.type.tensor_type.shape.dim
+        for axis, label in axes.items():
+            if 0 <= axis < len(dims):
+                dims[axis].dim_param = label
+                dims[axis].ClearField("dim_value")
+
+
+def _rename_value(proto, old: str, new: str) -> None:
+    for vi in list(proto.graph.input) + list(proto.graph.output):
+        if vi.name == old:
+            vi.name = new
+    for node in proto.graph.node:
+        for i, name in enumerate(node.input):
+            if name == old:
+                node.input[i] = new
+        for i, name in enumerate(node.output):
+            if name == old:
+                node.output[i] = new
+
+
+def trace_weightless(wrapper, dummies, input_names, output_names,
+                     dynamic_axes):
+    """Emit the graph with every parameter a DISTINCT, NAMED graph input.
+
+    Mirrors `torch.onnx.export`'s internal call sequence. Two things beyond a
+    bare `_model_to_graph` are required, and both were measured:
+
+    * `_trigger_symbolic_function_registration()` -- absent, the trace has no
+      symbolic for `aten::unflatten` and dies with `UnsupportedOperatorError
+      ... to ONNX opset version 20`. The "opset 20" in that message is a red
+      herring: it prints torch's default because the trace never reached the
+      requested opset.
+
+    * NOT running `_jit_pass_onnx_deduplicate_initializers`. It keys on the
+      storage pointer and every meta tensor has `data_ptr() == 0`, so it
+      collapses the parameter set: measured on the denoiser, 639 parameters
+      became 18 graph inputs plus 617 Identity nodes -- a graph that converts
+      but can no longer be spliced.
+
+    Returns `(proto, {parameter name: shape})`, where the shape map is keyed by
+    the MODULE ATTRIBUTE name so the splice can match checkpoint entries.
+    """
+    import onnx
+    from torch.onnx import OperatorExportTypes
+    from torch.onnx._internal.torchscript_exporter import utils as ex_utils
+
+    ex_utils._trigger_symbolic_function_registration()
+    ex_utils.GLOBALS.export_onnx_opset_version = OPSET
+    ex_utils.GLOBALS.onnx_shape_inference = True
+
+    graph, params, _out, module = ex_utils._create_jit_graph(wrapper, dummies)
+    params_dict = ex_utils._get_named_param_dict(graph, params)
+    # Which inputs are parameters is decided HERE, from the names
+    # `_create_jit_graph` assigned. After `_optimize_graph` renames the user
+    # inputs, an input can no longer be classified by name.
+    param_names = list(params_dict.keys())
+    graph = ex_utils._optimize_graph(
+        graph, OperatorExportTypes.ONNX, params_dict=params_dict,
+        dynamic_axes=dynamic_axes, input_names=list(input_names),
+        module=module)
+    ex_utils._C._jit_pass_onnx_assign_scoped_names_for_node_and_value(graph)
+    raw = graph._export_onnx(
+        {}, OPSET, dynamic_axes or {}, False, OperatorExportTypes.ONNX, True,
+        False, {}, True, "", {})[0]
+    proto = onnx.ModelProto()
+    proto.ParseFromString(raw)
+
+    # Name the parameter inputs after their module attribute. Input ORDER is
+    # preserved end to end (verified on the denoiser: 650 debug names identical
+    # before and after `_optimize_graph`), and the user inputs come first, so
+    # the split is by POSITION -- not by name. Classifying by name is not
+    # reliable: measured on this wrapper, `input_names` took effect on only
+    # some of the 11 user inputs.
+    state_dict = torch.jit._unique_state_dict(wrapper)
+    sd_names = list(state_dict.keys())
+    n_user = len(dummies)
+    proto_inputs = [g.name for g in proto.graph.input]
+    param_inputs = proto_inputs[n_user:]
+    if len(param_inputs) != len(sd_names):
+        raise SystemExit(
+            f"trace: {len(param_inputs)} parameter inputs but "
+            f"{len(sd_names)} parameters -- the exporter aliased them\n"
+            f"  proto inputs: {proto_inputs[:16]}")
+
+    for old, new in zip(proto_inputs[:n_user], input_names):
+        if old != new:
+            _rename_value(proto, old, new)
+    for old, new in zip(param_inputs, sd_names):
+        if old != new:
+            _rename_value(proto, old, new)
+
+    # Input/output names and dynamic axes are applied to the FINISHED proto
+    # rather than trusting `_optimize_graph`: see `_apply_io_names`.
+    _apply_io_names(proto, input_names, output_names, dynamic_axes)
+
+    print(f"[stream] trace: {len(proto.graph.node)} node(s), "
+          f"{len(proto.graph.input)} input(s) ({len(param_inputs)} parameters), "
+          f"{len(proto.graph.initializer)} initializer(s), "
+          f"rss={_peak_rss_gib():.1f} GiB")
+    return proto, {n: list(v.shape) for n, v in state_dict.items()}
+
+
+def checkpoint_dir(model_dir: str, component: str) -> str:
+    """Where a component's own safetensors live inside the checkpoint."""
+    return os.path.join(model_dir, component)
+
+
+def export_streaming_real(wrapper, dummies, input_names, output_names,
+                          dynamic_axes, *, model_dir: str, component: str,
+                          out_path: str, weights_file: str | None = None,
+                          ckpt_prefix: str = "", ckpt_rename: str | None = None,
+                          rope_theta: float | None = None
+                          ) -> str:
+    """Export one component with its REAL weights, holding no more than a chunk.
+
+    Three stages, only the last touches weight bytes:
+
+      1. trace on `meta`   -- graph structure, no storage (see trace_weightless)
+      2. splice            -- each parameter becomes an external initializer
+                              pointing at a checkpoint shard (headers only)
+      3. copy              -- append bytes 8 MiB at a time
+
+    `ckpt_prefix` is the module prefix the wrapper added that the checkpoint
+    does not carry (`model.` for the denoiser); `ckpt_rename` translates it to a
+    different path inside the checkpoint (`lm.` -> `model.language_model.` for
+    the text tower).
+
+    Returns the ONNX path written. The weights land next to it.
+    """
+    import onnx
+    pypi = _onnx2vkop_import_path()
+    if pypi not in sys.path:
+        sys.path.insert(0, pypi)
+    from onnx2vkop import stream_export as SE
+
+    ckpt = checkpoint_dir(model_dir, component)
+    weights_file = weights_file or (
+        os.path.splitext(os.path.basename(out_path))[0] + ".weights.bin")
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    index = SE.SafetensorsIndex(ckpt)
+    print(f"[stream] checkpoint: {len(index.entries)} tensor(s) in "
+          f"{len(index.shards)} shard(s) (headers only)")
+
+    proto, shapes = trace_weightless(wrapper, dummies, input_names,
+                                     output_names, dynamic_axes)
+
+    def strip(n: str) -> str:
+        if ckpt_rename and n.startswith(ckpt_prefix):
+            return ckpt_rename + n[len(ckpt_prefix):]
+        return n[len(ckpt_prefix):] if n.startswith(ckpt_prefix) else n
+
+    hits, unresolved = {}, []
+    for vi in proto.graph.input:
+        if vi.name not in shapes:
+            continue
+        base = strip(vi.name)
+        (hits.__setitem__(vi.name, base) if base in index
+         else unresolved.append(vi.name))
+
+    # A `persistent=False` buffer is COMPUTED from config and is in no
+    # checkpoint. `promote_computed_buffers` turns it into a real initializer.
+    if unresolved:
+        made = promote_computed_buffers(proto, unresolved, shapes, wrapper,
+                                        rope_theta=rope_theta)
+        print(f"[stream] promoted {made} computed buffer(s) to initializers: "
+              f"{unresolved}")
+        unresolved = []
+    print(f"[stream] resolved {len(hits)} weight(s) by name")
+
+    back = {v: k for k, v in hits.items()}
+    for vi in proto.graph.input:
+        if vi.name in hits:
+            vi.name = hits[vi.name]
+    for node in proto.graph.node:
+        for i, name in enumerate(node.input):
+            if name in hits:
+                node.input[i] = hits[name]
+
+    shapes_ck = {hits[n]: list(shapes[n]) for n in hits}
+    resolved = SE.splice_initializers(proto, shapes_ck, index,
+                                      weights_file=weights_file,
+                                      target_dtype=None)
+    for init in proto.graph.initializer:
+        if init.name in back:
+            init.name = back[init.name]
+    for node in proto.graph.node:
+        for i, name in enumerate(node.input):
+            if name in back:
+                node.input[i] = back[name]
+    if len(resolved) != len(hits):
+        raise SystemExit(f"[stream] spliced {len(resolved)} of {len(hits)}")
+
+    wpath = os.path.join(out_dir, weights_file)
+    nbytes, offsets = SE.copy_weights(resolved, wpath)
+    # `copy_weights` keys offsets by the names it was handed (checkpoint
+    # names); the initializers carry the wrapper names again, so translate.
+    SE.patch_offsets(proto, {back.get(k, k): v for k, v in offsets.items()})
+
+    fixed = SE.resolve_shape_dims(proto, dynamic_axes)
+    onnx.save(proto, out_path)
+    print(f"[stream] wrote {out_path} "
+          f"({os.path.getsize(out_path)/2**20:.1f} MiB) and {weights_file} "
+          f"({nbytes/2**30:.2f} GiB); {fixed} dim(s) recovered; "
+          f"peak rss={_peak_rss_gib():.1f} GiB")
+    return out_path
+
+
+def promote_computed_buffers(proto, names, shapes, wrapper,
+                             rope_theta: float | None = None) -> int:
+    """Turn computed-buffer graph inputs into inline initializers.
+
+    A non-persistent buffer (`rope.inv_freq`) is derived from config: it has no
+    checkpoint entry AND no bytes on a meta build. Its value is a pure function
+    of the module's constructor arguments, so it is rebuilt from the module
+    itself. Only `*rope.inv_freq` is known to need this; an unknown name is a
+    hard error rather than a guess.
+
+    The buffer is reached through the WRAPPER's own module tree by attribute
+    path, because each wrapper names its inner model differently (`model.` for
+    the denoiser, `d.` for the VAE decoder). Its value is recomputed with the
+    module's OWN formula from the constructor attributes it exposes -- those
+    differ per component (`rope_freq_dim` on the denoiser, a plain `inv_freq`
+    buffer on the VAE), so the attributes are read, not assumed.
+    """
+    import onnx
+    made = 0
+    for name in list(names):
+        if name not in shapes:
+            continue
+        if name.endswith(".inv_freq"):
+            owner = name[: -len(".inv_freq")]
+            rope = _resolve_attr(wrapper, owner)
+            arr = _rebuild_rope_inv_freq(rope, theta=rope_theta)
+        elif name.endswith(".M"):
+            # A static-table buffer a wrapper computed from its rope module
+            # (`Qwen3VLRotaryShim.M`). Unlike a meta `inv_freq` this holds a
+            # real value, because the wrapper built it from the (meta) inv_freq
+            # SHAPE and a plain arange -- so read it rather than re-derive it.
+            owner = name[: -len(".M")]
+            holder = _resolve_attr(wrapper, owner)
+            arr = getattr(holder, "M").detach().clone().to(torch.float32)
+        else:
+            raise SystemExit(
+                f"[stream] {name!r} is not in the checkpoint and is not a "
+                f"known computed buffer -- refusing to invent it")
+        init = proto.graph.initializer.add()
+        init.CopyFrom(onnx.numpy_helper.from_array(
+            arr.contiguous().to(torch.float32).numpy(), name))
+        for i, vi in enumerate(proto.graph.input):
+            if vi.name == name:
+                del proto.graph.input[i]
+                break
+        made += 1
+    return made
+
+
+def _rebuild_rope_inv_freq(rope, theta: float | None = None) -> torch.Tensor:
+    """Recompute a rotary embedding's `inv_freq` from its own attributes.
+
+    Two shapes exist in this model. `MiniMaxH3RotaryPosEmbed` exposes
+    `rope_freq_dim` and builds `1 / theta ** (arange(0, 2d, 2) / 2d)`.
+    `MiniMaxH3VideoRotaryPosEmbed` (the VAE) takes a precomputed `inv_freq` and
+    stores it as a plain tensor. Reading the formula's INPUTS rather than
+    assuming one of them is what keeps this from silently returning a
+    differently-sized table.
+    """
+    d = getattr(rope, "rope_freq_dim", None)
+    # The module rarely carries theta (the upstream classes take it as a
+    # CONSTRUCTOR argument); the caller's config value is the reliable source.
+    th = theta if theta is not None else getattr(rope, "rope_theta", None)
+    if d is not None and th is not None:
+        d = int(d)
+        return 1.0 / (float(th) ** (torch.arange(0, 2 * d, 2,
+                                                 dtype=torch.float32) / (2 * d)))
+    # A wrapper that knows its own reconstruction rule takes precedence: the
+    # VAE's rope keeps theta only as a CONSTRUCTOR argument, so nothing on the
+    # module can recover it, and the wrapper is handed it at build time.
+    rebuild = getattr(rope, "rebuilt_inv_freq", None)
+    if callable(rebuild):
+        return rebuild()
+    have = getattr(rope, "inv_freq", None)
+    if have is not None and have.device.type != "meta":
+        return have.detach().clone().to(torch.float32)
+    if have is not None and th is not None:
+        # HF's `Qwen3VLTextRotaryEmbedding`: `1 / theta ** (arange(0, dim, 2) /
+        # dim)`, whose length is `dim/2`. The module keeps neither `dim` nor
+        # theta, but its buffer's LENGTH gives `dim/2` and the caller supplies
+        # theta -- enough to reproduce the table exactly.
+        n = int(have.shape[-1])
+        idx = torch.arange(0, 2 * n, 2, dtype=torch.float32) / (2 * n)
+        return 1.0 / (float(th) ** idx)
+    raise SystemExit(
+        f"[stream] cannot rebuild {type(rope).__name__}.inv_freq: it exposes "
+        f"no (rope_freq_dim + rope_theta), no rebuilt_inv_freq(), no materialized "
+        f"inv_freq, and no theta was supplied. Hand the caller config's theta.")
+
+
+def _resolve_attr(root, dotted: str):
+    """Follow a dotted attribute path from `root`."""
+    obj = root
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
 __all__ = [
     "OPSET",
     "MIN_DIFFUSERS",
@@ -399,11 +764,15 @@ __all__ = [
     "check_diffusers",
     "check_runtime_ops",
     "check_transformers",
+    "checkpoint_dir",
     "export_graph",
+    "export_streaming_real",
     "is_meta",
     "meta_safe_buffers",
     "model_device",
     "patch_rmsnorm",
+    "promote_computed_buffers",
     "runtime_op_names",
+    "trace_weightless",
     "try_convert",
 ]

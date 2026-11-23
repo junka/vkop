@@ -113,6 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "tiny model (requires --dry-run). Verifies that the "
                         "wrappers trace and convert; says nothing about the "
                         "real shapes.")
+    p.add_argument("--stream", action="store_true",
+                   help="export with the checkpoint's REAL weights, streaming "
+                        "them so peak memory stays ~1 GiB. Without this the "
+                        "graph is traced from a config-only module, whose "
+                        "parameters are whatever nn.Linear initialized -- the "
+                        "structure is right but the bytes are not the model's. "
+                        "Requires --model.")
     return p
 
 

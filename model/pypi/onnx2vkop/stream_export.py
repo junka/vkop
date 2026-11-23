@@ -204,6 +204,20 @@ def build_graph_without_weights(model: nn.Module, args: Tuple, *,
                                 | None = None):
     """Stages 1: trace on meta and emit the proto with no initializer bytes.
 
+    Not enough on its own for a real export -- it emits correct GRAPH STRUCTURE
+    but its parameter inputs keep the exporter's generated names (`onnx::MatMul_43`),
+    so nothing can be resolved against a checkpoint. A caller that needs the
+    weights uses the per-component exporters' `trace_weightless`, which drives
+    the same primitives and then renames each parameter input after its module
+    attribute. This entry remains for structural/inventory use.
+
+    `_trigger_symbolic_function_registration()` is called first, and it is not
+    optional: without it the trace has no symbolic for `aten::unflatten` and
+    dies with `UnsupportedOperatorError ... to ONNX opset version 20`. That
+    "opset 20" is a red herring -- the message prints torch's default opset
+    because the trace never got as far as the requested one; with the
+    registration in place, opset 17 traces fine.
+
     `dynamic_axes` must be handed to the TRACE as well as to the write. torch
     consumes it in two places: `_model_to_graph` marks the traced inputs
     symbolic before the ONNX conversion pass, and `_export_onnx` records the
@@ -217,6 +231,8 @@ def build_graph_without_weights(model: nn.Module, args: Tuple, *,
 
     Returns (onnx.ModelProto, {param name: shape}).
     """
+    exporter_utils._trigger_symbolic_function_registration()
+
     graph, params, _out = exporter_utils._model_to_graph(
         model, args, verbose=False,
         input_names=input_names, output_names=output_names,

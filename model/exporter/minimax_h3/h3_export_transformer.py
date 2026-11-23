@@ -59,6 +59,7 @@ import torch.nn as nn
 
 from h3_export_common import (
     export_graph,
+    export_streaming_real,
     meta_safe_buffers,
     patch_rmsnorm,
     try_convert,
@@ -392,7 +393,13 @@ def run(args) -> int:
         cfg = dict(cfg)
         cfg["num_attention_heads"] = int(args.attn_heads)
 
-    device = torch.device("meta") if dry else torch.device("cpu")
+    # `--stream` builds on meta from the start: the splice supplies the bytes,
+    # and a CPU build would materialize 61.7 GiB of initializers for nothing --
+    # measured: the process is OOM-killed at 63.7 GB peak before the trace even
+    # begins.
+    device = (torch.device("meta")
+              if (dry or getattr(args, "stream", False))
+              else torch.device("cpu"))
     tag = "TINY" if args.tiny else "checkpoint config"
     print(f"[build] MiniMaxH3Transformer3DModel ({tag}) device={device}")
     print(f"[build] layers={cfg['num_layers']} hidden={cfg['hidden_size']} "
@@ -403,8 +410,8 @@ def run(args) -> int:
 
     model = build_model(cfg, device=device, tiny=args.tiny)
     patch_rmsnorm(model)
-    if dry:
-        n = meta_safe_buffers(model)
+    if device.type == "meta":
+        n = meta_safe_buffers(model)   # rope.inv_freq -> a splicable parameter
         print(f"[meta] {n} computed buffer(s) promoted to graph inputs")
 
     wrapper_cls = H3DenoiserOnnx if with_audio else H3DenoiserVideoOnlyOnnx
@@ -414,6 +421,20 @@ def run(args) -> int:
     out = args.out or ("transformer.onnx" if with_audio
                        else "transformer.video_only.onnx")
     outs = ["sample", "audio_sample"] if with_audio else ["sample"]
+
+    if getattr(args, "stream", False):
+        # Real weights, bounded memory: the model is already on meta, so the
+        # splice supplies every byte and nothing is materialized here.
+        export_streaming_real(
+            wrapper, dummies, names, outs,
+            dynamic_axes(with_audio=with_audio),
+            model_dir=args.model, component="transformer", out_path=out,
+            ckpt_prefix="model.", rope_theta=float(cfg["rope_theta"]),
+        )
+        if args.no_convert:
+            print("[stream] --no-convert: skipping onnx2vkop")
+            return 0
+        return 0 if try_convert(out, os.path.dirname(os.path.abspath(out))) == 0 else 5
 
     export_graph(
         wrapper, dummies, out,

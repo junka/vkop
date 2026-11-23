@@ -48,6 +48,7 @@ import torch.nn as nn
 
 from h3_export_common import (
     export_graph,
+    export_streaming_real,
     meta_safe_buffers,
     patch_rmsnorm,
     try_convert,
@@ -62,36 +63,67 @@ DEFAULT_TEXT_ENCODER_LAYER = 50
 class Qwen3VLRotaryShim(nn.Module):
     """`Qwen3VLTextRotaryEmbedding.forward` without the autocast context.
 
-    The reference wraps the frequency math in `maybe_autocast(device_type=...)`,
-    and `maybe_autocast` calls `torch.is_autocast_enabled(device_type)`, which
-    raises `RuntimeError: unknown device type for autocast` when the device is
-    `meta`. That makes a weights-free dry run impossible, and the autocast is a
-    fp32-forcing no-op here anyway (every operand is already cast with
-    `.float()`).
+    Two independent reasons this shim exists:
 
-    The body below is the reference body verbatim, minus the context manager;
-    `apply_interleaved_mrope` is reused from the real module so the MRoPE
-    interleaving cannot drift.
+    1. The reference wraps the frequency math in `maybe_autocast(device_type=...)`,
+       and `maybe_autocast` calls `torch.is_autocast_enabled(device_type)`, which
+       raises `RuntimeError: unknown device type for autocast` when the device
+       is `meta`. That makes a weights-free dry run impossible, and the autocast
+       is a fp32-forcing no-op here anyway (every operand is already cast with
+       `.float()`).
+
+    2. `transformers` 5.17 REMOVED `apply_interleaved_mrope`; the module now
+       mutates frequencies in place via `recomposition_frequencies`. Code that
+       called the old method dies with `AttributeError` on 5.17 and later.
+
+    The interleaving is replaced with the static-matmul form this repo's own
+    LLM exporter already uses (`llm/exporter/export/qwen3vl_export_onnx.py::
+    StaticInterleavedMrope`), which is bit-exact against both the old and the
+    new HF implementations (verified maxdiff 0.0, including distinct t/h/w
+    rows). The equivalence: column `j` of the interleaved frequency table comes
+    from a FIXED row of (t,h,w) --
+
+        row(j) = 1 (H) if j % 3 == 1 and j < 3*s1
+               = 2 (W) if j % 3 == 2 and j < 3*s2
+               = 0 (T) otherwise
+
+    -- so the whole selection is one matmul `pos (B,q,3) @ M (3,half)` with
+    `M[r,j] = inv_freq[j] * (r == row(j))`.
     """
 
     def __init__(self, rotary):
         super().__init__()
-        self._rotary = rotary
-        self.mrope_section = rotary.mrope_section
+        # NOT held as a submodule: the static matmul replaces everything it did,
+        # and assigning a Module would pull its buffers (`original_inv_freq` et
+        # al) into the traced parameter set, which then have no checkpoint entry.
+        self.mrope_section = list(rotary.mrope_section)
         self.attention_scaling = rotary.attention_scaling
         self.register_buffer("inv_freq", rotary.inv_freq, persistent=False)
+
+        inv_freq = rotary.inv_freq.float()
+        half = int(inv_freq.shape[0])
+        s1, s2 = self.mrope_section[1], self.mrope_section[2]
+        if 3 * s1 > half or 3 * s2 > half:
+            raise ValueError(
+                f"mrope_section {self.mrope_section} does not fit inv_freq of "
+                f"length {half}")
+        sel = torch.zeros(half, dtype=torch.long)
+        for j in range(half):
+            if j % 3 == 1 and j < 3 * s1:
+                sel[j] = 1
+            elif j % 3 == 2 and j < 3 * s2:
+                sel[j] = 2
+        M = torch.zeros(3, half, dtype=torch.float32)
+        M[sel, torch.arange(half)] = inv_freq
+        self.register_buffer("M", M)          # (3, half)
 
     def forward(self, x, position_ids):
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(
                 3, position_ids.shape[0], -1)
-        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(
-            3, position_ids.shape[1], -1, 1)
-        position_ids_expanded = position_ids[:, :, None, :].float()
-
-        freqs = (inv_freq_expanded.float()
-                 @ position_ids_expanded.float()).transpose(2, 3)
-        freqs = self._rotary.apply_interleaved_mrope(freqs, self.mrope_section)
+        pos = position_ids.to(torch.float32)          # (3, B, q)
+        pos_t = pos.permute(1, 2, 0)                  # (B, q, 3)
+        freqs = torch.matmul(pos_t, self.M)           # (B, q, half)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * self.attention_scaling
         sin = emb.sin() * self.attention_scaling
@@ -238,7 +270,11 @@ def run(args) -> int:
             "text_encoder/config.json) or --tiny"
         )
 
-    device = torch.device("meta") if dry else torch.device("cpu")
+    # `--stream` builds on meta: the splice supplies the bytes, and a CPU build
+    # would materialize the whole text tower for nothing.
+    device = (torch.device("meta")
+              if (dry or getattr(args, "stream", False))
+              else torch.device("cpu"))
     model = build_text_model(cfg, device=device, tiny=args.tiny)
     lm = model.model.language_model
     tcfg = model.config.text_config
@@ -269,7 +305,7 @@ def run(args) -> int:
                         # shim keeps the chain identical to the other graphs
 
     wrapper = Qwen3VLTextOnnx(lm, layer, num_heads // num_kv, scaling).eval()
-    if dry:
+    if device.type == "meta":
         # `inv_freq` is computed from config inside a meta context, so it is a
         # meta buffer; the exporter would inline it as a Constant and fail.
         n = meta_safe_buffers(model)
@@ -280,6 +316,24 @@ def run(args) -> int:
     attention_bias = Qwen3VLTextOnnx.causal_bias(seq).to(device)
 
     out = args.out or f"text_encoder_hs{layer}.onnx"
+
+    if getattr(args, "stream", False):
+        # Real weights, streamed. The wrapper's `lm.` prefix maps to the
+        # checkpoint's `model.language_model.` subtree -- the same tensor names
+        # under a different path, which is what `ckpt_rename` expresses.
+        export_streaming_real(
+            wrapper, (input_ids, attention_bias),
+            ["input_ids", "attention_bias"],
+            ["prompt_embeds"], dynamic_axes(),
+            model_dir=args.model, component="text_encoder", out_path=out,
+            ckpt_prefix="lm.", ckpt_rename="model.language_model.",
+            rope_theta=float(getattr(tcfg, "rope_theta", 10000.0)),
+        )
+        if args.no_convert:
+            print("[stream] --no-convert: skipping onnx2vkop")
+            return 0
+        return 0 if try_convert(out, os.path.dirname(os.path.abspath(out))) == 0 else 5
+
     export_graph(
         wrapper, (input_ids, attention_bias), out,
         input_names=["input_ids", "attention_bias"],

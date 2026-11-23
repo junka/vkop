@@ -55,6 +55,7 @@ import torch.nn as nn
 
 from h3_export_common import (
     export_graph,
+    export_streaming_real,
     meta_safe_buffers,
     patch_rmsnorm,
     try_convert,
@@ -108,12 +109,32 @@ class H3VideoRopeOnnx(nn.Module):
     `If`/`Tile` pair that the converter refuses.
     """
 
-    def __init__(self, rope):
+    def __init__(self, rope, theta: float | None = None):
         super().__init__()
         import math
 
         self._two_pi = 2.0 * math.pi
         self.register_buffer("inv_freq", rope.inv_freq, persistent=False)
+        # The upstream class keeps `theta`/`num_axes` only as CONSTRUCTOR
+        # arguments, and `inv_freq` is a non-persistent buffer whose value is
+        # gone on a meta build. Remember what is needed to rebuild it. The
+        # upstream formula is `1/theta ** arange(0, 1, 2*num_axes/dim)`, whose
+        # length is `dim/(2*num_axes)` -- so the step is simply `1/length`,
+        # which is all the length we need to record.
+        self._inv_freq_len = int(rope.inv_freq.shape[-1])
+        self._theta = float(theta) if theta is not None else None
+
+    def rebuilt_inv_freq(self):
+        """`MiniMaxH3VideoRotaryPosEmbed.__init__`'s formula, verbatim.
+
+        `arange(0, 1, 2*num_axes/dim)` has `dim/(2*num_axes)` entries and a
+        step of `1/len`, so the length alone determines the table.
+        """
+        if self._theta is not None:
+            step = 1.0 / self._inv_freq_len
+            return 1.0 / self._theta ** torch.arange(
+                0, 1, step, dtype=torch.float32)
+        return self.inv_freq.detach().clone().to(torch.float32)
 
     def forward(self, position_ids):
         angles = self._two_pi * position_ids[:, :, :, None] * self.inv_freq[None, None, None, :]
@@ -139,10 +160,18 @@ class H3VideoDecoderOnnx(nn.Module):
 
     INPUT_NAMES = ["latents", "position_ids"]
 
-    def __init__(self, decoder, *, onesided_shuffle: bool = False):
+    def __init__(self, decoder, *, onesided_shuffle: bool = False,
+                 rope_theta: float | None = None):
         super().__init__()
         self.d = decoder
-        self.rope = H3VideoRopeOnnx(decoder.rope)
+        # `self.rope` is the wrapper that emits the `.tile(2)` as a concat, but
+        # the DECODER's own `d.rope` is still the upstream module and remains
+        # part of the traced parameter set (its `inv_freq` is a non-persistent
+        # buffer). Give that one the same rebuild rule, or the splice cannot
+        # materialize it on a meta build.
+        self.rope = H3VideoRopeOnnx(decoder.rope, theta=rope_theta)
+        if not hasattr(decoder.rope, "rebuilt_inv_freq"):
+            decoder.rope.rebuilt_inv_freq = self.rope.rebuilt_inv_freq
 
     def forward(self, latents, position_ids):
         d = self.d
@@ -265,20 +294,44 @@ def run(args) -> int:
             "or --tiny"
         )
 
-    device = torch.device("meta") if dry else torch.device("cpu")
+    # `--stream` builds on meta: the splice supplies the bytes, and a CPU build
+    # would materialize the whole decoder for nothing.
+    device = (torch.device("meta")
+              if (dry or getattr(args, "stream", False))
+              else torch.device("cpu"))
     decoder, kwargs = build_decoder(cfg, device=device, tiny=args.tiny)
     print(f"[build] {'TINY ' if args.tiny else ''}MiniMaxH3VideoViTDecoder3d "
           f"device={device}")
     print(f"[build] " + " ".join(f"{k}={v}" for k, v in kwargs.items()))
 
     patch_rmsnorm(decoder)   # the QK norms are RMSNorm over head_dim
-    if dry:
+    if device.type == "meta":
         n = meta_safe_buffers(decoder)
         print(f"[meta] {n} computed buffer(s) promoted to graph inputs")
 
-    wrapper = H3VideoDecoderOnnx(decoder).eval()
+    wrapper = H3VideoDecoderOnnx(
+        decoder, rope_theta=float(cfg["decoder_rope_theta"])).eval()
     dummies = dummy_inputs(decoder, device=device)
     out = args.out or "vae_decoder.onnx"
+
+    if getattr(args, "stream", False):
+        # Real weights, streamed. This decoder is small enough (9.7 GiB) that a
+        # plain load_state_dict fits, but the streaming path is used here for
+        # the SAME reason as the other components: it is the only path that
+        # exports the checkpoint's bytes rather than the module's initializers.
+        export_streaming_real(
+            wrapper, dummies, H3VideoDecoderOnnx.INPUT_NAMES, ["video"],
+            dynamic_axes(),
+            model_dir=args.model, component="vae", out_path=out,
+            # The wrapper exposes the decoder as `.d`, the checkpoint stores it
+            # under `decoder.` -- the same tensors under a different path.
+            ckpt_prefix="d.", ckpt_rename="decoder.",
+            rope_theta=float(cfg["decoder_rope_theta"]),
+        )
+        if args.no_convert:
+            print("[stream] --no-convert: skipping onnx2vkop")
+            return 0
+        return 0 if try_convert(out, os.path.dirname(os.path.abspath(out))) == 0 else 5
 
     export_graph(
         wrapper, dummies, out,
