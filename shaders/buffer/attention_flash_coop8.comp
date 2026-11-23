@@ -238,16 +238,17 @@ void main() {
         sPool[rr * PKV + w] = v;
     }
     barrier();
-    FRA q0, q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q15;
+    FRA q0; FRA q1; FRA q2; FRA q3; FRA q4; FRA q5; FRA q6; FRA q7;
+    FRA q8; FRA q9; FRA q10; FRA q11; FRA q12; FRA q13; FRA q14; FRA q15;
 #define LOADQ(i) if (i < nd) { \
         coopMatLoad(q##i, sPool, uint(sg * 8 * PKV + i), uint(PKV), \
                     gl_CooperativeMatrixLayoutRowMajor); }
     FOR16(LOADQ)
 
-    ACC o0 = ACC(0.0), o1 = ACC(0.0), o2 = ACC(0.0), o3 = ACC(0.0),
-        o4 = ACC(0.0), o5 = ACC(0.0), o6 = ACC(0.0), o7 = ACC(0.0),
-        o8 = ACC(0.0), o9 = ACC(0.0), o10 = ACC(0.0), o11 = ACC(0.0),
-        o12 = ACC(0.0), o13 = ACC(0.0), o14 = ACC(0.0), o15 = ACC(0.0);
+    ACC o0 = ACC(0.0); ACC o1 = ACC(0.0); ACC o2 = ACC(0.0); ACC o3 = ACC(0.0);
+    ACC o4 = ACC(0.0); ACC o5 = ACC(0.0); ACC o6 = ACC(0.0); ACC o7 = ACC(0.0);
+    ACC o8 = ACC(0.0); ACC o9 = ACC(0.0); ACC o10 = ACC(0.0); ACC o11 = ACC(0.0);
+    ACC o12 = ACC(0.0); ACC o13 = ACC(0.0); ACC o14 = ACC(0.0); ACC o15 = ACC(0.0);
 
     // Lane's softmax row / columns within the subgroup's 8 x 32 tile.
     const int lr = lane >> 2;
@@ -315,9 +316,9 @@ void main() {
         barrier();
 
         // ---- S = Q · Kᵀ ----
-        ACC s0 = ACC(0.0), s1 = ACC(0.0), s2 = ACC(0.0), s3 = ACC(0.0);
+        ACC s0 = ACC(0.0); ACC s1 = ACC(0.0); ACC s2 = ACC(0.0); ACC s3 = ACC(0.0);
 #define QK(i) if (i < nd) { \
-        FRB k0, k1, k2, k3; \
+        FRB k0; FRB k1; FRB k2; FRB k3; \
         coopMatLoad(k0, sPool, uint(0 * 8 * PKV + i), uint(PKV), \
                     gl_CooperativeMatrixLayoutColumnMajor); \
         coopMatLoad(k1, sPool, uint(1 * 8 * PKV + i), uint(PKV), \
@@ -414,7 +415,7 @@ void main() {
         subgroupBarrier();
 
         // ---- O += P · V ----
-        FRA p0, p1, p2, p3;
+        FRA p0; FRA p1; FRA p2; FRA p3;
         coopMatLoad(p0, sPool, uint(pb + 0), uint(P_PITCH),
                     gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(p1, sPool, uint(pb + 1), uint(P_PITCH),
@@ -425,7 +426,7 @@ void main() {
                     gl_CooperativeMatrixLayoutRowMajor);
         const int vb = kvw >> 2; // V tile base, uvec4
 #define PV(i) if (i < nd) { \
-        FRB v0, v1, v2, v3; \
+        FRB v0; FRB v1; FRB v2; FRB v3; \
         coopMatLoad(v0, sPool, uint(vb + 0 * 8 * PKV + i), uint(PKV), \
                     gl_CooperativeMatrixLayoutRowMajor); \
         coopMatLoad(v1, sPool, uint(vb + 1 * 8 * PKV + i), uint(PKV), \

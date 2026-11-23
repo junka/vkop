@@ -110,12 +110,13 @@ void main() {
     const int x_n = n * IC * IH * IW;
 
 #if WN == 8
-#define DECL(i) ACC c##i##0 = ACC(0.0), c##i##1 = ACC(0.0), c##i##2 = ACC(0.0), \
-    c##i##3 = ACC(0.0), c##i##4 = ACC(0.0), c##i##5 = ACC(0.0), \
-    c##i##6 = ACC(0.0), c##i##7 = ACC(0.0);
+#define DECL(i) ACC c##i##0 = ACC(0.0); ACC c##i##1 = ACC(0.0); \
+    ACC c##i##2 = ACC(0.0); ACC c##i##3 = ACC(0.0); \
+    ACC c##i##4 = ACC(0.0); ACC c##i##5 = ACC(0.0); \
+    ACC c##i##6 = ACC(0.0); ACC c##i##7 = ACC(0.0);
 #else
-#define DECL(i) ACC c##i##0 = ACC(0.0), c##i##1 = ACC(0.0), c##i##2 = ACC(0.0), \
-    c##i##3 = ACC(0.0);
+#define DECL(i) ACC c##i##0 = ACC(0.0); ACC c##i##1 = ACC(0.0); \
+    ACC c##i##2 = ACC(0.0); ACC c##i##3 = ACC(0.0);
 #endif
     DECL(0) DECL(1) DECL(2) DECL(3)
 
@@ -158,7 +159,7 @@ void main() {
             const int ky = tap / 3;
             const int kx = tap - ky * 3;
             for (int icb = 0; icb < ICB; icb += 8) {
-                FRA a0, a1, a2, a3;
+                FRA a0; FRA a1; FRA a2; FRA a3;
                 const uint ao = uint(tap * ICB + icb);
                 coopMatLoad(a0, sW, (a_row + 0) * WP + ao, WP,
                             gl_CooperativeMatrixLayoutRowMajor);

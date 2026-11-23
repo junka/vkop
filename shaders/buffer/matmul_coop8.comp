@@ -228,8 +228,8 @@ void main() {
             }
         }
         for (int kk = 0; kk < BK; kk += 8) {
-            FRA a0, a1, a2, a3;
-            FRB b0, b1, b2, b3;
+            FRA a0; FRA a1; FRA a2; FRA a3;
+            FRB b0; FRB b1; FRB b2; FRB b3;
             coopMatLoad(a0, shA, (a_base + 0 * 8 * LDA + kk) / 8, LDA / 8,
                         gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(a1, shA, (a_base + 1 * 8 * LDA + kk) / 8, LDA / 8,
