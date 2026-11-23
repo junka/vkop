@@ -2215,6 +2215,33 @@ void tile_load_b_w8(int b, int col0, int kk) {
     sB[kr * SBROW + 2 * quad + 1] = (col + 3 < uPC.N) ? packHalf2x16(w.zw) : 0u;
 }
 
+// 4-bit weight (int4 / uint4 / nf4 / nvfp4), B is [batch, K, N] nibble-packed.
+// Same thread map as tile_load_b_w8: one thread decodes the four columns of
+// one K row -- half of one 32-bit word, at nibble 0 or 4 -- and writes the two
+// half2 words the FMA nest reads. Unlike a byte weight the scale changes along
+// K (one row per group), so it cannot wait for the epilogue: it is folded in
+// here, giving the tile the value an fp16 checkpoint of the dequantized weight
+// would hold. The column-parallel w4 kernel this replaces for M > 8 decoded
+// every weight once per output ROW and walked K serially per thread, which
+// made an 800-token int4 prefill ~7x slower than int8.
+void tile_load_b_w4(int b, int col0, int kk) {
+    int l = tile_tid();
+    int kr = l >> 4;
+    int quad = l & 15;
+    int col = col0 + quad * 4;
+    int k = kk + kr;
+    vec4 w = vec4(0.0);
+    // N % 8 == 0 (host-checked) puts every K row on a word boundary, so a
+    // 4-aligned column owns half a word at a fixed nibble.
+    if (col < uPC.N) {
+        int idx = (b * uPC.K + k) * uPC.N + col;
+        w = unpack_w4(uInputB.data[idx >> 3], idx & 7) *
+            scale4((k / uPC.group) * uPC.N + col);
+    }
+    sB[kr * SBROW + 2 * quad] = (col + 1 < uPC.N) ? packHalf2x16(w.xy) : 0u;
+    sB[kr * SBROW + 2 * quad + 1] = (col + 3 < uPC.N) ? packHalf2x16(w.zw) : 0u;
+}
+
 // One k-pair per thread, transB: a B word carries the two K values of one
 // column.
 void tile_fma_t(inout float acc[4][4], int lr, int lc) {
@@ -2321,6 +2348,14 @@ void matmul16_tiled() {
             tile_load_b_t(bb, col0, kk >> 1, halfK);
             barrier();
             tile_fma_t(acc, lr, lc);
+            barrier();
+        }
+    } else if (uPC.w4 != 0) {
+        for (int kk = k0; kk < kstop; kk += TILE_K) {
+            tile_load_a(b, row0, kk >> 1, halfK);
+            tile_load_b_w4(bb, col0, kk);
+            barrier();
+            tile_fma_n(acc, lr, lc);
             barrier();
         }
     } else if (uPC.weight_int8 != 0) {
@@ -3138,6 +3173,12 @@ void main() {
 #endif
     if (uPC.w4 != 0) {
 #ifdef FP16
+        // M > 8: the tiled nest stages the decoded, group-scaled weight once
+        // per 64-row block (tile_load_b_w4); the host raises tile only there.
+        if (uPC.tile != 0) {
+            matmul16_tiled();
+            return;
+        }
         matmul16_w4_quad();
 #else
         matmul_w4();

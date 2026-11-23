@@ -2708,8 +2708,9 @@ class MatMulBuffer : public BufferFactory {
                                    : (n >= 2048) ? 256
                                                  : (1 << 30);
             if (t128_on && fp16_ != 0 && para_.transB == 0 &&
-                para_.weight_int8 == 0 && para_.epi_bias == 0 &&
-                n % 8 == 0 && k % 16 == 0 && n >= 128 && m >= t128_min_m) {
+                para_.weight_int8 == 0 && para_.w4 == 0 &&
+                para_.epi_bias == 0 && n % 8 == 0 && k % 16 == 0 &&
+                n >= 128 && m >= t128_min_m) {
                 para_.tile = 2;
                 if (try_submit_bda(UP_DIV(n, 128), UP_DIV(m, 128), batch)) {
                     return;

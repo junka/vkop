@@ -483,13 +483,13 @@ void test_other_routes() {
     // decode GEMV for this n.
     CHECK_ROUTE(select_matmul(dev, s, f, av), kKsplitWide);
 
-    // 4-bit is excluded from tile and coop; the split-K window still claims
-    // decode (matmul.comp dequantizes in the ksplit entry too).
+    // 4-bit is excluded from coop; the split-K window claims decode
+    // (matmul.comp dequantizes in the ksplit entry too).
     f = fp16_w();
     f.weight = WeightKind::kInt4;
     CHECK_ROUTE(select_matmul(dev, sh(1, 1, 512, 512), f, av), kKsplit);
-    // Past the split-K window only the four-column quad kernel can read a
-    // packed 4-bit word.
+    // Without a group size (the fixture's default) the tile cannot walk the
+    // scale rows, so past the split-K window the quad kernel keeps it.
     CHECK_ROUTE(select_matmul(dev, sh(1, 9, 512, 512), f, av), kQuad4);
     // A wide N must NOT promote a 4-bit weight to kKsplitWide. That route
     // builds from a separate -DW8_WIDE module whose main() has no uPC.w4
@@ -510,6 +510,16 @@ void test_other_routes() {
                 kKsplitW4Wide);
     // Below the wide threshold the narrow kernel still wins.
     CHECK_ROUTE(select_matmul(dev, sh(1, 1, 512, 512), f, av), kKsplit);
+    // Past the split-K window a grouped 4-bit weight takes the 64x64 tile
+    // (tile_load_b_w4 stages the dequantized, group-scaled half), from the
+    // first row the GEMV gives up: batch*m = 9. Never the 128 tile, coopmat or
+    // the tile-split-K pair -- none of them has a nibble loader.
+    CHECK_ROUTE(select_matmul(dev, sh(1, 9, 512, 512), f, av), kTiled);
+    CHECK_ROUTE(select_matmul(dev, sh(1, 1024, 2048, 6144), f, av), kTiled);
+    CHECK_ROUTE(select_matmul(dev, sh(3, 3, 512, 512), f, av), kTiled);
+    CHECK_ROUTE(select_matmul(dev, sh(1, 8, 512, 512), f, av), kKsplit);
+    // A K that is not whole groups keeps the quad kernel past the window.
+    CHECK_ROUTE(select_matmul(dev, sh(1, 9, 5152, 512), f, av), kQuad4);
     // A K that is not a whole number of groups would leave the scale walk
     // scaling a partial group, so the predicate refuses it. 5152 = 80*64 + 32.
     CHECK_ROUTE(select_matmul(dev, sh(1, 1, 5152, 10240), f, av), kKsplit);

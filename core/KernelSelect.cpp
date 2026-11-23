@@ -222,8 +222,22 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
                                ? dtype_min_m
                                : ((coop16 && c.l2_resident) ? 12 : dtype_min_m));
 
+    // 4-bit weights join the tile through tile_load_b_w4, which folds the
+    // group scale into the staged half. Its only alternatives above the
+    // split-K GEMV's batch*m <= 8 are the column-parallel w4 kernel (one
+    // decode per output row, K walked serially per thread: 2.7 s for an
+    // 800-token Qwen3-VL-2B prefill against int8's 0.41 s), so the tile takes
+    // every shape the GEMV does not, with no row floor beyond that.
+    if (c.weight_4bit) {
+        c.tiled_min_m = 1;
+    }
+    const bool w4_tile_ok =
+        !c.weight_4bit ||
+        (!f.transB && (s.n % 8 == 0) && f.group_size > 0 &&
+         (s.k % f.group_size) == 0 &&
+         static_cast<long long>(s.batch) * s.m > 8);
     const bool tiled_ok_n = (s.n % 64 == 0) || (s.n % 8 == 0);
-    c.tiled = c.fused && !kn.tile_disabled && !c.weight_4bit &&
+    c.tiled = c.fused && !kn.tile_disabled && w4_tile_ok &&
               (s.k % 16 == 0) && (s.m >= c.tiled_min_m) && !f.epi_bias &&
               tiled_ok_n && (!c.weight_byte || (!f.transB && (s.n % 4 == 0)));
     // The 128x128 / 8x8-per-thread tile (MatMul's uPC.tile == 2) is worth about
@@ -243,7 +257,9 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
                 !f.epi_bias && (s.n % 8 == 0) && (s.k % 16 == 0) &&
                 !c.weight_4bit && (s.m >= t128_min_m) && (s.n >= 128);
 
-    if (c.tiled && !c.weight_byte && !f.transB && s.k >= 256) {
+    // The tile-split-K pair (TILED_KS_SPLIT/FOLD) has no quantized-B loader.
+    if (c.tiled && !c.weight_byte && !c.weight_4bit && !f.transB &&
+        s.k >= 256) {
         const long blocks = static_cast<long>(s.batch) * up_div(s.n, 64) *
                             up_div(s.m, 64);
         const int want = ks_depth_for(c, blocks);

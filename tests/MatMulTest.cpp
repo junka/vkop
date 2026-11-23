@@ -1558,6 +1558,11 @@ TEST(MatMulTest, MatMulInt4Nf4WeightOnlyBuffer) {
         {2, 1, 128, 32, 128, true},  // one group: per-column scales, batched A
         {1, 16, 64, 16, 64, false},  // prefill-shaped M
         {2, 4, 64, 16, 32, true},    // materialized broadcast weight
+        // fp16 batch*m > 8 takes the 64x64 tile (tile_load_b_w4):
+        {1, 9, 64, 16, 16, false},   // first row past the split-K window
+        {1, 70, 96, 136, 32, false}, // two row tiles, partial column tile
+        {3, 5, 128, 72, 64, false},  // batch*m = 15, broadcast weight
+        {2, 33, 64, 64, 16, true},   // materialized broadcast weight
     };
     LOG_INFO("4bit MatMul, FP32");
     run_matmul_w4<float>(cases);
