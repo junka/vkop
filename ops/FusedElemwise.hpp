@@ -151,6 +151,15 @@ class FusedElemwise : public BufferFactory {
     struct SpecVariant {
         std::unique_ptr<VulkanPipeline> pipe; // null: creation failed
         int id = 0;
+        // Descriptor sets allocated FROM this pipeline. Under
+        // VK_EXT_descriptor_buffer a "set" is a slot index into the owning
+        // pipeline's own region, so a specialized pipeline must allocate and
+        // be written through its own object: reusing the base pipeline's slot
+        // writes the bytes into a region the specialized pipeline never reads,
+        // and every dispatch binds blank descriptors (the values came out
+        // all-zero). Also correct in descriptor-set mode, where the set is a
+        // real object and either pool would do.
+        VkDescriptorSet ds[vkop::kInflight] = {};
     };
     std::map<std::vector<int32_t>, SpecVariant> spec_variants_;
     static constexpr int kSpecIds = 19 + 4 * kFusedMaxOps;
@@ -186,9 +195,15 @@ class FusedElemwise : public BufferFactory {
         return v;
     }
 
-    VulkanPipeline *spec_pipeline(const std::vector<int32_t> &v) {
+    // `out` receives the variant entry (its descriptor slots live there), and
+    // is valid whenever the return value is non-null.
+    VulkanPipeline *spec_pipeline(const std::vector<int32_t> &v,
+                                  SpecVariant **out = nullptr) {
         auto it = spec_variants_.find(v);
-        if (it != spec_variants_.end()) return it->second.pipe.get();
+        if (it != spec_variants_.end()) {
+            if (out) *out = &it->second;
+            return it->second.pipe.get();
+        }
         SpecVariant var;
         var.id = static_cast<int>(spec_variants_.size()) + 1;
         std::vector<VkSpecializationMapEntry> entries(v.size());
@@ -218,7 +233,9 @@ class FusedElemwise : public BufferFactory {
             var.pipe.reset();
         }
         VulkanPipeline *p = var.pipe.get();
-        spec_variants_.emplace(v, std::move(var));
+        SpecVariant *slot = &spec_variants_.emplace(v, std::move(var))
+                                 .first->second;
+        if (out) *out = slot;
         return p;
     }
 
@@ -499,21 +516,28 @@ class FusedElemwise : public BufferFactory {
             int nthreads = is_fp16 ? (total + 1) / 2 : total;
             const int nOps = static_cast<int>(ops_.size()) / 4;
             VulkanPipeline *sp = nullptr;
+            SpecVariant *var = nullptr;
             if (spec_enabled() && spv_ && nOps <= kFusedMaxOps &&
                 nInputs <= kFusedMaxInputs) {
                 auto v = spec_vector(nInputs);
-                sp = spec_pipeline(v);
-                if (sp) pc._pad0 = spec_variants_.at(v).id;
+                sp = spec_pipeline(v, &var);
+                if (sp) pc._pad0 = var->id;
             }
             if (sp) {
-                // Descriptor sets from the base pipeline bind to the
-                // specialized one: same set layout, same push range.
-                if (!m_ds_[m_id_]) {
-                    m_ds_[m_id_] = pipeline_->allocDescriptorSets();
+                // Allocate/write through the SPECIALIZED pipeline, not the
+                // base one: in descriptor-buffer mode a set is a slot in the
+                // pipeline's own region (see SpecVariant::ds), so allocating
+                // from the base pipeline writes the descriptor bytes into a
+                // region this pipeline never reads and the dispatch binds
+                // blank descriptors (address=0, range=0 -> all-zero output).
+                // In descriptor-set mode the set is a real object and either
+                // pool would do; allocating here keeps one code path.
+                if (!var->ds[m_id_]) {
+                    var->ds[m_id_] = sp->allocDescriptorSets();
                 }
-                fillWriteDescriptorSets(m_ds_[m_id_]);
-                pipeline_->updateDescriptorSets(writes_);
-                m_cmd_->bind(*sp, m_ds_[m_id_]);
+                fillWriteDescriptorSets(var->ds[m_id_]);
+                sp->updateDescriptorSets(writes_);
+                m_cmd_->bind(*sp, var->ds[m_id_]);
                 m_cmd_->push_constants(*sp, static_cast<uint32_t>(pc_size_),
                                        &pc);
                 dispatch_and_record(UP_DIV(nthreads, 256), 1, 1, &pc);
