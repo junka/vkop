@@ -137,8 +137,9 @@ class ITensor {
     // no staging buffer, no GPU copy, and no second resident copy of the
     // weight while it loads. Scoped rather than keyed on read_only_leaf
     // alone because graph inputs are leaves too, and some of them (KV cache)
-    // are written in place by the GPU every round. VKOP_UMA_STAGING=1 keeps
-    // the staged path for A/B.
+    // are written in place by the GPU every round. Opt-in (VKOP_UMA_IN_PLACE=1):
+    // writing through the mapping costs Qwen-Image ~1.5-2.4 s of extra load
+    // on an M5 Max (14 GB of DiT weights), so the staged path is the default.
     class InitializerUploadScope {
       public:
         InitializerUploadScope() : prev_(flag()) { flag() = true; }
@@ -1832,10 +1833,10 @@ template <typename T> class Tensor : public ITensor {
         vkobj_ = std::make_shared<VulkanBuffer>(vd, aligned, flags, props);
     }
     bool upload_in_place_eligible(const std::shared_ptr<VulkanDevice> &vd) {
-        static const bool force_staging =
-            std::getenv("VKOP_UMA_STAGING") != nullptr &&
-            std::getenv("VKOP_UMA_STAGING")[0] != '0';
-        return !force_staging && read_only_leaf_ &&
+        static const bool in_place =
+            std::getenv("VKOP_UMA_IN_PLACE") != nullptr &&
+            std::getenv("VKOP_UMA_IN_PLACE")[0] != '0';
+        return in_place && read_only_leaf_ &&
                ITensor::in_initializer_upload_scope() &&
                vd->is_unified_memory();
     }
