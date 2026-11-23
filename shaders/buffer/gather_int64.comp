@@ -101,9 +101,17 @@ void main()
     if (indices_linear_idx >= total_indices_size || indices_linear_idx < 0) return;
     int gather_idx = uIndex.data[indices_linear_idx].x;
 
-    // 4. Negative-index wrap.
+    // 4. Negative-index wrap, then the ONNX range requirement. A negative
+    //    index wraps ONCE; anything still outside [0, axis_size) is invalid.
+    //    Skip it and write a defined 0 rather than reading an arbitrary
+    //    element — Gather::cpuComputeInt64 (the VKOP_HOST_SHAPE path) makes the
+    //    same choice, so the two cannot disagree on the same graph.
     int axis_size = uGatherPara.inShape.v[uGatherPara.axis];
     if (gather_idx < 0) gather_idx += axis_size;
+    if (gather_idx < 0 || gather_idx >= axis_size) {
+        uOutput.data[gid] = ivec2(0);
+        return;
+    }
 
     // 5. Build the input coordinate: data dims [0,axis) and [axis+1,idims)
     //    come from the output coordinate (shifted past the indices block for

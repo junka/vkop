@@ -384,9 +384,22 @@ class Gather : public Operator {
                     idx_coord[sl.src_dim] = v;
                 }
             }
-            int gather_idx = (*indices)[nd_to_linear(idx_coord, i_stride)];
+            int64_t gather_idx = (*indices)[nd_to_linear(idx_coord, i_stride)];
             if (gather_idx < 0) {
                 gather_idx += axis_size;
+            }
+            // ONNX Gather wraps a negative index ONCE and then requires
+            // 0 <= idx < axis_size; an index outside that range after the wrap
+            // is invalid, not a valid lookup. Leaving data_coord[axis] at a
+            // still-negative value made this read element -1 — a heap read in
+            // front of the table, observed as a segfault at
+            // /transformer_blocks.0/ff/net.0/Gather in a converted MiniMax-H3
+            // model (onnxruntime runs the same graph fine). Skip the element
+            // instead, exactly as gather.comp / gather_int64.comp do, so the
+            // answer cannot change with VKOP_HOST_SHAPE. `out` is
+            // value-initialised, so a skipped element reads back as 0.
+            if (gather_idx < 0 || gather_idx >= axis_size) {
+                continue;
             }
             data_coord[axis] = static_cast<int>(gather_idx);
             out[o] = (*data)[nd_to_linear(data_coord, d_stride)];

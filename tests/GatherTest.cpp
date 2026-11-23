@@ -1,9 +1,14 @@
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <vector>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
 #include "ops/Gather.hpp"
+#include "ops/OperatorFactory.hpp"
+#include "ops/Ops.hpp"
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
@@ -236,4 +241,116 @@ TEST(GatherTest, GatherNonContiguousNoAlias) {
     auto before = vkop::core::ITensor::shape_view_stats().buffer_aliases;
     EXPECT_TRUE(fp32.run_test({fp32.input, fp32.indices}, {fp32.output}));
     EXPECT_EQ(vkop::core::ITensor::shape_view_stats().buffer_aliases, before);
+}
+// ---------------------------------------------------------------------------
+// Out-of-range negative index (the MiniMax-H3 crash)
+// ---------------------------------------------------------------------------
+//
+// ONNX Gather wraps a negative index ONCE (`idx += axis_size`) and then
+// requires 0 <= idx < axis_size. The host int64 path (cpuComputeInt64, taken
+// whenever VKOP_HOST_SHAPE is on — the default) used to skip the range check
+// and index the data tensor with a still-negative number. With an empty-ish
+// table and index -1 that read element -1, i.e. heap in front of the buffer;
+// it segfaulted at /transformer_blocks.0/ff/net.0/Gather in a converted
+// MiniMax-H3 transformer and VAE decoder, while onnxruntime ran the identical
+// ONNX fine.
+//
+// Defined result: a skipped element. Both the host path and gather.comp /
+// gather_int64.comp now do exactly that, and the output tensor starts zeroed,
+// so an out-of-range index yields 0. Skipping (rather than clamping, wrapping
+// twice, or throwing) is the right answer because:
+//   * it is what the GPU kernels already did for the indices-side miss, so the
+//     same graph cannot change behaviour when VKOP_HOST_SHAPE is toggled;
+//   * clamping would invent a value ONNX never asked for, and wrapping twice
+//     would silently turn -1 on a 0-length axis into a different read;
+//   * it is a defined, reproducible value in an output whose other elements
+//     are still correct — the alternative is a crash or a stale word.
+namespace {
+
+// data [4] int64, indices [3] int64 = {-1 (wraps to 3, valid), 9 (>= axis),
+// -9 (wraps to -5, still negative)} at axis 0.
+const std::vector<int64_t> kGatherOobData = {10, 20, 30, 40};
+const std::vector<int64_t> kGatherOobIdx = {-1, 9, -9};
+const std::vector<int64_t> kGatherOobExpect = {40, 0, 0};
+
+bool run_gather_int64_oob_case() {
+    auto &dev = []() -> std::shared_ptr<vkop::VulkanDevice> & {
+        static std::shared_ptr<vkop::VulkanDevice> d = [] {
+            if (!vkop::tests::TestEnv::is_initialized())
+                vkop::tests::TestEnv::initialize();
+            return vkop::tests::TestEnv::get_device();
+        }();
+        return d;
+    }();
+    auto cmdpool = vkop::tests::TestEnv::get_command_pool();
+
+    auto data = std::make_shared<Tensor<int64_t>>(std::vector<int>{4});
+    data->fillToCPU(kGatherOobData);
+    // Keep the CPU copy alive: the host path reads data_ directly.
+    auto keep_data = data->data();
+    data->as_storage_buffer(dev);
+    data->copyToGPU(cmdpool, keep_data.data());
+
+    auto indices = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    indices->fillToCPU(kGatherOobIdx);
+    auto keep_idx = indices->data();
+    indices->as_storage_buffer(dev);
+    indices->copyToGPU(cmdpool, keep_idx.data());
+
+    auto output = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    output->as_storage_buffer(dev);
+    output->toGPU();
+
+    auto op = vkop::ops::create_from_type(vkop::ops::OpType::GATHER, 0, 0,
+                                          /*backend_buffer=*/true);
+    if (!op) {
+        LOG_ERROR("create_from_type(GATHER) returned null");
+        return false;
+    }
+    op->set_runtime_device(dev, cmdpool);
+    op->setAttribute({{"axis", "0"}});
+
+    // The whole point: this must not crash on the out-of-range element.
+    op->onExecute({data, indices}, {output}, 0);
+    auto cmd = op->get_record();
+    std::vector<VkSubmitInfo> info{cmd->buildSubmitInfo()};
+    vkop::VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
+    cmd->wait();
+    dev->wait_all_done();
+
+    output->copyToCPU(cmdpool);
+    const auto &got = output->data();
+    if (got.size() != kGatherOobExpect.size()) {
+        LOG_ERROR("Gather int64 OOB: output has %zu elems, want %zu",
+                  got.size(), kGatherOobExpect.size());
+        return false;
+    }
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != kGatherOobExpect[i]) {
+            LOG_ERROR("Gather int64 OOB: elem %zu = %lld, want %lld", i,
+                      static_cast<long long>(got[i]),
+                      static_cast<long long>(kGatherOobExpect[i]));
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+// Default path: cpuComputeInt64 (VKOP_HOST_SHAPE on). This is the one that
+// crashed.
+TEST(GatherTest, Int64NegativeIndexOutOfRangeHostPath) {
+    EXPECT_TRUE(run_gather_int64_oob_case());
+}
+
+// The same case through the GPU kernel (gather_int64.comp), so the two paths
+// are pinned to the same answer. host_shape_enabled() latches its env read in
+// a function-local static, so this only switches paths when it runs before any
+// other Gather execute in the process — which is the case under ctest (each
+// TEST is its own process). If it does run second, it simply re-checks the
+// host path against the same expectation, which must also hold.
+TEST(GatherTest, Int64NegativeIndexOutOfRangeGpuShader) {
+    setenv("VKOP_HOST_SHAPE", "0", 1);
+    EXPECT_TRUE(run_gather_int64_oob_case());
 }
