@@ -257,6 +257,14 @@ struct MatmulFeatures {
     bool attn_softmax = false;
     // SwiGLU down-projection fold (x, Wd, Wg, Wu).
     bool down_act = false;
+    // SwiGLU gate/up fold (fuse_swiglu_gate_up): B is Wg/Wu interleaved four
+    // columns at a time, [K, 2*N_up], and the result is silu(x.Wg) * (x.Wu).
+    // The fp16 WIDE split-K GEMV and the Apple 8x8x8 coopmat GEMM apply the
+    // activation in their own epilogue (uPC.wide == 2). Every route that
+    // writes fp32 to the flat scratch buffer -- including the generic
+    // cooperative-matrix GEMM -- gets it from the pack pass instead
+    // (matmul_pack.comp's swiglu mode), so selection does not exclude it.
+    bool swiglu = false;
 };
 
 // What the op actually managed to build. A route whose module is missing (driver

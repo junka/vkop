@@ -679,9 +679,12 @@ class MatMulBuffer : public BufferFactory {
   private:
     struct alignas(16) MatMulPackPC {
         int total;
-        int _pad0;
-        int _pad1;
-        int _pad2;
+        // SwiGLU gate/up fold: when nonzero the scratch holds the plain
+        // [rows, 2*n_up] product and this pass applies silu(g)*u. `rows` is
+        // batch*m, `n_up` the folded output width (total == rows * n_up).
+        int swiglu;
+        int rows;
+        int n_up;
     };
 
     // BDA pack: two direct addresses fit in the PC (16 B scalars + 16 B).
@@ -1258,6 +1261,12 @@ class MatMulBuffer : public BufferFactory {
         // folded node: x . Wd[:K_out] with gate, up and SiLU dropped.
         sel_feat.down_act = down_inputs_ok && down_k_out >= 1 && (n % 4 == 0) &&
                             (down_n_up % 4 == 0);
+        // SwiGLU gate/up fold: tells selection the node needs a route that can
+        // apply silu(g)*u. The WIDE GEMV and the Apple coop8 module do it in
+        // their epilogue; the scratch+pack family (including the generic
+        // cooperative-matrix GEMM) does it in the pack pass. Only the
+        // self-packing coop module cannot, so coop_n_ok() steers away from it.
+        sel_feat.swiglu = swiglu_;
 
         // Modules set_runtime_device() already built are facts. The ones built
         // on first use (WIDE GEMV, 512-lane split-K, tile-split-K, the down
@@ -1551,7 +1560,14 @@ class MatMulBuffer : public BufferFactory {
         if (fp16_ != 0 &&
             (!fused_fp16 || coopmat || coopmat_i8 || coopmat_sklast) &&
             ks_n <= 1) {
-            size_t scratch_bytes = static_cast<size_t>(total) * sizeof(float);
+            // A SwiGLU-folded node's GEMM still computes and deposits the plain
+            // [rows, n] product (n = 2*n_up); only the packed OUTPUT is
+            // halved. Size the scratch for what the kernel writes, not for
+            // `total` (which is the folded output count).
+            const size_t scratch_elems =
+                static_cast<size_t>(batch) * static_cast<size_t>(m) *
+                static_cast<size_t>(n);
+            size_t scratch_bytes = scratch_elems * sizeof(float);
             if (scratch_bytes == 0) {
                 scratch_bytes = 16;
             }
@@ -1713,14 +1729,16 @@ class MatMulBuffer : public BufferFactory {
         para_.ks_part = 0;
         para_.wide = plan.wide ? 1 : 0;
         para_.ksplit_q = plan.ksplit_q;
-        // SwiGLU gate/up fold. Two kernels apply silu(g) * u in their own
-        // epilogue (uPC.wide == 2): the fp16 WIDE split-K GEMV, whose lane
-        // owns eight columns = one g/u quartet pair, and the Apple coopmat
-        // GEMM, whose epilogue lane holds eight consecutive columns of a row.
-        // Every other route computes the plain [.., 2*N_up] product into a
-        // scratch buffer and a pack pass applies the activation afterwards.
+        // SwiGLU gate/up fold. The fp16 WIDE split-K GEMV and the Apple
+        // coopmat GEMM (coop8) apply silu(g) * u in their own epilogue
+        // (uPC.wide == 2). The generic cooperative-matrix GEMM has no such
+        // epilogue but always deposits the plain [rows, 2*N_up] fp32 product
+        // into the flat scratch and packs it, so its pack pass applies the
+        // activation (swiglu_in_pack_). Every other route repoints objs_[0] at
+        // a scratch buffer and finishes with submit_swiglu_pack().
         swiglu_pack_ = false;
         swiglu_coop8_ = false;
+        swiglu_in_pack_ = false;
         if (swiglu_) {
             const bool gemv = plan.route == core::MatmulRoute::kKsplitWide ||
                               plan.route == core::MatmulRoute::kKsplitWide512;
@@ -1729,7 +1747,22 @@ class MatMulBuffer : public BufferFactory {
             } else if (plan.route == core::MatmulRoute::kTiled &&
                        coop8_eligible(m, n, k) && coop8_pipeline() != nullptr) {
                 swiglu_coop8_ = true;
+            } else if (coopmat) {
+                // Generic cooperative-matrix GEMM: its epilogue has no
+                // activation, but it always deposits the plain [rows, 2*n_up]
+                // fp32 product into the flat scratch buffer and then runs
+                // matmul_pack.comp. Leave objs_[0] alone and let that pack pass
+                // apply silu(g)*u while it converts to half2 (uPC.swiglu) --
+                // no extra dispatch, and the scratch is already sized and
+                // allocated by the coopmat block below.
+                swiglu_in_pack_ = true;
+                swiglu_rows_ = batch * m;
+                swiglu_nup_ = n / 2;
             } else {
+                // Scratch + pack for every other route: objs_[0] is repointed
+                // at an interleaved half buffer so the kernel's normal output
+                // is the plain [rows, 2*n_up] product, and execute() then runs
+                // submit_swiglu_pack() to finish silu(g)*u.
                 const VkDeviceSize bytes = static_cast<VkDeviceSize>(batch) *
                                            m * n * sizeof(uint16_t);
                 if (!swiglu_scratch_ || swiglu_scratch_bytes_ < bytes) {
@@ -2050,20 +2083,31 @@ class MatMulBuffer : public BufferFactory {
             if (!no_pack) {
                 // Barrier: flush coopmat's scratch writes for pack's reads.
                 scratch_->shaderWriteBarrier(m_cmd_->get());
-                if (!submit_pack_bda(total)) {
-                    // Pack pass: separate pipeline (no PC interference). One
-                    // thread per output word; reads flat fp32 from scratch,
-                    // packs half2 to output.
-                    int nwords = (total + 1) / 2;
-                    MatMulPackPC pack_pc{};
-                    pack_pc.total = total;
-                    fillDescriptorWrites(pack_ds_[m_id_]);
-                    pack_pipeline_->updateDescriptorSets(ds_writes_);
-                    m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
-                    m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
-                                           &pack_pc);
-                    dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
+                // The BDA pack PC carries only out/scratch addresses; it has
+                // no SwiGLU fields, so a folded node takes the descriptor
+                // pack below, whose shader understands uPC.swiglu.
+                if (!swiglu_in_pack_ && submit_pack_bda(total)) {
+                    return;
                 }
+                // Pack pass: separate pipeline (no PC interference). One
+                // thread per output word; reads flat fp32 from scratch,
+                // packs half2 to output. A SwiGLU-folded node also gets
+                // silu(g)*u applied here (uPC.swiglu).
+                int nwords = (total + 1) / 2;
+                MatMulPackPC pack_pc{};
+                pack_pc.total = total;
+                pack_pc.swiglu = swiglu_in_pack_ ? 1 : 0;
+                pack_pc.rows = swiglu_rows_;
+                pack_pc.n_up = swiglu_nup_;
+                fillDescriptorWrites(pack_ds_[m_id_]);
+                pack_pipeline_->updateDescriptorSets(ds_writes_);
+                m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+                m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
+                                       &pack_pc);
+                int groups = swiglu_in_pack_
+                                 ? UP_DIV(swiglu_rows_ * (swiglu_nup_ >> 2), 256)
+                                 : UP_DIV(nwords, 256);
+                dispatch_and_record(groups, 1, 1, &pack_pc);
             }
             return;
         }
@@ -3898,6 +3942,10 @@ class MatMulBuffer : public BufferFactory {
     bool swiglu_ = false;
     bool swiglu_pack_ = false;
     bool swiglu_coop8_ = false;
+    // The generic coopmat route applies silu(g)*u inside its own fp32->half2
+    // pack pass (matmul_pack.comp's swiglu mode) instead of a follow-up
+    // dispatch: it already writes [rows, 2*n_up] fp32 to the flat scratch.
+    bool swiglu_in_pack_ = false;
     int swiglu_rows_ = 0;
     int swiglu_nup_ = 0;
     std::shared_ptr<VulkanBuffer> swiglu_scratch_;

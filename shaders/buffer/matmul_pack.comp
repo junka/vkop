@@ -9,6 +9,13 @@
 // packs as half2, writes to output. One thread per output WORD.
 // Separate shader to avoid Intel ANV push-constant interference between
 // reduce and pack dispatches of the same pipeline.
+//
+// SwiGLU mode (uPC.swiglu != 0): the MatMul computed the plain product of x
+// and the interleaved [K, 2*N_up] weight -- four gate columns then the same
+// four up columns per octet -- so a thread reads four g and four u fp32 values
+// and emits silu(g) * u as four halves. This is what the generic
+// cooperative-matrix route uses: its epilogue has no activation, but it always
+// deposits fp32 into the same flat scratch, so the activation folds in here.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -28,10 +35,10 @@ layout(set = 0, binding = 3) readonly buffer Scratch {
 #endif
 
 layout(push_constant) uniform PC {
-    int total; // total output element count
-    int _pad0;
-    int _pad1;
-    int _pad2;
+    int total;   // output element count (the packed [.., N] result)
+    int swiglu;  // 1 = scratch holds [rows, 2*N]; apply silu(g)*u while packing
+    int rows;    // swiglu only: batch * m
+    int n_up;    // swiglu only: output columns (== total / rows)
 #ifdef BDA
     DataBuf uOutput;
     DataBuf uScratch;
@@ -45,6 +52,30 @@ layout(push_constant) uniform PC {
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
+    if (uPC.swiglu != 0) {
+        // One thread per four output halves. The weight interleaves gate and up
+        // four columns at a time, so a row of the plain [rows, 2*n_up] product
+        // reads g0 g1 g2 g3 u0 u1 u2 u3 g4 g5 g6 g7 u4 ..., i.e. within each
+        // octet the four gate values sit at cols 0..3 and the matching four up
+        // values at cols 4..7.
+        int per_row = uPC.n_up >> 2;
+        if (gid >= uPC.rows * per_row) return;
+        int row = gid / per_row;
+        int oct = gid % per_row;
+        int in_base = row * (uPC.n_up * 2) + oct * 8;
+        vec4 g = vec4(uintBitsToFloat(uScratch.data[in_base + 0]),
+                      uintBitsToFloat(uScratch.data[in_base + 1]),
+                      uintBitsToFloat(uScratch.data[in_base + 2]),
+                      uintBitsToFloat(uScratch.data[in_base + 3]));
+        vec4 u = vec4(uintBitsToFloat(uScratch.data[in_base + 4]),
+                      uintBitsToFloat(uScratch.data[in_base + 5]),
+                      uintBitsToFloat(uScratch.data[in_base + 6]),
+                      uintBitsToFloat(uScratch.data[in_base + 7]));
+        vec4 h = g / (1.0 + exp(-g)) * u;
+        uOutput.data[2 * gid + 0] = packHalf2x16(h.xy);
+        uOutput.data[2 * gid + 1] = packHalf2x16(h.zw);
+        return;
+    }
     int nwords = (uPC.total + 1) / 2;
     if (gid >= nwords) return;
     int e0 = 2 * gid;

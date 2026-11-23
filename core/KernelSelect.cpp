@@ -336,8 +336,13 @@ bool coopmat_gate(const Ctx &c) {
 // neighbouring row's element -- silently wrong output, no error. The
 // scratch+pack family (coop16.comp) buffers flat fp32 and lets the pack pass
 // re-pair words, so it is odd-N safe by construction.
+//
+// A SwiGLU-folded node needs the scratch+pack family for a second reason: the
+// activation is applied by the pack pass (matmul_pack.comp's swiglu mode), and
+// a self-packing module never runs it. Treat it like odd N and require the
+// scratch route.
 bool coop_n_ok(const Ctx &c) {
-    return (c.s->n & 1) == 0 || !c.av->coop_self_pack;
+    return ((c.s->n & 1) == 0 && !c.f->swiglu) || !c.av->coop_self_pack;
 }
 
 bool coopmat_applies(const Ctx &c) {
