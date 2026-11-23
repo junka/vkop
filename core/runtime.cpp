@@ -71,6 +71,7 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     case ops::OpType::TRANSPOSE:
     case ops::OpType::CONCAT:
     case ops::OpType::CONV2D:
+    case ops::OpType::CONVTRANSPOSE:
     case ops::OpType::ROTARY_EMBEDDING:
     case ops::OpType::GATHER:
     case ops::OpType::EXPAND:

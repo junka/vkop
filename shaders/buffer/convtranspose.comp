@@ -1,0 +1,156 @@
+#version 450 core
+
+// ConvTranspose (ONNX), SSBO backend. One thread per output element
+// [n, oc, od, oh, ow] — the transposed counterpart of buffer/conv2d.comp's
+// gather form.
+//
+// A forward convolution maps input positions to outputs by summing the taps
+// that overlap; a transposed convolution is the same relation read backwards:
+// every input position p contributes x[n, ic, p] * w[ic, ocg, k] to
+//   o = p * stride + k * dilation - pad_begin
+// so an output element is the sum over the taps that can have reached it:
+//   pos = o + pad_begin - k * dilation
+// valid iff pos is non-negative, inside the input, and divisible by `stride`
+// (in which case the input element it reads is pos / stride). Positions that
+// are not divisible are simply not reachable at this output — dropping them is
+// what makes the stride > 1 upsampling come out right, and it is also why the
+// per-tap `% stride` test below is load-bearing rather than a formality.
+//
+// Layout conventions mirror conv2d.comp exactly, so the same kernel covers
+// 1-D, 2-D and 3-D: shapes are NCHW-with-D (input [N, IC, ID, IH, IW]), and a
+// 2-D conv is the ID = 1 degenerate case while a 1-D conv has ID = IH = 1.
+// The host always fills all three spatial fields.
+//
+// ONNX weight layout for ConvTranspose is [IC, OC/group, kD, kH, kW] — NOT
+// [OC, IC/group, ...] like Conv. The groups split the INPUT channels: input
+// channel ic belongs to group ic / icg and may only reach the ocg output
+// channels of that same group, so the group index comes from `oc` here and
+// the weight's first index stays the raw input channel.
+//
+// Output size (the classic off-by-one): with `output_padding` in the picture,
+//   out = stride * (in - 1) + output_padding + dilation * (k - 1) + 1
+//         - pad_begin - pad_end
+// The host computes it (or takes the `output_shape` attribute when the graph
+// supplies one) and passes OD/OH/OW; this kernel only consumes them.
+//
+// DTYPES. fp32 and fp16, selected by -DFP16 (the tensor bytes are compact
+// 2-byte halves in both cases — the same convention buffer/gather.comp uses).
+// One thread owns one output element and stores it directly, so there is no
+// shared-word read-modify-write and no pack pass: `float16_t` is an actual
+// 16-bit store. Accumulation is fp32 in both builds.
+
+#ifdef FP16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#define DTYPE float16_t
+#else
+#define DTYPE float
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { DTYPE data[]; } uOutput;
+layout(set = 0, binding = 1) readonly buffer InX { DTYPE data[]; } uInputX;
+layout(set = 0, binding = 2) readonly buffer InW { DTYPE data[]; } uInputW;
+// Bias [OC] in the graph dtype; inert when has_bias is 0.
+layout(set = 0, binding = 3) readonly buffer Bias { DTYPE data[]; } uBias;
+
+// Loads through the element type and widens to fp32, so fp16 inputs are
+// accumulated in fp32 (never in half). Identity in the fp32 build.
+#define LOAD(data, idx) float((data)[(idx)])
+
+// Mirrors convtranspose::ConvTransposePC in ops/ConvTranspose.hpp, field for
+// field and in this order.
+layout(push_constant) uniform PC {
+    int N, IC, ID, IH, IW;
+    int OC, OD, OH, OW;
+    int KD, KH, KW;
+    int stride_d, stride_h, stride_w;
+    int pad_d, pad_h, pad_w;
+    int dil_d, dil_h, dil_w;
+    int groups;
+    int has_bias;
+    int ocg; // OC / groups — output channels per group
+    int icg; // IC / groups — input channels per group
+} uPC;
+
+// The kernel-x window, i.e. the kx values whose tap position can land inside
+// the input at all:
+//   pos = ow + pad_w - kx * dil_w,   0 <= pos <= (IW - 1) * stride_w
+//   => kx <= (ow + pad_w) / dil_w  and  kx >= (ow + pad_w - (IW-1)*stride_w) / dil_w
+// (ow + pad_w >= 0 always, so the upper division truncates downwards as
+// intended; the lower numerator may be negative, in which case the bound is 0.)
+// Hoisted out of the tap loop so the innermost loop is a straight walk.
+void conv_transpose_element(const int gid) {
+    const int ow = gid % uPC.OW;
+    const int oh = (gid / uPC.OW) % uPC.OH;
+    const int od = (gid / (uPC.OW * uPC.OH)) % uPC.OD;
+    const int oc = (gid / (uPC.OW * uPC.OH * uPC.OD)) % uPC.OC;
+    const int n = gid / (uPC.OW * uPC.OH * uPC.OD * uPC.OC);
+
+    // Group of this output channel: `ocg` consecutive output channels share
+    // one group, and group g reads input channels [g*icg, (g+1)*icg).
+    const int g = oc / uPC.ocg;
+    const int j = oc - g * uPC.ocg; // output channel within its group
+    const int ic_base = g * uPC.icg;
+
+    const int HW = uPC.IH * uPC.IW;
+    const int IDHW = uPC.ID * HW;
+    const int KHW = uPC.KH * uPC.KW;
+    const int dilw = uPC.dil_w;
+
+    int kx0 = 0;
+    int kx1 = -1;
+    {
+        const int pos0 = ow + uPC.pad_w;
+        const int num = pos0 - (uPC.IW - 1) * uPC.stride_w;
+        kx0 = (num <= 0) ? 0 : (num + dilw - 1) / dilw;
+        kx1 = min(uPC.KW - 1, pos0 / dilw);
+    }
+
+    float sum = 0.0;
+    for (int kic = 0; kic < uPC.icg; ++kic) {
+        const int ic = ic_base + kic;
+        const int xch = (n * uPC.IC + ic) * IDHW;
+        // Weight [IC, OCG, KD, KH, KW], row-major.
+        const int wch = (ic * uPC.ocg + j) * (uPC.KD * KHW);
+        for (int kd = 0; kd < uPC.KD; ++kd) {
+            const int posd = od + uPC.pad_d - kd * uPC.dil_d;
+            if (posd < 0 || posd >= uPC.ID * uPC.stride_d) continue;
+            if (posd % uPC.stride_d != 0) continue;
+            const int xdp = xch + (posd / uPC.stride_d) * HW;
+            const int wd = wch + kd * KHW;
+            for (int kh = 0; kh < uPC.KH; ++kh) {
+                const int posh = oh + uPC.pad_h - kh * uPC.dil_h;
+                if (posh < 0 || posh >= uPC.IH * uPC.stride_h) continue;
+                if (posh % uPC.stride_h != 0) continue;
+                const int xrow = xdp + (posh / uPC.stride_h) * uPC.IW;
+                const int wrow = wd + kh * uPC.KW;
+                for (int kx = kx0; kx <= kx1; ++kx) {
+                    const int posw = ow + uPC.pad_w - kx * dilw;
+                    if (posw % uPC.stride_w != 0) continue;
+                    sum += LOAD(uInputX.data, xrow + posw / uPC.stride_w) *
+                           LOAD(uInputW.data, wrow + kx);
+                }
+            }
+        }
+    }
+
+    if (uPC.has_bias != 0) {
+        sum += LOAD(uBias.data, oc);
+    }
+    uOutput.data[gid] = DTYPE(sum);
+}
+
+void main() {
+    // A zero-length spatial input or output has no work; the host still
+    // dispatches 0 threads in that case, so this only guards the divisions.
+    if (uPC.IW <= 0 || uPC.IH <= 0 || uPC.ID <= 0) return;
+    if (uPC.OW <= 0 || uPC.OH <= 0 || uPC.OD <= 0) return;
+
+    const int total = uPC.N * uPC.OC * uPC.OD * uPC.OH * uPC.OW;
+    const int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= total) return;
+    conv_transpose_element(gid);
+}

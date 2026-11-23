@@ -16,6 +16,7 @@ enum class OpType {
     BATCHNORM,
     CONCAT,
     CONV2D,
+    CONVTRANSPOSE,
     DIV,
     ERF,
     FLOOR,
@@ -87,65 +88,66 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "BatchNorm",         // BATCHNORM = 4
         "Concat",            // CONCAT = 5
         "Conv2d",            // CONV2D = 6
-        "Div",               // DIV = 7
-        "Erf",               // ERF = 8
-        "Floor",             // FLOOR = 9
-        "Gemm",              // GEMM = 10
-        "InstanceNorm",      // INSTANCENORM = 11
-        "GlobalAveragePool", // GLOBALAVERAGEPOOL = 12
-        "GridSample",        // GRIDSAMPLE = 13
-        "LayerNorm",         // LAYERNORM = 14
-        "MatMul",            // MATMUL = 15
-        "MaxPool2d",         // MAXPOOL2D = 16
-        "Mul",               // MUL = 17
-        "Pow",               // POW = 18
-        "PRelu",             // PRELU = 19
-        "Reduce",            // REDUCE = 20
-        "Relu",              // RELU = 21
-        "Reshape",           // RESHAPE = 22
-        "Resize",            // RESIZE = 23
-        "Sigmoid",           // SIGMOID = 24
-        "Slice",             // SLICE = 25
-        "Softmax",           // SOFTMAX = 26
-        "Softplus",          // SOFTPLUS = 27
-        "Split",             // SPLIT = 28
-        "Sub",               // SUB = 29
-        "TopK",              // TOPK = 30
-        "Transpose",         // TRANSPOSE = 31
-        "Nms",               // NMS = 32
-        "Gather",            // GATHER = 33
-        "Range",             // RANGE = 34
-        "Expand",            // EXPAND = 35
-        "Sqrt",              // SQRT = 36
-        "Sin",               // SIN = 37
-        "Cos",               // COS = 38
-        "Neg",               // NEG = 39
-        "Where",             // WHERE = 40
-        "Tanh",              // TANH = 41
-        "EmbeddingForward",  // EMBEDDING_FORWARD = 42
-        "Equal",             // EQUAL = 43
-        "NonZero",           // NONZERO = 44
-        "Pad",               // PAD = 45
-        "ScatterElements",   // SCATTER_ELEMENTS = 46
-        "Shape",             // SHAPE = 47
-        "Cast",              // CAST = 48
-        "Clip",              // CLIP = 49
-        "ScatterND",         // SCATTER_ND = 50
-        "Squeeze",           // SQUEEZE = 51
-        "Unsqueeze",         // UNSQUEEZE = 52
-        "RotaryEmbedding",   // ROTARY_EMBEDDING = 53
-        "FusedElemwise",     // FUSED_ELEMWISE = 54
-        "RMSNorm",           // RMSNORM = 55
-        "ReduceMean",        // REDUCEMEAN = 56
-        "Min",               // MIN = 57
-        "Max",               // MAX = 58
-        "Mod",               // MOD = 59
-        "QuantizeLinear",    // QUANTIZE_LINEAR = 60
-        "DequantizeLinear",  // DEQUANTIZE_LINEAR = 61
-        "Attention",         // ATTENTION = 62
-        "CumSum",            // CUMSUM = 63
-        "Conv1d",            // CONV1D = 64
-        "LinearAttention",   // LINEAR_ATTENTION = 65
+        "ConvTranspose",     // CONVTRANSPOSE = 7
+        "Div",               // DIV = 8
+        "Erf",               // ERF = 9
+        "Floor",             // FLOOR = 10
+        "Gemm",              // GEMM = 11
+        "InstanceNorm",      // INSTANCENORM = 12
+        "GlobalAveragePool", // GLOBALAVERAGEPOOL = 13
+        "GridSample",        // GRIDSAMPLE = 14
+        "LayerNorm",         // LAYERNORM = 15
+        "MatMul",            // MATMUL = 16
+        "MaxPool2d",         // MAXPOOL2D = 17
+        "Mul",               // MUL = 18
+        "Pow",               // POW = 19
+        "PRelu",             // PRELU = 20
+        "Reduce",            // REDUCE = 21
+        "Relu",              // RELU = 22
+        "Reshape",           // RESHAPE = 23
+        "Resize",            // RESIZE = 24
+        "Sigmoid",           // SIGMOID = 25
+        "Slice",             // SLICE = 26
+        "Softmax",           // SOFTMAX = 27
+        "Softplus",          // SOFTPLUS = 28
+        "Split",             // SPLIT = 29
+        "Sub",               // SUB = 30
+        "TopK",              // TOPK = 31
+        "Transpose",         // TRANSPOSE = 32
+        "Nms",               // NMS = 33
+        "Gather",            // GATHER = 34
+        "Range",             // RANGE = 35
+        "Expand",            // EXPAND = 36
+        "Sqrt",              // SQRT = 37
+        "Sin",               // SIN = 38
+        "Cos",               // COS = 39
+        "Neg",               // NEG = 40
+        "Where",             // WHERE = 41
+        "Tanh",              // TANH = 42
+        "EmbeddingForward",  // EMBEDDING_FORWARD = 43
+        "Equal",             // EQUAL = 44
+        "NonZero",           // NONZERO = 45
+        "Pad",               // PAD = 46
+        "ScatterElements",   // SCATTER_ELEMENTS = 47
+        "Shape",             // SHAPE = 48
+        "Cast",              // CAST = 49
+        "Clip",              // CLIP = 50
+        "ScatterND",         // SCATTER_ND = 51
+        "Squeeze",           // SQUEEZE = 52
+        "Unsqueeze",         // UNSQUEEZE = 53
+        "RotaryEmbedding",   // ROTARY_EMBEDDING = 54
+        "FusedElemwise",     // FUSED_ELEMWISE = 55
+        "RMSNorm",           // RMSNORM = 56
+        "ReduceMean",        // REDUCEMEAN = 57
+        "Min",               // MIN = 58
+        "Max",               // MAX = 59
+        "Mod",               // MOD = 60
+        "QuantizeLinear",    // QUANTIZE_LINEAR = 61
+        "DequantizeLinear",  // DEQUANTIZE_LINEAR = 62
+        "Attention",         // ATTENTION = 63
+        "CumSum",            // CUMSUM = 64
+        "Conv1d",            // CONV1D = 65
+        "LinearAttention",   // LINEAR_ATTENTION = 66
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -173,6 +175,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {    // Alphabet
         return vkop::ops::OpType::CONV1D;
     if (name == "Conv2d" || name == "Conv")
         return vkop::ops::OpType::CONV2D;
+    if (name == "ConvTranspose")
+        return vkop::ops::OpType::CONVTRANSPOSE;
     if (name == "Cos")
         return vkop::ops::OpType::COS;
     if (name == "CumSum" || name == "Cumsum")

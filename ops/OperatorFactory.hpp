@@ -23,6 +23,7 @@
 
 #include "Conv1d.hpp"
 #include "Conv2d.hpp"
+#include "ConvTranspose.hpp"
 #include "Cumsum.hpp"
 #include "Gemm.hpp"
 #include "GridSample.hpp"
@@ -100,6 +101,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<Concat>(fp16, backend_buffer);
     case OpType::CONV2D:
         return std::make_unique<Conv2d>(fp16, backend_buffer);
+    case OpType::CONVTRANSPOSE:
+        return std::make_unique<ConvTranspose>(fp16, backend_buffer);
     case OpType::CONV1D:
         return std::make_unique<Conv1d>(fp16, backend_buffer);
     case OpType::CUMSUM:

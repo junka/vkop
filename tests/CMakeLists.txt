@@ -90,6 +90,7 @@ set(TEST_SOURCES
     RobustnessTest.cpp
     BackendCoverageTest.cpp
     ConvWeightLayoutTest.cpp
+    ConvTransposeTest.cpp
 )
 
 # Test sources are compiled one TU per file. That used to be a bad deal: every

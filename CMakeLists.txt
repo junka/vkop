@@ -360,6 +360,11 @@ set(DUAL_FP16_SHADERS
     # the image format; this is the buffer side of that, and without it an
     # fp16 tensor would be walked as fp32 words.
     buffer/nms
+    # buffer/convtranspose.comp stores float16_t directly under -DFP16 (one
+    # thread per output element, so there is no shared-word race and no pack
+    # pass) and accumulates in fp32. Without this entry an fp16 ConvTranspose
+    # would walk half-typed storage as fp32 words.
+    buffer/convtranspose
     # buffer/clip.comp is the same kernel over packed half2 words under -DFP16
     # (one thread per uint word), and Clip's buffer op picks the build from the
     # tensor dtype. Without this entry an fp16 Clip would run the fp32 module

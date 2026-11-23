@@ -47,6 +47,11 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {"concat", "concat", false, true};
         case T::CONV2D:
             return {"conv2d", "conv2d", true, true};
+        case T::CONVTRANSPOSE:
+            // Buffer-only (there is no image transposed-convolution kernel);
+            // buffer/convtranspose.comp ships a -DFP16 build that stores
+            // float16_t directly, so the fp16 flag is real.
+            return {nullptr, "convtranspose", false, true};
         case T::COS:
             return {"cos", "cos", false, true};
         case T::DIV:
