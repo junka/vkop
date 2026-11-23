@@ -2676,11 +2676,7 @@ class MatMulBuffer : public BufferFactory {
             // straddles a batch boundary, so no per-row batch fixups in the
             // shader.
             set_route(plan.tag, batch, m, n, k, rep);
-            // The 128x128 / 8x8-per-thread kernel (uPC.tile == 2) covers the
-            // plain fp16 [batch, K, N] shape: no byte weight, no epilogue,
-            // N % 8 == 0 for its uvec4 B loads, and enough rows and columns
-            // that a 128-wide block is not mostly padding. VKOP_TILE128=0
-            // keeps the 64x64 kernel (A/B switch).
+            // A/B switch for the 128x128 kernel below.
             static const bool t128_on = [] {
                 const char *e = std::getenv("VKOP_TILE128");
                 return e == nullptr || std::atoi(e) != 0;
@@ -2698,9 +2694,22 @@ class MatMulBuffer : public BufferFactory {
                     return;
                 }
             }
+            // The 128x128 / 8x8-per-thread kernel (uPC.tile == 2) covers the
+            // plain fp16 [batch, K, N] shape: no byte weight, no epilogue, and
+            // N % 8 == 0 for its uvec4 B loads. The row floor falls as N grows
+            // (see core::KernelSelect's make_ctx, which mirrors this to keep
+            // coopmat off the same shapes): a 128-wide block needs enough
+            // columns to spread its fixed 64-row staging over. Measured first m
+            // where it beat coopmat on Ada -- N<=1536 never, N=2048 m~256,
+            // N=3072 m~192, N>=4096 m~128. VKOP_TILE128=0 keeps the 64x64
+            // kernel (A/B switch).
+            const int t128_min_m = (n >= 4096)   ? 128
+                                   : (n >= 3072) ? 192
+                                   : (n >= 2048) ? 256
+                                                 : (1 << 30);
             if (t128_on && fp16_ != 0 && para_.transB == 0 &&
                 para_.weight_int8 == 0 && para_.epi_bias == 0 &&
-                n % 8 == 0 && k % 16 == 0 && m >= 256 && n >= 256) {
+                n % 8 == 0 && k % 16 == 0 && n >= 128 && m >= t128_min_m) {
                 para_.tile = 2;
                 if (try_submit_bda(UP_DIV(n, 128), UP_DIV(m, 128), batch)) {
                     return;

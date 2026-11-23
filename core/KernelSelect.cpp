@@ -137,6 +137,7 @@ struct Ctx {
     bool weight_4bit = false;
     bool fused = false;
     bool tiled = false;
+    bool tile128 = false;
     bool ksplit_ok = false;
     // True when the winning shape is a transB=1 byte weight admitted by the
     // split-K GEMV's [batch, N, K] form. The WIDE variants keep their
@@ -225,6 +226,22 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
     c.tiled = c.fused && !kn.tile_disabled && !c.weight_4bit &&
               (s.k % 16 == 0) && (s.m >= c.tiled_min_m) && !f.epi_bias &&
               tiled_ok_n && (!c.weight_byte || (!f.transB && (s.n % 4 == 0)));
+    // The 128x128 / 8x8-per-thread tile (MatMul's uPC.tile == 2) is worth about
+    // 1.7x over the 64x64 tile once a block is not mostly padding. MatMul
+    // enables it under these same conditions; mirror them here so the coopmat
+    // gate can step aside for it (see coopmat_gate). The row floor falls as N
+    // grows, because a 128-wide block only pays off once there are enough
+    // columns to spread the fixed 64-row staging over. Measured on b3 / RTX
+    // 4000 Ada (K=2048, min of 3, 20 reps), first m where the 128 tile beat
+    // coopmat: N<=1536 never (out to m=320), N=2048 at m~256, N=3072 at
+    // m~192, N>=4096 at m~128.
+    const int t128_min_m = (s.n >= 4096)   ? 128
+                           : (s.n >= 3072) ? 192
+                           : (s.n >= 2048) ? 256
+                                           : 1 << 30; // N<=1536: never
+    c.tile128 = c.tiled && c.fused && !c.weight_byte && !f.transB &&
+                !f.epi_bias && (s.n % 8 == 0) && (s.k % 16 == 0) &&
+                !c.weight_4bit && (s.m >= t128_min_m) && (s.n >= 128);
 
     if (c.tiled && !c.weight_byte && !f.transB && s.k >= 256) {
         const long blocks = static_cast<long>(s.batch) * up_div(s.n, 64) *
@@ -308,6 +325,16 @@ bool coopmat_i8_applies(const Ctx &c) {
 bool coopmat_gate(const Ctx &c) {
     // Opt-in bypass for PoC — forces coopmat regardless of shape thresholds.
     if (c.kn->force_coop) return true;
+    // A shape the 128x128 fp16 tile serves is faster on that tile than on any
+    // cooperative-matrix build. Measured on b3 / RTX 4000 Ada (K=2048, min of
+    // 3, 12-30 reps): the tile wins every shape it covers by 1.2x - 2.1x over
+    // coopmat, across N 4096..16384 and m 128..512. That is the tile128
+    // kernel's 8x8 sub-tile (128 FMAs per 16 shared words, against 32 per 8),
+    // not a property of cooperative matrices -- which is why the rule defers
+    // only where MatMul would really dispatch tile128 (see c.tile128). A
+    // device whose coopmat build beats the tile is unaffected as long as its
+    // crossover sits inside these floors.
+    if (c.tile128) return false;
     const MatmulShape &s = *c.s;
     if (c.av->coop_bm < 32) {
         // 8x8x16: a 16x32 workgroup tile. Below one full TILE_M of rows the
