@@ -104,6 +104,16 @@ target_link_libraries(ppu_roundtrip PRIVATE ${CMAKE_DL_LIBS})
 add_executable(ppu_spirv_dispatch tests/spirv_dispatch.cpp)
 target_include_directories(ppu_spirv_dispatch PRIVATE ${_vulkan_inc})
 target_link_libraries(ppu_spirv_dispatch PRIVATE ${CMAKE_DL_LIBS})
+
+# Numeric probe: dispatch any kernel whose bindings are out/in/in2 + an 8-byte
+# push constant, feed it exact inputs from files, and print the raw outputs so
+# a lowering can be diffed against a host reference. No reference formula is
+# baked in -- that is what lets it catch a runtime-only miscompile (a constant
+# argument can be folded correctly by llc while the emitted instruction is
+# wrong, which is exactly how the cos()/sin() ppu lowering bug stayed hidden).
+add_executable(ppu_numprobe tests/numprobe.cpp)
+target_include_directories(ppu_numprobe PRIVATE ${_vulkan_inc})
+target_link_libraries(ppu_numprobe PRIVATE ${CMAKE_DL_LIBS})
 # The emitter as a standalone tool, so the coverage sweeps in the other
 # workstream (and on a host without the SDK) still have one binary to drive.
 add_executable(ppu_emit spirv-emit/emit_main.cpp spirv-emit/emit.cpp)

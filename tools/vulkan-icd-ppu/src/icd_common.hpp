@@ -393,6 +393,12 @@ struct RecordedOp {
   ComputePipeline_T *pipeline = nullptr;
   uint32_t group[3] = {1, 1, 1};
   uint64_t indirect_addr = 0;  // device address of the 3x uint32 group count
+  // Host mapping of the indirect buffer, when it has one (HOST_VISIBLE). The
+  // counts are then readable without touching the device -- vkop's attention
+  // publishes its grid through exactly such a mapping. Null for a device-only
+  // indirect buffer, where the counts were written by a compute shader and
+  // must be read back stream-ordered instead.
+  void *indirect_host = nullptr;
   std::vector<uint64_t> args;  // 64-bit kernel arguments, in order
   uint64_t push_constant_addr = 0;
 

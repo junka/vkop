@@ -394,6 +394,14 @@ extern "C" VKAPI_ATTR void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer comm
   op.kind = RecordedOp::Kind::DispatchIndirect;
   op.pipeline = cb->pipeline;
   op.indirect_addr = ppu::buffer_address(buf, offset);
+  // If the buffer is host-visible, its group counts are readable directly at
+  // submit. vkop's attention publishes its grid through such a mapping every
+  // round, so this is the common case and avoids a device round trip per op.
+  if (buf->memory != nullptr && buf->memory->kind == MemoryKind::HostMapped &&
+      buf->memory->host_ptr != nullptr) {
+    op.indirect_host = static_cast<uint8_t *>(buf->memory->host_ptr) +
+                       buf->memory_offset + offset;
+  }
   op.args.assign(cb->pipeline->arg_slots.size(), 0ull);
   const auto &slots = cb->pipeline->arg_slots;
   for (size_t i = 0; i < slots.size(); ++i) {

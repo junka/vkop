@@ -393,8 +393,15 @@ const char *llc_path(std::string *why) {
 
 uint64_t spirv_cache_key(const uint32_t *spirv, size_t word_count, const char *entry_point) {
   // Bump kFormatVersion whenever the emitter's codegen changes in a way that
-  // must not be served from an existing on-disk cache.
-  constexpr uint64_t kFormatVersion = 1;
+  // must not be served from an existing on-disk cache. The key is the SPIR-V
+  // bytes plus this constant, so a shader re-compiled with a FIXED emitter has
+  // exactly the same key as the one the buggy emitter cached -- without a bump
+  // the fix is invisible and the stale object keeps running.
+  //
+  //   1  initial
+  //   2  OpVectorShuffle, OpCompositeInsert, runtime vector indices in
+  //      OpAccessChain, sin/cos quarter-turn scaling
+  constexpr uint64_t kFormatVersion = 2;
   uint64_t h = fnv1a(spirv, word_count * sizeof(uint32_t),
                      1469598103934665603ull ^ kFormatVersion);
   if (entry_point != nullptr)

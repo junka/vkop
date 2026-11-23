@@ -19,18 +19,44 @@ struct LaunchShape {
   unsigned block[3];
 };
 
-LaunchShape shape_for(const RecordedOp &op) {
+LaunchShape shape_for(Device_T *dev, RecordedOp &op) {
   LaunchShape s{};
   s.block[0] = op.pipeline->local_size[0];
   s.block[1] = op.pipeline->local_size[1];
   s.block[2] = op.pipeline->local_size[2];
   if (op.kind == RecordedOp::Kind::DispatchIndirect) {
-    // CUDA has no indirect launch in the base driver API here; the group
-    // counts live in device memory. We refuse rather than guessing.
-    for (int i = 0; i < 3; ++i) s.grid[i] = 0;
+    // The group counts live in device memory (a VkDispatchIndirectCommand).
+    // This driver stack has no indirect launch, but the counts are only three
+    // uint32s and reading them back is a real read of the same 12 bytes the
+    // hardware would have read -- so the geometry is the application's, never
+    // a guess. The copy is stream-ordered, so if a pre-pass compute shader
+    // (vkop's dispatch_from_shape) wrote them in this same command buffer, the
+    // read observes that write; the host-visible path is covered the same way.
+    uint32_t cmd[3] = {0, 0, 0};
+    if (op.indirect_host != nullptr) {
+      // Host-visible indirect buffer: the counts are in the mapping, written
+      // by the application (or a prior map/flush). Read them directly -- on a
+      // per-round decode path this must not cost a device round trip.
+      std::memcpy(cmd, op.indirect_host, sizeof(cmd));
+    } else if (op.indirect_addr != 0) {
+      ppu::Driver &d = ppu::driver();
+      ppu::CUresult rc = d.cuMemcpyDtoH_v2(cmd, op.indirect_addr, sizeof(cmd));
+      if (rc != ppu::CUDA_SUCCESS) {
+        PPU_ERR("indirect dispatch: reading group counts failed: %s",
+                ppu::cu_strerror(rc));
+      }
+    }
+    for (int i = 0; i < 3; ++i) s.grid[i] = cmd[i];
+    op.group[0] = cmd[0];
+    op.group[1] = cmd[1];
+    op.group[2] = cmd[2];
   } else {
     for (int i = 0; i < 3; ++i) s.grid[i] = std::max(1u, op.group[i]);
   }
+  // A zero group count is legal in Vulkan (the dispatch does nothing), but
+  // cuLaunchKernel rejects gridDim 0. Clamp only for the launch; the recorded
+  // counts stay as read.
+  for (int i = 0; i < 3; ++i) s.grid[i] = std::max(1u, s.grid[i]);
   for (int i = 0; i < 3; ++i) s.block[i] = std::max(1u, s.block[i]);
   return s;
 }
@@ -44,7 +70,7 @@ bool replay_op(Device_T *dev, RecordedOp &op) {
         PPU_ERR("submit: dispatch with no compiled kernel");
         return false;
       }
-      LaunchShape s = shape_for(op);
+      LaunchShape s = shape_for(dev, op);
       std::vector<void *> kernel_args;
       kernel_args.reserve(op.args.size() + 1);
       // cuLaunchKernel wants an array of pointers to each argument value. A
@@ -74,10 +100,33 @@ bool replay_op(Device_T *dev, RecordedOp &op) {
       return true;
     }
     case RecordedOp::Kind::DispatchIndirect: {
-      // Not supported: requires device-side group counts, which this driver
-      // stack cannot feed to cuLaunchKernel.
-      PPU_ERR("submit: vkCmdDispatchIndirect is not implemented on this backend");
-      return false;
+      // Same launch as a direct dispatch: shape_for has already read the
+      // group counts out of the indirect buffer (stream-ordered, so a
+      // preceding dispatch_from_shape pre-pass is visible).
+      if (op.pipeline == nullptr || op.pipeline->function == nullptr) {
+        PPU_ERR("submit: indirect dispatch with no compiled kernel");
+        return false;
+      }
+      LaunchShape s = shape_for(dev, op);
+      std::vector<void *> kernel_args;
+      kernel_args.reserve(op.args.size() + 1);
+      for (size_t i = 0; i < op.args.size(); ++i) kernel_args.push_back(&op.args[i]);
+      uint64_t push_addr = op.push_constant_addr;
+      if (op.pipeline->has_push_constants) {
+        if (push_addr == 0) {
+          PPU_ERR("submit: kernel takes a push-constant block but none was recorded");
+          return false;
+        }
+        kernel_args.push_back(&push_addr);
+      }
+      ppu::CUresult rc = d.cuLaunchKernel(op.pipeline->function, s.grid[0], s.grid[1],
+                                          s.grid[2], s.block[0], s.block[1], s.block[2],
+                                          0, dev->stream, kernel_args.data(), nullptr);
+      if (rc != CUDA_SUCCESS) {
+        PPU_ERR("cuLaunchKernel (indirect) failed: %s", ppu::cu_strerror(rc));
+        return false;
+      }
+      return true;
     }
     case RecordedOp::Kind::CopyBuffer: {
       ppu::CUresult rc =

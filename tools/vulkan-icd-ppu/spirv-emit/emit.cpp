@@ -242,6 +242,10 @@ struct Collector {
     Module m;
     uint32_t cur_fn = 0;
     bool in_body = false;
+    // OpSpecConstantOp lives at module scope (before any OpFunction), so the
+    // function-body path below never sees it. Keep the raw instructions for
+    // the folding pass.
+    std::vector<Inst> spec_ops;
 };
 
 spv_result_t on_header(void *, spv_endianness_t, uint32_t, uint32_t, uint32_t,
@@ -289,7 +293,15 @@ spv_result_t on_inst(void *ud, const spv_parsed_instruction_t *ins) {
         m.types[ins->result_id] = t;
         return SPV_SUCCESS;
     }
-    case SpvOpConstant: {
+    case SpvOpConstant:
+    case SpvOpSpecConstant: {
+        // A specialization constant takes its DEFAULT value here. The ICD does
+        // not implement vkCreateComputePipelines' pSpecializationInfo (the
+        // Vulkan pipeline is created once and the values are not plumbed into
+        // the emitter), so a shader specialized at pipeline creation would run
+        // with different values than it was compiled with. Compiling the
+        // default means the kernels are self-consistent: the guard a spec
+        // constant selects is the one the compiled code takes.
         Const k;
         k.type_id = ins->type_id;
         const uint32_t bits = w(2);
@@ -445,6 +457,8 @@ spv_result_t on_inst(void *ud, const spv_parsed_instruction_t *ins) {
     if (c->cur_fn != 0 && !m.funcs.empty()) {
         if (ins->opcode == SpvOpLabel) c->in_body = true;
         if (c->in_body) m.funcs.back().insts.emplace_back(ins);
+    } else if (ins->opcode == SpvOpSpecConstantOp) {
+        c->spec_ops.emplace_back(ins);
     }
     return SPV_SUCCESS;
 }
@@ -980,7 +994,9 @@ class Emitter {
             case SpvOpInBoundsAccessChain: emit_access_chain(ins); break;
             case SpvOpCompositeExtract: emit_composite_extract(ins); break;
             case SpvOpCompositeConstruct: emit_composite_construct(ins); break;
+            case SpvOpCompositeInsert: emit_composite_insert(ins); break;
             case SpvOpVectorExtractDynamic: emit_vector_extract_dynamic(ins); break;
+            case SpvOpVectorShuffle: emit_vector_shuffle(ins); break;
             case SpvOpFMul: emit_binop(ins, "fmul"); break;
             case SpvOpFAdd: emit_binop(ins, "fadd"); break;
             case SpvOpFSub: emit_binop(ins, "fsub"); break;
@@ -1585,6 +1601,30 @@ class Emitter {
                                         " undef, i32 undef, 0\n";
     }
 
+    // OpCompositeInsert: write ONE member of a composite, yielding a new
+    // composite with the other members copied from the base. LLVM's
+    // insertelement (vector) / insertvalue (struct, array) are the exact match.
+    //
+    // This is what `o.y = 0.0;` over a vec2 compiles to in the fp16 store tail
+    // of the fused-elementwise kernel, so without it that whole kernel fails to
+    // lower. A multi-index path (structs of structs) has no direct LLVM form and
+    // nothing in the shader set needs one, so it stays unsupported rather than
+    // shipping an untested rebuild chain.
+    void emit_composite_insert(const Inst &ins) {
+        const std::string ty = llvm_type(m_, ins.type_id);
+        const bool vec = !ty.empty() && ty[0] == '<';
+        const uint32_t obj = ins.word(2), comp = ins.word(3);
+        if (ins.argc() != 5)
+            throw Unsupported{"OpCompositeInsert with a multi-index path"};
+        const std::string res = "%r" + std::to_string(ins.result_id);
+        val_[ins.result_id] = res;
+        vtype_[ins.result_id] = ins.type_id;
+        body_ += "  " + res + " = " + (vec ? "insertelement " : "insertvalue ") +
+                 ty + " " + bare_value(comp) + ", " + type_of_value(obj) + " " +
+                 bare_value(obj) + ", " + (vec ? "i32 " : "") +
+                 std::to_string(ins.word(4)) + "\n";
+    }
+
     // Extract a lane of a vector with a runtime index: SPIR-V semantics, but
     // LLVM IR's extractelement is the exact match.
     void emit_vector_extract_dynamic(const Inst &ins) {
@@ -1595,6 +1635,37 @@ class Emitter {
         vtype_[ins.result_id] = ins.type_id;
         body_ += "  " + r + " = extractelement " + type_of_value(v) + " " +
                  bare_value(v) + ", i32 " + bare_value(idx) + "\n";
+    }
+
+    // OpVectorShuffle: a compile-time lane permutation over two vectors.
+    // `shufflevector` is the exact match.  SPIR-V components index v1 then v2
+    // (a value >= |v1| selects v2's lane c-|v1|); LLVM's concatenated operand
+    // numbering is the same, so the literals carry over unmodified.  0xFFFFFFFF
+    // is "don't care" in SPIR-V and `undef` in LLVM, and a mask NARROWER than
+    // the operands (e.g. reading only lanes 0..1 of a vec4) is the normal GLSL
+    // "swizzle down" form, so the result type comes from the instruction, not
+    // from the operands.
+    void emit_vector_shuffle(const Inst &ins) {
+        const std::string ty = llvm_type(m_, ins.type_id);
+        const uint32_t v1 = ins.word(2), v2 = ins.word(3);
+        const std::string op1 = type_of_value(v1), op2 = type_of_value(v2);
+        const std::string r = "%r" + std::to_string(ins.result_id);
+        val_[ins.result_id] = r;
+        vtype_[ins.result_id] = ins.type_id;
+        // A vector and a scalar (1-wide) operand cannot share a shufflevector,
+        // and SPIR-V forbids it too, but stay explicit rather than emit invalid
+        // IR: widen nothing, just name both with their own types.
+        const size_t at = ty.find(" x ");
+        const std::string n = at == std::string::npos ? "1" : ty.substr(1, at - 1);
+        std::string mask = "<" + n + " x i32> <";
+        for (uint16_t i = 4; i < ins.argc(); i++) {
+            const uint32_t c = ins.word(i);
+            if (i > 4) mask += ", ";
+            mask += (c == 0xFFFFFFFFu) ? "i32 undef" : "i32 " + std::to_string(c);
+        }
+        mask += ">";
+        body_ += "  " + r + " = shufflevector " + op1 + " " + bare_value(v1) +
+                 ", " + op2 + " " + bare_value(v2) + ", " + mask + "\n";
     }
 
     // GEP selector widths on this backend: i32 for struct members and vector
@@ -1636,7 +1707,19 @@ class Emitter {
                 idx_s += ", i64 " + as_i64(idx);
                 cur = t->second.elem;
             } else if (op == SpvOpTypeVector) {
-                idx_s += ", i32 " + std::to_string(cval(idx));
+                // A vector member is addressed either by a compile-time
+                // component (the normal `.x`/`.y`) or by a RUNTIME lane index
+                // (`v[i]`, and `p[lin & 1] = x` over a vec2). The dynamic case
+                // must keep the index: `cval()` returns 0 for a non-constant,
+                // so stringifying it pinned every dynamic lane access to
+                // component 0 and silently dropped the other half of a vec2
+                // store -- the fused-elementwise fp16 tail writes both halves
+                // of a word through exactly this form. GEP with a runtime
+                // vector index is the exact lowering LLVM/Clang uses.
+                if (m_.consts.count(idx))
+                    idx_s += ", i32 " + std::to_string(cval(idx));
+                else
+                    idx_s += ", i32 " + value_text(idx);
                 cur = t->second.elem;
             } else {
                 idx_s += ", i64 " + as_i64(idx);
@@ -2045,8 +2128,24 @@ class Emitter {
         case 4:  step(r, "llvm.fabs.f32", {args[0]}); return;   // FAbs
         case 8:  step(r, "llvm.floor.f32", {args[0]}); return;  // Floor
         case 9:  step(r, "llvm.ceil.f32", {args[0]}); return;   // Ceil
-        case 13: step(r, "llvm.ppu.sin", {args[0]}); return;    // Sin
-        case 14: step(r, "llvm.ppu.cos", {args[0]}); return;    // Cos
+        case 13: {                                              // Sin
+            // The PPU sine/cosine take the angle in QUARTER TURNS (units of
+            // pi/2), not radians -- measured on device: llvm.ppu.sin(1) is
+            // 1.0, llvm.ppu.sin(2) is 0.0, i.e. sin(pi/2 * x). A literal
+            // argument hides this because llc folds it with the host sinf,
+            // which is why only runtime values (attention rotary tables)
+            // exposed it. Scale by 2/pi before the call.
+            const std::string t = tmp();
+            fmul_lit(t, args[0], aty, "6.36619746685028076e-01");  // 2/pi
+            step(r, "llvm.ppu.sin", {t});
+            return;
+        }
+        case 14: {                                              // Cos
+            const std::string t = tmp();
+            fmul_lit(t, args[0], aty, "6.36619746685028076e-01");  // 2/pi
+            step(r, "llvm.ppu.cos", {t});
+            return;
+        }
         case 21: step(r, "llvm.ppu.tanh", {args[0]}); return;   // Tanh
         case 25: {                                              // Atan2
             // atan2(y,x) = atan(y/x) with quadrant fixups; atan has no PPU
@@ -2214,8 +2313,21 @@ class Emitter {
         case 4:  fcall(t, "llvm.fabs.f32", {w[0]}); break;   // FAbs
         case 8:  fcall(t, "llvm.floor.f32", {w[0]}); break;  // Floor
         case 9:  fcall(t, "llvm.ceil.f32", {w[0]}); break;   // Ceil
-        case 13: fcall(t, "llvm.ppu.sin", {w[0]}); break;    // Sin
-        case 14: fcall(t, "llvm.ppu.cos", {w[0]}); break;    // Cos
+        case 13: {                                           // Sin
+            // Quarter-turn argument, as in the scalar path: sin(pi/2 * x).
+            const std::string s = tmp();
+            body_ += "  " + s + " = fmul " + f + " " + w[0] +
+                     ", 6.36619746685028076e-01\n";
+            fcall(t, "llvm.ppu.sin", {s});
+            break;
+        }
+        case 14: {                                           // Cos
+            const std::string s = tmp();
+            body_ += "  " + s + " = fmul " + f + " " + w[0] +
+                     ", 6.36619746685028076e-01\n";
+            fcall(t, "llvm.ppu.cos", {s});
+            break;
+        }
         case 21: fcall(t, "llvm.ppu.tanh", {w[0]}); break;   // Tanh
         case 27: {                                           // Exp
             const std::string s = tmp();
@@ -2410,6 +2522,153 @@ const char *kDeclares =
 
 namespace {
 
+// Result of a folded OpSpecConstantOp: an ordinary constant of the same type.
+void set_int_const(Module &m, const Inst &ins, int64_t v) {
+    Const k;
+    k.type_id = ins.type_id;
+    k.is_int = true;
+    k.ival = v;
+    const std::string ty = llvm_type(m, ins.type_id);
+    k.set(ty, std::to_string(v));
+    m.consts[ins.result_id] = k;
+}
+
+void set_bool_const(Module &m, const Inst &ins, bool v) {
+    Const k;
+    k.type_id = ins.type_id;
+    k.is_int = true;
+    k.ival = v ? -1 : 0;
+    k.set("i1", v ? "true" : "false");
+    m.consts[ins.result_id] = k;
+}
+
+bool spec_fold_fail(const Module &m, const Inst &ins, std::string &error) {
+    error = "OpSpecConstantOp %" + std::to_string(ins.result_id) +
+            " has a non-constant operand (type " + llvm_type(m, ins.type_id) + ")";
+    return false;
+}
+
+// Fold OpSpecConstantOp to its DEFAULT-value result.
+//
+// The ICD never reads pSpecializationInfo, so every specialization constant in
+// a pipeline keeps the default value the SPIR-V author wrote. Folding those
+// expressions here therefore reproduces the geometry the application asked for
+// *and* keeps the emitter from having to model spec constants at all: after this
+// pass the instructions are ordinary constants.
+//
+// The fused-elementwise kernel uses them for its whole controlled program
+// (every `SC_*` word is a spec constant, and the branch guards are
+// `SLessThan`/`SGreaterThanEqual`/`LogicalAnd` over them), so without this
+// pass the kernel does not lower at all and the artifact that embeds it fails
+// to create a pipeline.
+//
+// Only the operators those shaders actually use are implemented; anything else
+// reports its name rather than quietly producing a wrong constant.
+bool fold_spec_constant_ops(Module &m, const std::vector<Inst> &spec_ops,
+                            std::string &error) {
+    for (const Inst &ins : spec_ops) {
+        // Operands: type, result id, opcode literal, then the operands of
+        // the equivalent ordinary instruction.
+        const uint32_t opcode = ins.word(2);
+        const auto operand_i64 = [&](uint16_t i, int64_t &out) -> bool {
+            const uint32_t id = ins.word(i);
+            auto c = m.consts.find(id);
+            if (c == m.consts.end()) return false;
+            out = c->second.ival;
+            return true;
+        };
+        int64_t a = 0, b = 0;
+        switch (opcode) {
+        case SpvOpIAdd:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_int_const(m, ins, a + b);
+            break;
+        case SpvOpISub:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_int_const(m, ins, a - b);
+            break;
+        case SpvOpIMul:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_int_const(m, ins, a * b);
+            break;
+        case SpvOpIEqual:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a == b);
+            break;
+        case SpvOpINotEqual:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a != b);
+            break;
+        case SpvOpSLessThan:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a < b);
+            break;
+        case SpvOpSLessThanEqual:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a <= b);
+            break;
+        case SpvOpSGreaterThan:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a > b);
+            break;
+        case SpvOpSGreaterThanEqual:
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a >= b);
+            break;
+        case SpvOpLogicalAnd: {
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a != 0 && b != 0);
+            break;
+        }
+        case SpvOpLogicalOr: {
+            if (ins.argc() < 5 || !operand_i64(3, a) || !operand_i64(4, b))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a != 0 || b != 0);
+            break;
+        }
+        case SpvOpLogicalNot:
+            if (ins.argc() < 4 || !operand_i64(3, a))
+                return spec_fold_fail(m, ins, error);
+            set_bool_const(m, ins, a == 0);
+            break;
+        case SpvOpSelect: {
+            if (ins.argc() < 6 || !operand_i64(3, a))
+                return spec_fold_fail(m, ins, error);
+            const uint32_t take = ins.word(a != 0 ? 4 : 5);
+            auto c = m.consts.find(take);
+            if (c == m.consts.end()) return spec_fold_fail(m, ins, error);
+            m.consts[ins.result_id] = c->second;
+            break;
+        }
+        case SpvOpSNegate:
+            if (ins.argc() < 4 || !operand_i64(3, a))
+                return spec_fold_fail(m, ins, error);
+            set_int_const(m, ins, -a);
+            break;
+        default:
+            error = "OpSpecConstantOp opcode " + std::to_string(opcode) +
+                    " is not folded (the ICD uses default specialization "
+                    "values; add it to fold_spec_constant_ops)";
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+namespace {
+
 // Parse and validate once. Returns Status and fills `m` on success.
 Status collect(const uint32_t *words, size_t word_count, Module &m, std::string &error) {
     if (words == nullptr || word_count < 5) {
@@ -2435,7 +2694,9 @@ Status collect(const uint32_t *words, size_t word_count, Module &m, std::string 
         return Status::InvalidModule;
     }
     spvContextDestroy(ctx);
+    std::vector<Inst> spec_ops = std::move(col.spec_ops);
     m = std::move(col.m);
+    if (!fold_spec_constant_ops(m, spec_ops, error)) return Status::Unsupported;
     return Status::Ok;
 }
 
