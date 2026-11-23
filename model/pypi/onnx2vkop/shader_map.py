@@ -73,6 +73,8 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "Gemm": (None, "gemm", False, False),
     "GlobalAveragePool": ("globalaveragepool", "globalaveragepool", False, True),
     "GridSample": ("gridsample", "gridsample", False, False),
+    "InstanceNorm": (None, "instance_norm", False, True),
+    "InstanceNormalization": (None, "instance_norm", False, True),
     "LayerNorm": ("layernorm", "layernorm", False, True),
     "LayerNormalization": ("layernorm", "layernorm", False, True),
     "LinearAttention": (None, "linear_attention", False, True),
@@ -832,7 +834,8 @@ def known_ops() -> Set[str]:
 _FP16_DTYPE_DRIVEN: Set[str] = {
     "Add", "Atan", "Attention", "Clip", "Concat", "Conv", "Conv2d", "Cos", "Div",
     "Erf", "Expand", "Floor", "FusedElemwise", "Gather", "GlobalAveragePool",
-    "LayerNorm", "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d",
+    "InstanceNorm", "InstanceNormalization", "LayerNorm",
+    "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d",
     "Maxpool2d", "Min", "Mod", "Mul", "Neg", "Nms", "Pad", "PRelu", "Pow",
     "Reduce", "ReduceMean", "Relu", "Reshape", "Resize", "RMSNorm", "RotaryEmbedding",
     "ScatterElements", "Sigmoid", "Sin", "Slice", "Softmax", "Softplus",

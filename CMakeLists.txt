@@ -365,6 +365,11 @@ set(DUAL_FP16_SHADERS
     # tensor dtype. Without this entry an fp16 Clip would run the fp32 module
     # over half-typed storage.
     buffer/clip
+    # buffer/instance_norm.comp reads x through BUF_LOAD and writes one packed
+    # half2 WORD per thread, so -DFP16 is the same kernel over half2 words
+    # (accumulation stays fp32 in both builds). ONNX InstanceNormalization is
+    # what nn.GroupNorm exports to, and its tensors follow the graph's dtype.
+    buffer/instance_norm
     # buffer/pad.comp is a word mover over BUF_LOAD; the -DFP16 build reads and
     # writes packed half2 words (one thread per output word), and without it an
     # fp16 VAE activation would be padded as fp32 words.

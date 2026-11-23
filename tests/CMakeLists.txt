@@ -52,6 +52,7 @@ set(TEST_SOURCES
     FloorTest.cpp
     MaxPoolTest.cpp
     LayerNormTest.cpp
+    InstanceNormTest.cpp
     ResizeTest.cpp
     PReluTest.cpp
     SigmoidTest.cpp

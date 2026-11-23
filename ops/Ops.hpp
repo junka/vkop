@@ -20,6 +20,7 @@ enum class OpType {
     ERF,
     FLOOR,
     GEMM,
+    INSTANCENORM,
     GLOBALAVERAGEPOOL,
     GRIDSAMPLE,
     LAYERNORM,
@@ -90,60 +91,61 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "Erf",               // ERF = 8
         "Floor",             // FLOOR = 9
         "Gemm",              // GEMM = 10
-        "GlobalAveragePool", // GLOBALAVERAGEPOOL = 11
-        "GridSample",        // GRIDSAMPLE = 12
-        "LayerNorm",         // LAYERNORM = 13
-        "MatMul",            // MATMUL = 14
-        "MaxPool2d",         // MAXPOOL2D = 15
-        "Mul",               // MUL = 16
-        "Pow",               // POW = 17
-        "PRelu",             // PRELU = 18
-        "Reduce",            // REDUCE = 19
-        "Relu",              // RELU = 20
-        "Reshape",           // RESHAPE = 21
-        "Resize",            // RESIZE = 22
-        "Sigmoid",           // SIGMOID = 23
-        "Slice",             // SLICE = 24
-        "Softmax",           // SOFTMAX = 25
-        "Softplus",          // SOFTPLUS = 26
-        "Split",             // SPLIT = 27
-        "Sub",               // SUB = 28
-        "TopK",              // TOPK = 29
-        "Transpose",         // TRANSPOSE = 30
-        "Nms",               // NMS = 31
-        "Gather",            // GATHER = 32
-        "Range",             // RANGE = 33
-        "Expand",            // EXPAND = 34
-        "Sqrt",              // SQRT = 35
-        "Sin",               // SIN = 36
-        "Cos",               // COS = 37
-        "Neg",               // NEG = 38
-        "Where",             // WHERE = 39
-        "Tanh",              // TANH = 40
-        "EmbeddingForward",  // EMBEDDING_FORWARD = 41
-        "Equal",             // EQUAL = 42
-        "NonZero",           // NONZERO = 43
-        "Pad",               // PAD = 44
-        "ScatterElements",   // SCATTER_ELEMENTS = 45
-        "Shape",             // SHAPE = 46
-        "Cast",              // CAST = 47
-        "Clip",              // CLIP = 48
-        "ScatterND",         // SCATTER_ND = 49
-        "Squeeze",           // SQUEEZE = 50
-        "Unsqueeze",         // UNSQUEEZE = 51
-        "RotaryEmbedding",   // ROTARY_EMBEDDING = 52
-        "FusedElemwise",     // FUSED_ELEMWISE = 53
-        "RMSNorm",           // RMSNORM = 54
-        "ReduceMean",        // REDUCEMEAN = 55
-        "Min",               // MIN = 56
-        "Max",               // MAX = 57
-        "Mod",               // MOD = 58
-        "QuantizeLinear",    // QUANTIZE_LINEAR = 59
-        "DequantizeLinear",  // DEQUANTIZE_LINEAR = 60
-        "Attention",         // ATTENTION = 61
-        "CumSum",            // CUMSUM = 62
-        "Conv1d",            // CONV1D = 63
-        "LinearAttention",   // LINEAR_ATTENTION = 64
+        "InstanceNorm",      // INSTANCENORM = 11
+        "GlobalAveragePool", // GLOBALAVERAGEPOOL = 12
+        "GridSample",        // GRIDSAMPLE = 13
+        "LayerNorm",         // LAYERNORM = 14
+        "MatMul",            // MATMUL = 15
+        "MaxPool2d",         // MAXPOOL2D = 16
+        "Mul",               // MUL = 17
+        "Pow",               // POW = 18
+        "PRelu",             // PRELU = 19
+        "Reduce",            // REDUCE = 20
+        "Relu",              // RELU = 21
+        "Reshape",           // RESHAPE = 22
+        "Resize",            // RESIZE = 23
+        "Sigmoid",           // SIGMOID = 24
+        "Slice",             // SLICE = 25
+        "Softmax",           // SOFTMAX = 26
+        "Softplus",          // SOFTPLUS = 27
+        "Split",             // SPLIT = 28
+        "Sub",               // SUB = 29
+        "TopK",              // TOPK = 30
+        "Transpose",         // TRANSPOSE = 31
+        "Nms",               // NMS = 32
+        "Gather",            // GATHER = 33
+        "Range",             // RANGE = 34
+        "Expand",            // EXPAND = 35
+        "Sqrt",              // SQRT = 36
+        "Sin",               // SIN = 37
+        "Cos",               // COS = 38
+        "Neg",               // NEG = 39
+        "Where",             // WHERE = 40
+        "Tanh",              // TANH = 41
+        "EmbeddingForward",  // EMBEDDING_FORWARD = 42
+        "Equal",             // EQUAL = 43
+        "NonZero",           // NONZERO = 44
+        "Pad",               // PAD = 45
+        "ScatterElements",   // SCATTER_ELEMENTS = 46
+        "Shape",             // SHAPE = 47
+        "Cast",              // CAST = 48
+        "Clip",              // CLIP = 49
+        "ScatterND",         // SCATTER_ND = 50
+        "Squeeze",           // SQUEEZE = 51
+        "Unsqueeze",         // UNSQUEEZE = 52
+        "RotaryEmbedding",   // ROTARY_EMBEDDING = 53
+        "FusedElemwise",     // FUSED_ELEMWISE = 54
+        "RMSNorm",           // RMSNORM = 55
+        "ReduceMean",        // REDUCEMEAN = 56
+        "Min",               // MIN = 57
+        "Max",               // MAX = 58
+        "Mod",               // MOD = 59
+        "QuantizeLinear",    // QUANTIZE_LINEAR = 60
+        "DequantizeLinear",  // DEQUANTIZE_LINEAR = 61
+        "Attention",         // ATTENTION = 62
+        "CumSum",            // CUMSUM = 63
+        "Conv1d",            // CONV1D = 64
+        "LinearAttention",   // LINEAR_ATTENTION = 65
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -199,6 +201,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {    // Alphabet
         return vkop::ops::OpType::GLOBALAVERAGEPOOL;
     if (name == "GridSample")
         return vkop::ops::OpType::GRIDSAMPLE;
+    if (name == "InstanceNormalization" || name == "InstanceNorm")
+        return vkop::ops::OpType::INSTANCENORM;
     if (name == "LayerNormalization" || name == "LayerNorm")
         return vkop::ops::OpType::LAYERNORM;
     if (name == "LinearAttention" || name == "GatedDeltaNet")

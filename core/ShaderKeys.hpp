@@ -71,6 +71,12 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {"globalaveragepool", "globalaveragepool", false, true};
         case T::GRIDSAMPLE:
             return {"gridsample", "gridsample", false, false};
+        case T::INSTANCENORM:
+            // Buffer-only (no image twin). The buffer kernel reads x through
+            // BUF_LOAD and writes one packed half2 word per thread, so it
+            // ships a dual build and an fp16 tensor gets buffer_instance_norm_fp16
+            // rather than the fp32 module over half bytes.
+            return {nullptr, "instance_norm", false, true};
         case T::LAYERNORM:
             return {"layernorm", "layernorm", false, true};
         case T::MATMUL:

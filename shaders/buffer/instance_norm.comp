@@ -1,0 +1,158 @@
+#version 450 core
+
+#include "../common/buffer_common.comp"
+#include "../common/subgroup_reduce.comp"
+
+// InstanceNormalization SSBO op (ONNX InstanceNormalization, and the op a
+// torch nn.GroupNorm exports to: GroupNorm(C, G) traces as
+//   Reshape [N,C,*spatial] -> [N,G,C/G*spatial] -> InstanceNormalization(
+//   scale=[G], bias=[G], epsilon) -> Reshape back -> Mul(weight) -> Add(bias)
+// so a rank-3 [N,G,spatial] input with G channels IS GroupNorm; no separate
+// GroupNorm path is needed -- see ops/InstanceNorm.hpp).
+//
+// Semantics, per (n, c) slice: mean and variance over ALL spatial elements of
+// that slice, then
+//
+//   y = scale[c] * (x - mean) / sqrt(var + eps) + bias[c]
+//
+// with the BIASED variance (divide by M, not M-1). One workgroup per (n, c)
+// slice: dispatch (N*C, 1, 1), 256 lanes.
+//
+// Two reductions, not the single fused (sum, sum_sq) pass LayerNorm uses.
+// LayerNorm gets var = E[x^2] - mean^2 from one pass, which loses precision
+// when E[x^2] and mean^2 are close -- i.e. whenever a slice's offset is large
+// relative to its spread, exactly the case in a decoder/VAE activation whose
+// mean sits far from zero. Here pass 1 reduces sum -> mean and pass 2 reduces
+// sum((x-mean)^2), which is stable for any offset. The slice is read twice
+// more than a fused pass would (it is L2-resident for any realistic spatial
+// extent), and the op is off the LLM hot path, so the trade is worth it.
+//
+// fp32 accumulation is used in BOTH builds: every load is widened to float
+// (BUF_LOAD unpacks half2 to float for the -DFP16 build) and the shared
+// reduction runs on float. Summing a video-sized spatial extent in fp16 would
+// lose low-order bits of x - mean and drift the variance.
+//
+// Storage, both builds:
+//   base (fp32): one element per uint word (float bits), one thread per
+//                element in every pass.
+//   -DFP16:      packed half2, two elements per uint word. Reads go through
+//                BUF_LOAD (no write involved), but the WRITE pass owns one
+//                whole output WORD per thread: two threads read-modify-writing
+//                the same word would drop one half, and a slice boundary that
+//                falls mid-word would let two workgroups race. inner_size must
+//                therefore be even in the fp16 build (host-guarded, as in
+//                LayerNorm/RMSNorm), which also makes every slice start on a
+//                word boundary.
+//
+// The workgroup reduce is the shared 256-slot tree from layernorm.comp in the
+// base build; -DSUBGROUP folds it with subgroupAdd via
+// shaders/common/subgroup_reduce.comp (no _sg module is built today -- the
+// macro keeps the source ready for one, and the runtime falls back to this
+// module when the archive has no <key>_sg).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+// Per-channel affine, [C] in the input's own dtype (one element per channel,
+// packed half2 in the fp16 build).
+layout(set = 0, binding = 2) readonly buffer Scale {
+    uint data[];
+} uScale;
+layout(set = 0, binding = 3) readonly buffer BiasB {
+    uint data[];
+} uBias;
+
+// Matches ops::InstanceNormPC field for field: 16-byte scalar prefix, then the
+// left-aligned dims[8] (the buffer-backend shape convention).
+layout(push_constant) uniform PC_IN {
+    float eps;
+    int rank;       // input rank (3..8): [N, C, *spatial]
+    int outer_size; // N * C independent slices = gl_WorkGroupID.x bound
+    int channels;   // C = dims[1]; slice wg belongs to channel wg % C
+    IArr8 dims;     // full input shape, left-aligned
+} uIN;
+
+shared float s_red[256];
+
+// One workgroup sum: the shared-memory tree of layernorm.comp, or the
+// subgroupAdd fold in the -DSUBGROUP build. Every lane must call it (the
+// caller's early-out is on gl_WorkGroupID, which is uniform), and the result
+// is left in s_red[0]. The macro ends with a barrier, so s_red may be reused
+// by the next call.
+float wg_sum(float v, uint lid) {
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM(s_red, v);
+#else
+    s_red[lid] = v;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_red[lid] += s_red[lid + s];
+        }
+        barrier();
+    }
+#endif
+    return s_red[0];
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.x; // = slice index (n * C + c)
+    uint lid = gl_LocalInvocationID.x;
+    if (wg >= uint(uIN.outer_size)) return;
+
+    // Reduction extent = product of dims[2..rank-1]; the per-(n,c) spatial
+    // block is exactly that many contiguous elements starting at wg * inner.
+    int inner = 1;
+    for (int i = 2; i < uIN.rank; ++i) inner *= uIN.dims.v[i];
+
+    int base = int(wg) * inner;
+    // Per-channel affine. The scale/bias tables are [C] elements of the input
+    // dtype, so the same dtype decides the element access for both.
+    int c = int(wg) % uIN.channels;
+    float g_scale = BUF_LOAD(uScale.data, c);
+    float g_bias = BUF_LOAD(uBias.data, c);
+
+    // ---- pass 1: mean ----
+    float lsum = 0.0f;
+    for (int i = int(lid); i < inner; i += int(gl_WorkGroupSize.x)) {
+        lsum += BUF_LOAD(uInput.data, base + i);
+    }
+    float mean = wg_sum(lsum, lid) / float(inner);
+
+    // ---- pass 2: biased variance, around the computed mean ----
+    float lsq = 0.0f;
+    for (int i = int(lid); i < inner; i += int(gl_WorkGroupSize.x)) {
+        float d = BUF_LOAD(uInput.data, base + i) - mean;
+        lsq += d * d;
+    }
+    // Biased (divide by M): ONNX InstanceNormalization's definition, and the
+    // one nn.GroupNorm uses. Dividing by M-1 here is the classic off-by-one.
+    float var = wg_sum(lsq, lid) / float(inner);
+    float inv_std = inversesqrt(max(var, 0.0f) + uIN.eps);
+
+    // ---- pass 3: y = scale * (x - mean) * inv_std + bias ----
+#ifdef FP16
+    // One thread per output WORD (two elements): a read-modify-write of a
+    // shared half2 word from two threads would lose one half. The host
+    // guarantees an even inner_size, so no word straddles two slices.
+    int nwords = inner >> 1;
+    for (int w = int(lid); w < nwords; w += int(gl_WorkGroupSize.x)) {
+        int word = base / 2 + w;
+        vec2 x = unpackHalf2x16(uInput.data[word]);
+        float r0 = (x.x - mean) * inv_std * g_scale + g_bias;
+        float r1 = (x.y - mean) * inv_std * g_scale + g_bias;
+        uOutput.data[word] = packHalf2x16(vec2(r0, r1));
+    }
+#else
+    for (int i = int(lid); i < inner; i += int(gl_WorkGroupSize.x)) {
+        float x = uintBitsToFloat(uInput.data[base + i]);
+        float r = (x - mean) * inv_std * g_scale + g_bias;
+        uOutput.data[base + i] = floatBitsToUint(r);
+    }
+#endif
+}

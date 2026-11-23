@@ -1080,7 +1080,7 @@ RUNTIME_OPS = frozenset({
     "Clip", "Concat", "Conv", "Conv1D", "Conv1d", "Conv2d", "Cos", "CumSum", "Cumsum", "DequantizeLinear", "Div",
     "EmbeddingForward", "Equal", "Erf", "Expand", "Floor", "FusedElemwise",
     "Gather", "GatedDeltaNet", "Gemm", "GlobalAveragePool", "GridSample",
-    "LayerNorm", "LayerNormalization",
+    "InstanceNorm", "InstanceNormalization", "LayerNorm", "LayerNormalization",
     "LinearAttention", "MatMul", "Max",
     "MaxPool", "MaxPool2d", "Min", "Mod",
     "Mul", "Neg", "Nms", "NonZero", "Pad", "Pow", "PRelu", "QuantizeLinear",

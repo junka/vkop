@@ -35,6 +35,7 @@
 #include "AveragePool.hpp"
 #include "Concat.hpp"
 #include "GlobalAveragePool.hpp"
+#include "InstanceNorm.hpp"
 #include "Nms.hpp"
 #include "Pad.hpp"
 #include "Reshape.hpp"
@@ -119,6 +120,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<GlobalAveragePool>(fp16, backend_buffer);
     case OpType::GRIDSAMPLE:
         return std::make_unique<GridSample>(fp16, backend_buffer);
+    case OpType::INSTANCENORM:
+        return std::make_unique<InstanceNorm>(fp16, backend_buffer);
     case OpType::LAYERNORM:
         return std::make_unique<LayerNorm>(fp16, backend_buffer);
     case OpType::MATMUL:
