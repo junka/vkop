@@ -1573,7 +1573,9 @@ void VulkanDevice::initDescriptorBuffer() {
     if (!m_support_descriptor_buffer_) {
         return;
     }
-    auto disable = [this](const char *why) {
+    // LOG_WARN compiles to nothing under NDEBUG, which would make `why` an
+    // unused parameter and break the -Werror Release build.
+    auto disable = [this]([[maybe_unused]] const char *why) {
         m_support_descriptor_buffer_ = false;
         shader_caps_.descriptor_buffer.enabled = false;
         LOG_WARN("VK_EXT_descriptor_buffer %s; falling back to descriptor "
