@@ -53,6 +53,7 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "AveragePool": ("averagepool", "averagepool", False, False),
     "BatchNorm": ("batchnorm", "batchnorm", False, False),
     "BatchNormalization": ("batchnorm", "batchnorm", False, False),
+    "Clip": (None, "clip", False, True),
     "Concat": ("concat", "concat", False, True),
     "Conv": ("conv2d", "conv2d", True, True),
     "Conv2d": ("conv2d", "conv2d", True, True),
@@ -829,7 +830,7 @@ def known_ops() -> Set[str]:
 # which is where TopK -- in the switch, but with a single buffer shader -- is
 # put back outside the domain.
 _FP16_DTYPE_DRIVEN: Set[str] = {
-    "Add", "Atan", "Attention", "Concat", "Conv", "Conv2d", "Cos", "Div",
+    "Add", "Atan", "Attention", "Clip", "Concat", "Conv", "Conv2d", "Cos", "Div",
     "Erf", "Expand", "Floor", "FusedElemwise", "Gather", "GlobalAveragePool",
     "LayerNorm", "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d",
     "Maxpool2d", "Min", "Mod", "Mul", "Neg", "Nms", "Pad", "PRelu", "Pow",

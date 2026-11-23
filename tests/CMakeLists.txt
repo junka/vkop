@@ -84,6 +84,7 @@ set(TEST_SOURCES
     BufferRankTest.cpp
     WhereTest.cpp
     PadTest.cpp
+    ClipTest.cpp
     SqueezeUnsqueezeTest.cpp
     RobustnessTest.cpp
     BackendCoverageTest.cpp

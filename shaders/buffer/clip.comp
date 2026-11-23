@@ -1,0 +1,79 @@
+#version 450 core
+
+// Elementwise unary SSBO op: Clip (clamp to [min, max]). One thread per output
+// element (fp32) or per uint word (fp16 packed half2), exactly like relu.comp.
+// Self-contained rather than including unary_elementwise_body.comp, because the
+// push constant carries two extra values the shared body does not have.
+//
+// ONNX Clip may leave either bound ABSENT, and an absent bound means -inf
+// (min) / +inf (max). The push constant therefore carries explicit
+// has_min/has_max flags as well as the values: a sentinel cannot express
+// "unbounded", because a legitimate bound may itself be +-inf or +-FLT_MAX,
+// and treating those as "no bound" would silently turn a real clamp into an
+// identity. The two flags are also what keeps the ASYMMETRIC cases -- only min
+// set, only max set, which is how torch.clamp exports today -- from being
+// expressed by a guessed value.
+//
+// NaN: ONNX does not specify it, so this follows torch.clamp, which passes NaN
+// through unchanged. The GLSL built-ins cannot do that reliably: max(x, lo) is
+// only required to return the non-NaN operand (the "maxNum" behaviour), and
+// glslang's spec text has max(x, y) returning x when `x < y` is false, so
+// max(NaN, lo) and max(lo, NaN) are not even symmetric. An explicit isnan()
+// early-out makes the result driver-independent and matches the reference.
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Order must match ops::ClipPC in ops/Clip.hpp (24 words = 96 B).
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;
+    int total;
+    float vmin;
+    float vmax;
+    int has_min;
+    int has_max;
+    int _pad0;
+    int _pad1;
+} uPC;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+float apply(float x) {
+    // NaN in -> NaN out (torch.clamp). Checked first, so neither flag can turn
+    // it into a bound.
+    if (isnan(x)) {
+        return x;
+    }
+    if (uPC.has_min != 0) {
+        x = max(x, uPC.vmin);
+    }
+    if (uPC.has_max != 0) {
+        x = min(x, uPC.vmax);
+    }
+    return x;
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    vec2 p = unpackHalf2x16(uInput.data[gid]);
+    p.x = apply(p.x);
+    if (2 * gid + 1 < uPC.total) {
+        p.y = apply(p.y);
+    }
+    uOutput.data[gid] = packHalf2x16(p);
+#else
+    if (gid >= uPC.total) return;
+    uOutput.data[gid] = floatBitsToUint(apply(uintBitsToFloat(uInput.data[gid])));
+#endif
+}

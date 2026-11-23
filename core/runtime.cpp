@@ -67,6 +67,7 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     case ops::OpType::ERF:
     case ops::OpType::FLOOR:
     case ops::OpType::RELU:
+    case ops::OpType::CLIP:
     case ops::OpType::TRANSPOSE:
     case ops::OpType::CONCAT:
     case ops::OpType::CONV2D:

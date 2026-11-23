@@ -57,6 +57,7 @@ enum class OpType {
     SCATTER_ELEMENTS,
     SHAPE,
     CAST,
+    CLIP,
     SCATTER_ND,
     SQUEEZE,
     UNSQUEEZE,
@@ -126,22 +127,23 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "ScatterElements",   // SCATTER_ELEMENTS = 45
         "Shape",             // SHAPE = 46
         "Cast",              // CAST = 47
-        "ScatterND",         // SCATTER_ND = 48
-        "Squeeze",           // SQUEEZE = 49
-        "Unsqueeze",         // UNSQUEEZE = 50
-        "RotaryEmbedding",   // ROTARY_EMBEDDING = 51
-        "FusedElemwise",     // FUSED_ELEMWISE = 52
-        "RMSNorm",           // RMSNORM = 53
-        "ReduceMean",        // REDUCEMEAN = 54
-        "Min",               // MIN = 55
-        "Max",               // MAX = 56
-        "Mod",               // MOD = 57
-        "QuantizeLinear",    // QUANTIZE_LINEAR = 58
-        "DequantizeLinear",  // DEQUANTIZE_LINEAR = 59
-        "Attention",         // ATTENTION = 60
-        "CumSum",            // CUMSUM = 61
-        "Conv1d",            // CONV1D = 62
-        "LinearAttention",   // LINEAR_ATTENTION = 63
+        "Clip",              // CLIP = 48
+        "ScatterND",         // SCATTER_ND = 49
+        "Squeeze",           // SQUEEZE = 50
+        "Unsqueeze",         // UNSQUEEZE = 51
+        "RotaryEmbedding",   // ROTARY_EMBEDDING = 52
+        "FusedElemwise",     // FUSED_ELEMWISE = 53
+        "RMSNorm",           // RMSNORM = 54
+        "ReduceMean",        // REDUCEMEAN = 55
+        "Min",               // MIN = 56
+        "Max",               // MAX = 57
+        "Mod",               // MOD = 58
+        "QuantizeLinear",    // QUANTIZE_LINEAR = 59
+        "DequantizeLinear",  // DEQUANTIZE_LINEAR = 60
+        "Attention",         // ATTENTION = 61
+        "CumSum",            // CUMSUM = 62
+        "Conv1d",            // CONV1D = 63
+        "LinearAttention",   // LINEAR_ATTENTION = 64
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -161,6 +163,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {    // Alphabet
         return vkop::ops::OpType::BATCHNORM;
     if (name == "Cast")
         return vkop::ops::OpType::CAST;
+    if (name == "Clip")
+        return vkop::ops::OpType::CLIP;
     if (name == "Concat")
         return vkop::ops::OpType::CONCAT;
     if (name == "Conv1d" || name == "Conv1D")

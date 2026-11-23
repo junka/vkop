@@ -39,9 +39,13 @@ def _convert(path):
 
 
 def test_unknown_op_is_rejected(tmp_path):
+    # RoiAlign: a real ONNX op the runtime has no kernel for. This used to use
+    # Clip, which is now implemented -- an example op that gains a kernel turns
+    # this test into a false failure the moment the kernel lands, so it has to
+    # name something the runtime genuinely cannot build.
     with pytest.raises(UnsupportedOpError) as ei:
-        _convert(_single_node_model(tmp_path, "Clip", min=0.0, max=1.0))
-    assert "Clip" in str(ei.value)
+        _convert(_single_node_model(tmp_path, "RoiAlign"))
+    assert "RoiAlign" in str(ei.value)
 
 
 def test_supported_op_converts(tmp_path):

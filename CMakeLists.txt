@@ -360,6 +360,11 @@ set(DUAL_FP16_SHADERS
     # the image format; this is the buffer side of that, and without it an
     # fp16 tensor would be walked as fp32 words.
     buffer/nms
+    # buffer/clip.comp is the same kernel over packed half2 words under -DFP16
+    # (one thread per uint word), and Clip's buffer op picks the build from the
+    # tensor dtype. Without this entry an fp16 Clip would run the fp32 module
+    # over half-typed storage.
+    buffer/clip
     # buffer/pad.comp is a word mover over BUF_LOAD; the -DFP16 build reads and
     # writes packed half2 words (one thread per output word), and without it an
     # fp16 VAE activation would be padded as fp32 words.

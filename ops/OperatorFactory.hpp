@@ -4,6 +4,7 @@
 
 #include "Atan.hpp"
 #include "BatchNorm.hpp"
+#include "Clip.hpp"
 #include "Erf.hpp"
 #include "Floor.hpp"
 #include "LayerNorm.hpp"
@@ -92,6 +93,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<AveragePool>(fp16, backend_buffer);
     case OpType::BATCHNORM:
         return std::make_unique<BatchNorm>(fp16, backend_buffer);
+    case OpType::CLIP:
+        return std::make_unique<Clip>(fp16, backend_buffer);
     case OpType::CONCAT:
         return std::make_unique<Concat>(fp16, backend_buffer);
     case OpType::CONV2D:

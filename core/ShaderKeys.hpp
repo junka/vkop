@@ -159,6 +159,10 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {nullptr, "linear_attention", false, true};
         case T::CAST:
             return {nullptr, "cast", false, false};
+        case T::CLIP:
+            // Packed-half2 twin (buffer/clip is in DUAL_FP16_SHADERS), so the
+            // fp16 flag really resolves a different module.
+            return {nullptr, "clip", false, true};
         case T::WHERE:
             return {nullptr, "where", false, false};
         // Host-only ops with no shader to swap.
