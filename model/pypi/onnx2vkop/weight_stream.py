@@ -346,13 +346,16 @@ def _int4_layout_ok(init, uses: Dict[str, list], group_size: int) -> bool:
       * N % 8 -- a packed row has to start on a 32-bit word;
       * K % group_size, with group_size positive and even -- a group is a whole
         number of rows and the fp16 tap reads two halves per word;
-      * a chain that reaches exactly one MatMul in its B position. 4-bit has a
-        MatMul kernel only (no Gemm, no Conv), a shared weight has no single
-        layout, and a weight already carrying a third input is a graph this
-        pass did not build;
-      * the [K, N] orientation, which for a source behind a Transpose means the
-        flip KnWeightLayout performs. The check is on the STORED dims, since
-        the source's [N, K] is the payload's [K, N] the other way round.
+      * a chain that reaches exactly one MatMul or Gemm in its B position. The
+        runtime's 4-bit kernel hangs off MatMul, but `lower_gemm_to_matmul`
+        rewrites every supported Gemm into MatMul + Add before the DAG exists,
+        so a Gemm-declared weight ends up on that same kernel. A shared weight
+        has no single layout, and a weight already carrying a third input is a
+        graph this pass did not build;
+      * the [K, N] orientation, which for a source behind a Transpose -- or a
+        Gemm with transB=1, which means the same thing -- is the flip
+        KnWeightLayout performs. The check is on the STORED dims, since the
+        source's [N, K] is the payload's [K, N] the other way round.
     """
     dims = [int(d) for d in init.dims]
     if len(dims) != 2:
@@ -361,7 +364,7 @@ def _int4_layout_ok(init, uses: Dict[str, list], group_size: int) -> bool:
     if chain is None:
         return False
     node, operand = chain[-1]
-    if node.op_type != "MatMul" or operand != 1:
+    if node.op_type not in ("MatMul", "Gemm") or operand != 1:
         return False
     transposed = is_transposed_weight(uses, init.name)
     n, k = (dims[0], dims[1]) if transposed else (dims[1], dims[0])
@@ -634,12 +637,26 @@ def view_chain_to_weight(uses: Dict[str, list], name):
 
 
 def _last_two_swap(node) -> bool:
-    """Is this node a Transpose that swaps the last two dims?
+    """Does this node make its weight read as the transpose of its storage?
 
-    The only view that changes which axis a matrix's rows are -- and therefore
-    the only one that moves the per-output-column scale. `Transpose` with any
-    other perm is not a matrix transpose of a 2-D weight.
+    Two nodes do, and both matter for the same reason -- they decide which
+    STORED axis holds the output columns, and therefore which axis a 4-bit
+    scale table is reduced over:
+
+      * `Transpose` with a perm that swaps the last two dims (any other perm is
+        not a matrix transpose of a 2-D weight);
+      * `Gemm` with transB=1. Gemm's B is the checkpoint's [N, K] and transB=1
+        says "read it as [K, N]", which is exactly what the Transpose spelling
+        means. This is not a hypothetical: MiniMax-H3's adaLN projections are
+        Gemm(transB=1), 496 MiB each across 50 layers (24.31 GiB), and every
+        one of them was hydrated into RAM because this function said "not
+        transposed" and `_int4_layout_ok` therefore refused to defer it.
+
+    `lower_gemm_to_matmul` later rewrites Gemm into MatMul + Add (carrying
+    transB onto the MatMul), so the runtime never sees a Gemm either way.
     """
+    if node.op_type == "Gemm":
+        return bool(next((a.i for a in node.attribute if a.name == "transB"), 0))
     if node.op_type != "Transpose":
         return False
     perm = next((list(a.ints) for a in node.attribute if a.name == "perm"), None)

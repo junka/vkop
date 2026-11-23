@@ -335,6 +335,45 @@ def code_byte(fmt, reader, scale, transposed: bool = False):
     return codes
 
 
+def _has_bias(node) -> bool:
+    """Does this weight consumer already use the slot a scale would take?
+
+    Gemm's third input is C, Conv's is B. MatMul has neither, so slot 2 there is
+    free for vkop's `[A, B, scale]` extension. Gemm and Conv with a bias take
+    the scale one slot further along, which is the shape `ops/Gemm.hpp` and
+    `shaders/buffer/conv2d.comp` document:
+
+        MatMul, no bias : [A, B, scale]
+        Gemm,   w/ bias : [A, B, C, scale]
+        Conv,   w/ bias : [X, W, B, scale]
+
+    These are vkop extensions, not ONNX -- `onnx.checker` rejects them (a
+    4-input Gemm is "not in range [min=2, max=3]") -- but the converter never
+    runs the checker on a model this large, and onnxoptimizer and shape
+    inference both tolerate the extra input. What must NOT happen is treating
+    slot 2 as the scale when it is really a bias: that is what corrupted the
+    MiniMax-H3 int4 conversion (see `scale_slot`).
+    """
+    return node.op_type in ("Gemm", "Conv") and len(node.input) >= 3
+
+
+def scale_slot(node) -> int | None:
+    """The input index a weight-only scale occupies, or will occupy, on `node`.
+
+    A bias, when present, sits between the weight and the scale -- the kernels
+    read `[A, B, C, scale]` and key the scale off `has_bias`, precisely so the
+    two cannot be confused. So the answer is 3 for a biased Gemm/Conv and 2
+    otherwise. MatMul never has a bias.
+    """
+    if node.op_type == "Gemm":
+        return 3 if _has_bias(node) else 2
+    if node.op_type == "Conv":
+        return 3 if _has_bias(node) else 2
+    if node.op_type == "MatMul":
+        return 2
+    return None
+
+
 def finalize(model, deferred, verbose=True) -> int:
     """Attach a scale to every quantizing deferred entry, on the proto.
 
@@ -394,13 +433,19 @@ def finalize(model, deferred, verbose=True) -> int:
                 f"take its scale; the runtime would bind no scale and read raw "
                 f"codes")
         carrier, _operand = chain[-1]
-        if len(carrier.input) > 2:
-            # Already carries a scale (or something else past the weight): the
-            # quantizer's contract is a three-input MatMul, and this pass must
-            # not manufacture a fourth. Record what is there so the missing
-            # check below does not mistake "already done" for "could not".
-            entry["scale"] = carrier.input[2]
-            appended[name] = carrier.input[2]
+        slot = scale_slot(carrier)
+        if slot is None:
+            raise ValueError(
+                f"'{name}' is quantized on the way out but its consumer is a "
+                f"{carrier.op_type}, which has no weight-only scale contract; "
+                f"the runtime would bind no scale and read raw codes")
+        if len(carrier.input) > slot:
+            # Already carries a scale: the quantizer's contract is a fixed
+            # input list, and this pass must not manufacture a duplicate.
+            # Record what is there so the missing check below does not mistake
+            # "already done" for "could not".
+            entry["scale"] = carrier.input[slot]
+            appended[name] = carrier.input[slot]
             continue
         scale_name = entry.get("scale") or f"{name}_scale"
         if scale_name not in existing:

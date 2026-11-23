@@ -3727,7 +3727,26 @@ class FusionOptimizer:
             beta = attrs.get("beta", 1.0)
             trans_a = attrs.get("transA", 0)
             activation = attrs.get("activation")
-            has_bias = len(node.inputs) >= 3
+            # A quantized weight's scale rides in the slot right after the
+            # bias, or right after B when there is no bias -- so the input
+            # COUNT alone cannot say whether input 2 is C or a scale. The
+            # runtime keys it off the weight's format (ops/Gemm.hpp:
+            # `weight_int8 ? (inputs.size() == 4) : (inputs.size() > 2)`), and
+            # this pass has to agree or it turns `[A, B, scale]` into
+            # MatMul + Add(scale).
+            weight_quantized = False
+            if len(node.inputs) > 1:
+                _w = dag_model.initializers.get(node.inputs[1]["name"])
+                if _w is not None and _w.data_type in (
+                        onnx.TensorProto.INT8, onnx.TensorProto.INT4,
+                        onnx.TensorProto.UINT8, onnx.TensorProto.UINT4,
+                        onnx.TensorProto.FLOAT8E4M3FN,
+                        onnx.TensorProto.FLOAT8E5M2):
+                    weight_quantized = True
+            if weight_quantized:
+                has_bias = len(node.inputs) >= 4
+            else:
+                has_bias = len(node.inputs) >= 3
             if trans_a != 0 or alpha != 1.0 or activation:
                 # Not equivalent to a plain MatMul(+Add); leave for the Gemm
                 # runtime op if it ever exists. Print so the gap is visible.
@@ -3740,16 +3759,32 @@ class FusionOptimizer:
             if beta not in (0.0, 1.0):
                 print(f"  skip Gemm->MatMul for '{node.name}': beta={beta}")
                 continue
-            matches.append({"node": node, "beta": beta})
+            matches.append({"node": node, "beta": beta,
+                            "has_bias": has_bias})
         return matches
 
     @staticmethod
     def fold_gemm_to_matmul(dag_model, match) -> bool:
         node = match["node"]
         beta = match["beta"]
+        has_bias = match["has_bias"]
         trans_b = (node.attributes or {}).get("transB", 0)
         orig_output = node.outputs[0]
         out_name = orig_output["name"]
+
+        # A weight-only quantized Gemm carries its dequant scale as the LAST
+        # input: [A, B_int8, C, scale] with a bias, [A, B_int8, scale] without
+        # (ops/Gemm.hpp derives which with `weight_int8 ? (size == 4) : (size >
+        # 2)`). Lowering rebuilds the node as a MatMul, so the scale has to
+        # travel with it -- MatMul's spelling is [A, B, scale]. Dropping it left
+        # the weight with no table, which the runtime rejects, and a deferred
+        # int4 weight would have been encoded without one.
+        #
+        # The bias, when present, is consumed by the Add below and must NOT be
+        # carried; when absent, input 2 is already the scale and rides along.
+        scale = node.inputs[3:] if (has_bias and len(node.inputs) > 3) else (
+            node.inputs[2:] if (not has_bias and len(node.inputs) > 2) else [])
+        bias = node.inputs[2] if has_bias else None
 
         if beta == 1.0:
             # MatMul writes a fresh tensor; Add reads it + the bias, writes the
@@ -3763,7 +3798,7 @@ class FusionOptimizer:
                 op_type="MatMul",
                 name=f"{node.name}_mm",
                 attributes={"transB": trans_b} if trans_b else {},
-                inputs=[node.inputs[0], node.inputs[1]],
+                inputs=[node.inputs[0], node.inputs[1]] + list(scale),
                 outputs=[mm_out],
             )
             # The Add's first operand references the MatMul's output. Node input
@@ -3781,7 +3816,7 @@ class FusionOptimizer:
                 op_type="Add",
                 name=f"{node.name}_bias",
                 attributes={},
-                inputs=[mm_in, node.inputs[2]],
+                inputs=[mm_in, bias],
                 outputs=[orig_output],
             )
             dag_model.nodes[mm_node.name] = mm_node
@@ -3793,7 +3828,7 @@ class FusionOptimizer:
                 op_type="MatMul",
                 name=node.name,
                 attributes={"transB": trans_b} if trans_b else {},
-                inputs=[node.inputs[0], node.inputs[1]],
+                inputs=[node.inputs[0], node.inputs[1]] + list(scale),
                 outputs=[orig_output],
             )
             dag_model.nodes[node.name] = mm_node
