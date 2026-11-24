@@ -1,6 +1,6 @@
 # vkop op probes -- one binary, dispatched by name.
 #
-# 23 probes used to be 23 executables in tests/, each recompiling the whole
+# These probes used to be 26 executables in tests/, each recompiling the whole
 # vkop header prefix (~5.5s) on every header edit for ~2.8s of actual probe
 # code. They are now one target, and the probe sources are compiled in a few
 # merged translation units rather than one TU each (see PROBE_BUCKETS).
@@ -36,9 +36,15 @@ set(PROBE_SOURCES
     matmul_ada_probe.cpp
     matmul_route_probe.cpp
     descriptor_buffer_probe.cpp
+    # Migrated from tests/ once the dispatcher grew an argv passthrough: these
+    # three take parameters (a .vkopbin, n/k/reps, full|tiny) rather than
+    # running a fixed sweep.
+    image_layout_probe.cpp
+    min_max_probe.cpp
+    readback_probe.cpp
 )
 
-# A bucket count of 1 would be fastest but puts all 23 in one TU. Four keeps
+# A bucket count of 1 would be fastest but puts all 26 in one TU. Four keeps
 # the per-header-edit cost near the measured 4-probe merge (10.2s) while
 # limiting how much a single broken probe takes down with it.
 set(PROBE_BUCKETS 4 CACHE STRING

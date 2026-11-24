@@ -188,7 +188,7 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_unary() {
+int run_unary(int argc, char **argv) {
     // Shader variants are opt-in at this stage (see try_build_bda_pipeline).
     const bool desc_only = std::getenv("UNARY_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {

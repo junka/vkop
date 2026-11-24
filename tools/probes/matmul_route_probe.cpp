@@ -39,7 +39,7 @@ using vkop::VulkanInstance;
 using vkop::core::ITensor;
 using vkop::core::Tensor;
 
-int run_matmul_route() {
+int run_matmul_route(int argc, char **argv) {
     if (std::getenv("MATMUL_ROUTE_ALLOW_COOP") == nullptr) {
         setenv("VKOP_NO_COOP", "1", 1);
     }

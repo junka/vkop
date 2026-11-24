@@ -40,7 +40,7 @@ using vkop::VulkanDevice;
 using vkop::VulkanInstance;
 using vkop::core::Tensor;
 
-int run_embedding() {
+int run_embedding(int argc, char **argv) {
     const bool desc_only = std::getenv("EMBEDDING_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

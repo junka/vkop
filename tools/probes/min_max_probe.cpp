@@ -4,13 +4,14 @@
 //   - in1 as rank-0 (empty shape) vs rank-1 [1]
 //   - fp16 vs fp32 data
 //   - total = 4194304 (full) vs 6144 (tiny, known-good control)
-// Usage: MinMaxProbe [full|tiny]  (default full)
+// Run: vkop_probes min-max [full|tiny]  (default full)
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "core/Tensor.hpp"
@@ -23,11 +24,17 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 
+#include "probe_common.hpp"
+
 using vkop::core::ITensor;
 using vkop::core::Tensor;
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
+
+namespace vkop {
+namespace probes {
+namespace min_max {
 
 namespace {
 
@@ -152,7 +159,7 @@ int run_case(vkop::ops::OpType op_type, const char *op_name,
 
 } // namespace
 
-int main(int argc, char **argv) {
+int run_min_max(int argc, char **argv) {
     bool full = (argc < 2) || std::string(argv[1]) == "full";
     // Builds Min/Max through the op factory, not through a model, so it needs
     // the build tree's archive (libvkop carries no shaders of its own).
@@ -161,6 +168,10 @@ int main(int argc, char **argv) {
     Logger::getInstance().setLevel(LOG_INFO);
     const auto &phydevs =
         vkop::VulkanInstance::getVulkanInstance().getPhysicalDevices();
+    if (phydevs.empty()) {
+        std::printf("SKIP: no Vulkan device\n");
+        return 0;
+    }
     auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
     auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
 
@@ -180,3 +191,10 @@ int main(int argc, char **argv) {
     printf(rc == 0 ? "ALL PASS\n" : "FAILURES PRESENT\n");
     return rc;
 }
+
+REGISTER_PROBE("min-max", "Min/Max large-shape scalar broadcast", nullptr,
+               run_min_max);
+
+} // namespace min_max
+} // namespace probes
+} // namespace vkop

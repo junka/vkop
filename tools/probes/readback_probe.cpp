@@ -29,8 +29,12 @@
 // 2048 hidden), and the activation's row count is varied to show how the copy
 // scales when a batch or a prefill chunk routes at once.
 //
-// Build: tests target (see tests/CMakeLists.txt), run as
-//   ./build/readback_probe [n_experts] [k] [reps]
+// Build: tools/probes (one dispatched binary), run as
+//   ./build/tools/probes/vkop_probes readback [n_experts] [k] [reps]
+//
+// Uses VulkanInstance/VulkanDevice directly rather than tests' TestEnv: the
+// test harness drags in gtest and the libtorch subset headers, which a probe
+// has no use for and which would tax every TU it is merged into.
 
 #include <algorithm>
 #include <chrono>
@@ -43,7 +47,11 @@
 #include "core/Tensor.hpp"
 #include "include/dev_shaders.hpp"
 #include "ops/Ops.hpp"
-#include "tests/setup.hpp"
+#include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -51,7 +59,10 @@ using vkop::VulkanDevice;
 using vkop::core::ITensor;
 using vkop::core::Tensor;
 using vkop::ops::OpType;
-using vkop::tests::TestEnv;
+
+namespace vkop {
+namespace probes {
+namespace readback {
 
 namespace {
 
@@ -182,7 +193,7 @@ Result run_once(const std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main(int argc, char **argv) {
+int run_readback(int argc, char **argv) {
     int n_experts = argc > 1 ? std::atoi(argv[1]) : 60;
     int k = argc > 2 ? std::atoi(argv[2]) : 4;
     int reps = argc > 3 ? std::atoi(argv[3]) : 200;
@@ -191,9 +202,14 @@ int main(int argc, char **argv) {
     // same way the gtest main does: libvkop embeds no SPIR-V of its own and the
     // TopK pipeline has to come from somewhere.
     vkop::dev::seed_shader_archive_from_build_tree();
-    TestEnv::initialize();
-    auto dev = TestEnv::get_device();
-    auto pool = TestEnv::get_command_pool();
+    const auto &phydevs =
+        vkop::VulkanInstance::getVulkanInstance().getPhysicalDevices();
+    if (phydevs.empty()) {
+        std::printf("SKIP: no Vulkan device\n");
+        return 0;
+    }
+    auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+    auto pool = std::make_shared<VulkanCommandPool>(dev);
 
     printf("[rbprobe] device=%s  n_experts=%d  k=%d  reps=%d\n",
            dev->getDeviceName().c_str(), n_experts, k, reps);
@@ -283,6 +299,14 @@ int main(int argc, char **argv) {
            "expert-id tensor.\n",
            k * static_cast<int>(sizeof(int)), 1000.0 * (med - hit));
 
-    TestEnv::cleanup();
+    pool.reset();
+    dev.reset();
     return 0;
 }
+
+REGISTER_PROBE("readback", "MoE router expert-id readback cost", nullptr,
+               run_readback);
+
+} // namespace readback
+} // namespace probes
+} // namespace vkop

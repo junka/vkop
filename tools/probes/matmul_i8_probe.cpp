@@ -43,7 +43,7 @@ using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
 using vkop::VulkanInstance;
 
-int run_matmul_i8() {
+int run_matmul_i8(int argc, char **argv) {
     const bool desc_only =
         std::getenv("MATMUL_I8_BDA_DESC_ONLY") != nullptr;
     // Force the UINT8→UINT32 MMA module (it is the same kernel templated on

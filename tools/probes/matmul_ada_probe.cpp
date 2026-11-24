@@ -140,7 +140,7 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_matmul_ada() {
+int run_matmul_ada(int argc, char **argv) {
     const char *case_env = std::getenv("MATMUL_ADA_CASE");
     const std::string mode = case_env ? case_env : "sklast";
     const bool desc_only = std::getenv("MATMUL_ADA_BDA_DESC_ONLY") != nullptr;

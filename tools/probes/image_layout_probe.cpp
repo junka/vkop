@@ -14,9 +14,9 @@
 // are what the allocator really reserves (VMA block rounding included) -- that
 // second number is the one a fold decision should trust.
 //
-// Usage:
-//   tests/ImageLayoutProbe                          # synthetic shapes only
-//   tests/ImageLayoutProbe path/to/model.vkopbin    # + real model tensors
+// Run:
+//   vkop_probes image-layout                          # synthetic shapes only
+//   vkop_probes image-layout path/to/model.vkopbin    # + real model tensors
 
 #include <algorithm>
 #include <cstdio>
@@ -34,12 +34,18 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 
+#include "probe_common.hpp"
+
 using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
 using vkop::VulkanImage;
 using vkop::VulkanInstance;
+
+namespace vkop {
+namespace probes {
+namespace image_layout {
 
 namespace {
 
@@ -588,7 +594,7 @@ void report_model(const std::string &path, const std::shared_ptr<VulkanCommandPo
 
 } // namespace
 
-int main(int argc, char **argv) {
+int run_image_layout(int argc, char **argv) {
     Logger::getInstance().setLevel(LOG_ERROR);
     auto &inst = VulkanInstance::getVulkanInstance();
     auto &phydevs = inst.getPhysicalDevices();
@@ -621,3 +627,10 @@ int main(int argc, char **argv) {
     g_dev.reset();
     return 0;
 }
+
+REGISTER_PROBE("image-layout", "image2DArray padding vs folded image2D", nullptr,
+               run_image_layout);
+
+} // namespace image_layout
+} // namespace probes
+} // namespace vkop

@@ -98,7 +98,7 @@ void check(const char *name, vkop::ops::Operator *op,
 
 } // namespace
 
-int run_int64() {
+int run_int64(int argc, char **argv) {
     const bool desc_only = std::getenv("INT64_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

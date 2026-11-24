@@ -156,7 +156,7 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_rotary() {
+int run_rotary(int argc, char **argv) {
     const bool desc_only = std::getenv("ROTARY_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

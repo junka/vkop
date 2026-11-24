@@ -4,7 +4,7 @@
 
 // Dispatcher plumbing for the vkop op probes.
 //
-// These were 23 standalone executables, each with its own main(), its own
+// These were 26 standalone executables, each with its own main(), its own
 // device open and its own copy of the same scaffolding. Compiling any one of
 // them spends ~5.5s on the shared header prefix against ~2.8s on the probe's
 // own code, so merging them into one binary pays for itself: four probes in
@@ -33,8 +33,10 @@ struct Probe {
     // it exactly as before, so existing ctest ENVIRONMENT properties and
     // hand-run commands keep working unchanged.
     const char *desc_env;
-    // The probe's former main(), kept verbatim.
-    int (*run)();
+    // The probe's former main(), kept verbatim. argv[0] is the probe's name,
+    // argv[1..] are whatever the caller typed after it, so a probe that read
+    // argc/argv before still sees the same layout.
+    int (*run)(int argc, char **argv);
 };
 
 void register_probe(Probe probe);

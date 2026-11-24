@@ -564,50 +564,10 @@ add_executable(UnusedOutputsTest UnusedOutputsTest.cpp)
 target_link_libraries(UnusedOutputsTest PRIVATE vkop vload)
 add_test(NAME UnusedOutputsTest COMMAND UnusedOutputsTest)
 
-# Image layout accounting probe (not a gtest): reports driver rowPitch /
-# arrayPitch padding for the image2DArray (NCHW->RGBA) layout vs a folded
-# single image2D, plus the real per-tensor gap for a given .vkopbin.
-# Run:  ./ImageLayoutProbe [path/to/model.vkopbin]
-# EXCLUDE_FROM_ALL: a manual diagnostic, not a ctest test. Leaving it in `all`
-# made every vkop header edit recompile 33 probe binaries nobody had asked for.
-add_executable(ImageLayoutProbe EXCLUDE_FROM_ALL ImageLayoutProbe.cpp)
-target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)
-
-# Readback-cost probe for MoE expert routing (direction B0). Runs a TopK over
-# router-shaped logits and times the expert-id copyToCPU, which is the op
-# sequence a CPU-dispatched expert cache depends on and which no current decode
-# round contains (measured 0 readbacks/round). Not a gtest: it prints a
-# distribution and a projection rather than asserting a value.
-# Run:  ./readback_probe [n_experts] [k] [reps]
-add_executable(readback_probe EXCLUDE_FROM_ALL readback_probe.cpp setup_env.cpp)
-target_link_libraries(readback_probe PRIVATE vkop vload)
-add_dependencies(readback_probe shader_archive)
-target_compile_definitions(readback_probe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
-# setup.cpp pulls torch for its tensor helpers; the probe only needs Vulkan,
-# but linking the helper drags torch's headers in, and torch's own headers do
-# not survive the project's -Werror. Silence the same warnings all_tests does.
-target_include_directories(readback_probe PRIVATE
-    ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR})
-if(MSVC)
-    target_compile_options(readback_probe PRIVATE /wd4100)
-else()
-    target_compile_options(readback_probe PRIVATE
-        -Wno-unused-parameter
-        -Wno-unused-variable
-        -Wno-unused-function
-    )
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(readback_probe PRIVATE -Wno-dangling-reference)
-    endif()
-endif()
-
-# Min/Max large-shape scalar-broadcast repro probe (full-DiT decode
-# DEVICE_LOST at /Min_24+/Max_24). Usage: MinMaxProbe [full|tiny]
-add_executable(MinMaxProbe EXCLUDE_FROM_ALL MinMaxProbe.cpp)
-target_link_libraries(MinMaxProbe PRIVATE vkop vload)
-# Builds its ops directly, so it needs the same archive seed as all_tests.
-add_dependencies(MinMaxProbe shader_archive)
-target_compile_definitions(MinMaxProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+# Image layout accounting probe, readback-cost probe and the Min/Max repro
+# probe moved to tools/probes/ along with the op probes: same dispatched
+# binary, same reason (a manual diagnostic should not rebuild on every header
+# edit, and one binary beats three).
 
 # ConvWeightLayoutTest fixture: one rank-4 and one rank-5 Conv, converted twice
 # from the same tracked .onnx -- once with the converter's layout pass and once
@@ -664,7 +624,7 @@ target_link_libraries(BufferDeviceAddressTest PRIVATE vkop vload)
 add_test(NAME BufferDeviceAddressTest COMMAND BufferDeviceAddressTest)
 
 # The op probes (BDA routes + descriptor fallback) moved to tools/probes/:
-# one dispatched binary instead of 23 executables, built on demand rather
+# one dispatched binary instead of 26 executables, built on demand rather
 # than as part of `all`. Run `vkop_probes` with no argument to list them.
 
 

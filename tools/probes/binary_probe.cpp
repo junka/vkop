@@ -195,7 +195,7 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_binary() {
+int run_binary(int argc, char **argv) {
     const bool desc_only = std::getenv("BINARY_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

@@ -484,8 +484,8 @@ writer 写出的、或转换时找不到 master 而没内嵌的模型**跑不起
 只能重转。
 
 单元测试、probe、`bench_matmul` 这类**不经模型**直接 `create_from_type()` 建算子的
-二进制是例外：它们没有模型可拿 shader，所以 `tests/setup.cpp`（以及 `MinMaxProbe`）
-从编译期注入的构建树路径把归档装成进程默认，见
+二进制是例外：它们没有模型可拿 shader，所以 `tests/setup.cpp`（以及
+`tools/probes/` 里的每个探针）从编译期注入的构建树路径把归档装成进程默认，见
 [include/dev_shaders.hpp](../include/dev_shaders.hpp)。这是 dev-only 的：出货的
 `llm_driver`/`vkbench` 不 include 这个头，所以它们除了模型那份拿不到别的 shader。
 

@@ -218,7 +218,7 @@ void run_transpose(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_reduce_transpose() {
+int run_reduce_transpose(int argc, char **argv) {
     const bool desc_only = std::getenv("MISC_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

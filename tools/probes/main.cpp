@@ -1,11 +1,11 @@
 // Copyright 2026 @junka
 //
-// Dispatcher for the vkop op probes (formerly 23 separate executables).
+// Dispatcher for the vkop op probes (formerly 26 separate executables).
 //
-//   probes                     list every probe
-//   probes <name>              run one probe (reads its own *_DESC_ONLY env)
-//   probes <name> --desc       same, with that probe's descriptor-only env set
-//   probes all [--desc]        run every probe, each in a forked child
+//   probes                       list every probe
+//   probes <name> [args...]      run one probe; extra args go to the probe
+//   probes <name> ... --desc     same, with that probe's descriptor-only env set
+//   probes all [--desc]          run every probe, each in a forked child
 //
 // Each probe runs in a forked child. That is not politeness: several probes
 // end in _exit() on purpose (the b3 NVIDIA driver segfaults in its EGL atexit
@@ -52,16 +52,24 @@ const Probe *find_probe(const char *name) {
 }
 
 void list_probes() {
-    std::printf("usage: probes <name> [--desc] | probes all [--desc]\n\n");
+    std::printf("usage: probes <name> [args...] [--desc] | probes all [--desc]\n\n");
     std::printf("  %-20s %s\n", "all", "run every probe");
     for (const Probe &p : all_probes()) {
         std::printf("  %-20s %s\n", p.name, p.help ? p.help : "");
     }
+    std::printf("\nargs after the probe name go to the probe itself, e.g.\n"
+                "  probes min-max tiny\n"
+                "  probes readback 60 4 200\n"
+                "  probes image-layout some/model.vkopbin\n");
 }
 
 // Run one probe in a forked child and return its exit code. A signal death
 // (the EGL teardown bug) is reported as a failure rather than propagated.
-int run_forked(const Probe &probe) {
+//
+// argv[0] is the probe's own name so a probe that printed argv[0] or fed it to
+// getopt still sees what its standalone binary saw; the rest is the caller's
+// tail. A probe that never touched argv simply ignores the parameters.
+int run_forked(const Probe &probe, const std::vector<char *> &args) {
     std::fflush(nullptr);
     const pid_t pid = fork();
     if (pid < 0) {
@@ -69,7 +77,15 @@ int run_forked(const Probe &probe) {
         return 2;
     }
     if (pid == 0) {
-        const int rc = probe.run();
+        std::vector<char *> child_argv;
+        child_argv.reserve(args.size() + 2);
+        child_argv.push_back(const_cast<char *>(probe.name));
+        for (char *a : args) {
+            child_argv.push_back(a);
+        }
+        child_argv.push_back(nullptr);
+        const int rc = probe.run(static_cast<int>(child_argv.size()) - 1,
+                                 child_argv.data());
         std::fflush(nullptr);
         std::_Exit(rc);
     }
@@ -95,14 +111,17 @@ int main(int argc, char **argv) {
 
     bool desc_only = false;
     const char *name = nullptr;
+    std::vector<char *> args; // arguments forwarded to the probe unchanged
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--desc") == 0) {
             desc_only = true;
         } else if (!name) {
             name = argv[i];
         } else {
-            std::printf("FAIL: unexpected argument '%s'\n", argv[i]);
-            return 2;
+            // Everything after the probe name belongs to the probe: these
+            // probes take model paths, counts and mode words (ImageLayoutProbe
+            // a .vkopbin, readback_probe n/k/reps, MinMaxProbe full|tiny).
+            args.push_back(argv[i]);
         }
     }
 
@@ -114,6 +133,11 @@ int main(int argc, char **argv) {
 
     if (std::strcmp(name, "all") == 0) {
         int failed = 0;
+        // A sweep runs every probe with no extra arguments: a positional
+        // argument means different things to different probes (a model path to
+        // image-layout, a mode word to min-max), so there is no useful common
+        // meaning to forward. Name the probe to pass it arguments.
+        const std::vector<char *> no_args;
         for (const Probe &p : all_probes()) {
             std::printf("\n===== %s =====\n", p.name);
             std::fflush(nullptr);
@@ -123,7 +147,7 @@ int main(int argc, char **argv) {
             if (desc_only && p.desc_env) {
                 setenv(p.desc_env, "1", 1);
             }
-            const int rc = run_forked(p);
+            const int rc = run_forked(p, no_args);
             if (desc_only && p.desc_env) {
                 unsetenv(p.desc_env);
             }
@@ -146,5 +170,5 @@ int main(int argc, char **argv) {
     if (desc_only && probe->desc_env) {
         setenv(probe->desc_env, "1", 1);
     }
-    return run_forked(*probe);
+    return run_forked(*probe, args);
 }

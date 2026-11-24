@@ -212,7 +212,7 @@ void run_i8_wide_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_matmul() {
+int run_matmul(int argc, char **argv) {
     const bool desc_only = std::getenv("MATMUL_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

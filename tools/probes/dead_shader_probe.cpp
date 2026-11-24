@@ -500,7 +500,7 @@ void test_coop16_inwg(int M, int N, int K) {
 
 } // namespace
 
-int run_dead_shader() {
+int run_dead_shader(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     g_desc_only = std::getenv("DEAD_BDA_DESC_ONLY") != nullptr;
     if (g_desc_only) {

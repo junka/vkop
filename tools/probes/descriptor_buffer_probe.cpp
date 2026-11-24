@@ -87,7 +87,7 @@ std::vector<VkDescriptorSetLayoutBinding> make_bindings() {
 
 } // namespace
 
-int run_descriptor_buffer() {
+int run_descriptor_buffer(int argc, char **argv) {
     Logger::getInstance().setLevel(LOG_INFO);
     const auto &phydevs =
         VulkanInstance::getVulkanInstance().getPhysicalDevices();

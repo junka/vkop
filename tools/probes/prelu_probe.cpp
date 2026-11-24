@@ -164,7 +164,7 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_prelu() {
+int run_prelu(int argc, char **argv) {
     const bool desc_only = std::getenv("PRELU_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");

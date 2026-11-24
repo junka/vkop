@@ -444,7 +444,7 @@ void test_linear_attention(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int run_linear_attn() {
+int run_linear_attn(int argc, char **argv) {
     Logger::getInstance().setLevel(LOG_ERROR);
     vkop::dev::seed_shader_archive_from_build_tree();
     const auto &phydevs =
