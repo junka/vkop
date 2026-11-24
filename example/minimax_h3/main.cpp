@@ -47,6 +47,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <string>
@@ -54,7 +56,12 @@
 
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
+#include "h3_host.hpp"
 #include "include/logger.hpp"
+
+#if defined(H3_HAVE_TOKENIZER)
+#include "tokenizer.hpp"
+#endif
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
@@ -97,6 +104,14 @@ struct Options {
     std::string transformer_path;
     std::string vae_path;
     std::string text_encoder_path;
+    // The REAL conditioning path. `prompt` + tokenizer + text encoder replace
+    // the synthetic ids/embeds; `checkpoint` supplies the timestep MLP the
+    // graph deliberately omits.
+    std::string prompt;
+    std::string tokenizer_path;
+    std::string checkpoint_dir;
+    // The VAE's `config.json`, for `latents_mean`/`latents_std`.
+    std::string vae_config;
     int steps = 2;
     int text_tokens = 8;
     int latent_frames = 2;
@@ -112,8 +127,14 @@ void usage(const char *argv0) {
         stderr,
         "Usage: %s [--transformer TF.vkopbin] [--vae VAE.vkopbin]\n"
         "          [--text-encoder TE.vkopbin] [options]\n"
+        "  --prompt TEXT      real prompt (needs --tokenizer and --text-encoder)\n"
+        "  --tokenizer BIN    tokenizer .bin (qwen3_vl.bin works: H3's is the\n"
+        "                     same Qwen2 tokenizer, byte-identical)\n"
+        "  --checkpoint DIR   H3 checkpoint dir (supplies the timestep MLP)\n"
+        "  --vae-config JSON  the VAE's config.json (latents_mean/std); with it\n"
+        "                     the decoder receives de-normalized latents\n"
         "  --steps N          denoising steps (default 2)\n"
-        "  --text-tokens N    text rows (default 8)\n"
+        "  --text-tokens N    synthetic text rows when no --prompt (default 8)\n"
         "  --latent-frames N  video latent frames (default 2)\n"
         "  --latent-h N       latent height, multiple of 2 (default 4)\n"
         "  --latent-w N       latent width, multiple of 2 (default 4)\n"
@@ -142,6 +163,14 @@ bool parse_args(int argc, char **argv, Options &o) {
             o.vae_path = argv[++i];
         } else if (a == "--text-encoder" && i + 1 < argc) {
             o.text_encoder_path = argv[++i];
+        } else if (a == "--prompt" && i + 1 < argc) {
+            o.prompt = argv[++i];
+        } else if (a == "--tokenizer" && i + 1 < argc) {
+            o.tokenizer_path = argv[++i];
+        } else if (a == "--checkpoint" && i + 1 < argc) {
+            o.checkpoint_dir = argv[++i];
+        } else if (a == "--vae-config" && i + 1 < argc) {
+            o.vae_config = argv[++i];
         } else if (a == "--steps" && next_int(argc, argv, i, o.steps)) {
         } else if (a == "--text-tokens" && next_int(argc, argv, i, o.text_tokens)) {
         } else if (a == "--latent-frames" &&
@@ -237,6 +266,125 @@ std::vector<float> random_f32(size_t n, float lo, float hi, uint32_t seed) {
     for (auto &v : out) v = dist(rng);
     return out;
 }
+
+// `randn_tensor`: the initial noise of both streams is standard normal, drawn
+// video-latents-first then audio-rows (the order is part of what the reference
+// generator reproduces, though a single request only needs it self-consistent).
+std::vector<float> randn_f32(size_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> dist(0.0F, 1.0F);
+    std::vector<float> out(n);
+    for (auto &v : out) v = dist(rng);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// a minimal PNG writer (RGB8, no interlace) -- the only output format the
+// board can show without a codec
+// ---------------------------------------------------------------------------
+
+namespace png {
+
+inline uint32_t crc32(const uint8_t *data, size_t n) {
+    static uint32_t table[256];
+    static bool ready = false;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1u) ? (0xedb88320u ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+        ready = true;
+    }
+    uint32_t c = 0xffffffffu;
+    for (size_t i = 0; i < n; ++i) {
+        c = table[(c ^ data[i]) & 0xffu] ^ (c >> 8);
+    }
+    return c ^ 0xffffffffu;
+}
+
+inline void put_u32(std::vector<uint8_t> &v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x >> 24));
+    v.push_back(static_cast<uint8_t>(x >> 16));
+    v.push_back(static_cast<uint8_t>(x >> 8));
+    v.push_back(static_cast<uint8_t>(x));
+}
+
+inline void chunk(std::vector<uint8_t> &out, const char tag[5],
+                  const std::vector<uint8_t> &body) {
+    put_u32(out, static_cast<uint32_t>(body.size()));
+    const size_t crc_start = out.size();
+    for (int i = 0; i < 4; ++i) {
+        out.push_back(static_cast<uint8_t>(tag[i]));
+    }
+    out.insert(out.end(), body.begin(), body.end());
+    const uint32_t c = crc32(out.data() + crc_start, 4 + body.size());
+    put_u32(out, c);
+}
+
+// `rgb` is width*height*3 bytes. Row-major, top-left origin.
+inline bool write_rgb(const std::string &path, int width, int height,
+                      const std::vector<uint8_t> &rgb) {
+    if (rgb.size() != static_cast<size_t>(width) * height * 3) {
+        return false;
+    }
+    std::vector<uint8_t> out = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    std::vector<uint8_t> ihdr;
+    put_u32(ihdr, static_cast<uint32_t>(width));
+    put_u32(ihdr, static_cast<uint32_t>(height));
+    ihdr.push_back(8);  // bit depth
+    ihdr.push_back(2);  // colour type: truecolour
+    ihdr.push_back(0);  // deflate
+    ihdr.push_back(0);  // adaptive filtering
+    ihdr.push_back(0);  // no interlace
+    chunk(out, "IHDR", ihdr);
+
+    // Raw scanlines with filter byte 0, wrapped in zlib "stored" blocks. No
+    // compression: these frames are a few hundred KB and this keeps the writer
+    // dependency-free.
+    std::vector<uint8_t> raw;
+    raw.reserve((static_cast<size_t>(width) * 3 + 1) * height);
+    for (int y = 0; y < height; ++y) {
+        raw.push_back(0);
+        const uint8_t *row = rgb.data() + static_cast<size_t>(y) * width * 3;
+        raw.insert(raw.end(), row, row + static_cast<size_t>(width) * 3);
+    }
+    std::vector<uint8_t> z;
+    z.push_back(0x78);
+    z.push_back(0x01);
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        const size_t n = std::min<size_t>(65535, raw.size() - pos);
+        z.push_back(pos + n == raw.size() ? 1 : 0);
+        z.push_back(static_cast<uint8_t>(n));
+        z.push_back(static_cast<uint8_t>(n >> 8));
+        z.push_back(static_cast<uint8_t>(~n));
+        z.push_back(static_cast<uint8_t>((~n) >> 8));
+        z.insert(z.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos),
+                 raw.begin() + static_cast<std::ptrdiff_t>(pos + n));
+        pos += n;
+    }
+    uint32_t a = 1, b = 0;
+    for (uint8_t c : raw) {
+        a = (a + c) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    put_u32(z, (b << 16) | a);
+    chunk(out, "IDAT", z);
+    chunk(out, "IEND", {});
+
+    std::FILE *f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        return false;
+    }
+    std::fwrite(out.data(), 1, out.size(), f);
+    std::fclose(f);
+    return true;
+}
+
+}  // namespace png
 
 // ---------------------------------------------------------------------------
 // the packed layout the denoiser reads by index
@@ -335,9 +483,10 @@ Layout build_layout(const Options &o) {
 // `(num_timesteps, 2688)` because `arange` on a meta build cannot fold; see the
 // exporter README, "Host vs device split".
 //
-// A real driver loads `time_embedder.linear_{1,2}` from the checkpoint. This
-// example has no weights, so it emits a deterministic, finite temb of the right
-// SHAPE -- which is what the graph contract needs and what a smoke run checks.
+// With `--checkpoint` the real `time_embedder.linear_{1,2}` weights drive this
+// (see `h3::TimestepMLP`). Without them this emits a deterministic, finite temb
+// of the right SHAPE, which is what the graph contract needs and all a
+// weights-free smoke run can check.
 std::vector<float> make_temb(int num_timesteps, uint32_t seed) {
     return random_f32(static_cast<size_t>(num_timesteps) * kTembDim,
                       -0.05F, 0.05F, seed);
@@ -451,12 +600,29 @@ void euler_step(std::vector<float> &x, const std::vector<float> &v,
 // ---------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
+    // Line-buffer stdout even when redirected: a run is tens of GPU-seconds per
+    // step, and block buffering hides progress until the process exits.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     Options opt;
     if (!parse_args(argc, argv, opt)) {
         return 2;
     }
 
     Logger::getInstance().setLevel(LOG_ERROR);
+
+    // A missing `--save` directory would silently drop every output (the
+    // writers just fail to open their file), which reads as "the run produced
+    // nothing". Create it up front.
+    if (!opt.save_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(opt.save_dir, ec);
+        if (ec) {
+            std::fprintf(stderr, "cannot create %s: %s\n", opt.save_dir.c_str(),
+                         ec.message().c_str());
+            return 2;
+        }
+    }
 
     std::shared_ptr<VulkanDevice> dev;
     try {
@@ -484,16 +650,208 @@ int main(int argc, char **argv) {
     int failures = 0;
 
     // -----------------------------------------------------------------
+    // REAL conditioning, computed before the sampler runs
+    // -----------------------------------------------------------------
+    //
+    // Three host-side pieces the graphs deliberately omit:
+    //   tokenizer      -> input_ids          (Qwen2 BPE, same as the LLM's)
+    //   text_encoder   -> prompt_embeds      (Qwen3-VL tower, hidden_states[50])
+    //   checkpoint MLP -> temb               (time_proj + time_embedder)
+    // When any is missing the denoiser falls back to synthetic inputs, which
+    // still exercises the graph but produces noise.
+    std::vector<float> prompt_embeds;      // [n_text, 5120]
+    std::vector<float> real_temb;          // [num_timesteps, 2688]
+    int n_text_tokens = 0;
+    // The denoiser's last `sample`, as `[C, F, H, W]` latents: the VAE's input.
+    // Empty when the transformer did not run.
+    std::vector<float> video_latents;
+
+
+    // The sigma grids the sampler below walks. They are built here, before the
+    // timestep MLP, because `temb` needs rows for every DISTINCT timestep (the
+    // AdaLN modulation is a function of t).
+    //
+    // Video and audio run their own schedules -- `scheduler/` has shift 12 and
+    // `audio_scheduler/` shift 3 -- so one step sees two different timesteps and
+    // `timestep_indices` is what tells the graph which row each packed row
+    // wants. `MiniMaxH3Scheduler.set_timesteps`: `t = 1 - sigma` over
+    // `shift*base/(1+(shift-1)*base)` for `base = linspace(1, 0, steps+1)`.
+    const int steps = std::max(1, opt.steps);
+    auto build_grid = [steps](float shift) {
+        std::vector<float> g(static_cast<size_t>(steps) + 1);
+        for (int i = 0; i <= steps; ++i) {
+            const float base =
+                1.0F - static_cast<float>(i) / static_cast<float>(steps);
+            g[static_cast<size_t>(i)] = shift * base / (1.0F + (shift - 1.0F) * base);
+        }
+        return g;
+    };
+    const std::vector<float> sigmas = build_grid(12.0F);       // video
+    const std::vector<float> audio_sigmas = build_grid(3.0F);  // audio
+
+    const bool want_text = !opt.text_encoder_path.empty() && !opt.prompt.empty();
+    if (want_text) {
+        if (opt.tokenizer_path.empty()) {
+            throw std::runtime_error(
+                "--prompt needs --tokenizer <bin> (qwen3_vl.bin works: H3's "
+                "tokenizer is byte-identical)");
+        }
+#if defined(H3_HAVE_TOKENIZER)
+        qwen::Tokenizer tok;
+        tok.load(opt.tokenizer_path);
+        const std::vector<uint32_t> ids = tok.encode(opt.prompt);
+        n_text_tokens = static_cast<int>(ids.size());
+        std::printf("\n[text] prompt -> %d token(s)\n", n_text_tokens);
+
+        auto rt_te = std::make_shared<Runtime>(pool, opt.text_encoder_path,
+                                               /*precision=*/1);
+        rt_te->set_backend_buffer(true);
+        rt_te->LoadModel();
+
+        std::vector<int64_t> id64(ids.begin(), ids.end());
+        upload_i64(rt_te, pool, "input_ids", id64,
+                          {1, static_cast<uint32_t>(n_text_tokens)});
+
+        // Strictly-causal additive mask, in the graph's own dtype.
+        auto bias_t = rt_te->GetInput("attention_bias");
+        if (!bias_t) throw std::runtime_error("text encoder has no attention_bias");
+        const bool bias_fp32 = bias_t->dtype() == typeid(float);
+        const float neg = bias_fp32 ? -1.0e4F : -65504.0F;
+        std::vector<float> bias(static_cast<size_t>(n_text_tokens) * n_text_tokens,
+                                0.0F);
+        for (int r = 0; r < n_text_tokens; ++r) {
+            for (int c = r + 1; c < n_text_tokens; ++c) {
+                bias[static_cast<size_t>(r) * n_text_tokens + c] = neg;
+            }
+        }
+        upload_float(rt_te, pool, "attention_bias", bias,
+                     {1, 1, static_cast<uint32_t>(n_text_tokens),
+                      static_cast<uint32_t>(n_text_tokens)});
+
+        auto ms = rt_te->Run();
+        rt_te->ReadResult();
+        auto pe = rt_te->GetOutput("prompt_embeds");
+        if (!pe) throw std::runtime_error("text encoder produced no prompt_embeds");
+        const bool pe_fp16 = pe->dtype() == typeid(uint16_t);
+        prompt_embeds.resize(static_cast<size_t>(n_text_tokens) * kTextFeatureDim);
+        if (pe_fp16) {
+            auto t = as_tensor<uint16_t>(pe);
+            for (size_t i = 0; i < prompt_embeds.size(); ++i)
+                prompt_embeds[i] = vkop::core::ITensor::fp16_to_fp32((*t)[i]);
+        } else {
+            auto t = as_tensor<float>(pe);
+            prompt_embeds.assign(t->data().begin(), t->data().end());
+        }
+        double sum = 0.0F, amax = 0.0F;
+        size_t nonfinite = 0;
+        for (float x : prompt_embeds) {
+            if (!std::isfinite(x)) {
+                ++nonfinite;
+                continue;
+            }
+            sum += x;
+            amax = std::max(amax, static_cast<double>(std::fabs(x)));
+        }
+        std::printf("[text] prompt_embeds [%d, %d] in %.0f ms  nonfinite=%zu "
+                    "absmax=%.3f mean=%.4f\n",
+                    n_text_tokens, kTextFeatureDim, ms, nonfinite, amax,
+                    sum / static_cast<double>(prompt_embeds.size()));
+        if (nonfinite != 0) ++failures;
+#else
+        throw std::runtime_error(
+            "built without the tokenizer (ENABLE_LLM_CHAT off and "
+            "llm/tokenizer unavailable); rebuild with the tokenizer");
+#endif
+    }
+
+    // Per step, the DISTINCT timesteps of the packed sequence, `sorted`
+    // ascending, plus each modality's index into them -- exactly
+    // `MiniMaxH3PrepareLayoutStep.build_row_timesteps`'s
+    // `torch.unique(row_timesteps, sorted=True, return_inverse=True)`.
+    // Video and audio run different shifts, so a step usually has two rows; at
+    // step 0 both sigmas are 1 and they collapse to one. Text rows inherit the
+    // video timestep (they never reach an output head), so they share its row.
+    std::vector<int> step_row_offset(static_cast<size_t>(steps) + 1, 0);
+    std::vector<int> step_row_count(static_cast<size_t>(steps), 1);
+    std::vector<int> audio_row_index(static_cast<size_t>(steps), 0);
+    std::vector<float> temb_times;
+
+    for (int i = 0; i < steps; ++i) {
+        const float vt = 1.0F - sigmas[static_cast<size_t>(i)];
+        const float at = 1.0F - audio_sigmas[static_cast<size_t>(i)];
+        step_row_offset[static_cast<size_t>(i)] =
+            static_cast<int>(temb_times.size());
+        if (at > vt) {
+            // sigma_video > sigma_audio for every interior base, so the video t
+            // is the smaller of the two.
+            temb_times.push_back(vt);
+            temb_times.push_back(at);
+            step_row_count[static_cast<size_t>(i)] = 2;
+            audio_row_index[static_cast<size_t>(i)] = 1;
+        } else {
+            temb_times.push_back(vt);
+            step_row_count[static_cast<size_t>(i)] = 1;
+            audio_row_index[static_cast<size_t>(i)] = 0;
+        }
+    }
+    step_row_offset[static_cast<size_t>(steps)] =
+        static_cast<int>(temb_times.size());
+
+    if (!opt.checkpoint_dir.empty()) {
+        h3::TimestepMLP mlp(opt.checkpoint_dir);
+        real_temb = mlp.run(temb_times);
+        if (mlp.out_dim() != kTembDim) {
+            throw std::runtime_error("timestep MLP out_dim " +
+                                     std::to_string(mlp.out_dim()) +
+                                     " != the graph's 2688");
+        }
+        std::printf("[temb] checkpoint timestep MLP loaded (%d -> %d), %zu row(s), "
+                    "t = %.4f .. %.4f, %d row(s) on the busiest step\n",
+                    mlp.hidden(), mlp.out_dim(), temb_times.size(),
+                    temb_times.front(), temb_times.back(),
+                    *std::max_element(step_row_count.begin(),
+                                      step_row_count.end()));
+    }
+
+    // -----------------------------------------------------------------
     // denoiser: one graph forward per denoising step
     // -----------------------------------------------------------------
     if (!opt.transformer_path.empty()) {
         try {
-            const Layout l = build_layout(opt);
+            // The layout uses the REAL prompt length when one was encoded.
+            Layout l;
+            if (n_text_tokens > 0) {
+                h3::LayoutSpec spec;
+                spec.num_text_tokens = n_text_tokens;
+                spec.num_latent_frames = opt.latent_frames;
+                spec.latent_height = opt.latent_h;
+                spec.latent_width = opt.latent_w;
+                spec.num_audio_latents = opt.audio_latents;
+                spec.audio_channels = 2;
+                spec.patch_t = 1; spec.patch_h = 2; spec.patch_w = 2;
+                const h3::PackedLayout pl = h3::build_packed_layout(spec);
+                l.n_text = pl.n_text; l.n_audio = pl.n_audio;
+                l.n_video = pl.n_video; l.seq = pl.seq;
+                l.token_tags = pl.token_tags;
+                l.timestep_indices = pl.timestep_indices;
+                l.position_ids = pl.position_ids;
+                l.video_indices = pl.video_indices;
+                l.audio_indices = pl.audio_indices;
+                l.text_indices = pl.text_indices;
+                l.pack_order = pl.pack_order;
+                if (!l.audio_indices.empty() && !opt.with_audio) {
+                    // video-only graph has no audio rows
+                    l.n_audio = 0; l.seq = l.n_text + l.n_video;
+                }
+            } else {
+                l = build_layout(opt);
+            }
             std::printf(
                 "\n[transformer] %s\n  layout: text=%d audio=%d video=%d "
-                "seq=%d steps=%d\n",
+                "seq=%d steps=%d%s\n",
                 opt.transformer_path.c_str(), l.n_text, l.n_audio, l.n_video,
-                l.seq, opt.steps);
+                l.seq, opt.steps,
+                n_text_tokens > 0 ? " (real text conditioning)" : "");
 
             // precision=1: the artifacts are converted -q fp16, and the fp16
             // shader family is what they embed.
@@ -512,18 +870,33 @@ int main(int argc, char **argv) {
                 static_cast<size_t>(l.n_text) * kTextFeatureDim;
 
             // The noisy rows. The host owns the sampler; the graph only sees
-            // the current x_t.
-            std::vector<float> video = random_f32(n_vid, -1.0F, 1.0F, 0x1234u);
-            std::vector<float> audio = random_f32(n_aud, -1.0F, 1.0F, 0x5678u);
-            const std::vector<float> text = random_f32(n_txt, -1.0F, 1.0F, 0x9abcu);
-            const std::vector<float> temb = make_temb(1, 0xdef0u);
+            // the current x_t. When a prompt was encoded, `text` is the real
+            // conditioner output; otherwise it is noise (a graph smoke test).
+            std::vector<float> video = randn_f32(n_vid, 0x1234u);
+            std::vector<float> audio = randn_f32(n_aud, 0x5678u);
+            const std::vector<float> text =
+                prompt_embeds.empty()
+                    ? random_f32(n_txt, -1.0F, 1.0F, 0x9abcu)
+                    : prompt_embeds;
+            // A real checkpoint supplies this step's rows inside the loop; the
+            // synthetic path uploads its single row here.
+            const std::vector<float> temb =
+                real_temb.empty()
+                    ? make_temb(1, 0xdef0u)
+                    : std::vector<float>(
+                          real_temb.begin(),
+                          real_temb.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  step_row_count[0] * kTembDim));
 
             upload_float(rt, pool, "hidden_states", video,
                          {1, static_cast<uint32_t>(l.n_video), kVideoFeatureDim});
             upload_float(rt, pool, "encoder_hidden_states", text,
-                         {1, static_cast<uint32_t>(l.n_text), static_cast<uint32_t>(kTextFeatureDim)});
+                         {1, static_cast<uint32_t>(l.n_text),
+                          static_cast<uint32_t>(kTextFeatureDim)});
             upload_float(rt, pool, "temb", temb,
-                         {1, static_cast<uint32_t>(kTembDim)});
+                         {static_cast<uint32_t>(temb.size() / kTembDim),
+                          static_cast<uint32_t>(kTembDim)});
             upload_i64(rt, pool, "timestep_indices", l.timestep_indices,
                        {static_cast<uint32_t>(l.seq)});
             upload_i64(rt, pool, "token_tags", l.token_tags,
@@ -546,20 +919,42 @@ int main(int argc, char **argv) {
                            {static_cast<uint32_t>(l.seq)});
             }
 
-            // sigma schedule: linspace(1, 0, steps) through the exponential
-            // shift, shift = 12 for video. Kept on the host, as the reference
-            // does.
-            const int steps = std::max(1, opt.steps);
-            std::vector<float> sigmas(static_cast<size_t>(steps) + 1);
-            for (int i = 0; i <= steps; ++i) {
-                const float base =
-                    1.0F - static_cast<float>(i) / static_cast<float>(steps);
-                sigmas[i] = 12.0F * base / (1.0F + 11.0F * base);
-            }
+            // `sigmas` was built before the timestep MLP: it doubles as the
+            // `t` grid that produces `temb`, so it must exist by then.
+            const size_t temb_stride = static_cast<size_t>(kTembDim);
+            const bool real_mlp = !real_temb.empty();
 
             for (int step = 0; step < steps; ++step) {
+                if (real_mlp) {
+                    // This step's DISTINCT timesteps, sorted, and the matching
+                    // `timestep_indices`. Uploading both per step is what makes
+                    // the trajectory track t; a single fixed row is the
+                    // smoke-test shortcut.
+                    const int off = step_row_offset[static_cast<size_t>(step)];
+                    const int cnt = step_row_count[static_cast<size_t>(step)];
+                    const std::vector<float> rows(
+                        real_temb.begin() +
+                            static_cast<std::ptrdiff_t>(off) * temb_stride,
+                        real_temb.begin() +
+                            static_cast<std::ptrdiff_t>(off + cnt) * temb_stride);
+                    upload_float(rt, pool, "temb", rows,
+                                 {static_cast<uint32_t>(cnt),
+                                  static_cast<uint32_t>(kTembDim)});
+                    // `build_row_timesteps`: text inherits the video row (0);
+                    // the audio rows take their own when the two differ.
+                    std::vector<int64_t> idx = l.timestep_indices;
+                    for (int r : l.audio_indices) {
+                        idx[static_cast<size_t>(r)] =
+                            audio_row_index[static_cast<size_t>(step)];
+                    }
+                    upload_i64(rt, pool, "timestep_indices", idx,
+                               {static_cast<uint32_t>(l.seq)});
+                }
                 auto ms = rt->Run();
-                std::printf("  step %d/%d  run %.1f ms\n", step + 1, steps, ms);
+                std::printf("  step %d/%d  t=%.4f sigma=%.4f->%.4f  run %.1f ms\n",
+                            step + 1, steps, 1.0F - sigmas[static_cast<size_t>(step)],
+                            sigmas[static_cast<size_t>(step)],
+                            sigmas[static_cast<size_t>(step) + 1], ms);
 
                 auto s = rt->GetOutput("sample");
                 if (!s) {
@@ -598,9 +993,6 @@ int main(int argc, char **argv) {
                              {1, static_cast<uint32_t>(l.n_video),
                               kVideoFeatureDim});
                 if (joint && !audio.empty()) {
-                    // The audio stream has its own schedule (shift 3); a smoke
-                    // run steps it with the same ratio, which is fine for
-                    // finiteness but is NOT the reference's audio schedule.
                     auto a = rt->GetOutput("audio_sample");
                     if (a) {
                         std::vector<float> avel;
@@ -613,7 +1005,10 @@ int main(int argc, char **argv) {
                             auto typed = as_tensor<float>(a);
                             avel.assign(typed->data().begin(), typed->data().end());
                         }
-                        euler_step(audio, avel, sigmas[step], sigmas[step + 1]);
+                        // The audio rows step down their OWN schedule
+                        // (`audio_scheduler/`, shift 3), not the video one.
+                        euler_step(audio, avel, audio_sigmas[step],
+                                   audio_sigmas[step + 1]);
                         upload_float(rt, pool, "audio_hidden_states", audio,
                                      {1, static_cast<uint32_t>(l.n_audio),
                                       kAudioFeatureDim});
@@ -621,10 +1016,22 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // The denoiser speaks patch rows; the VAE speaks volumes. Undo
+            // `patchify` here, exactly as `MiniMaxH3AfterDenoiseStep` does
+            // (frame-major row order, patch axes innermost).
+            video_latents = h3::unpatchify(
+                video, kVideoFeatureDim / (1 * 2 * 2), opt.latent_frames,
+                opt.latent_h, opt.latent_w, /*pt=*/1, /*ph=*/2, /*pw=*/2);
+            std::printf("  latents [%d, %d, %d, %d]\n", kVaeLatentChannels,
+                        opt.latent_frames, opt.latent_h, opt.latent_w);
+
             if (!opt.save_dir.empty()) {
                 std::string path = opt.save_dir + "/sample.f32";
                 std::FILE *f = std::fopen(path.c_str(), "wb");
-                if (f) {
+                if (!f) {
+                    std::fprintf(stderr, "  cannot write %s\n", path.c_str());
+                    ++failures;
+                } else {
                     std::fwrite(video.data(), sizeof(float), video.size(), f);
                     std::fclose(f);
                     std::printf("  saved %s (%zu floats)\n", path.c_str(),
@@ -640,7 +1047,10 @@ int main(int argc, char **argv) {
     // -----------------------------------------------------------------
     // text encoder: input_ids -> prompt_embeds
     // -----------------------------------------------------------------
-    if (!opt.text_encoder_path.empty()) {
+    // Skip this synthetic pass when `--prompt` already ran the tower above: the
+    // real conditioning is the one the denoiser saw, so re-encoding random ids
+    // would only cost a load.
+    if (!opt.text_encoder_path.empty() && !want_text) {
         try {
             const int seq = std::max(1, opt.text_tokens);
             std::printf("\n[text_encoder] %s\n  seq=%d\n",
@@ -714,9 +1124,52 @@ int main(int argc, char **argv) {
             rt->set_backend_buffer(true);
             rt->LoadModel();
 
-            const std::vector<float> latents = random_f32(
-                static_cast<size_t>(kVaeLatentChannels) * frames * height * width,
-                -1.0F, 1.0F, 0xc0deu);
+            // `MiniMaxH3VideoDecodeStep`: the sampler produces NORMALIZED
+            // latents, and the graph starts at `decode`, so the de-normalization
+            // `latents * std + mean` (per channel) happens here.
+            std::vector<float> latents;
+            const bool real_latents =
+                video_latents.size() ==
+                static_cast<size_t>(kVaeLatentChannels) * frames * height * width;
+            if (real_latents) {
+                latents = video_latents;
+                const std::string cfg_path =
+                    opt.vae_config.empty() ? std::string() : opt.vae_config;
+                std::vector<float> mean, stdv;
+                if (!cfg_path.empty()) {
+                    std::ifstream cf(cfg_path);
+                    const std::string json((std::istreambuf_iterator<char>(cf)),
+                                           std::istreambuf_iterator<char>());
+                    mean = h3::read_float_array(json, "latents_mean");
+                    stdv = h3::read_float_array(json, "latents_std");
+                }
+                if (mean.size() == static_cast<size_t>(kVaeLatentChannels) &&
+                    stdv.size() == static_cast<size_t>(kVaeLatentChannels)) {
+                    const size_t plane =
+                        static_cast<size_t>(frames) * height * width;
+                    for (int c = 0; c < kVaeLatentChannels; ++c) {
+                        const float m = mean[static_cast<size_t>(c)];
+                        const float sd = stdv[static_cast<size_t>(c)];
+                        for (size_t i = 0; i < plane; ++i) {
+                            float &v = latents[static_cast<size_t>(c) * plane + i];
+                            v = v * sd + m;
+                        }
+                    }
+                    std::printf("  latents de-normalized from %s\n",
+                                cfg_path.c_str());
+                } else {
+                    std::printf(
+                        "  WARNING: no latents_mean/std (pass --vae-config); the "
+                        "decoder sees un-normalized latents\n");
+                }
+            } else {
+                std::printf(
+                    "  WARNING: no denoised latents; decoding seeded noise\n");
+                latents = randn_f32(
+                    static_cast<size_t>(kVaeLatentChannels) * frames * height *
+                        width,
+                    0xc0deu);
+            }
             const std::vector<float> grid =
                 build_vae_position_grid(frames, height, width);
 
@@ -737,16 +1190,75 @@ int main(int argc, char **argv) {
             Stats st = summarize(rt, pool, "video", fp16);
             if (st.nonfinite != 0) ++failures;
 
-            if (!opt.save_dir.empty() && fp16) {
-                auto typed = as_tensor<uint16_t>(v);
+            if (!opt.save_dir.empty() && v) {
                 std::string path = opt.save_dir + "/video.f16";
                 std::FILE *f = std::fopen(path.c_str(), "wb");
                 if (f) {
-                    std::fwrite(&(*typed)[0], sizeof(uint16_t),
-                                typed->num_elements(), f);
+                    if (fp16) {
+                        auto typed = as_tensor<uint16_t>(v);
+                        std::fwrite(&(*typed)[0], sizeof(uint16_t),
+                                    typed->num_elements(), f);
+                        std::printf("  saved %s (%d halfs)\n", path.c_str(),
+                                    typed->num_elements());
+                    } else {
+                        auto typed = as_tensor<float>(v);
+                        std::fwrite(&(*typed)[0], sizeof(float),
+                                    typed->num_elements(), f);
+                        std::printf("  saved %s (%d floats)\n", path.c_str(),
+                                    typed->num_elements());
+                    }
                     std::fclose(f);
-                    std::printf("  saved %s (%d halfs)\n", path.c_str(),
-                                typed->num_elements());
+                }
+
+                // `MiniMaxH3VideoDecodeStep`: the decoder emits ImageNet-
+                // normalized RGB, so `v * std + mean`, then clamp to [0,1].
+                const int pw_frames = frames * kVaePatchT;
+                const int ph_px = height * kVaePatch;
+                const int pw_px = width * kVaePatch;
+                const size_t need =
+                    static_cast<size_t>(3) * pw_frames * ph_px * pw_px;
+                std::vector<float> f32;
+                if (fp16) {
+                    auto typed = as_tensor<uint16_t>(v);
+                    f32.resize(typed->num_elements());
+                    for (size_t i = 0; i < f32.size(); ++i)
+                        f32[i] = ITensor::fp16_to_fp32((*typed)[i]);
+                } else {
+                    auto typed = as_tensor<float>(v);
+                    f32.assign(typed->data().begin(), typed->data().end());
+                }
+                if (f32.size() == need) {
+                    const float im_mean[3] = {0.485F, 0.456F, 0.406F};
+                    const float im_std[3] = {0.229F, 0.224F, 0.225F};
+                    const size_t plane =
+                        static_cast<size_t>(ph_px) * pw_px;
+                    int written = 0;
+                    for (int t = 0; t < pw_frames; ++t) {
+                        std::vector<uint8_t> rgb(plane * 3);
+                        for (int c = 0; c < 3; ++c) {
+                            const size_t off =
+                                (static_cast<size_t>(c) * pw_frames + t) * plane;
+                            for (size_t i = 0; i < plane; ++i) {
+                                float x = f32[off + i] * im_std[c] + im_mean[c];
+                                x = std::min(1.0F, std::max(0.0F, x));
+                                rgb[i * 3 + static_cast<size_t>(c)] =
+                                    static_cast<uint8_t>(x * 255.0F + 0.5F);
+                            }
+                        }
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "/frame_%03d.png", t);
+                        if (png::write_rgb(opt.save_dir + name, pw_px, ph_px,
+                                           rgb)) {
+                            ++written;
+                        }
+                    }
+                    std::printf("  wrote %d PNG frame(s) %dx%d\n", written,
+                                pw_px, ph_px);
+                } else {
+                    std::printf(
+                        "  (video has %zu floats, expected %zu for 3x%dx%dx%d; "
+                        "no PNG)\n",
+                        f32.size(), need, pw_frames, ph_px, pw_px);
                 }
             }
         } catch (const std::exception &e) {

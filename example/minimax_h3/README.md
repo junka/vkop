@@ -78,6 +78,55 @@ rasterizer proves nothing about the target.
 Knobs: `--steps`, `--text-tokens`, `--latent-frames`, `--latent-h`,
 `--latent-w`, `--audio-latents`, `--no-audio`, `--save DIR`.
 
+### Real conditioning: prompt in, PNG frames out
+
+Without `--prompt` the driver feeds noise and the frames are noise. The full
+path takes five inputs and produces `frame_NNN.png`:
+
+```bash
+./minimax_h3 \
+  --prompt "a cat walking on the beach at sunset, cinematic" \
+  --tokenizer    h3_qwen2.bin \
+  --text-encoder text_encoder_fixed.vkopbin \
+  --checkpoint   /data2/wjjdata/minimax-h3/transformer \
+  --transformer  tf_fixed_i4.vkopbin \
+  --vae          vae_fixed.vkopbin \
+  --vae-config   /data2/wjjdata/minimax-h3/vae/config.json \
+  --steps 50 --latent-frames 2 --latent-h 16 --latent-w 16 --save out/
+```
+
+What each piece is, and why it is host-side:
+
+* `--tokenizer` — Qwen2 BPE. MiniMax-H3's `tokenizer/` produces a `.bin`
+  **byte-identical** to the LLM's `qwen3_vl.bin`, so either works.
+* `--text-encoder` — the Qwen3-VL tower truncated after `hidden_states[50]`
+  (pre-final-norm, no `lm_head`). Graph inputs are `input_ids` and
+  `attention_bias` (a host-built additive causal mask, `-65504` for masked).
+* `--checkpoint` — the denoiser's own shards, read for the timestep MLP only:
+  `time_embedder.linear_1` (`5376x256`), `linear_2` (`2688x5376`), plus biases,
+  all F32. `get_timestep_embedding` (256-half sinusoid, **cos first**) →
+  `linear_1` → SiLU → `linear_2`. `h3_host.hpp` has a minimal safetensors
+  reader for exactly these four tensors.
+* `--vae-config` — the VAE's `config.json`, for `latents_mean`/`latents_std`.
+  The graph starts at `decode`, so `latents * std + mean` is host-side; the
+  decoded RGB is ImageNet-normalized and is reverted by the PNG writer.
+
+The driver runs both schedules from the checkpoint's own configs: **video
+shift 12, audio shift 3**. Because they differ, one step has two distinct
+timesteps, so `temb` is uploaded per step together with a matching
+`timestep_indices` — that is `build_row_timesteps`'s
+`unique(sorted=True, return_inverse=True)`.
+
+The initial noise is standard normal (`randn_tensor`), not uniform.
+
+After sampling, the driver **un-patchifies** the rows back into
+`[24, F, H, W]`, de-normalizes, runs the VAE, and writes one PNG per latent
+frame times `patch_t = 4`.
+
+**Step count matters.** With shift 12 a coarse grid barely moves: at 4 steps
+the first three sigmas are `1.0, 0.973, 0.923` and the run is still nearly
+pure noise. The checkpoint's reference pipeline defaults to **50**.
+
 ### Shape rules the driver encodes
 
 These are weight shapes in the graph, so the driver treats them as constants and
@@ -104,9 +153,18 @@ The driver prints, per output, `n` / `finite` / `min` / `max` / `mean`, writes
 the tensors when asked, and exits non-zero only on a real problem. A run that
 prints `OK` has proven: the artifact loads on this device, every graph input's
 recorded dtype and shape line up, the plan executes, and no intermediate
-produced NaN/Inf. It has **not** proven numerical agreement with the reference
-model — that needs real conditioning (text tower + checkpoint timestep MLP +
-scheduler), which is the production driver's job, not an example's.
+produced NaN/Inf.
+
+With the five real-conditioning inputs it also proves the host-side contract
+end to end: tokenizer → tower → packed layout → per-step `temb`/indices →
+sampler → un-patchify → de-normalize → decoder → PNG. That is every piece of
+the reference pipeline that lives outside the graphs. It is still not a
+numerical agreement test — for that, compare `prompt_embeds` and `sample`
+against a torch run on the same ids.
+
+Note `prompt_embeds` can show a large `absmax` (~1.5e4): Qwen3-VL's
+`hidden_states[50]` is pre-final-norm and carries outlier channels. That is
+expected and is why the conditioner width is 5120.
 
 ### Measured on b3 (RTX 4000 Ada, 2026-11-23/24)
 
