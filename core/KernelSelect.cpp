@@ -223,22 +223,26 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
                                : ((coop16 && c.l2_resident) ? 12 : dtype_min_m));
 
     // 4-bit weights join the tile through tile_load_b_w4, which folds the
-    // group scale into the staged half. Its only alternatives above the
+    // group scale into the staged value. Its only alternatives above the
     // split-K GEMV's batch*m <= 8 are the column-parallel w4 kernel (one
     // decode per output row, K walked serially per thread: 2.7 s for an
     // 800-token Qwen3-VL-2B prefill against int8's 0.41 s), so the tile takes
     // every shape the GEMV does not, with no row floor beyond that.
     //
-    // EXCEPT when the node is also a SwiGLU gate/up fold. That combination
-    // measures wrong: with the same weights, the tiled route reports a handful
-    // of elements off by 13-56% (e.g. M=33 K=128 N=64 one element, M=33 K=512
-    // three) while the identical shape through the split-K GEMV is exact, and
-    // the tiled route is exact for the same weights WITHOUT swiglu. So it is
-    // the fold's scratch+pack half on a tiled shape, not the nibble decode.
-    // Until that is rooted out the tile steps aside: the GEMV route is slower
-    // at prefill but correct, and decode (batch*m <= 8) never reached the tile
-    // anyway. MatMulTest.MatMulW4SwigluGateUp covers all three nibble formats
-    // on both routes.
+    // This once excluded the SwiGLU gate/up fold, because the tiled route
+    // reported a handful of elements 13-56% off the split-K GEMV there (M=33
+    // K=128 N=64 one element, M=33 K=512 three) while being exact on the same
+    // weights without the fold. The cause was the loader's staging width, not
+    // the route or the fold: it packed `code * group_scale` into half2, and
+    // that product is not representable in fp16, so every staged weight lost
+    // ~5e-4 relative. On a plain product the test's absolute floor absorbed
+    // it; under silu a near-zero gate is multiplied by silu's slope and the
+    // relative error blows up on exactly the few elements seen. Snapping the
+    // group scale to a power of two -- making `code * 2^n` exact in fp16 --
+    // made the error disappear, which is what pinned it to rounding rather
+    // than to a decode or layout defect. tile_load_b_w4 now stages fp32 (see
+    // tile_fma_n_w4); MatMulTest.MatMulW4SwigluGateUp covers all three nibble
+    // formats across both routes.
     if (c.weight_4bit) {
         c.tiled_min_m = 1;
     }
@@ -246,8 +250,7 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
         !c.weight_4bit ||
         (!f.transB && (s.n % 8 == 0) && f.group_size > 0 &&
          (s.k % f.group_size) == 0 &&
-         static_cast<long long>(s.batch) * s.m > 8 &&
-         !(c.weight_4bit && f.swiglu));
+         static_cast<long long>(s.batch) * s.m > 8);
     const bool tiled_ok_n = (s.n % 64 == 0) || (s.n % 8 == 0);
     c.tiled = c.fused && !kn.tile_disabled && w4_tile_ok &&
               (s.k % 16 == 0) && (s.m >= c.tiled_min_m) && !f.epi_bias &&

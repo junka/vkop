@@ -2095,12 +2095,20 @@ void matmul16_softmax() {
 #define SROW (TILE_K / 2 + 1)
 // Words per [k][column-pair] shared row, used when B is [batch, K, N].
 #define SBROW (TILE_N / 2)
+// Words per [k][column] shared row for the 4-bit loader, which stages fp32
+// rather than packed halves (see tile_load_b_w4). Padded by one word for the
+// same bank-aliasing reason as SROW. 16 * 65 = 1040 words fits inside the
+// 2048 sB already reserves, so the two layouts share storage -- one entry
+// point runs per dispatch, so they are never live at the same time.
+#define SBROW_F32 (TILE_N + 1)
 
 // glslang only accepts `shared` at global scope; the tiled path is the sole
 // user, and the naive paths never touch these.
 shared uint sA[TILE_M * SROW];
-// Sized for the wider of the two stagings: transB keeps [col][k-pair] (9 words
-// per row), [batch,K,N] keeps [k][col-pair] (32 words per row, 64 k-rows).
+// Sized for the wider of the stagings: transB keeps [col][k-pair] (9 words per
+// row, 64 rows), [batch,K,N] keeps [k][col-pair] (32 words per row, 64 k-rows),
+// and the 4-bit loader's fp32 [k][column] needs 16 * 65 = 1040. 2048 words
+// covers all three.
 shared uint sB[TILE_N * SBROW];
 
 int tile_tid() {
@@ -2225,13 +2233,30 @@ void tile_load_b_w8(int b, int col0, int kk) {
 
 // 4-bit weight (int4 / uint4 / nf4 / nvfp4), B is [batch, K, N] nibble-packed.
 // Same thread map as tile_load_b_w8: one thread decodes the four columns of
-// one K row -- half of one 32-bit word, at nibble 0 or 4 -- and writes the two
-// half2 words the FMA nest reads. Unlike a byte weight the scale changes along
-// K (one row per group), so it cannot wait for the epilogue: it is folded in
-// here, giving the tile the value an fp16 checkpoint of the dequantized weight
-// would hold. The column-parallel w4 kernel this replaces for M > 8 decoded
-// every weight once per output ROW and walked K serially per thread, which
-// made an 800-token int4 prefill ~7x slower than int8.
+// one K row -- half of one 32-bit word, at nibble 0 or 4. Unlike a byte weight
+// the scale changes along K (one row per group), so it cannot wait for the
+// epilogue: it is folded in here, giving the tile the value an fp16 checkpoint
+// of the dequantized weight would hold. The column-parallel w4 kernel this
+// replaces for M > 8 decoded every weight once per output ROW and walked K
+// serially per thread, which made an 800-token int4 prefill ~7x slower than
+// int8.
+//
+// The staged value is fp32, NOT the packed half2 tile_load_b_w8 writes. A byte
+// weight's codes are integers <= 128 (int8) or values an fp16 holds exactly
+// (fp8 e4m3/e5m2), so a half2 tile is lossless for them. A 4-bit weight's
+// staged value is `code * group_scale`, and that product has no such property:
+// rounding it to half costs ~5e-4 relative PER WEIGHT, and a K-deep dot then
+// carries ~sqrt(K) of it. That is small enough to vanish on a plain product
+// (the abs floor absorbs it) but not under SwiGLU, where silu's slope around
+// g == 0 magnifies a near-zero gate: the same weights through this tile
+// reported elements 12-56% off the split-K GEMV, while the GEMV -- which
+// accumulates in fp32 and applies the scale after -- was exact.
+// Proof, and the regression test: with the group scale snapped to a power of
+// two (so `code * 2^n` is exact in fp16) the half2 tile becomes lossless and
+// the error disappears, which is what identified the rounding rather than a
+// decode or layout defect. Reading the width from the FMA nest's [k][column]
+// words means this loader no longer shares tile_fma_n's packing, so it has its
+// own SBROW_F32 row stride and the nest that consumes it is tile_fma_n_w4.
 void tile_load_b_w4(int b, int col0, int kk) {
     int l = tile_tid();
     int kr = l >> 4;
@@ -2246,8 +2271,53 @@ void tile_load_b_w4(int b, int col0, int kk) {
         w = unpack_w4(uInputB.data[idx >> 3], idx & 7) *
             scale4((k / uPC.group) * uPC.N + col);
     }
-    sB[kr * SBROW + 2 * quad] = (col + 1 < uPC.N) ? packHalf2x16(w.xy) : 0u;
-    sB[kr * SBROW + 2 * quad + 1] = (col + 3 < uPC.N) ? packHalf2x16(w.zw) : 0u;
+    int row = kr * SBROW_F32;
+    sB[row + quad * 4 + 0] = (col + 0 < uPC.N) ? floatBitsToUint(w.x) : 0u;
+    sB[row + quad * 4 + 1] = (col + 1 < uPC.N) ? floatBitsToUint(w.y) : 0u;
+    sB[row + quad * 4 + 2] = (col + 2 < uPC.N) ? floatBitsToUint(w.z) : 0u;
+    sB[row + quad * 4 + 3] = (col + 3 < uPC.N) ? floatBitsToUint(w.w) : 0u;
+}
+
+// The 4-bit nest's FMA: same 4x4 register tile and [k][column] staging as
+// tile_fma_n, but the staged words are fp32 rather than packed half2, so each
+// tap loads four words and unpacks nothing. Kept separate from tile_fma_n
+// because the two read different layouts out of the same sB.
+void tile_fma_n_w4(inout float acc[4][4], int lr, int lc) {
+#pragma unroll
+    for (int kt = 0; kt < TILE_K; ++kt) {
+        // sA holds two k per word; take the half this kt selects.
+        int aw = kt >> 1;
+        vec2 a0 = unpackHalf2x16(sA[(lr + 0) * SROW + aw]);
+        vec2 a1 = unpackHalf2x16(sA[(lr + 1) * SROW + aw]);
+        vec2 a2 = unpackHalf2x16(sA[(lr + 2) * SROW + aw]);
+        vec2 a3 = unpackHalf2x16(sA[(lr + 3) * SROW + aw]);
+        bool hi = (kt & 1) != 0;
+        float av0 = hi ? a0.y : a0.x;
+        float av1 = hi ? a1.y : a1.x;
+        float av2 = hi ? a2.y : a2.x;
+        float av3 = hi ? a3.y : a3.x;
+        int w0 = kt * SBROW_F32 + lc;
+        vec4 b = vec4(uintBitsToFloat(sB[w0 + 0]),
+                      uintBitsToFloat(sB[w0 + 1]),
+                      uintBitsToFloat(sB[w0 + 2]),
+                      uintBitsToFloat(sB[w0 + 3]));
+        acc[0][0] += av0 * b.x;
+        acc[0][1] += av0 * b.y;
+        acc[0][2] += av0 * b.z;
+        acc[0][3] += av0 * b.w;
+        acc[1][0] += av1 * b.x;
+        acc[1][1] += av1 * b.y;
+        acc[1][2] += av1 * b.z;
+        acc[1][3] += av1 * b.w;
+        acc[2][0] += av2 * b.x;
+        acc[2][1] += av2 * b.y;
+        acc[2][2] += av2 * b.z;
+        acc[2][3] += av2 * b.w;
+        acc[3][0] += av3 * b.x;
+        acc[3][1] += av3 * b.y;
+        acc[3][2] += av3 * b.z;
+        acc[3][3] += av3 * b.w;
+    }
 }
 
 // One k-pair per thread, transB: a B word carries the two K values of one
@@ -2363,7 +2433,7 @@ void matmul16_tiled() {
             tile_load_a(b, row0, kk >> 1, halfK);
             tile_load_b_w4(bb, col0, kk);
             barrier();
-            tile_fma_n(acc, lr, lc);
+            tile_fma_n_w4(acc, lr, lc);
             barrier();
         }
     } else if (uPC.weight_int8 != 0) {

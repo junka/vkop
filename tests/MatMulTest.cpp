@@ -1082,16 +1082,15 @@ class MatMulW4Test : public TestCase<T> {
                 return false;
             }
             // Mixed abs+rel. A folded (swiglu) node needs a wider band than a
-            // plain product, and the reason is the fp16 staging every 4-bit
-            // kernel shares, not the epilogue: tile_load_b_w4 rounds
-            // (code * group_scale) to half before the FMA nest, so a K-deep
-            // sum carries ~sqrt(K) * 1.5e-3 of that rounding, which silu then
-            // multiplies by the up projection. Measured with the same weights
-            // through two DIFFERENT routes (tiled and, with VKOP_NO_TILE, the
-            // split-K GEMV) the worst element is identical to the last digit --
-            // that is what rules out a layout or decode bug, because those are
-            // orders of magnitude larger (the nf4 WIDE defect was 460 vs -25 on
-            // one shape).
+            // plain product because silu multiplies a near-zero gate by its
+            // slope, which magnifies whatever relative error the gate carries.
+            // The 4-bit kernels are exact in fp32 (tile_load_b_w4 stages the
+            // dequantized value as fp32 and matmul16_w4_ksplit_wide applies
+            // the group scale after accumulating), so nothing here hides a
+            // decode or layout defect: those are orders of magnitude larger
+            // (the nf4 WIDE defect was 460 against -25 on one shape), while
+            // the fp16 STAGING the tile used to do measured at most 12-56% on
+            // a handful of elements and was fixed rather than absorbed.
             const float rel = swiglu_ ? 0.10F : 0.05F;
             const float abs_floor = swiglu_ ? 0.10F : 0.05F;
             float threshold = std::max(abs_floor, std::abs(ev) * rel);
@@ -2094,8 +2093,13 @@ TEST(MatMulTest, MatMulW4SwigluGateUp) {
         {1, 4, 128, 96, 8, "ksplit/quad: scratch + pack"},
         {1, 1, 1024, 512, 64, "WIDE, K=1024"},
         {1, 1, 512, 512, 64, "WIDE, K=512 (control)"},
-        {1, 9, 128, 96, 8, "batch*m > 8, swiglu steps off the tile"},
-        {1, 20, 128, 96, 8, "two row blocks, still no tile"},
+        {1, 9, 128, 96, 8, "batch*m > 8: takes the 64x64 tile"},
+        {1, 20, 128, 96, 8, "two row blocks on the tile"},
+        // The shapes that used to expose the tile's fp16 staging: M > 8 with a
+        // K deep enough (K=512) for the staging error to reach the test's
+        // relative band through silu. Both take the tile now.
+        {1, 33, 128, 32, 8, "M=33 K=128 on the tile"},
+        {1, 33, 512, 32, 8, "M=33 K=512 on the tile"},
     };
     for (const auto &c : cases) {
         for (const int variant : {0, 1, 2}) {
