@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// binary: binary ops with a _bda variant
+//
+// Migrated from tests/BinaryBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // End-to-end probe for the binary device-address variant.
 //
 // BinaryElemPC is already 128 B, so the BDA build pushes a 24 B scalar block
@@ -24,6 +31,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace binary {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -181,7 +195,7 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
+int run_binary() {
     const bool desc_only = std::getenv("BINARY_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -223,3 +237,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("binary", "binary ops with a _bda variant",
+               "BINARY_BDA_DESC_ONLY", run_binary);
+
+} // namespace binary
+} // namespace probes
+
+} // namespace vkop

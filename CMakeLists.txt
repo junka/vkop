@@ -1324,6 +1324,11 @@ enable_testing()
 add_subdirectory(tests)
 endif()
 
+# Op probes: one dispatched binary instead of a separate executable per probe.
+# Manual diagnostics rather than ctest tests, so they are listed separately
+# from the suite above (see tools/probes/CMakeLists.txt).
+add_subdirectory(tools/probes)
+
 # LLM conversational driver (Qwen3-VL, buffer backend). Text in → text out.
 # Links vkop + vload (graph runtime + model loader) and the standalone Qwen
 # tokenizer (BBPE encode/decode + chat template). The tokenizer ships its own

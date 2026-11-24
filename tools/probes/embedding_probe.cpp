@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// embedding: EmbeddingForward, five addresses
+//
+// Migrated from tests/EmbeddingBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for EmbeddingForward fixed-hotness sum (five pointers, 32->72 B
 // PC). EMBEDDING_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through
 // descriptors.
@@ -20,13 +27,20 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace embedding {
+
+
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
 using vkop::VulkanInstance;
 using vkop::core::Tensor;
 
-int main() {
+int run_embedding() {
     const bool desc_only = std::getenv("EMBEDDING_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -121,3 +135,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("embedding", "EmbeddingForward, five addresses",
+               "EMBEDDING_BDA_DESC_ONLY", run_embedding);
+
+} // namespace embedding
+} // namespace probes
+
+} // namespace vkop

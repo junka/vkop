@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// int64: int64 shape-meta twins
+//
+// Migrated from tests/Int64BdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for the int64 shape-meta twins (buffer_*_int64). These paths are
 // only reached with VKOP_HOST_SHAPE=0, so the probe forces it before any op is
 // created. Each op checks exact int64 results and that the BDA module
@@ -19,6 +26,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace int64 {
+
 
 using vkop::core::Tensor;
 using vkop::VulkanCommandBuffer;
@@ -84,7 +98,7 @@ void check(const char *name, vkop::ops::Operator *op,
 
 } // namespace
 
-int main() {
+int run_int64() {
     const bool desc_only = std::getenv("INT64_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -181,3 +195,12 @@ int main() {
     std::fflush(nullptr);
     _exit(failures == 0 ? 0 : 1);
 }
+
+
+REGISTER_PROBE("int64", "int64 shape-meta twins",
+               "INT64_BDA_DESC_ONLY", run_int64);
+
+} // namespace int64
+} // namespace probes
+
+} // namespace vkop

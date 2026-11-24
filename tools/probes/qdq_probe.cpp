@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// qdq: QuantizeLinear / DequantizeLinear
+//
+// Migrated from tests/QdqBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // End-to-end probe for the QuantizeLinear/DequantizeLinear device-address
 // variant. One format-polymorphic module covers quantize and dequantize, so
 // the only BDA key is buffer_quantize_linear_bda.
@@ -24,6 +31,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace qdq {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -211,7 +225,7 @@ int run_quant(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
+int run_qdq() {
     const bool desc_only = std::getenv("QDQ_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -246,3 +260,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("qdq", "QuantizeLinear / DequantizeLinear",
+               "QDQ_BDA_DESC_ONLY", run_qdq);
+
+} // namespace qdq
+} // namespace probes
+
+} // namespace vkop

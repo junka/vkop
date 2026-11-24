@@ -1,6 +1,16 @@
 // Copyright 2026 @junka
-// BDA probe for Expand (broadcast; 2 direct addresses, 80->96 B PC).
-// EXPAND_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through descriptors.
+// rotary: RotaryEmbedding, four addresses
+//
+// Migrated from tests/RotaryBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
+// BDA probe for RotaryEmbedding (half-split RoPE). Four data buffers fit in
+// the 128 B push-constant limit: RotaryPC is 40 B of scalars + 4 pointers
+// (72 B total).
+//
+// ROTARY_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through descriptors.
 
 #include <algorithm>
 #include <cmath>
@@ -20,12 +30,20 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace rotary {
+
+
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
 using vkop::VulkanInstance;
 using vkop::core::ITensor;
 using vkop::core::Tensor;
+using vkop::ops::OpType;
 
 namespace {
 
@@ -55,52 +73,62 @@ template <typename T> float from_storage(T v) {
 }
 
 template <typename T>
+std::shared_ptr<Tensor<T>> upload(std::shared_ptr<VulkanDevice> &dev,
+                                  std::shared_ptr<VulkanCommandPool> &pool,
+                                  const std::vector<int> &shape,
+                                  const std::vector<float> &vals) {
+    auto t = std::make_shared<Tensor<T>>(shape);
+    std::vector<T> bytes(vals.size());
+    for (size_t i = 0; i < vals.size(); ++i) {
+        bytes[i] = to_storage<T>(vals[i]);
+    }
+    t->fillToCPU(bytes);
+    t->as_storage_buffer(dev);
+    t->copyToGPU(pool);
+    return t;
+}
+
+template <typename T>
 void run_case(std::shared_ptr<VulkanDevice> &dev,
               std::shared_ptr<VulkanCommandPool> &pool, int fp16,
               bool desc_only) {
-    const std::vector<int> in_shape = {1, 2, 1, 3};
-    const std::vector<int> out_shape = {4, 2, 5, 3};
-    const std::vector<int> target = {4, 1, 5, 1};
-    const int b = 4, c = 2, y = 5, x = 3;
-    std::vector<float> in_vals(6);
-    for (size_t i = 0; i < in_vals.size(); ++i) {
-        in_vals[i] = 0.5F + 0.1F * static_cast<float>(i);
+    const std::vector<int> x_shape = {1, 2, 3, 4};
+    const std::vector<int> cs_shape = {1, 1, 3, 4};
+    const int heads = 2, seq = 3, head_dim = 4, rd = 4, half = 2;
+    const size_t n = 24;
+    std::vector<float> xv(n), cv(12), sv(12), want(n);
+    for (size_t i = 0; i < n; ++i) {
+        xv[i] = 0.1F + 0.09F * static_cast<float>(i);
     }
-    std::vector<float> want(b * c * y * x);
-    for (int ob = 0; ob < b; ++ob) {
-        for (int oc = 0; oc < c; ++oc) {
-            for (int oy = 0; oy < y; ++oy) {
-                for (int ox = 0; ox < x; ++ox) {
-                    // inDims = {1,2,1,3}: only c and x are broadcast-relevant.
-                    want[((ob * c + oc) * y + oy) * x + ox] =
-                        in_vals[(0 * 2 + oc) * 3 + ox];
+    for (size_t i = 0; i < 12; ++i) {
+        cv[i] = 0.9F - 0.01F * static_cast<float>(i);
+        sv[i] = 0.1F + 0.01F * static_cast<float>(i);
+    }
+    for (int b = 0; b < 1; ++b) {
+        for (int h = 0; h < heads; ++h) {
+            for (int s = 0; s < seq; ++s) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const int idx = ((b * heads + h) * seq + s) * head_dim + d;
+                    const int cs = (b * seq + s) * rd + d;
+                    want[idx] =
+                        (d < half) ? xv[idx] * cv[cs] - xv[idx + half] * sv[cs]
+                                   : xv[idx - half] * sv[cs] + xv[idx] * cv[cs];
                 }
             }
         }
     }
 
-    auto input = std::make_shared<Tensor<T>>(in_shape);
-    std::vector<T> bytes(in_vals.size());
-    for (size_t i = 0; i < in_vals.size(); ++i) {
-        bytes[i] = to_storage<T>(in_vals[i]);
-    }
-    input->fillToCPU(bytes);
-    input->as_storage_buffer(dev);
-    input->copyToGPU(pool);
-
-    auto tgt = std::make_shared<Tensor<int64_t>>(
-        std::vector<int>{static_cast<int>(target.size())});
-    std::vector<int64_t> tv(target.begin(), target.end());
-    tgt->fillToCPU(tv);
-
-    auto out = std::make_shared<Tensor<T>>(out_shape);
+    auto x = upload<T>(dev, pool, x_shape, xv);
+    auto cs = upload<T>(dev, pool, cs_shape, cv);
+    auto sn = upload<T>(dev, pool, cs_shape, sv);
+    auto out = std::make_shared<Tensor<T>>(x_shape);
     out->as_storage_buffer(dev);
     out->toGPU();
 
-    auto op = vkop::ops::create_from_type(vkop::ops::OpType::EXPAND, fp16, 0,
+    auto op = vkop::ops::create_from_type(OpType::ROTARY_EMBEDDING, fp16, 0,
                                           /*backend_buffer=*/true);
     op->set_runtime_device(dev, pool);
-    op->onExecute({input, tgt}, {out}, 0);
+    op->onExecute({x, cs, sn}, {out}, 0);
     auto cmd = op->get_record();
     std::vector<VkSubmitInfo> info{cmd->buildSubmitInfo()};
     VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
@@ -108,28 +136,28 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
     dev->wait_all_done();
     out->copyToCPU(pool);
 
-    for (size_t i = 0; i < want.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const float got = from_storage<T>((*out)[i]);
         if (std::fabs(got - want[i]) >
             0.02F * std::max(1.0F, std::fabs(want[i]))) {
-            std::printf("FAIL: Expand %s[%zu] got %f want %f\n",
+            std::printf("FAIL: Rotary %s[%zu] got %f want %f\n",
                         fp16 ? "fp16" : "fp32", i, got, want[i]);
             failures++;
             return;
         }
     }
     if (!desc_only) {
-        check(op->bda_pipeline_ready(), "Expand BDA pipeline");
-        check(op->bda_dispatched(), "Expand BDA dispatch");
+        check(op->bda_pipeline_ready(), "Rotary BDA pipeline");
+        check(op->bda_dispatched(), "Rotary BDA dispatch");
     }
-    std::printf("PASS: Expand %s (bda=%d)\n", fp16 ? "fp16" : "fp32",
+    std::printf("PASS: Rotary %s (bda=%d)\n", fp16 ? "fp16" : "fp32",
                 op->bda_dispatched() ? 1 : 0);
 }
 
 } // namespace
 
-int main() {
-    const bool desc_only = std::getenv("EXPAND_BDA_DESC_ONLY") != nullptr;
+int run_rotary() {
+    const bool desc_only = std::getenv("ROTARY_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
     } else {
@@ -160,3 +188,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("rotary", "RotaryEmbedding, four addresses",
+               "ROTARY_BDA_DESC_ONLY", run_rotary);
+
+} // namespace rotary
+} // namespace probes
+
+} // namespace vkop

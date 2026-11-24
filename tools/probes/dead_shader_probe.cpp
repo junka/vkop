@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// dead-shader: shaders no model reaches
+//
+// Migrated from tests/DeadShaderBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for the shaders no model reaches: the host-only ops
 // (NonZero/Range), the reference argmax kernel, and the disabled coopmat
 // split-K / in-workgroup routes. These have no engine dispatch path, so the
@@ -26,6 +33,13 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanPipeline.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace dead_shader {
+
 
 using vkop::core::ITensor;
 using vkop::core::Tensor;
@@ -486,7 +500,7 @@ void test_coop16_inwg(int M, int N, int K) {
 
 } // namespace
 
-int main() {
+int run_dead_shader() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     g_desc_only = std::getenv("DEAD_BDA_DESC_ONLY") != nullptr;
     if (g_desc_only) {
@@ -546,3 +560,12 @@ int main() {
     std::fflush(nullptr);
     _exit(failures == 0 ? 0 : 1);
 }
+
+
+REGISTER_PROBE("dead-shader", "shaders no model reaches",
+               "DEAD_BDA_DESC_ONLY", run_dead_shader);
+
+} // namespace dead_shader
+} // namespace probes
+
+} // namespace vkop

@@ -1,6 +1,13 @@
 // Copyright 2026 @junka
-// BDA probe for PReLU (X + slope, 3 direct addresses; compact 104 B PC).
-// PRELU_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through descriptors.
+// resize: Resize, two direct addresses
+//
+// Migrated from tests/ResizeBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
+// BDA probe for Resize (nearest/asymmetric; 2 direct addresses, 80->96 B PC).
+// RESIZE_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through descriptors.
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +26,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace resize {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -58,58 +72,59 @@ template <typename T>
 void run_case(std::shared_ptr<VulkanDevice> &dev,
               std::shared_ptr<VulkanCommandPool> &pool, int fp16,
               bool host_import, bool desc_only) {
-    const std::vector<int> shape = {4, 5};
-    const std::vector<int> slope_shape = {5};
-    const size_t n = 20;
-    std::vector<float> xv(n), sv(5), want(n);
-    for (size_t i = 0; i < n; ++i) {
-        xv[i] = -1.6F + 0.17F * static_cast<float>(i);
+    const std::vector<int> in_shape = {1, 2, 4, 4};
+    const std::vector<int> out_shape = {1, 2, 8, 8};
+    const int n = 1, c = 2, ih = 4, iw = 4, oh = 8, ow = 8;
+    std::vector<float> in_vals(n * c * ih * iw);
+    for (size_t i = 0; i < in_vals.size(); ++i) {
+        in_vals[i] = 0.25F + 0.07F * static_cast<float>(i);
     }
-    for (int j = 0; j < 5; ++j) {
-        sv[j] = 0.1F + 0.07F * static_cast<float>(j);
-    }
-    for (size_t i = 0; i < n; ++i) {
-        const float x = xv[i];
-        const float s = sv[i % 5];
-        want[i] = std::max(0.0F, x) + s * std::min(0.0F, x);
+    std::vector<float> want(n * c * oh * ow);
+    for (int b = 0; b < n; ++b) {
+        for (int ch = 0; ch < c; ++ch) {
+            for (int y = 0; y < oh; ++y) {
+                for (int x = 0; x < ow; ++x) {
+                    const int sy = y * ih / oh;
+                    const int sx = x * iw / ow;
+                    want[((b * c + ch) * oh + y) * ow + x] =
+                        in_vals[((b * c + ch) * ih + sy) * iw + sx];
+                }
+            }
+        }
     }
 
-    auto x = std::make_shared<Tensor<T>>(shape);
-    auto slope = std::make_shared<Tensor<T>>(slope_shape);
-    auto out = std::make_shared<Tensor<T>>(shape);
-    auto upload = [&](const std::shared_ptr<Tensor<T>> &t,
-                      const std::vector<float> &vals) {
-        std::vector<T> bytes(vals.size());
-        for (size_t i = 0; i < vals.size(); ++i) {
-            bytes[i] = to_storage<T>(vals[i]);
-        }
-        t->fillToCPU(bytes);
-        t->as_storage_buffer(dev);
-        t->copyToGPU(pool);
-    };
+    auto input = std::make_shared<Tensor<T>>(in_shape);
+    auto out = std::make_shared<Tensor<T>>(out_shape);
     if (host_import) {
         if (!dev->is_support_host_import()) {
             std::printf("SKIP: host import unsupported; fallback untested\n");
             return;
         }
-        x->as_host_imported_buffer(dev, n);
-        out->as_host_imported_buffer(dev, n);
-        auto *p = static_cast<T *>(x->host_import_ptr());
-        for (size_t i = 0; i < n; ++i) {
-            p[i] = to_storage<T>(xv[i]);
+        input->as_host_imported_buffer(dev, in_vals.size());
+        out->as_host_imported_buffer(dev, want.size());
+        auto *p = static_cast<T *>(input->host_import_ptr());
+        for (size_t i = 0; i < in_vals.size(); ++i) {
+            p[i] = to_storage<T>(in_vals[i]);
         }
-        upload(slope, sv);
     } else {
-        upload(x, xv);
-        upload(slope, sv);
+        std::vector<T> bytes(in_vals.size());
+        for (size_t i = 0; i < in_vals.size(); ++i) {
+            bytes[i] = to_storage<T>(in_vals[i]);
+        }
+        input->fillToCPU(bytes);
+        input->as_storage_buffer(dev);
+        input->copyToGPU(pool);
         out->as_storage_buffer(dev);
         out->toGPU();
     }
 
-    auto op = vkop::ops::create_from_type(vkop::ops::OpType::PRELU, fp16, 0,
+    auto op = vkop::ops::create_from_type(vkop::ops::OpType::RESIZE, fp16, 0,
                                           /*backend_buffer=*/true);
+    op->setAttribute({{"mode", "nearest"},
+                      {"coordinate_transformation_mode", "asymmetric"},
+                      {"sizes", "[8,8]"}});
     op->set_runtime_device(dev, pool);
-    op->onExecute({x, slope}, {out}, 0);
+    op->onExecute({input}, {out}, 0);
     auto cmd = op->get_record();
     std::vector<VkSubmitInfo> info{cmd->buildSubmitInfo()};
     VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
@@ -123,11 +138,11 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
         out->copyToCPU(pool);
         p = out->data().data();
     }
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < want.size(); ++i) {
         const float got = from_storage<T>(p[i]);
         if (std::fabs(got - want[i]) >
             0.02F * std::max(1.0F, std::fabs(want[i]))) {
-            std::printf("FAIL: PRelu %s%s[%zu] got %f want %f\n",
+            std::printf("FAIL: Resize %s%s[%zu] got %f want %f\n",
                         fp16 ? "fp16" : "fp32",
                         host_import ? " host-import" : "", i, got, want[i]);
             failures++;
@@ -135,23 +150,23 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
         }
     }
     if (!desc_only) {
-        check(op->bda_pipeline_ready(), "PRelu BDA pipeline");
+        check(op->bda_pipeline_ready(), "Resize BDA pipeline");
         if (host_import) {
             check(!op->bda_dispatched(),
-                  "PRelu host-import must take the descriptor path");
+                  "Resize host-import must take the descriptor path");
         } else {
-            check(op->bda_dispatched(), "PRelu BDA dispatch");
+            check(op->bda_dispatched(), "Resize BDA dispatch");
         }
     }
-    std::printf("PASS: PRelu %s%s (bda=%d)\n", fp16 ? "fp16" : "fp32",
+    std::printf("PASS: Resize %s%s (bda=%d)\n", fp16 ? "fp16" : "fp32",
                 host_import ? " host-import fallback" : "",
                 op->bda_dispatched() ? 1 : 0);
 }
 
 } // namespace
 
-int main() {
-    const bool desc_only = std::getenv("PRELU_BDA_DESC_ONLY") != nullptr;
+int run_resize() {
+    const bool desc_only = std::getenv("RESIZE_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
     } else {
@@ -183,3 +198,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("resize", "Resize, two direct addresses",
+               "RESIZE_BDA_DESC_ONLY", run_resize);
+
+} // namespace resize
+} // namespace probes
+
+} // namespace vkop

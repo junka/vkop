@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// matmul: MatMul BDA incl. 512-lane split
+//
+// Migrated from tests/MatMulBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // End-to-end probe for the MatMul address-table BDA variant.
 //
 // MatMul's push constant is already 128 B, so its BDA build binds ONE address
@@ -26,6 +33,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace matmul {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -198,7 +212,7 @@ void run_i8_wide_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
+int run_matmul() {
     const bool desc_only = std::getenv("MATMUL_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -261,3 +275,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("matmul", "MatMul BDA incl. 512-lane split",
+               "MATMUL_BDA_DESC_ONLY", run_matmul);
+
+} // namespace matmul
+} // namespace probes
+
+} // namespace vkop

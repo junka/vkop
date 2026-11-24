@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// reduce-transpose: Reduce + Transpose
+//
+// Migrated from tests/ReduceTransposeBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for Reduce and Transpose: both have two data buffers and enough
 // push-constant room for direct addresses (Reduce 96->112 B, Transpose
 // 112->128 B), so neither needs an address table.
@@ -22,6 +29,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace reduce_transpose {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -204,7 +218,7 @@ void run_transpose(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
+int run_reduce_transpose() {
     const bool desc_only = std::getenv("MISC_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -239,3 +253,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("reduce-transpose", "Reduce + Transpose",
+               "MISC_BDA_DESC_ONLY", run_reduce_transpose);
+
+} // namespace reduce_transpose
+} // namespace probes
+
+} // namespace vkop

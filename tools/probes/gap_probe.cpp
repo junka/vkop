@@ -1,6 +1,13 @@
 // Copyright 2026 @junka
-// BDA probe for Resize (nearest/asymmetric; 2 direct addresses, 80->96 B PC).
-// RESIZE_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through descriptors.
+// gap: GlobalAveragePool
+//
+// Migrated from tests/GapBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
+// BDA probe for GlobalAveragePool (two direct addresses, 16->32 B PC).
+// GAP_BDA_DESC_ONLY=1 unsets VKOP_BDA: same values through descriptors.
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +26,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace gap {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -58,44 +72,37 @@ template <typename T>
 void run_case(std::shared_ptr<VulkanDevice> &dev,
               std::shared_ptr<VulkanCommandPool> &pool, int fp16,
               bool host_import, bool desc_only) {
-    const std::vector<int> in_shape = {1, 2, 4, 4};
-    const std::vector<int> out_shape = {1, 2, 8, 8};
-    const int n = 1, c = 2, ih = 4, iw = 4, oh = 8, ow = 8;
-    std::vector<float> in_vals(n * c * ih * iw);
-    for (size_t i = 0; i < in_vals.size(); ++i) {
-        in_vals[i] = 0.25F + 0.07F * static_cast<float>(i);
+    const std::vector<int> shape = {2, 3, 4, 5};
+    const int batch = 2, channels = 3, spatial = 20;
+    const size_t n = 120;
+    std::vector<float> vals(n);
+    for (size_t i = 0; i < n; ++i) {
+        vals[i] = 0.5F + 0.03F * static_cast<float>(i);
     }
-    std::vector<float> want(n * c * oh * ow);
-    for (int b = 0; b < n; ++b) {
-        for (int ch = 0; ch < c; ++ch) {
-            for (int y = 0; y < oh; ++y) {
-                for (int x = 0; x < ow; ++x) {
-                    const int sy = y * ih / oh;
-                    const int sx = x * iw / ow;
-                    want[((b * c + ch) * oh + y) * ow + x] =
-                        in_vals[((b * c + ch) * ih + sy) * iw + sx];
-                }
+    std::vector<float> want(batch * channels, 0.0F);
+    for (int b = 0; b < batch; ++b) {
+        for (int c = 0; c < channels; ++c) {
+            float sum = 0.0F;
+            for (int s = 0; s < spatial; ++s) {
+                sum += vals[(b * channels + c) * spatial + s];
             }
+            want[b * channels + c] = sum / static_cast<float>(spatial);
         }
     }
 
-    auto input = std::make_shared<Tensor<T>>(in_shape);
-    auto out = std::make_shared<Tensor<T>>(out_shape);
+    auto input = std::make_shared<Tensor<T>>(shape);
+    auto out = std::make_shared<Tensor<T>>(std::vector<int>{batch, channels});
     if (host_import) {
-        if (!dev->is_support_host_import()) {
-            std::printf("SKIP: host import unsupported; fallback untested\n");
-            return;
-        }
-        input->as_host_imported_buffer(dev, in_vals.size());
+        input->as_host_imported_buffer(dev, n);
         out->as_host_imported_buffer(dev, want.size());
         auto *p = static_cast<T *>(input->host_import_ptr());
-        for (size_t i = 0; i < in_vals.size(); ++i) {
-            p[i] = to_storage<T>(in_vals[i]);
+        for (size_t i = 0; i < n; ++i) {
+            p[i] = to_storage<T>(vals[i]);
         }
     } else {
-        std::vector<T> bytes(in_vals.size());
-        for (size_t i = 0; i < in_vals.size(); ++i) {
-            bytes[i] = to_storage<T>(in_vals[i]);
+        std::vector<T> bytes(n);
+        for (size_t i = 0; i < n; ++i) {
+            bytes[i] = to_storage<T>(vals[i]);
         }
         input->fillToCPU(bytes);
         input->as_storage_buffer(dev);
@@ -104,11 +111,9 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
         out->toGPU();
     }
 
-    auto op = vkop::ops::create_from_type(vkop::ops::OpType::RESIZE, fp16, 0,
+    auto op = vkop::ops::create_from_type(vkop::ops::OpType::GLOBALAVERAGEPOOL,
+                                          fp16, 0,
                                           /*backend_buffer=*/true);
-    op->setAttribute({{"mode", "nearest"},
-                      {"coordinate_transformation_mode", "asymmetric"},
-                      {"sizes", "[8,8]"}});
     op->set_runtime_device(dev, pool);
     op->onExecute({input}, {out}, 0);
     auto cmd = op->get_record();
@@ -124,11 +129,11 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
         out->copyToCPU(pool);
         p = out->data().data();
     }
-    for (size_t i = 0; i < want.size(); ++i) {
+    for (int i = 0; i < batch * channels; ++i) {
         const float got = from_storage<T>(p[i]);
         if (std::fabs(got - want[i]) >
             0.02F * std::max(1.0F, std::fabs(want[i]))) {
-            std::printf("FAIL: Resize %s%s[%zu] got %f want %f\n",
+            std::printf("FAIL: GAP %s%s[%d] got %f want %f\n",
                         fp16 ? "fp16" : "fp32",
                         host_import ? " host-import" : "", i, got, want[i]);
             failures++;
@@ -136,23 +141,23 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
         }
     }
     if (!desc_only) {
-        check(op->bda_pipeline_ready(), "Resize BDA pipeline");
+        check(op->bda_pipeline_ready(), "GAP BDA pipeline");
         if (host_import) {
             check(!op->bda_dispatched(),
-                  "Resize host-import must take the descriptor path");
+                  "GAP host-import must take the descriptor path");
         } else {
-            check(op->bda_dispatched(), "Resize BDA dispatch");
+            check(op->bda_dispatched(), "GAP BDA dispatch");
         }
     }
-    std::printf("PASS: Resize %s%s (bda=%d)\n", fp16 ? "fp16" : "fp32",
+    std::printf("PASS: GAP %s%s (bda=%d)\n", fp16 ? "fp16" : "fp32",
                 host_import ? " host-import fallback" : "",
                 op->bda_dispatched() ? 1 : 0);
 }
 
 } // namespace
 
-int main() {
-    const bool desc_only = std::getenv("RESIZE_BDA_DESC_ONLY") != nullptr;
+int run_gap() {
+    const bool desc_only = std::getenv("GAP_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
     } else {
@@ -184,3 +189,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("gap", "GlobalAveragePool",
+               "GAP_BDA_DESC_ONLY", run_gap);
+
+} // namespace gap
+} // namespace probes
+
+} // namespace vkop

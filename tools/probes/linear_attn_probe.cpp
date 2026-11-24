@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// linear-attn: CumSum / Conv1d / LinearAttention
+//
+// Migrated from tests/LinearAttnOpsProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // End-to-end probe for the three qwen3_5 linear-attention ops:
 //   CumSum          (prefix sum along an axis)
 //   Conv1d          (causal depthwise conv with a rolling state)
@@ -28,6 +35,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace linear_attn {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -430,7 +444,7 @@ void test_linear_attention(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
+int run_linear_attn() {
     Logger::getInstance().setLevel(LOG_ERROR);
     vkop::dev::seed_shader_archive_from_build_tree();
     const auto &phydevs =
@@ -453,3 +467,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("linear-attn", "CumSum / Conv1d / LinearAttention", nullptr,
+               run_linear_attn);
+
+} // namespace linear_attn
+} // namespace probes
+} // namespace vkop
+

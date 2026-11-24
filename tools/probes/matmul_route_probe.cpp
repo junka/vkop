@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// matmul-route: print MatMul route selection
+//
+// Migrated from tests/MatmulRouteProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // Prints the KernelSelect route for a simple fp16 MatMul, so a BDA/table
 // experiment can pick a shape that lands on the base `submit()` kernel rather
 // than coop/ksplit512/down_act. Not an assertion test: prints and exits 0.
@@ -18,6 +25,13 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace matmul_route {
+
+
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
@@ -25,7 +39,7 @@ using vkop::VulkanInstance;
 using vkop::core::ITensor;
 using vkop::core::Tensor;
 
-int main() {
+int run_matmul_route() {
     if (std::getenv("MATMUL_ROUTE_ALLOW_COOP") == nullptr) {
         setenv("VKOP_NO_COOP", "1", 1);
     }
@@ -75,3 +89,12 @@ int main() {
     }
     return 0;
 }
+
+
+REGISTER_PROBE("matmul-route", "print MatMul route selection", nullptr,
+               run_matmul_route);
+
+} // namespace matmul_route
+} // namespace probes
+} // namespace vkop
+

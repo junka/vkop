@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// matmul-ada: Ada sklast / ACC geometries
+//
+// Migrated from tests/MatmulAdaBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for the Ada-only MatMul kernels: coopmat_sklast and the two
 // 16x16x16 ACC geometries (64x64 / 64x128). Both routes are unreachable on
 // ARL (it lists only the 8x8x16 MMA), so this probe SKIPs there; it exists for
@@ -29,6 +36,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace matmul_ada {
+
 
 using vkop::core::ITensor;
 using vkop::core::Tensor;
@@ -126,7 +140,7 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
+int run_matmul_ada() {
     const char *case_env = std::getenv("MATMUL_ADA_CASE");
     const std::string mode = case_env ? case_env : "sklast";
     const bool desc_only = std::getenv("MATMUL_ADA_BDA_DESC_ONLY") != nullptr;
@@ -209,3 +223,12 @@ int main() {
     std::fflush(nullptr);
     _exit(failures == 0 ? 0 : 1);
 }
+
+
+REGISTER_PROBE("matmul-ada", "Ada sklast / ACC geometries",
+               "MATMUL_ADA_BDA_DESC_ONLY", run_matmul_ada);
+
+} // namespace matmul_ada
+} // namespace probes
+
+} // namespace vkop

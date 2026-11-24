@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// downact: SwiGLU down-projection fold
+//
+// Migrated from tests/DownActBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for the SwiGLU down-projection fold (MatMul with down_act=1).
 // The fold reads nine data buffers -- several through uvec4/uvec2 aliases --
 // so it is the widest BDA address table in the MatMul family. Checks the
@@ -25,6 +32,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace downact {
+
 
 using vkop::core::ITensor;
 using vkop::core::Tensor;
@@ -145,7 +159,7 @@ bool run_case(std::shared_ptr<VulkanDevice> dev,
 
 } // namespace
 
-int main() {
+int run_downact() {
     const bool desc_only = std::getenv("DOWNACT_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
@@ -187,3 +201,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("downact", "SwiGLU down-projection fold",
+               "DOWNACT_BDA_DESC_ONLY", run_downact);
+
+} // namespace downact
+} // namespace probes
+
+} // namespace vkop

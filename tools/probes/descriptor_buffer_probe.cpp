@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// descriptor-buffer: VK_EXT_descriptor_buffer host cost
+//
+// Migrated from tests/DescriptorBufferProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // VK_EXT_descriptor_buffer host-side cost probe.
 //
 // Answers three concrete questions on the machine it runs on:
@@ -37,6 +44,13 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace descriptor_buffer {
+
+
 using vkop::VulkanBuffer;
 using vkop::VulkanDevice;
 using vkop::VulkanInstance;
@@ -73,7 +87,7 @@ std::vector<VkDescriptorSetLayoutBinding> make_bindings() {
 
 } // namespace
 
-int main() {
+int run_descriptor_buffer() {
     Logger::getInstance().setLevel(LOG_INFO);
     const auto &phydevs =
         VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -339,3 +353,12 @@ int main() {
     // real status and skips the teardown that never mattered for a probe.
     _exit(failures ? 1 : 0);
 }
+
+
+REGISTER_PROBE("descriptor-buffer", "VK_EXT_descriptor_buffer host cost", nullptr,
+               run_descriptor_buffer);
+
+} // namespace descriptor_buffer
+} // namespace probes
+} // namespace vkop
+

@@ -1,16 +1,17 @@
 // Copyright 2026 @junka
-// End-to-end probe for the buffer-device-address unary variants.
+// softmax: fp16 two-pass reduce+pack
 //
-// Every unary op that ships <key>_bda[_fp16] is driven through the real op
-// class. This checks:
-//   1. the BDA pipeline is built when VKOP_BDA=1 and the dev archive carries
-//      the key (UNARY_BDA_DESC_ONLY pins the opposite: no BDA pipeline);
-//   2. fp32 and fp16 values are correct through the address path;
-//   3. host-imported buffers (hasDeviceAddress()==false) still compute
-//      correctly through the descriptor pipeline of the same op.
+// Migrated from tests/SoftmaxBdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
+// End-to-end probe for the Softmax device-address variant.
 //
-// Skips cleanly without BDA; descriptor-only devices are covered by
-// BufferBackendTest.
+// Softmax exercises the two-dispatch BDA pattern: the fp16 build reduces into
+// a scratch buffer and then runs a pack pass from the SAME BDA pipeline with a
+// different push constant. Shape {2,3,4}, axis=1 -> axis_size=3, inner=4,
+// outer=8, so the reduce's inner stride is non-trivial.
 
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,13 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace softmax {
+
 
 using vkop::VulkanCommandBuffer;
 using vkop::VulkanCommandPool;
@@ -48,32 +56,6 @@ void check(bool condition, const char *what) {
     }
 }
 
-struct Case {
-    OpType type;
-    const char *name;
-    float (*ref)(float);
-};
-
-const Case kCases[] = {
-    {OpType::NEG, "Neg", [](float x) { return -x; }},
-    {OpType::SIGMOID, "Sigmoid",
-     [](float x) { return 1.0F / (1.0F + std::exp(-x)); }},
-    {OpType::TANH, "Tanh", [](float x) { return std::tanh(x); }},
-    {OpType::ERF, "Erf", [](float x) { return std::erf(x); }},
-    {OpType::SQRT, "Sqrt", [](float x) { return std::sqrt(x); }},
-    {OpType::ATAN, "Atan", [](float x) { return std::atan(x); }},
-    {OpType::COS, "Cos", [](float x) { return std::cos(x); }},
-    {OpType::SIN, "Sin", [](float x) { return std::sin(x); }},
-    {OpType::SOFTPLUS, "Softplus",
-     [](float x) { return std::log(std::exp(x) + 1.0F); }},
-    {OpType::RELU, "Relu", [](float x) { return std::max(0.0F, x); }},
-    {OpType::FLOOR, "Floor", [](float x) { return std::floor(x); }},
-};
-
-float ratio_error(float got, float want) {
-    return std::fabs(got - want) / std::max(1.0F, std::fabs(want));
-}
-
 template <typename T> T to_storage(float v) {
     if constexpr (std::is_same_v<T, uint16_t>) {
         return ITensor::fp32_to_fp16(v);
@@ -92,20 +74,38 @@ template <typename T> float from_storage(T v) {
 
 template <typename T>
 int run_case(std::shared_ptr<VulkanDevice> &dev,
-             std::shared_ptr<VulkanCommandPool> &pool, const Case &c, int fp16,
+             std::shared_ptr<VulkanCommandPool> &pool, int fp16,
              bool host_import) {
-    const std::vector<int> shape = {4, 5};
-    const size_t n = 20;
-    auto input = std::make_shared<Tensor<T>>(shape);
-    auto output = std::make_shared<Tensor<T>>(shape);
-    std::vector<float> in_vals(n);
-    std::vector<float> want(n);
+    const std::vector<int> shape = {2, 3, 4};
+    const int outer = 2;
+    const int axis = 3;
+    const int inner = 4;
+    const size_t n = 24;
+
+    std::vector<float> xv(n);
     for (size_t i = 0; i < n; ++i) {
-        // Positive range keeps Sqrt well-defined for every case.
-        in_vals[i] = 0.5F + 0.25F * static_cast<float>(i);
-        want[i] = c.ref(in_vals[i]);
+        xv[i] = -1.0F + 0.17F * static_cast<float>(i);
+    }
+    std::vector<float> want(n);
+    for (int o = 0; o < outer; ++o) {
+        for (int in = 0; in < inner; ++in) {
+            float mx = -1e30F;
+            for (int a = 0; a < axis; ++a) {
+                mx = std::max(mx, xv[o * axis * inner + a * inner + in]);
+            }
+            float sum = 0.0F;
+            for (int a = 0; a < axis; ++a) {
+                sum += std::exp(xv[o * axis * inner + a * inner + in] - mx);
+            }
+            for (int a = 0; a < axis; ++a) {
+                const size_t i = o * axis * inner + a * inner + in;
+                want[i] = std::exp(xv[i] - mx) / sum;
+            }
+        }
     }
 
+    auto input = std::make_shared<Tensor<T>>(shape);
+    auto output = std::make_shared<Tensor<T>>(shape);
     if (host_import) {
         if (!dev->is_support_host_import()) {
             std::printf("SKIP: host import unsupported; fallback untested\n");
@@ -115,12 +115,12 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
         output->as_host_imported_buffer(dev, n);
         auto *in_ptr = static_cast<T *>(input->host_import_ptr());
         for (size_t i = 0; i < n; ++i) {
-            in_ptr[i] = to_storage<T>(in_vals[i]);
+            in_ptr[i] = to_storage<T>(xv[i]);
         }
     } else {
         std::vector<T> bytes(n);
         for (size_t i = 0; i < n; ++i) {
-            bytes[i] = to_storage<T>(in_vals[i]);
+            bytes[i] = to_storage<T>(xv[i]);
         }
         input->fillToCPU(bytes);
         input->as_storage_buffer(dev);
@@ -129,16 +129,17 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
         output->toGPU();
     }
 
-    auto op = vkop::ops::create_from_type(c.type, fp16, 0,
+    auto op = vkop::ops::create_from_type(OpType::SOFTMAX, fp16, 0,
                                           /*backend_buffer=*/true);
-    check(op != nullptr, c.name);
+    check(op != nullptr, "create_from_type(Softmax)");
     if (!op) {
         return 1;
     }
+    op->setAttribute({{"axis", "1"}});
     op->set_runtime_device(dev, pool);
-    const bool desc_only = std::getenv("UNARY_BDA_DESC_ONLY") != nullptr;
+    const bool desc_only = std::getenv("SOFTMAX_BDA_DESC_ONLY") != nullptr;
     if (!host_import) {
-        check(op->bda_pipeline_ready() == !desc_only, c.name);
+        check(op->bda_pipeline_ready() == !desc_only, "Softmax BDA pipeline");
     }
 
     op->onExecute({input}, {output}, 0);
@@ -157,15 +158,15 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
     }
     for (size_t i = 0; i < n; ++i) {
         const float got = from_storage<T>(out_ptr[i]);
-        if (ratio_error(got, want[i]) > 0.02F) {
-            std::printf("FAIL: %s %s%s[%zu] got %f want %f\n", c.name,
+        if (std::fabs(got - want[i]) > 0.02F) {
+            std::printf("FAIL: Softmax %s%s[%zu] got %f want %f\n",
                         fp16 ? "fp16" : "fp32",
                         host_import ? " host-import" : "", i, got, want[i]);
             failures++;
             return 1;
         }
     }
-    std::printf("PASS: %s %s%s (bda_pipeline=%d)\n", c.name,
+    std::printf("PASS: Softmax %s%s (bda_pipeline=%d)\n",
                 fp16 ? "fp16" : "fp32",
                 host_import ? " host-import fallback" : "",
                 op->bda_pipeline_ready() ? 1 : 0);
@@ -174,9 +175,8 @@ int run_case(std::shared_ptr<VulkanDevice> &dev,
 
 } // namespace
 
-int main() {
-    // Shader variants are opt-in at this stage (see try_build_bda_pipeline).
-    const bool desc_only = std::getenv("UNARY_BDA_DESC_ONLY") != nullptr;
+int run_softmax() {
+    const bool desc_only = std::getenv("SOFTMAX_BDA_DESC_ONLY") != nullptr;
     if (desc_only) {
         unsetenv("VKOP_BDA");
     } else {
@@ -200,14 +200,20 @@ int main() {
         return 0;
     }
 
-    for (const Case &c : kCases) {
-        run_case<float>(dev, pool, c, /*fp16=*/0, /*host_import=*/false);
-        run_case<uint16_t>(dev, pool, c, /*fp16=*/1, /*host_import=*/false);
-    }
-    // One fallback case is enough: all unary ops share the same submit path.
-    run_case<float>(dev, pool, kCases[0], /*fp16=*/0, /*host_import=*/true);
+    run_case<float>(dev, pool, /*fp16=*/0, /*host_import=*/false);
+    run_case<uint16_t>(dev, pool, /*fp16=*/1, /*host_import=*/false);
+    run_case<float>(dev, pool, /*fp16=*/0, /*host_import=*/true);
 
     std::printf(failures ? "RESULT: %d FAILURE(S)\n" : "RESULT: all pass\n",
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("softmax", "fp16 two-pass reduce+pack",
+               "SOFTMAX_BDA_DESC_ONLY", run_softmax);
+
+} // namespace softmax
+} // namespace probes
+
+} // namespace vkop

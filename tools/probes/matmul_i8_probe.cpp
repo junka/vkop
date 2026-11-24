@@ -1,4 +1,11 @@
 // Copyright 2026 @junka
+// matmul-i8: int8/uint8 coopmat MatMul
+//
+// Migrated from tests/MatMulI8BdaProbe.cpp. run_*() keeps the original main() body
+// verbatim (own device, own env knobs, own teardown); only the name changed
+// and the file now registers itself with the tools/probes dispatcher.
+
+// Copyright 2026 @junka
 // BDA probe for the int8-weight cooperative-matrix MatMul route.
 // Uses VKOP_COOP_I8=1 so the selector can pick coopmat_i8; checks the values
 // (A is quantized per row inside the kernel, so tolerance is looser) and that
@@ -22,6 +29,13 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 
+#include "probe_common.hpp"
+
+namespace vkop {
+namespace probes {
+namespace matmul_i8 {
+
+
 using vkop::core::ITensor;
 using vkop::core::Tensor;
 using vkop::VulkanCommandBuffer;
@@ -29,7 +43,7 @@ using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
 using vkop::VulkanInstance;
 
-int main() {
+int run_matmul_i8() {
     const bool desc_only =
         std::getenv("MATMUL_I8_BDA_DESC_ONLY") != nullptr;
     // Force the UINT8→UINT32 MMA module (it is the same kernel templated on
@@ -159,3 +173,12 @@ int main() {
                 failures);
     return failures == 0 ? 0 : 1;
 }
+
+
+REGISTER_PROBE("matmul-i8", "int8/uint8 coopmat MatMul",
+               "MATMUL_I8_BDA_DESC_ONLY", run_matmul_i8);
+
+} // namespace matmul_i8
+} // namespace probes
+
+} // namespace vkop
