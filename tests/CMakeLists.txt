@@ -100,8 +100,52 @@ set(TEST_SOURCES
 # job count set by memory, not by the header. Build with -j6: 16 concurrent
 # compiles OOM 30 GB. N > 1 merges the sources back into N buckets (amortises
 # any leftover per-TU cost); 1 = a single combined TU. 0 = one TU per file.
-set(MERGE_TEST_SOURCES 0 CACHE STRING
+# Default is 4, not one-TU-per-file. A header edit rebuilds every dependent
+# TU, and one-TU-per-file makes that 56 separate parses of the same ~545k
+# preprocessed lines (184k Vulkan-Hpp + 163k libtorch + 110k libstdc++). Four
+# round-robin buckets parse that prefix 4x instead of 56x: measured 21.5s/TU
+# * 56 = ~20 min vs 87s for the four buckets. 0 restores per-file TUs (needed
+# when a test uses a static name that collides across files); 1 is a single
+# merged TU.
+set(MERGE_TEST_SOURCES 4 CACHE STRING
     "Number of test TUs to split the suite into (0 = one per file, 1 = merged)")
+
+# ---- Build-time switches -----------------------------------------------------
+# The suite's cost is dominated by parsing the same header prefix in every TU:
+# ~545k preprocessed lines per test TU, of which 184k are Vulkan-Hpp, 163k
+# libtorch, 110k libstdc++ and only 27k vkop's own. Three orthogonal levers:
+#
+#   VKOP_TEST_PCH          precompile tests/setup.hpp (~2x per TU)
+#   MERGE_TEST_SOURCES     4 buckets instead of 56 TUs (the big one)
+#   VKOP_TEST_FULL_DEBUG   full -g instead of -g1 (~1.5x, 2x the object bytes)
+#
+# Full -g is opt-in because -g1 keeps line tables (backtraces still resolve to
+# a file:line) and drops only local-variable info; the top-level build's
+# -O0 -g is left untouched so benchmark numbers stay comparable.
+option(VKOP_TEST_PCH "Precompile tests/setup.hpp for the test TUs" ON)
+option(VKOP_TEST_FULL_DEBUG "Compile tests with full -g instead of -g1" OFF)
+
+if(MSVC OR (APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+    # PCH is supported on MSVC and AppleClang too, but the flags that have to
+    # match exactly (-isystem libc++ bridge, /Zi) are more brittle there than
+    # the win justifies. -g1 stays off-like: MSVC already uses /Zi.
+    set(VKOP_TEST_PCH OFF)
+endif()
+
+if(NOT VKOP_TEST_FULL_DEBUG AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Appended after the top-level -O0 -g, so this wins (GCC: last -g level
+    # specified takes effect).
+    set(VKOP_TEST_DEBUG_FLAG -g1)
+else()
+    set(VKOP_TEST_DEBUG_FLAG "")
+endif()
+
+# Apply the debug level to a test-side target.
+function(vkop_test_debug_flag target)
+    if(VKOP_TEST_DEBUG_FLAG)
+        target_compile_options(${target} PRIVATE ${VKOP_TEST_DEBUG_FLAG})
+    endif()
+endfunction()
 
 # ---- GCC version guard for macOS --------------------------------------------
 # The actual libc++ ABI bridge lives in the top-level CMakeLists.txt.  We
@@ -242,7 +286,11 @@ if(MERGE_TEST_SOURCES GREATER 1)
     # Generate N combined sources, round-robin over the test files. Round-robin
     # rather than contiguous chunks so the big suites (BufferRankTest,
     # RobustnessTest) land in different buckets.
-    list(FILTER TEST_SOURCES EXCLUDE REGEX "setup\\.cpp$")
+    #
+    # setup.cpp (defines main) and torch_subset.cpp (must see <torch/torch.h>
+    # before setup.hpp's relay declarations, so it can never sit behind a
+    # force-included PCH) stay separate TUs.
+    list(FILTER TEST_SOURCES EXCLUDE REGEX "^(setup|torch_subset)\\.cpp$")
     list(LENGTH TEST_SOURCES TEST_SOURCE_COUNT)
 
     set(TEST_TU_SOURCES)
@@ -271,7 +319,7 @@ if(MERGE_TEST_SOURCES GREATER 1)
         list(APPEND TEST_TU_SOURCES ${TU})
     endforeach()
 
-    add_executable(all_tests setup.cpp ${TEST_TU_SOURCES})
+    add_executable(all_tests setup.cpp torch_subset.cpp ${TEST_TU_SOURCES})
     set_source_files_properties(${TEST_TU_SOURCES} PROPERTIES GENERATED TRUE)
 elseif(MERGE_TEST_SOURCES EQUAL 1)
     # Generate a single combined source that includes all test files.
@@ -281,13 +329,15 @@ elseif(MERGE_TEST_SOURCES EQUAL 1)
         "// Merges all test sources into one translation unit for faster compilation.\n"
     )
     foreach(SRC ${TEST_SOURCES})
-        # Exclude setup.cpp since it contains main() and static definitions
-        if(NOT SRC STREQUAL "setup.cpp")
+        # Exclude setup.cpp since it contains main() and static definitions;
+        # torch_subset.cpp must stay its own TU (it has to see <torch/torch.h>
+        # before anything from setup.hpp).
+        if(NOT SRC MATCHES "^(setup|torch_subset)\\.cpp$")
             file(APPEND ${ALL_TESTS_COMBINED} "#include \"${CMAKE_CURRENT_SOURCE_DIR}/${SRC}\"\n")
         endif()
     endforeach()
 
-    add_executable(all_tests setup.cpp ${ALL_TESTS_COMBINED})
+    add_executable(all_tests setup.cpp torch_subset.cpp ${ALL_TESTS_COMBINED})
     set_source_files_properties(${ALL_TESTS_COMBINED} PROPERTIES GENERATED TRUE)
 else()
     add_executable(all_tests ${TEST_SOURCES})
@@ -322,6 +372,27 @@ target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${TORCH_CPU_LIBRARY}
     ${C10_LIBRARY}
     GTest::gtest GTest::gtest_main)
+
+# ---- Precompiled header ------------------------------------------------------
+# setup.hpp is the first include of every test TU and pulls the whole parse
+# prefix (Tensor/Vulkan/libtorch-subset/gtest): ~545k preprocessed lines per
+# TU, of which 184k Vulkan-Hpp, 163k libtorch, 110k libstdc++ and only 27k
+# vkop's own. Precompiling it turns that prefix into one deserialize per TU:
+# measured 21.5s -> 10.6s on a single test file (2.0x), 9.2s with -g1.
+#
+# target_precompile_headers is used rather than a hand-rolled .gch because it
+# owns the rebuild ordering, respects SKIP_PRECOMPILE_HEADERS, and the compile
+# still goes through ccache (which hashes the PCH use and caches the result).
+if(VKOP_TEST_PCH)
+    target_precompile_headers(all_tests PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/setup.hpp>")
+    # torch_subset.cpp is the one TU that must NOT see setup.hpp: it includes
+    # <torch/torch.h> first so the relay declarations in torch_subset.hpp do
+    # not make torch.h's own declarations ambiguous (see its header comment).
+    set_source_files_properties(torch_subset.cpp PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
 if(UNIX AND NOT APPLE)
     # VulkanSurface's inline detectDisplayType() calls XCloseDisplay; the test
     # TU emits that inline, but vkop's static archive does not carry the X11
@@ -497,7 +568,9 @@ add_test(NAME UnusedOutputsTest COMMAND UnusedOutputsTest)
 # arrayPitch padding for the image2DArray (NCHW->RGBA) layout vs a folded
 # single image2D, plus the real per-tensor gap for a given .vkopbin.
 # Run:  ./ImageLayoutProbe [path/to/model.vkopbin]
-add_executable(ImageLayoutProbe ImageLayoutProbe.cpp)
+# EXCLUDE_FROM_ALL: a manual diagnostic, not a ctest test. Leaving it in `all`
+# made every vkop header edit recompile 33 probe binaries nobody had asked for.
+add_executable(ImageLayoutProbe EXCLUDE_FROM_ALL ImageLayoutProbe.cpp)
 target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)
 
 # Readback-cost probe for MoE expert routing (direction B0). Runs a TopK over
@@ -506,7 +579,7 @@ target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)
 # round contains (measured 0 readbacks/round). Not a gtest: it prints a
 # distribution and a projection rather than asserting a value.
 # Run:  ./readback_probe [n_experts] [k] [reps]
-add_executable(readback_probe readback_probe.cpp setup_env.cpp)
+add_executable(readback_probe EXCLUDE_FROM_ALL readback_probe.cpp setup_env.cpp)
 target_link_libraries(readback_probe PRIVATE vkop vload)
 add_dependencies(readback_probe shader_archive)
 target_compile_definitions(readback_probe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
@@ -530,7 +603,7 @@ endif()
 
 # Min/Max large-shape scalar-broadcast repro probe (full-DiT decode
 # DEVICE_LOST at /Min_24+/Max_24). Usage: MinMaxProbe [full|tiny]
-add_executable(MinMaxProbe MinMaxProbe.cpp)
+add_executable(MinMaxProbe EXCLUDE_FROM_ALL MinMaxProbe.cpp)
 target_link_libraries(MinMaxProbe PRIVATE vkop vload)
 # Builds its ops directly, so it needs the same archive seed as all_tests.
 add_dependencies(MinMaxProbe shader_archive)
@@ -878,3 +951,15 @@ if(MSVC)
         endif()
     endforeach()
 endif()
+
+# Every test-side executable (the gtest suite, the plain-main tests and the
+# probes) gets the -g1 default. all_tests is included: it is already in
+# BUILDSYSTEM_TARGETS by the time this runs, so it needs no separate call.
+get_property(_vkop_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(t IN LISTS _vkop_test_targets)
+    get_target_property(_ttype ${t} TYPE)
+    if(_ttype STREQUAL "EXECUTABLE")
+        vkop_test_debug_flag(${t})
+    endif()
+endforeach()
+
