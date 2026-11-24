@@ -981,7 +981,31 @@ class ModelConverter:
             # the runtime picks each op's shader from the dtype of the tensors
             # it is handed and a weight flipped on its own would leave the op
             # reading half-typed storage with the FP32 kernel.
-            GraphFp16.apply(dag_model, getattr(args, "target_backend", "buffer"))
+            fp16_summary = GraphFp16.apply(
+                dag_model, getattr(args, "target_backend", "buffer"))
+            # A REFUSED domain pass must not fall through to the weight pass
+            # below. The domain pass declines when some node would end up with
+            # an FP32 operand beside an FP16 one -- a width mix one shader
+            # cannot execute, because the runtime picks each node's build from
+            # its data input. Weight-only quantization then halves the weights
+            # anyway, which is exactly that mix, and the artifact ships with a
+            # dtype the runtime rejects at execute time. Measured on the
+            # MiniMax-H3 text encoder: the fp16 `attention_bias` reaches its
+            # first op through a Cast(to=fp32), that Cast seeds an FP32 island,
+            # the pass refused with 250 conflicts, and the old silent fallback
+            # produced `Attention: the attention bias must have Q's element
+            # type (Q is float16, the bias is float32)` on every run.
+            if fp16_summary.get("refused"):
+                raise RuntimeError(
+                    "onnx2vkop: -q fp16 refused this graph -- the FP16 domain "
+                    "pass found nodes that would mix FP32 and FP16 operands, "
+                    "which the runtime cannot execute (one shader per node, "
+                    "picked from the data input's dtype). Converting anyway "
+                    "would ship exactly that mix. The conflict lines above "
+                    "name the nodes; the usual cause is an activation chain "
+                    "traced in one width while its inputs or weights are "
+                    "declared in the other, so fix the export's dtype "
+                    "coherence (or convert -q fp32) rather than forcing it.")
             # Then the weight pass, for what the domain pass cannot own: an
             # export that already declares FP16 activations but ships its
             # weights FP32. On a graph the domain pass just flipped it finds

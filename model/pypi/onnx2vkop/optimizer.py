@@ -110,11 +110,33 @@ class ConstantFolder:
 
     @staticmethod
     def _shape_known(model, name):
-        """该张量的形状是否在 value_info/input 里全部已知（dim_value>0）。"""
+        """该张量的形状是否在 value_info/input 里全部已知（dim_value>0）。
+
+        "Known" means a CONCRETE rank with every dim a positive constant. Two
+        distinct ONNX states must not be confused here, which is why the
+        `owns_dims` check comes first:
+
+          * no `shape` field      -> rank unknown, nothing can be folded from
+                                     it (the gate must say False);
+          * `shape` with 0 dims   -> a genuine rank-0 scalar, and `Shape` of it
+                                     is legitimately `[]`.
+
+        The second case used to be reached by the first too: `all(...)` over an
+        empty dim list is vacuously True, so `Shape(x)` on a tensor whose shape
+        inference produced no shape field folded to an EMPTY int64 array
+        instead of a shape vector. Everything downstream then folded to empty
+        and the consuming Mul recorded a 0 in its output dims, which made the
+        runtime allocate a zero-length axis -- Softmax then divided by zero
+        (`total / axis_size`). Measured on the MiniMax-H3 denoiser and video VAE
+        (both have `Shape(Transpose(q)) -> Slice -> ... -> Mul` scale chains).
+        """
         for v in list(model.graph.value_info) + list(model.graph.input) \
                  + list(model.graph.output):
             if v.name == name:
-                dims = v.type.tensor_type.shape.dim
+                tt = v.type.tensor_type
+                if not tt.HasField("shape"):
+                    return False  # rank unknown -> not a known shape
+                dims = tt.shape.dim
                 return all(d.HasField("dim_value") and d.dim_value > 0 for d in dims)
         return False
 

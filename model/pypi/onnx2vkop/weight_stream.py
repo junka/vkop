@@ -915,6 +915,9 @@ class InPlaceSourceGuard:
                 continue
             if guard._tmpdir is None:
                 guard._tmpdir = tempfile.mkdtemp(prefix="vkop-inplace-")
+            # Same directory is not required: the copy is private and short
+            # lived. A multi-GB checkpoint costs one streamed copy here, which
+            # is the price of not destroying the input.
             dst = os.path.join(guard._tmpdir, "src%d" % len(guard.paths))
             try:
                 shutil.copyfile(src_real, dst)
@@ -943,8 +946,9 @@ class InPlaceSourceGuard:
 
 
 # The guard in force while save_to_binary writes its blob. Module-level because
-# every payload writer resolves its source through source_read_path, and
-# threading a parameter through all of them would only add a way to forget it.
+# every payload writer (write_payload and the helper readers it dispatches to)
+# resolves its source through source_read_path, and threading a parameter
+# through all of them would only add a way to forget it.
 _active_guard = None
 
 
@@ -1025,7 +1029,7 @@ def _read_rows(src_entry: dict, base_dir: str, row0: int, rows: int,
     """Rows [row0, row0+rows) of a [K, N] 16-bit deferred source, as fp16 bits.
 
     `out_f` is the file being written; when the source and that file are the
-    same one (an in-place reconversion) it is what redirects this read to the
+    same file (an in-place reconversion) it is what redirects this read to the
     guard's copy -- see source_read_path.
     """
     path = source_read_path(src_entry, out_f, base_dir)

@@ -228,6 +228,31 @@ def build_text_model(cfg: dict, *, device: torch.device, tiny: bool):
         model = Qwen3VLForConditionalGeneration(qcfg)
     model.eval()
 
+    # Build the tower in the artifact's FP16 domain, not torch's FP32 default.
+    #
+    # This is not a speed knob: it is what makes the traced graph's dtype
+    # COHERENT, and incoherent graphs are what `-q fp16` refuses (see the
+    # failure this fixes). Two states, measured on the real 64-layer config:
+    #
+    #   * FP32 build (the default): the activations trace fp32, and the one
+    #     fp16 graph input -- `attention_bias`, which `causal_bias` makes fp16
+    #     to match HF's `create_causal_mask` -- reaches the attention through a
+    #     `Cast(to=fp32)`. That Cast seeds an FP32 island (298 Pow, 103 Cast
+    #     nodes forced wide by the domain pass), the pass then refuses with
+    #     250 nodes mixing FP32 and FP16 operands, and the artifact is unusable.
+    #   * FP16 build: the activations trace fp16, the mask needs no Cast, and
+    #     the domain pass flips the whole graph.
+    #
+    # Measured: `Cast(attention_bias)` count goes 2 -> 0 across the build-dtype
+    # switch. The LLM exporter already does exactly this (`torch_dtype=
+    # torch.float16`); bf16 was tried and does NOT help -- the mask is fp16
+    # either way, so the fp32 Cast is still inserted.
+    #
+    # This tower keeps no module in fp32 (`_keep_in_fp32_modules` is empty), so
+    # the whole model follows. Only the graph matters here, and it is the text
+    # tower's: the vision tower is not exported on this path.
+    model = model.to(torch.float16)
+
     # Eager attention. With `sdpa` (or flash) the trace dies on
     # "conversion of scaled_dot_product_attention not implemented if
     # enable_gqa is True", which is exactly the GQA this tower uses.
