@@ -12,13 +12,14 @@ into
 
 so the LM head runs with M=1. Four properties are being pinned:
 
-  * it is **declared, not guessed** — an LM head that says nothing keeps
-    computing all L rows, because the graph itself cannot show which rows a
-    caller reads (``logits`` has no in-graph consumer). Two channels say it:
-    the model-level metadata prop ``vkop_logits_last_row:<output>`` (the
-    carrier that travels with the artifact) and the conversion-time env var
-    ``VKOP_LOGITS_LAST_ROW`` (the bridge for an .onnx that cannot be
-    re-exported);
+  * it is **on by default for `logits`, off by explicit request** -- the
+    graph cannot show which rows a caller reads (``logits`` has no in-graph
+    consumer), so the converter decides: converter.resolve_logits_last_row
+    cuts a graph output named ``logits`` unless VKOP_LOGITS_LAST_ROW=0 (CLI
+    --all-logits-rows) or the metadata prop ``vkop_logits_last_row:logits``
+    = "0" asks for every position. Other outputs are cut only when named, by
+    that metadata prop or by VKOP_LOGITS_LAST_ROW=<names>. At the optimizer
+    level a DAG with nothing declared still folds nothing;
   * it is **self-described** — a graph that already contains the last-row
     ``Slice`` needs neither declaration. ``Slice`` commutes with a ``MatMul``
     (rows are independent), so the pass pushes it in front, which is a
@@ -456,7 +457,13 @@ def test_env_names_the_output(tmp_path, monkeypatch):
     dag = ModelConverter().parse_onnx_model(path, 1)
     assert dag.logits_last_row == {"logits", "logits2"}
 
+    # Unset/empty is the default, which already names `logits`; only "0"
+    # keeps every position.
     monkeypatch.setenv("VKOP_LOGITS_LAST_ROW", "")
+    dag = ModelConverter().parse_onnx_model(path, 1)
+    assert dag.logits_last_row == {"logits"}
+
+    monkeypatch.setenv("VKOP_LOGITS_LAST_ROW", "0")
     dag = ModelConverter().parse_onnx_model(path, 1)
     assert dag.logits_last_row == set()
 
@@ -558,12 +565,43 @@ def test_metadata_declaration_reaches_the_fold(tmp_path, monkeypatch):
     assert [o for o in dag.outputs if o["name"] == "logits"][0]["shape"] == [1, 1, 16]
 
 
-def test_embedded_slice_folds_end_to_end(tmp_path, monkeypatch):
-    """The same for the self-described form, parsed off a real ONNX: no
-    declaration of any kind is needed."""
+def test_default_reaches_the_fold(tmp_path, monkeypatch):
+    """End to end with nothing declared anywhere: the converter's default cuts
+    `logits` to its last row."""
     from onnx2vkop.converter import ModelConverter
 
     monkeypatch.delenv("VKOP_LOGITS_LAST_ROW", raising=False)
+    path = _lm_onnx(tmp_path, embed_slice=False)
+    dag = ModelConverter().parse_onnx_model(path, 1)
+    assert dag.logits_last_row == {"logits"}
+    FusionOptimizer.optimize(dag)
+    mm = next(n for n in dag.nodes.values() if n.op_type == "MatMul")
+    assert mm.inputs[0]["name"] != "x"
+    assert [o for o in dag.outputs if o["name"] == "logits"][0]["shape"] == [1, 1, 16]
+
+
+def test_env_zero_keeps_every_row_end_to_end(tmp_path, monkeypatch):
+    """The explicit opt-out: VKOP_LOGITS_LAST_ROW=0 leaves the LM head on all
+    rows."""
+    from onnx2vkop.converter import ModelConverter
+
+    monkeypatch.setenv("VKOP_LOGITS_LAST_ROW", "0")
+    path = _lm_onnx(tmp_path, embed_slice=False)
+    dag = ModelConverter().parse_onnx_model(path, 1)
+    assert dag.logits_last_row == set()
+    FusionOptimizer.optimize(dag)
+    assert not any(n.op_type == "Slice" for n in dag.nodes.values())
+    mm = next(n for n in dag.nodes.values() if n.op_type == "MatMul")
+    assert mm.inputs[0]["name"] == "x"
+
+
+def test_embedded_slice_folds_end_to_end(tmp_path, monkeypatch):
+    """The same for the self-described form, parsed off a real ONNX: no
+    declaration of any kind is needed -- it folds even with the default
+    switched off, because the export itself already keeps one row."""
+    from onnx2vkop.converter import ModelConverter
+
+    monkeypatch.setenv("VKOP_LOGITS_LAST_ROW", "0")
     path = _lm_onnx(tmp_path, embed_slice=True)
     dag = ModelConverter().parse_onnx_model(path, 1)
     assert dag.logits_last_row == set()
@@ -608,3 +646,61 @@ def test_written_artifact_carries_the_slice():
     assert b"Slice" in op_types, op_types
     assert b"MatMul" in op_types, op_types
     assert b"LM_HEAD__lastrow_starts" in init_names, init_names
+
+
+# ---- converter-level policy: default on for `logits`, explicit opt-out ----
+
+class _Prop:
+    def __init__(self, key, value):
+        self.key, self.value = key, value
+
+
+def _resolve(props=(), env=None):
+    from onnx2vkop.converter import resolve_logits_last_row
+    return resolve_logits_last_row(list(props), env)
+
+
+def test_default_cuts_logits_only():
+    assert _resolve() == {"logits"}
+    assert _resolve(env="") == {"logits"}
+
+
+def test_env_zero_keeps_every_row():
+    assert _resolve(env="0") == set()
+    # ...whatever the metadata says: the explicit conversion-time choice wins.
+    assert _resolve([_Prop("vkop_logits_last_row:logits", "1")], "0") == set()
+
+
+def test_metadata_zero_keeps_that_output():
+    assert _resolve([_Prop("vkop_logits_last_row:logits", "0")]) == set()
+    assert _resolve([_Prop("vkop_logits_last_row:logits", "")]) == set()
+
+
+def test_metadata_and_env_add_outputs():
+    assert _resolve([_Prop("vkop_logits_last_row:lm_out", "1")]) == {
+        "logits", "lm_out"}
+    assert _resolve(env="lm_out, other") == {"logits", "lm_out", "other"}
+    assert _resolve(env="*") == {"logits", "*"}
+
+
+def test_unrelated_metadata_ignored():
+    assert _resolve([_Prop("vkop_causal_mask:attention_bias", "1")]) == {
+        "logits"}
+
+
+def test_default_does_not_reach_other_outputs():
+    """The default names `logits`, not "*": a DiT-like graph whose MatMul
+    writes a rank-3 graph output under another name keeps all its rows."""
+    dag = build(declared=tuple(_resolve()))
+    dag.outputs[0]["name"] = "noise_pred"
+    dag.nodes["LM_HEAD"].outputs[0]["name"] = "noise_pred"
+    assert matches_of(dag) == []
+
+
+def test_cli_flag_maps_to_env_zero(monkeypatch):
+    from onnx2vkop import cli
+    monkeypatch.setattr(sys, "argv", ["cli", "-i", "x.onnx", "--all-logits-rows"])
+    args = cli.parse_args()
+    monkeypatch.delenv("VKOP_LOGITS_LAST_ROW", raising=False)
+    cli._apply_build_knobs(args)
+    assert os.environ["VKOP_LOGITS_LAST_ROW"] == "0"

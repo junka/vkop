@@ -152,6 +152,7 @@ def _count_constants(model):
 def test_cli_writes_only_the_knobs_it_was_given(monkeypatch):
     monkeypatch.setenv("VKOP_MAX_FOLD_ROUNDS", "9")  # pre-existing shell value
     monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "4")   # pre-existing shell value
+    monkeypatch.delenv("VKOP_LOGITS_LAST_ROW", raising=False)
     # _apply_build_knobs writes os.environ itself, which monkeypatch cannot
     # undo -- it only restores keys a test set through it. Without this the
     # knobs below (VKOP_NO_PASSES=a,b, VKOP_STREAM_WEIGHTS=off, ...) leak into
@@ -162,6 +163,7 @@ def test_cli_writes_only_the_knobs_it_was_given(monkeypatch):
             external_blob_mb=1, max_fold_rounds=None, max_fuse_rounds=3,
             no_passes="a,b", no_fusions=None, stream_weights="off",
             stream_min_mib=None, layout_audit="full", numeric_audit="off",
+            logits_last_row=None,
         ))
         assert os.environ["VKOP_EXTERNAL_BLOB_MB"] == "1"
         assert os.environ["VKOP_MAX_FUSE_ROUNDS"] == "3"
@@ -173,6 +175,8 @@ def test_cli_writes_only_the_knobs_it_was_given(monkeypatch):
         assert os.environ["VKOP_MAX_FOLD_ROUNDS"] == "9"
         assert "VKOP_NO_FUSIONS" not in os.environ
         assert os.environ["VKOP_STREAM_MIN_MIB"] == "4"
+        # No --all-logits-rows: the converter's default (cut `logits`) stands.
+        assert "VKOP_LOGITS_LAST_ROW" not in os.environ
     finally:
         os.environ.clear()
         os.environ.update(saved)

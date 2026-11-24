@@ -450,6 +450,14 @@ Examples:
              "always on: listing it is reported and ignored.",
     )
     parser.add_argument(
+        "--all-logits-rows", dest="logits_last_row", action="store_const",
+        const="0", default=None,
+        help="Keep every sequence position of the `logits` output (equivalent "
+             "to VKOP_LOGITS_LAST_ROW=0). By default the LM head is cut to the "
+             "last position, which is all a decoder reads; pass this for "
+             "perplexity, prompt logprobs or a per-position reference diff.",
+    )
+    parser.add_argument(
         "--stream-weights", choices=["on", "off"], default=None,
         help="Leave large pass-through weights in the ONNX external-data file "
              "instead of loading them into memory (default on). A float16 "
@@ -509,6 +517,7 @@ def _apply_build_knobs(args) -> None:
         "VKOP_MAX_FUSE_ROUNDS": args.max_fuse_rounds,
         "VKOP_NO_PASSES": args.no_passes,
         "VKOP_NO_FUSIONS": args.no_fusions,
+        "VKOP_LOGITS_LAST_ROW": getattr(args, "logits_last_row", None),
         "VKOP_STREAM_WEIGHTS": args.stream_weights,
         "VKOP_STREAM_MIN_MIB": args.stream_min_mib,
         "VKOP_LAYOUT_AUDIT": args.layout_audit,

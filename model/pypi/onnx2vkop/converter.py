@@ -69,6 +69,49 @@ except ImportError:
     )
 
 
+
+# The graph output the LM head writes in every exporter in this tree.
+DEFAULT_LOGITS_LAST_ROW = frozenset({"logits"})
+
+
+def resolve_logits_last_row(metadata_props, env_value):
+    """Graph outputs whose LM head keeps only the last sequence position.
+
+    Default: {"logits"}. A greedy or sampling decoder reads logits[0, L-1, :]
+    and nothing else, and every driver here (llm_chat, llm_serve, llm_driver's
+    ORT diff) takes the last row by shape, so a one-row output is read the same
+    way. Only the name `logits` is assumed -- not "*" -- because other models
+    end in a MatMul too (the DiT's proj_out is rank 3) and need every row.
+
+    Keeping every position has to be said explicitly (perplexity, prompt
+    logprobs, a per-position ORT diff):
+      * VKOP_LOGITS_LAST_ROW=0 (or the CLI's --all-logits-rows): no output is
+        cut, whatever the metadata says;
+      * metadata `vkop_logits_last_row:<out>` = "0": that output keeps all rows.
+    Adding outputs: metadata `vkop_logits_last_row:<out>` with any other value,
+    or VKOP_LOGITS_LAST_ROW=<a,b> (comma-separated names, "*" for every graph
+    output a MatMul produces). A graph that already slices its own last row
+    folds regardless (optimizer.match_logits_last_row).
+    """
+    env = (env_value or "").strip()
+    if env == "0":
+        return set()
+    wanted = set(DEFAULT_LOGITS_LAST_ROW)
+    for entry in metadata_props or []:
+        if not entry.key.startswith(_VKOP_LOGITS_LAST_ROW_META_PREFIX):
+            continue
+        name = entry.key[len(_VKOP_LOGITS_LAST_ROW_META_PREFIX):]
+        if (entry.value or "").strip() in ("", "0"):
+            wanted.discard(name)
+        else:
+            wanted.add(name)
+    for name in env.split(","):
+        name = name.strip()
+        if name:
+            wanted.add(name)
+    return wanted
+
+
 class UnsupportedOpError(RuntimeError):
     """A graph contains an op_type the runtime cannot execute.
 
@@ -478,35 +521,23 @@ class ModelConverter:
                 ", ".join(sorted(dag_model.causal_mask_inputs)),
             )
 
-        # VKOP_LOGITS_LAST_ROW=<graph output names>: keep only the last position
-        # of those outputs. A greedy decode reads logits[0, L-1, :] and nothing
-        # else, while the LM head computes and stores all L rows — at L=1860
-        # that is a 2505 ms MatMul (14% of the prefill, linear in M) writing a
-        # 1.13 GB fp16 buffer nobody reads. Which rows a caller wants is a
-        # *policy* the graph cannot show (`logits` has no in-graph consumer),
-        # so it is declared, not inferred — same shape as the causal mask two
-        # blocks up: a model-level metadata prop is the carrier, the env var
-        # the bridge for an .onnx that cannot be re-exported. "*" means every
-        # graph output a MatMul produces. A graph whose export already contains
-        # the last-row Slice needs neither (optimizer.match_logits_last_row
-        # pushes it through the MatMul on its own).
-        for entry in getattr(model, "metadata_props", []):
-            if not entry.key.startswith(_VKOP_LOGITS_LAST_ROW_META_PREFIX):
-                continue
-            if entry.value in ("", "0"):
-                continue
-            dag_model.logits_last_row.add(
-                entry.key[len(_VKOP_LOGITS_LAST_ROW_META_PREFIX) :]
-            )
-        for name in os.environ.get("VKOP_LOGITS_LAST_ROW", "").split(","):
-            name = name.strip()
-            if name:
-                dag_model.logits_last_row.add(name)
+        # Which logits rows to keep is a policy the graph cannot show (`logits`
+        # has no in-graph consumer), so it is decided here; see
+        # resolve_logits_last_row for the rules. The default keeps only the
+        # last position of a graph output named `logits`: every driver in this
+        # tree reads that row alone, and the other L-1 rows cost 100-200 ms of
+        # LM head per long prefill (Qwen3-VL-2B, L~850-3200 on an M5 Max).
+        dag_model.logits_last_row = resolve_logits_last_row(
+            getattr(model, "metadata_props", []),
+            os.environ.get("VKOP_LOGITS_LAST_ROW"))
         if dag_model.logits_last_row:
             print(
                 "Logits last row only:",
                 ", ".join(sorted(dag_model.logits_last_row)),
+                "(--all-logits-rows keeps every position)",
             )
+        else:
+            print("Logits: every position kept")
 
         graph = model.graph
         # `full_check` serializes the whole model to a byte string before the

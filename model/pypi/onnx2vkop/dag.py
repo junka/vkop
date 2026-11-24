@@ -113,8 +113,8 @@ _VKOP_CAUSAL_MASK_META_PREFIX = "vkop_causal_mask:"
 # ORT-diffing driver) and one that wants only the next token look identical.
 # Declaring it lets the converter cut the LM head's M down to 1, which needs no
 # kernel work (a Slice on the activation) and nothing the runtime has to know.
-# A model that says nothing computes all L rows, exactly as exported, so the
-# declaration can only add speed on the declared output.
+# The converter now cuts `logits` by default (converter.resolve_logits_last_row);
+# a value of "0" here keeps every position of that output instead.
 _VKOP_LOGITS_LAST_ROW_META_PREFIX = "vkop_logits_last_row:"
 
 # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——对 3.4GB 的 LLM
@@ -245,12 +245,11 @@ class DAGBasedModel:
         # standard causal additive mask. Read by the attention matcher; empty
         # for a model that declares nothing.
         self.causal_mask_inputs: set = set()
-        # Graph outputs to keep only at their last position, declared by the
-        # model-level metadata prop `vkop_logits_last_row:<output>` or the
-        # conversion-time env var VKOP_LOGITS_LAST_ROW. "*" means every graph
-        # output a MatMul produces. Empty — the default — leaves the graph
-        # exactly as exported (a graph that carries the last-row Slice itself
-        # needs no entry here; the optimizer's matcher finds that on its own).
+        # Graph outputs to keep only at their last position. The converter
+        # fills it from converter.resolve_logits_last_row ({"logits"} unless
+        # VKOP_LOGITS_LAST_ROW=0 / --all-logits-rows or the metadata says
+        # otherwise); a DAG built directly starts empty and folds nothing
+        # but a graph that already carries the last-row Slice.
         self.logits_last_row: set = set()
 
     def add_node(self, node: Node):
