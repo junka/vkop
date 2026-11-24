@@ -85,6 +85,12 @@ target_compile_features(vkop_probes PRIVATE cxx_std_17)
 # every backtrace line-accurate at half the object size).
 if(MSVC)
     target_compile_options(vkop_probes PRIVATE /wd4100)
+    # The probes are POSIX programs (setenv/unsetenv, posix_memalign) and MSVC
+    # has none of them, so hand every probe TU the shim. Force-included rather
+    # than included per file because 20-odd probe files call setenv without
+    # knowing it is a portability problem.
+    target_compile_options(
+        vkop_probes PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/probe_compat.hpp")
 else()
     target_compile_options(vkop_probes PRIVATE
         -Wno-unused-parameter

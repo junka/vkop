@@ -614,38 +614,13 @@ add_executable(PreprocessJpgTest PreprocessJpgTest.cpp)
 target_link_libraries(PreprocessJpgTest PRIVATE vkop vload)
 add_test(NAME PreprocessJpgTest COMMAND PreprocessJpgTest)
 
-# Buffer-device-address plumbing probe: capability gate, address caching and
-# sub-range view arithmetic. Skips cleanly on a device without BDA (the
-# compatibility contract) and asserts host-imported buffers stay
-# descriptor-only. Not a gtest: the skip path is a normal device capability,
-# not a test failure.
-add_executable(BufferDeviceAddressTest BufferDeviceAddressTest.cpp)
-target_link_libraries(BufferDeviceAddressTest PRIVATE vkop vload)
-add_test(NAME BufferDeviceAddressTest COMMAND BufferDeviceAddressTest)
-
 # The op probes (BDA routes + descriptor fallback) moved to tools/probes/:
 # one dispatched binary instead of 26 executables, built on demand rather
 # than as part of `all`. Run `vkop_probes` with no argument to list them.
 
-
-if(MSVC)
-    # The probes are POSIX programs (setenv/unsetenv, posix_memalign). MSVC
-    # has none of them, so every probe gets probe_compat.hpp prepended. The
-    # gtest suite is excluded because setup.hpp already defines the same
-    # shims -- force-including both would redefine them.
-    get_property(vkop_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-    foreach(t IN LISTS vkop_test_targets)
-        get_target_property(ttype ${t} TYPE)
-        if(ttype STREQUAL "EXECUTABLE" AND NOT t STREQUAL "all_tests")
-            target_compile_options(
-                ${t} PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/probe_compat.hpp")
-        endif()
-    endforeach()
-endif()
-
-# Every test-side executable (the gtest suite, the plain-main tests and the
-# probes) gets the -g1 default. all_tests is included: it is already in
-# BUILDSYSTEM_TARGETS by the time this runs, so it needs no separate call.
+# Every test-side executable (the gtest suite and the plain-main tests) gets
+# the -g1 default. all_tests is included: it is already in BUILDSYSTEM_TARGETS
+# by the time this runs, so it needs no separate call.
 get_property(_vkop_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(t IN LISTS _vkop_test_targets)
     get_target_property(_ttype ${t} TYPE)
