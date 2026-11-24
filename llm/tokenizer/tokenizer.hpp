@@ -112,9 +112,10 @@ public:
     // user 轮里哪个 token 要按 grid 展开成 N 份；未注册返回 -1。
     int32_t image_pad_token_id() const;
 
-private:
-    // 按字面量查已注册的特殊 token id；调用方走上面那几个具名入口。
+    // 按字面量查已注册的特殊 token id；未注册返回 -1。
     int32_t special_token_id(const std::string& literal) const;
+
+private:
 
     // BBpe 核心合并逻辑
     void bpe_merge(std::vector<uint32_t>& tokens) const;

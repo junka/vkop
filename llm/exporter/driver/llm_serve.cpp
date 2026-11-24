@@ -8,7 +8,7 @@
 //
 // 协议（每行一帧，从 --rpc-in 读，往 --rpc-out 写）：
 //   请求                                    响应
-//   HELLO                              →  READY <abi>
+//   HELLO                              →  READY <abi> <max_kv>
 //   COUNT <id> <nmsg>                    → COUNTED <id> <tokens>
 //     <role>\n<text-b64>\n  × nmsg
 //   GEN <id> <max_new> <nmsg>            → TOKENS_IN <id> <n>
@@ -74,6 +74,7 @@
 
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+#include "vulkan/VulkanLib.hpp"
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
@@ -83,6 +84,8 @@
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
+using vkop::VulkanBuffer;
+using vkop::VulkanCommandBuffer;
 using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::core::as_tensor;
@@ -382,7 +385,8 @@ class InferenceServer {
                     const std::string &kv_kind, int prefill_chunk,
                     const std::string &kv_warm = "",
                     float repetition_penalty = 1.0f, uint64_t seed = 0,
-                    int sample_topk = kDefaultSampleTopK)
+                    int sample_topk = kDefaultSampleTopK,
+                    int context_length = 0, double kv_budget_mb = 0)
         : max_kv_(max_kv), prefill_chunk_(std::max(1, prefill_chunk)),
           model_path_(model) {
         sampler_ = Sampler(seed);
@@ -441,6 +445,7 @@ class InferenceServer {
         vocab_ = loaded.second;
         std::printf("[serve] embed vocab=%d hidden=%d\n", vocab_, arch_.hidden);
 
+        max_kv_ = resolve_window_(max_kv_, context_length, kv_budget_mb);
         kv_ = std::make_unique<KVCache>(rt_, cmdpool_, arch_.nlayers, arch_.nkv,
                                         arch_.hd, max_kv_, arch_.cache_kind,
                                         arch_.kv_layers);
@@ -457,6 +462,26 @@ class InferenceServer {
         }
         for (int32_t id : tok_.stop_token_ids())
             stop_ids_.push_back(static_cast<uint32_t>(id));
+        // Turn boundaries the chat template's own stop list leaves out. A
+        // model that writes a new turn header (<|im_start|>), the document
+        // end, or a tool *result* has finished its turn: without these the
+        // reply carried a literal "<|im_start|>user\n<|im_start|>assistant"
+        // text block to Claude Code (seen in a real session), and a
+        // hallucinated <tool_response> would be streamed as prose.
+        for (const char *lit : {"<|im_start|>", "<|endoftext|>",
+                                "<tool_response>", "<|user|>", "<|system|>"}) {
+            const int32_t id = tok_.special_token_id(lit);
+            if (id >= 0 && !is_stop(static_cast<uint32_t>(id)))
+                stop_ids_.push_back(static_cast<uint32_t>(id));
+        }
+        // Special tokens that may reach the client: the markers the HTTP layer
+        // parses. Every other special id is dropped from the text (see
+        // emits_text()).
+        for (const char *lit : {"<tool_call>", "</tool_call>", "<think>",
+                                "</think>"}) {
+            const int32_t id = tok_.special_token_id(lit);
+            if (id >= 0) text_specials_.push_back(static_cast<uint32_t>(id));
+        }
         dec_in_ = std::make_unique<vkop::llm::DecodeInputs>(rt_, dev_, cmdpool_,
                                                             arch_);
         if (!tok_.chat_template().empty())
@@ -625,6 +650,94 @@ class InferenceServer {
         return 0;
     }
 
+    // ---- the KV window ------------------------------------------------------
+    // `requested` <= 0 is "auto": the model's native context (--context-length,
+    // the checkpoint's max_position_embeddings) capped by what the cache may
+    // take of device memory. An explicit --max-kv is honoured but clamped to
+    // the native context -- rows past it are positions the model was never
+    // trained on. The result is a multiple of 1024 rows so the attention tiles
+    // (256) and prefill chunks divide it.
+    //
+    // Memory: --kv-budget-mb when given; otherwise 25% of what the device-local
+    // heap still has after the model loaded (VK_EXT_memory_budget), or 30% of
+    // the heap size without that extension. On a UMA Mac the heap is system
+    // RAM, so the cap is what keeps a 256k-token model from asking for 30 GB.
+    size_t kv_bytes_per_row_all_layers_() const {
+        const size_t layers =
+            arch_.kv_layers.empty() ? static_cast<size_t>(arch_.nlayers)
+                                    : arch_.kv_layers.size();
+        return kv_row_vals() * kv_elem_bytes() * layers;
+    }
+
+    double kv_memory_budget_bytes_(double budget_mb) const {
+        if (budget_mb > 0) return budget_mb * 1048576.0;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bp{};
+        bp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 mp{};
+        mp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        const bool has_budget = dev_->is_support_memory_budget();
+        if (has_budget) mp.pNext = &bp;
+        // Through the project loader (vulkan/VulkanLib.hpp): the binary does
+        // not link libvulkan, so the global prototype has no definition.
+        vkop::VulkanLib::getVulkanLib().vkGetPhysicalDeviceMemoryProperties2(
+            dev_->getPhysicalDevice(), &mp);
+        const auto &mem = mp.memoryProperties;
+        uint32_t heap = 0;
+        for (uint32_t h = 0; h < mem.memoryHeapCount; ++h) {
+            if ((mem.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                mem.memoryHeaps[h].size > mem.memoryHeaps[heap].size)
+                heap = h;
+        }
+        const double size = static_cast<double>(mem.memoryHeaps[heap].size);
+        if (has_budget && bp.heapBudget[heap] > bp.heapUsage[heap]) {
+            const double free_b =
+                static_cast<double>(bp.heapBudget[heap] - bp.heapUsage[heap]);
+            std::printf("[serve] device heap %.1f GB, budget %.1f GB, in use "
+                        "%.1f GB\n", size / 1e9, bp.heapBudget[heap] / 1e9,
+                        bp.heapUsage[heap] / 1e9);
+            return 0.25 * free_b;
+        }
+        return 0.3 * size;
+    }
+
+    int resolve_window_(int requested, int context_length, double budget_mb) {
+        constexpr int kAlign = 1024;
+        const size_t row_bytes = kv_bytes_per_row_all_layers_();
+        int window = requested;
+        if (requested <= 0) {
+            const double budget = kv_memory_budget_bytes_(budget_mb);
+            const double fit = row_bytes ? budget / static_cast<double>(row_bytes) : 0;
+            int64_t rows = static_cast<int64_t>(fit);
+            if (context_length > 0 && rows > context_length) rows = context_length;
+            rows = (rows / kAlign) * kAlign;
+            if (rows < kAlign) {
+                throw std::runtime_error(
+                    "--max-kv auto: the KV budget fits only " +
+                    std::to_string(static_cast<int64_t>(fit)) +
+                    " rows; pass --max-kv or --kv-budget-mb");
+            }
+            window = static_cast<int>(rows);
+            std::printf("[serve] --max-kv auto: %d rows (model context %s, "
+                        "budget fits %lld, %.2f GB of cache)\n",
+                        window,
+                        context_length > 0 ? std::to_string(context_length).c_str()
+                                           : "unknown",
+                        static_cast<long long>(fit),
+                        static_cast<double>(window) * row_bytes / 1e9);
+        } else if (context_length > 0 && requested > context_length) {
+            window = context_length;
+            std::printf("[serve] --max-kv %d exceeds the model's %d-token "
+                        "context; clamped to %d\n",
+                        requested, context_length, window);
+        }
+        std::fflush(stdout);
+        return window;
+    }
+
+    // The window this server really holds (after auto / clamping). Reported in
+    // the READY line so the HTTP layer trims against the same number.
+    int max_kv() const { return max_kv_; }
+
     // ---- the row pitch ------------------------------------------------------
     // The kernel does not address cache rows by the tensor's logical length.
     // Attention::row_capacity() takes the stride from the bound buffer's SIZE,
@@ -650,90 +763,61 @@ class InferenceServer {
         return pitch;
     }
 
-    // The resize below has to actually land, or the readback copies a shorter
-    // buffer than assumed and the file is quietly wrong.
-    void check_layer_size_(int layer, int got_values, size_t want_values) const {
-        if (static_cast<size_t>(got_values) == want_values) return;
-        throw std::runtime_error(
-            "--kv-cache: past_key_values_" + std::to_string(layer) + " holds " +
-            std::to_string(got_values) + " values, expected " +
-            std::to_string(want_values));
+    // The layer's preallocated cache buffer (past and present share it).
+    std::shared_ptr<VulkanBuffer> kv_buffer_(int layer) {
+        auto t = rt_->GetInput(arch_.kv_in(layer));
+        if (!t) throw std::runtime_error("--kv-cache: no " + arch_.kv_in(layer));
+        if (arch_.cache_kind == ElemKind::kFloat16)
+            return as_tensor<uint16_t>(t)->as_storage_buffer(dev_);
+        return as_tensor<int8_t>(t)->as_storage_buffer(dev_);
     }
 
-    // Layer `layer`'s live rows, gathered from the pitched buffer into `out`
-    // (rows * row_bytes, block-major like the file). Leaves the tensor sized to
-    // the full pitch; the caller restores the logical length with
-    // kv_->resume_from().
-    template <typename C>
-    void pack_layer_(int layer, uint32_t rows, int pitch, char *out) {
-        const std::string name = arch_.kv_in(layer);
-        rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(arch_.nkv),
-                                static_cast<uint32_t>(pitch),
-                                static_cast<uint32_t>(arch_.hd)});
-        auto tg = as_tensor<C>(rt_->GetInput(name));
-        // A real GPU->CPU readback, not the bytes we last uploaded: the cache
-        // inputs are deliberately left out of host_copy_valid_ in
-        // core/runtime.cpp because the fused Attention writes them in place, so
-        // the driver's copy goes stale on the first round.
-        tg->copyToCPU(cmdpool_);
-        check_layer_size_(layer, tg->num_elements(),
-                          static_cast<size_t>(pitch) * kv_row_vals());
-        // num_elements() is the shape; the staging container is what the copy
-        // below actually reads. They disagree if the readback kept a shorter
-        // host copy than the shape asks for, and the pitch walk would then run
-        // off the end of the allocation.
-        if (tg->data().size() < static_cast<size_t>(pitch) * kv_row_vals())
-            throw std::runtime_error(
-                "--kv-dump: past_key_values_" + std::to_string(layer) +
-                " read back " + std::to_string(tg->data().size()) +
-                " values, needs " +
-                std::to_string(static_cast<size_t>(pitch) * kv_row_vals()) +
-                " for a pitch of " + std::to_string(pitch));
-        const C *src = tg->data().data();
-        // Offsets in and out are element counts here, not bytes: `src` steps by
-        // the pitch in elements, `out` by the packed row count. Scaling either
-        // side by sizeof(C) as well doubles the block stride, which for the
-        // 2-byte fp16 cache read past the staging container (segfault in the
-        // first dump) and would have written garbage even if it had not.
-        const size_t dev_blk = static_cast<size_t>(pitch) * arch_.hd;
-        const size_t file_blk = static_cast<size_t>(rows) * arch_.hd;
-        for (int b = 0; b < 2 * arch_.nkv; ++b) {
-            std::memcpy(out + static_cast<size_t>(b) * file_blk * sizeof(C),
-                        src + static_cast<size_t>(b) * dev_blk,
-                        file_blk * sizeof(C));
-        }
-        // The pitched image is staging for this one write -- 32 MB per layer at
-        // max_kv 16384 -- so hand it back instead of leaving 28 of them held.
-        tg->data().clear();
-        tg->data().shrink_to_fit();
+    // A mapped staging buffer for one layer's live rows (rows * row_bytes).
+    std::shared_ptr<VulkanBuffer> kv_staging_(size_t bytes) {
+        auto st = std::make_shared<VulkanBuffer>(
+            dev_, bytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!st->getMappedMemory())
+            throw std::runtime_error("--kv-cache: staging buffer not mappable");
+        return st;
     }
 
-    // The inverse of pack_layer_: put `rows` contiguous rows back into the
-    // buffer at the pitch the kernel will read them from. Rows at or beyond
-    // `rows` stay zero, which is what an uncomputed row already is.
-    template <typename C>
-    void unpack_layer_(int layer, uint32_t rows, int pitch, const char *in,
-                       std::vector<C> &scratch) {
-        const std::string name = arch_.kv_in(layer);
-        rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(arch_.nkv),
-                                static_cast<uint32_t>(pitch),
-                                static_cast<uint32_t>(arch_.hd)});
-        auto tg = as_tensor<C>(rt_->GetInput(name));
-        check_layer_size_(layer, tg->num_elements(),
-                          static_cast<size_t>(pitch) * kv_row_vals());
-        const size_t total = static_cast<size_t>(pitch) * kv_row_vals();
-        scratch.assign(total, C{0});
-        const size_t dev_blk = static_cast<size_t>(pitch) * arch_.hd;
-        const size_t file_blk = static_cast<size_t>(rows) * arch_.hd;
-        for (int b = 0; b < 2 * arch_.nkv; ++b) {
-            std::memcpy(scratch.data() + static_cast<size_t>(b) * dev_blk,
-                        in + static_cast<size_t>(b) * file_blk * sizeof(C),
-                        file_blk * sizeof(C));
+    // Move layer `layer`'s first `rows` rows between the pitched device buffer
+    // and `staging`, packed block-major like the file: 2*nkv ranged copies of
+    // rows*hd elements each. Only the live rows travel. The previous form read
+    // back / uploaded the WHOLE pitched layer through a host vector, so dump
+    // and warm-load cost grew with --max-kv rather than with the prefix: fine
+    // at 16k rows, ~19 GB of traffic once the window follows the model's
+    // native context.
+    void transfer_rows_(int layer, uint32_t rows, int pitch,
+                        const std::shared_ptr<VulkanBuffer> &staging,
+                        bool to_device) {
+        auto buf = kv_buffer_(layer);
+        const VkDeviceSize eb = static_cast<VkDeviceSize>(kv_elem_bytes());
+        const VkDeviceSize dev_blk = static_cast<VkDeviceSize>(pitch) * arch_.hd * eb;
+        const VkDeviceSize file_blk = static_cast<VkDeviceSize>(rows) * arch_.hd * eb;
+        auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool_);
+        cmd->begin();
+        if (!to_device) {
+            // The fused Attention wrote these rows; make them visible to the
+            // transfer (the buffer's own access tracking does not see shader
+            // writes).
+            buf->shaderWriteBarrier(cmd->get());
         }
-        // The same fill + upload a prefill round does for its inputs; the
-        // buffer itself is the one KVCache preallocated at max_kv rows.
-        tg->fillToCPU(scratch.data());
-        tg->copyToGPU(cmdpool_);
+        for (int b = 0; b < 2 * arch_.nkv; ++b) {
+            if (to_device)
+                buf->copyStageBufferToBuffer(cmd->get(), staging->getBuffer(),
+                                             b * file_blk, file_blk, b * dev_blk);
+            else
+                buf->copyBufferToStageBuffer(cmd->get(), staging->getBuffer(),
+                                             b * file_blk, file_blk, b * dev_blk);
+        }
+        if (to_device) buf->readBarrier(cmd->get());
+        cmd->end();
+        cmd->submit(dev_->getComputeQueue());
+        cmd->wait();
     }
 
     size_t artifact_bytes() const {
@@ -791,7 +875,8 @@ class InferenceServer {
                   static_cast<std::streamsize>(rows) * 4);
 
         const size_t layer_bytes = static_cast<size_t>(rows) * row_bytes;
-        std::vector<char> buf(layer_bytes);
+        auto staging = kv_staging_(layer_bytes);
+        const char *mapped = static_cast<const char *>(staging->getMappedMemory());
         for (int i = 0; i < arch_.nlayers; ++i) {
             const int pitch = kv_pitch_(i);
             if (static_cast<uint32_t>(pitch) < rows)
@@ -799,11 +884,8 @@ class InferenceServer {
                     "--kv-dump: layer " + std::to_string(i) + " holds " +
                     std::to_string(pitch) + " rows but the conversation covered " +
                     std::to_string(rows));
-            if (arch_.cache_kind == ElemKind::kFloat16)
-                pack_layer_<uint16_t>(i, rows, pitch, buf.data());
-            else
-                pack_layer_<int8_t>(i, rows, pitch, buf.data());
-            out.write(buf.data(), static_cast<std::streamsize>(layer_bytes));
+            transfer_rows_(i, rows, pitch, staging, /*to_device=*/false);
+            out.write(mapped, static_cast<std::streamsize>(layer_bytes));
         }
         out.flush();
         if (!out) throw std::runtime_error("--kv-dump: write failed: " + tmp);
@@ -897,12 +979,11 @@ class InferenceServer {
                 static_cast<std::streamsize>(rows) * 4);
         if (!in) throw fail("truncated id stream");
         const size_t layer_bytes = static_cast<size_t>(rows) * row_bytes;
-        std::vector<char> buf(layer_bytes);
-        std::vector<uint16_t> scratch16;
-        std::vector<int8_t> scratch8;
+        auto staging = kv_staging_(layer_bytes);
+        char *mapped = static_cast<char *>(staging->getMappedMemory());
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < nlayers; ++i) {
-            in.read(buf.data(), static_cast<std::streamsize>(layer_bytes));
+            in.read(mapped, static_cast<std::streamsize>(layer_bytes));
             if (!in) throw fail("truncated cache payload");
             const int pitch = kv_pitch_(i);
             if (static_cast<uint32_t>(pitch) < rows)
@@ -910,10 +991,7 @@ class InferenceServer {
                            " rows but layer " + std::to_string(i) +
                            " has room for " + std::to_string(pitch) +
                            " (--max-kv)");
-            if (arch_.cache_kind == ElemKind::kFloat16)
-                unpack_layer_<uint16_t>(i, rows, pitch, buf.data(), scratch16);
-            else
-                unpack_layer_<int8_t>(i, rows, pitch, buf.data(), scratch8);
+            transfer_rows_(i, rows, pitch, staging, /*to_device=*/true);
         }
         covered_ids_ = std::move(ids);
         kv_->resume_from(static_cast<int>(rows));
@@ -1368,6 +1446,20 @@ class InferenceServer {
                stop_ids_.end();
     }
 
+  public:
+    // Whether a generated (non-stop) token belongs in the reply text. Decoding
+    // runs with skip_special=false so the tool-call markers survive, which
+    // also let every other control token (<|vision_start|>, <|image_pad|>,
+    // ...) through as literal text. Only the allow-listed markers pass now.
+    bool emits_text(uint32_t id) const {
+        if (!tok_.id_to_piece(id, /*skip_special=*/true).empty()) return true;
+        if (tok_.id_to_piece(id, /*skip_special=*/false).empty()) return true;
+        return std::find(text_specials_.begin(), text_specials_.end(), id) !=
+               text_specials_.end();
+    }
+
+  private:
+
     int max_kv_;
     // k of the GPU TopK post-process (0: none, 1: argmax only).
     int topk_k_ = 0;
@@ -1403,6 +1495,7 @@ class InferenceServer {
     // for a dense model -- nothing in the dense path touches it.
     std::unique_ptr<LinearState> lin_state_;
     std::vector<uint32_t> stop_ids_;
+    std::vector<uint32_t> text_specials_;
     std::vector<uint32_t> covered_ids_;
     // False while a round is overwriting rows covered_ids_ still claims.
     bool prefix_trusted_ = true;
@@ -1438,7 +1531,7 @@ void emit(int fd, const std::string &line) {
 
 const char *kUsage =
     "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
-    "[--max-kv N] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}] "
+    "[--max-kv N|auto] [--context-length N] [--kv-budget-mb MB] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}] "
     "[--prefill-chunk N] [--kv-warm FILE] [--kv-dump FILE] "
     "[--repetition-penalty F] [--seed N] [--sample-topk K] "
     "[--rpc-in FD] [--rpc-out FD]\n";
@@ -1453,7 +1546,9 @@ int main(int argc, char **argv) {
     const std::string model_path = argv[1];
     const std::string embed_path = argv[2];
     const std::string tok_path = argv[3];
-    int max_kv = 8192;
+    int max_kv = 8192;   // 0 = auto (see resolve_window_)
+    int context_length = 0;
+    double kv_budget_mb = 0;
     int prefill_chunk = vkop::llm::kDefaultPrefillChunk;
     int sample_topk = kDefaultSampleTopK;
     if (const char *e = std::getenv("VKOP_SAMPLE_TOPK")) sample_topk = std::atoi(e);
@@ -1464,7 +1559,18 @@ int main(int argc, char **argv) {
     uint64_t seed = 0;
     for (int i = 4; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--max-kv" && i + 1 < argc) max_kv = std::atoi(argv[++i]);
+        if (a == "--max-kv" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            max_kv = (v == "auto") ? 0 : std::atoi(v.c_str());
+            if (v != "auto" && max_kv <= 0) {
+                std::fprintf(stderr, "[serve] --max-kv must be > 0 or auto\n");
+                return 1;
+            }
+        }
+        else if (a == "--context-length" && i + 1 < argc)
+            context_length = std::atoi(argv[++i]);
+        else if (a == "--kv-budget-mb" && i + 1 < argc)
+            kv_budget_mb = std::atof(argv[++i]);
         else if (a == "--kv-kind" && i + 1 < argc) kv_kind = argv[++i];
         else if (a == "--prefill-chunk" && i + 1 < argc) prefill_chunk = std::atoi(argv[++i]);
         else if (a == "--kv-warm" && i + 1 < argc) kv_warm = argv[++i];
@@ -1482,10 +1588,6 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, kUsage, argv[0]);
             return 1;
         }
-    }
-    if (max_kv <= 0) {
-        std::fprintf(stderr, "[serve] --max-kv must be > 0\n");
-        return 1;
     }
 
 #ifdef _WIN32
@@ -1506,14 +1608,18 @@ int main(int argc, char **argv) {
         srv = std::make_unique<InferenceServer>(model_path, embed_path, tok_path,
                                                 max_kv, kv_kind, prefill_chunk,
                                                 kv_warm, repetition_penalty, seed,
-                                                sample_topk);
+                                                sample_topk, context_length,
+                                                kv_budget_mb);
         srv->set_kv_dump_path(kv_dump);
     } catch (const std::exception &e) {
         emit(rpc_out, std::string("FATAL ") + b64_encode(e.what()));
         std::fprintf(stderr, "[serve] startup failed: %s\n", e.what());
         return 1;
     }
-    emit(rpc_out, "READY 3");
+    // READY <abi> <window>: the second field is the KV window actually held
+    // (after --max-kv auto / clamping); older HTTP layers read only the first.
+    const std::string ready = "READY 3 " + std::to_string(srv->max_kv());
+    emit(rpc_out, ready);
 
     LineReader in(rpc_in);
     std::string line;
@@ -1547,7 +1653,7 @@ int main(int argc, char **argv) {
             emit(rpc_out, "BYE");
             break;
         }
-        if (cmd == "HELLO") { emit(rpc_out, "READY 3"); continue; }
+        if (cmd == "HELLO") { emit(rpc_out, ready); continue; }
         if (cmd == "RESET") {
             try { srv->reset(); emit(rpc_out, "OK"); }
             catch (const std::exception &e) {
@@ -1627,6 +1733,7 @@ int main(int argc, char **argv) {
             std::string streamed;   // exactly what the client saw
             qwen::StreamState st;
             auto cb = [&](uint32_t tok) {
+                if (!srv->emits_text(tok)) return;
                 emitted_ids.push_back(tok);
                 // skip_special=false: <tool_call> / </tool_call> are registered
                 // special tokens, and they are how the client sees a tool call

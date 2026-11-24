@@ -201,7 +201,12 @@ class Backend:
             line = self._recv()
             kind, _, rest = line.partition(" ")
             if kind == "READY":
-                self.abi = int(rest or 1)
+                # READY <abi> [<max_kv>]: the window the backend really holds
+                # (after --max-kv auto / clamping to the model's context).
+                fields = rest.split()
+                self.abi = int(fields[0]) if fields else 1
+                if len(fields) > 1 and int(fields[1]) > 0:
+                    self.max_kv = int(fields[1])
                 return
             if kind == "FATAL":
                 raise RuntimeError(base64.b64decode(rest).decode("utf-8", "replace"))
@@ -1370,6 +1375,10 @@ def build_backend(args):
     argv = [args.bin, model, args.embed, args.tokenizer,
             "--max-kv", str(args.max_kv), "--kv-kind", args.kv_kind,
             "--prefill-chunk", str(args.prefill_chunk)]
+    if args.context_length > 0:
+        argv += ["--context-length", str(args.context_length)]
+    if args.kv_budget_mb > 0:
+        argv += ["--kv-budget-mb", repr(args.kv_budget_mb)]
     if args.kv_cache:
         # One path, both directions. Expand it here: the backend is exec'd
         # without a shell, so a ~/... the user typed would stay literal.
@@ -1387,7 +1396,10 @@ def build_backend(args):
     # --coop restores the default selection for benchmarking.
     if not args.coop:
         env["VKOP_NO_COOP"] = "1"
-    return Backend(argv, env, max_kv=args.max_kv)
+    # "auto" is resolved by the backend after it loads the model; until its
+    # READY line says the real number, trim against the model's context.
+    guess = args.max_kv if args.max_kv != "auto" else (args.context_length or 8192)
+    return Backend(argv, env, max_kv=int(guess))
 
 
 # Every option a preset may set: long name -> (does it name a file, converter).
@@ -1395,6 +1407,17 @@ def build_backend(args):
 # check, so those three cannot drift apart. A key the table does not hold is an
 # error rather than a silent no-op: a typo'd "max_kV" that the server ignores is
 # the failure this whole file exists to make visible.
+def _max_kv_value(v):
+    """--max-kv: a row count, or "auto" (the model's context, capped by the
+    device memory budget -- resolved by llm_serve after the model loads)."""
+    if isinstance(v, str) and v.strip().lower() == "auto":
+        return "auto"
+    n = int(v)
+    if n <= 0:
+        raise ValueError("--max-kv must be > 0 or auto")
+    return n
+
+
 _PRESET_OPTIONS = {
     "host": (False, str),
     "port": (False, int),
@@ -1403,7 +1426,9 @@ _PRESET_OPTIONS = {
     "embed": (True, str),
     "tokenizer": (True, str),
     "model-name": (False, str),
-    "max-kv": (False, int),
+    "max-kv": (False, _max_kv_value),
+    "context-length": (False, int),
+    "kv-budget-mb": (False, float),
     "kv-kind": (False, str),
     "prefill-chunk": (False, int),
     "kv-cache": (True, str),
@@ -1420,6 +1445,7 @@ _PRESET_ENV = {
     "host": "VKOP_SERVE_HOST", "port": "VKOP_SERVE_PORT",
     "bin": "VKOP_SERVE_BIN", "model": "VKOP_MODEL", "embed": "VKOP_EMBED",
     "tokenizer": "VKOP_TOKENIZER", "max-kv": "VKOP_MAX_KV",
+    "context-length": "VKOP_CONTEXT_LENGTH", "kv-budget-mb": "VKOP_KV_BUDGET_MB",
     "kv-kind": "VKOP_KV_KIND", "prefill-chunk": "VKOP_SERVE_CHUNK",
     "kv-cache": "VKOP_KV_CACHE",
     "repetition-penalty": "VKOP_REPETITION_PENALTY",
@@ -1551,12 +1577,22 @@ def main():
     ap.add_argument("--tokenizer", default=os.environ.get(
         "VKOP_TOKENIZER", os.path.join(ROOT, "llm", "tokenizer",
                                        "qwen3_vl.bin")))
-    ap.add_argument("--max-kv", type=int,
-                    default=int(os.environ.get("VKOP_MAX_KV", "16384")),
-                    help="KV window in rows (prompt + generation must fit). "
-                         "Claude Code's own system prompt is ~11k tokens, so "
-                         "the 8192 default of llm_chat is too tight. Each row "
-                         "costs 2*nkv*hd*2 bytes per layer.")
+    ap.add_argument("--max-kv", type=_max_kv_value,
+                    default=_max_kv_value(os.environ.get("VKOP_MAX_KV", "auto")),
+                    help="KV window in rows (prompt + generation must fit), or "
+                         "'auto' (default): the model's --context-length capped "
+                         "by the device memory budget. An explicit count above "
+                         "--context-length is clamped to it. Each row costs "
+                         "2*nkv*hd*2 bytes per layer (fp16 cache).")
+    ap.add_argument("--context-length", type=int,
+                    default=int(os.environ.get("VKOP_CONTEXT_LENGTH", "0")),
+                    help="The model's native context (HF config "
+                         "max_position_embeddings). 0 = unknown: auto then "
+                         "sizes by memory only and nothing is clamped.")
+    ap.add_argument("--kv-budget-mb", type=float,
+                    default=float(os.environ.get("VKOP_KV_BUDGET_MB", "0")),
+                    help="Device memory the KV cache may take under "
+                         "--max-kv auto. 0 = 25%% of the free device heap.")
     ap.add_argument("--kv-kind", default=os.environ.get("VKOP_KV_KIND", "auto"))
     ap.add_argument("--prefill-chunk", type=int,
                     default=int(os.environ.get("VKOP_SERVE_CHUNK", "256")),
@@ -1655,6 +1691,11 @@ def main():
     print("[serve] waiting for the model to load...", file=sys.stderr)
     backend.wait_ready()
     print(f"[serve] ready: http://{args.host}:{args.port}", file=sys.stderr)
+    # Claude Code cannot learn the window of a model id it does not know and
+    # assumes 1M tokens, so it never compacts and the history gets trimmed
+    # here instead. This variable is how the client is told the real number.
+    print(f"[serve] KV window {backend.max_kv} tokens -- start the client with "
+          f"CLAUDE_CODE_MAX_CONTEXT_TOKENS={backend.max_kv}", file=sys.stderr)
 
     Handler.backend = backend
     Handler.metrics = Metrics()

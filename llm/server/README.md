@@ -88,15 +88,25 @@ EOF
 CLAUDE_CONFIG_DIR=/tmp/cccfg claude
 ```
 
-Claude Code 会提示 `doesn't recognize the model`，并假设 1m 上下文窗口 —— 那是它自己的
-模型表里没有这个名字，不影响使用；真实的窗口由服务端的 `--max-kv` 决定（见下）。
+Claude Code 不认识这个模型名，会假设 1m 上下文窗口，于是永远不主动压缩历史，超窗只能靠
+服务端裁剪。服务端启动时会打印真实窗口和对应的客户端变量：
+
+```
+[serve] --max-kv auto: 57344 rows (model context 262144, budget fits 58161, 6.58 GB of cache)
+[serve] KV window 57344 tokens -- start the client with CLAUDE_CODE_MAX_CONTEXT_TOKENS=57344
+```
+
+把它放进同一个 `settings.json` 的 `env`（`"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "57344"`），
+Claude Code 就按这个窗口做自动压缩。
 
 ## 参数
 
 | 开关 | 默认 | 说明 |
 |---|---|---|
 | `--host` / `--port` | `127.0.0.1` / `8787` | |
-| `--max-kv` | 16384 | KV 窗口行数。prompt + 生成长度必须装得下。Claude Code 的系统提示约 11k token，`llm_chat` 的 8192 不够。每行的显存代价是 `2*nkv*hd*2` 字节/层（fp16 缓存），fp8 缓存是它的一半，见「KV cache 精度」 |
+| `--max-kv` | auto | KV 窗口行数，prompt + 生成长度必须装得下。`auto`＝模型原生上下文（`--context-length`）与显存预算取小，按 1024 行取整，`llm_serve` 加载完模型后算出来，经 `READY 3 <行数>` 报回 HTTP 层做裁剪。显式给的行数超过 `--context-length` 会被夹到它 —— 再往后的位置模型没训练过。每行的显存代价是 `2*nkv*hd*2` 字节/层（fp16 缓存），fp8 缓存是它的一半，见「KV cache 精度」 |
+| `--context-length` | 0 | 模型原生上下文，即 HF config 的 `max_position_embeddings`（Qwen3-VL-2B 是 262144，Phi-4-mini 131072，GLM-Edge 8192）。0＝未知：`auto` 只按显存定，也不夹显式值 |
+| `--kv-budget-mb` | 0 | `--max-kv auto` 时 KV 缓存可占的显存。0＝加载模型后设备堆剩余预算（`VK_EXT_memory_budget`）的 25%，没有该扩展时取堆大小的 30%。本机（M5 Max，36 GB 统一内存）得 6.6 GB / 57344 行；取 40% 时是 10.6 GB / 92160 行，系统空闲内存掉到 19%，这台机器曾在这个水位 OOM 重启过，所以默认取得保守 |
 | `--prefill-chunk` | 256 | prefill 每次派发的 token 数。两道墙：图里的 logits 是 `(1,q,vocab)`，8192 在 152k 词表上要 2.5 GB；以及这台驱动上单次派发占用 GPU 的工作量 —— `q=1024` 在覆盖行数超过约 6k 后会把 GPU 打掉（`VK_ERROR_DEVICE_LOST`，见「已知问题」）。256 是能跑完 Claude Code 那 11k token 提示的值；更大更快（q=1024 实测 46 tok/s vs 256 的 28），但只适合短 prompt |
 | `--max-output` | 1024 | 单次回复的生成上限。客户端要的 `max_tokens` 更小时按客户端的来；更大时按这个截断 —— Claude Code 要 32000，在这块 GPU 上是 1.8 小时 |
 | `--kv-kind` | auto | **只做校验，不选精度**。缓存的数据类型是制品的属性（转换器按图里的 past/present 声明选 attention kernel），所以这个参数改不了它。请求值和制品声明不一致时 `llm_serve` 直接报错退出 —— 以前它会把错尺寸的缓冲交给 kernel，静默读错缓存，4 bit 值配 fp16 图还会在建立 plan 时段错误。要 fp8 KV 就导出 fp8 制品（见下） |
@@ -194,9 +204,19 @@ python3 llm/server/anthropic_server.py --model llm/exporter/llm_fp8_kv.vkopbin \
 （上一轮同尺寸实测是 244 秒 / 6.9 秒 / 读 13.0 秒 / 写 15.0 秒；读写时间差在页缓存和盘
 状态，量级没变。）
 
-两点不漂亮但可接受：读回/上传按行距铺满整个 `[.., max_kv, ..]` 容器，所以真正的字节之外
-还要多搬「还没算的那段窗口」的零（这里 940 MB 而非 463 MB）—— 把 `--max-kv` 收到贴近
-前缀长度就基本没有零可搬；以及 fp8 缓存下 cold 和 warm 可能差一个首字母大小写。
+读回/上传现在只搬活跃行：每层 `2*nkv` 段各一次 ranged `vkCmdCopyBuffer`，经一块映射的
+staging 直接读写文件（`transfer_rows_`）。此前是按行距把整个 `[.., max_kv, ..]` 容器读回 /
+上传，代价随 `--max-kv` 而不是前缀长度增长 —— 22 行的前缀写盘要 4 秒，窗口改成按模型上下文
+定（几万行）以后会到每次 ~19 GB。实测（M5 Max，fp16，`--max-kv auto`＝57344 行）：
+
+| | 之前（16384 行窗口） | 现在（57344 行窗口） |
+|---|---|---|
+| 写 22 行 | 4.0 秒 | — |
+| 写 ~12k 行 | 13594 行 / 1487 MB / 7.1 秒 | 11852 行 / 1296 MB / 1.0 秒 |
+| 写 32.9k 行 | 装不下 | 3598 MB / 2.1 秒 |
+| 读 32.9k 行 | 装不下 | 3598 MB / 5.7 秒，首请求 TTFT 31.5 秒 → 0.74 秒，答案相同 |
+
+另外 fp8 缓存下 cold 和 warm 可能差一个首字母大小写。
 
 大小写那件事的实测边界（239 token 的合成 prompt，同一问题、同一制品）：
 
@@ -338,6 +358,12 @@ chunk 是一轮，decode 每步一轮），`VKOP_SUBMITPROF_TOPN=N` 控制最慢
   （151657/151658），所以 `llm_serve` 解码时必须 `skip_special=false`，否则标记被过滤掉、
   只剩下一个裸 JSON，客户端就会当成正文。服务端把标记之外的内容转成 `text` block、
   里面的 JSON 转成 `tool_use` block，并把 `stop_reason` 置为 `tool_use`。
+- **其它特殊 token**：`skip_special=false` 也让所有控制 token 原样进了正文 —— 实测 2B 模型
+  在 Claude Code 会话里写出过一个内容为 `<|im_start|>user\n<|im_start|>assistant\n` 的
+  text block。现在两条规则：轮边界（`<|im_start|>`、`<|endoftext|>`、`<tool_response>`、
+  Phi 的 `<|user|>`/`<|system|>`）和模板自带的停止符一样结束本轮 —— 写新轮头或自己编工具
+  结果，都说明这一轮已经说完了；其余特殊 token 只有 `<tool_call>`、`</tool_call>`、`<think>`、
+  `</think>` 进正文，别的一律丢掉（`InferenceServer::emits_text`）。
 - **工具结果**：`tool_result` block 渲染成 `<tool_response>...</tool_response>`，连续几个
   合并进同一个 user 轮 —— 和 Qwen 的 chat template 一致。
 - **工具定义**：转成 Qwen 的 `# Tools` 系统前缀，schema 按 OpenAI function 形式重排
@@ -383,8 +409,20 @@ chunk 是一轮，decode 每步一轮），`VKOP_SUBMITPROF_TOPN=N` 控制最慢
   prefill 一旦宽到会选中 coopmat 路由，模型输出就退化）。服务端因此默认设
   `VKOP_NO_COOP=1`；根因不在本服务里，修好后再用 `--coop` 打开。
 - 速度（本机 Radeon Pro 560X、int8 权重）：decode 约 1 s/token，prefill 约 28 tok/s
-  （chunk 256）。此前记的 200 ms/token 是 ARL iGPU 上的数。用 `--max-kv` 调窗口时注意：
-  更大的窗口让 attention_bias 和 KV 都更长，decode 会更慢。
+  （chunk 256）。此前记的 200 ms/token 是 ARL iGPU 上的数。
+- 速度（M5 Max，fp16 权重，`--max-kv auto`＝57344 行）：短上下文 decode 14 ms/token，
+  12k 上下文 20 ms/token（Claude Code 的会话），33k 上下文 27 ms/token；prefill 约
+  1750 tok/s（11.7k）/ 1050 tok/s（32.9k）。decode 时间跟着**已用**行数走，不跟窗口大小走：
+  attention 只扫已用的行（见下一条）。
+- **decode attention 按 KV 切片**（`attention.comp -DKV_SPLIT`，`AttentionBuffer::split_route`）。
+  原来的 kernel 一个查询行一个 workgroup，decode 一步只有 16 个（GQA 16 头），每个串行扫完
+  整段历史：12k 上下文时 Attention 占一步 41 ms 里的 29 ms（1.05 ms/层，约为 KV 带宽下限的
+  10 倍）。现在每行的 KV 切成若干段整 tile，一个 workgroup 一段（目标 512 个 workgroup，
+  `VKOP_ATTN_SPLIT_WGS` 可调），写出 (m, l, o) 局部量，第二次派发按行合并；cache 是原地
+  更新时，拷贝那一半也只派发新行（原来每层要发 ~116k 个立刻返回的空 workgroup）。14.5k
+  上下文 decode 49.9 → 20.7 ms/token，短上下文 14.1 → 14.2（不变），输出逐 token 相同。
+  `VKOP_ATTN_SPLIT=0` 退回原 kernel 做 A/B；旧制品里没有这两个 shader key，会打印一行提示
+  并沿用原 kernel，要重转才能用上。
 
 ## 验证
 

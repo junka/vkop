@@ -58,6 +58,7 @@ namespace vkop {
     PFN(vkGetPhysicalDeviceQueueFamilyProperties)                              \
     PFN(vkGetPhysicalDeviceProperties)                                         \
     PFN(vkGetPhysicalDeviceProperties2)                                        \
+    PFN(vkGetPhysicalDeviceMemoryProperties2)                                  \
     PFN(vkEnumeratePhysicalDevices)                                            \
     PFN(vkEnumerateDeviceExtensionProperties)                                  \
     PFN(vkResetCommandBuffer)                                                  \

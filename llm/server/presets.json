@@ -12,24 +12,26 @@
 
   "presets": {
     "qwen3-vl-2b": {
-      "_comment": "The 2B fp16 artifact the README's numbers come from. An ~11k-token agent prompt needs the 16384 window and the 256 chunk; kv-cache makes a restart skip the re-prefill.",
+      "_comment": "The 2B fp16 artifact the README's numbers come from. context-length is the checkpoint's max_position_embeddings (262144); max-kv auto takes that capped by the device memory budget (the server prints the result and the CLAUDE_CODE_MAX_CONTEXT_TOKENS to start the client with). kv-cache makes a restart skip the re-prefill.",
       "model": "../exporter/llm.vkopbin",
       "embed": "../exporter/embed_tokens.bin",
       "tokenizer": "../tokenizer/qwen3_vl.bin",
       "model-name": "vkop-qwen3-vl-2b",
-      "max-kv": 16384,
+      "context-length": 262144,
+      "max-kv": "auto",
       "prefill-chunk": 256,
       "max-output": 1024,
       "kv-cache": "../exporter/kv_prefix.bin"
     },
 
     "qwen3-vl-2b-fp8kv": {
-      "_comment": "Same model, e4m3 KV cache: half the bytes per row, so a larger window fits. Needs the fp8 variant artifact (llm/exporter/make_kv_variant.py --fp8), not just this preset -- if it is not built the server says 'missing:' and stops.",
+      "_comment": "Same model, e4m3 KV cache: half the bytes per row, so max-kv auto fits twice the rows. Needs the fp8 variant artifact (llm/exporter/make_kv_variant.py --fp8), not just this preset -- if it is not built the server says 'missing:' and stops.",
       "model": "../exporter/llm_fp8_kv.vkopbin",
       "embed": "../exporter/embed_tokens.bin",
       "tokenizer": "../tokenizer/qwen3_vl.bin",
       "model-name": "vkop-qwen3-vl-2b-fp8kv",
-      "max-kv": 24576,
+      "context-length": 262144,
+      "max-kv": "auto",
       "prefill-chunk": 256,
       "max-output": 1024
     },
