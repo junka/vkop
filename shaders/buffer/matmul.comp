@@ -626,6 +626,16 @@ float e2m1_val(uint c) {
 // projection by default) was decoded as if it were int4. The nibble grid still
 // has plausible magnitudes, so the mismatch surfaced only as a wrong answer:
 // measured N=2048 on ARL, nf4 460.5 vs -25.5 expected, uint4 -8.16 vs -10.41.
+// True when the 4-bit payload is the plain signed int4 grid -- the one case
+// where w4_at reduces to w4_val. Uniform over a dispatch, so a hot loop can
+// test it ONCE and run a w4_val body: w4_at's three per-nibble format tests
+// are not hoisted out of the K loop by every compiler (Metal via MoltenVK kept
+// them inside, doubling the WIDE GEMV's decode cost: Qwen3-VL-2B int4 decode
+// 11.7 -> 21.5 ms/token).
+bool w4_plain() {
+    return uPC.nvfp4 == 0 && uPC.uint4 == 0 && uPC.nf4 == 0;
+}
+
 float w4_at(uint word, int e) {
     if (uPC.nvfp4 != 0) return e2m1_val((word >> uint(e * 4)) & 15u);
     if (uPC.uint4 != 0) return w4u_val(word, e);
@@ -635,6 +645,12 @@ float w4_at(uint word, int e) {
 
 // Four consecutive 4-bit weights starting at nibble `base` (0 or 4) of a word.
 vec4 unpack_w4(uint word, int base) {
+    // Plain signed int4 -- the common payload -- skips w4_at's per-nibble
+    // format tests; every other format still decodes through w4_at.
+    if (w4_plain()) {
+        return vec4(w4_val(word, base), w4_val(word, base + 1),
+                    w4_val(word, base + 2), w4_val(word, base + 3));
+    }
     return vec4(w4_at(word, base), w4_at(word, base + 1),
                 w4_at(word, base + 2), w4_at(word, base + 3));
 }
@@ -1480,9 +1496,86 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
 // changing the payload layout, the activation dtype, or the converter.
 //
 // The nibble order within the word is low-first and column-ascending, which is
-// what w4_at(word, e) decodes: e == 0 is the lowest column of the octet.
+// what w4_val / w4_at(word, e) decode: e == 0 is the lowest column of the octet.
 // ks_store_wide (eight columns, no column scale) is reused; the per-group
 // scale is applied where the group boundary falls, see the two loops.
+// The K walk of matmul16_w4_ksplit_wide over this lane's groups, with the
+// nibble decoder as a parameter so the kernel can pick it once per dispatch
+// (see w4_plain): w4_val for plain int4, w4_at for every other 4-bit format.
+// Eight k's per trip, the shape the int8 WIDE GEMV uses: the two-at-a-time form
+// kept only two loads in flight per lane and stalled on DRAM latency. The group
+// boundary bounds the trip -- a scale covers `uPC.group` consecutive k, so the
+// accumulators are flushed and scaled once per group; group is even
+// (host-checked) and the tail loop takes the last few k of each group. DEC(w, e)
+// is column e of the lane's octet (low nibble first, column-ascending), so the
+// four low columns feed acc and the four high ones acc2. Two scale quads, not
+// one: a column's group scale is its own, and reusing the ja..ja+3 quad for the
+// upper half is silently wrong whenever the two differ.
+#define W4_WIDE_GROUPS(DEC) \
+        for (int g = k0 / group; g < ngroups && g * group < kend; ++g) {      \
+            int gk0 = max(k0, g * group);                                     \
+            int gk1 = min(kend, (g + 1) * group);                             \
+            vec4 acc = vec4(0.0);                                             \
+            vec4 acc2 = vec4(0.0);                                            \
+            int k = gk0;                                                      \
+            for (; k + 7 < gk1; k += 8) {                                     \
+                uint w0 = uInputB.data[(b_base + (k + 0) * uPC.N) >> 3];      \
+                uint w1 = uInputB.data[(b_base + (k + 1) * uPC.N) >> 3];      \
+                uint w2 = uInputB.data[(b_base + (k + 2) * uPC.N) >> 3];      \
+                uint w3 = uInputB.data[(b_base + (k + 3) * uPC.N) >> 3];      \
+                uint w4 = uInputB.data[(b_base + (k + 4) * uPC.N) >> 3];      \
+                uint w5 = uInputB.data[(b_base + (k + 5) * uPC.N) >> 3];      \
+                uint w6 = uInputB.data[(b_base + (k + 6) * uPC.N) >> 3];      \
+                uint w7 = uInputB.data[(b_base + (k + 7) * uPC.N) >> 3];      \
+                vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);     \
+                vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]); \
+                vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]); \
+                vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]); \
+                acc += a0.x * vec4(DEC(w0, 0), DEC(w0, 1), DEC(w0, 2),        \
+                                   DEC(w0, 3)) +                              \
+                       a0.y * vec4(DEC(w1, 0), DEC(w1, 1), DEC(w1, 2),        \
+                                   DEC(w1, 3)) +                              \
+                       a1.x * vec4(DEC(w2, 0), DEC(w2, 1), DEC(w2, 2),        \
+                                   DEC(w2, 3)) +                              \
+                       a1.y * vec4(DEC(w3, 0), DEC(w3, 1), DEC(w3, 2),        \
+                                   DEC(w3, 3)) +                              \
+                       a2.x * vec4(DEC(w4, 0), DEC(w4, 1), DEC(w4, 2),        \
+                                   DEC(w4, 3)) +                              \
+                       a2.y * vec4(DEC(w5, 0), DEC(w5, 1), DEC(w5, 2),        \
+                                   DEC(w5, 3)) +                              \
+                       a3.x * vec4(DEC(w6, 0), DEC(w6, 1), DEC(w6, 2),        \
+                                   DEC(w6, 3)) +                              \
+                       a3.y * vec4(DEC(w7, 0), DEC(w7, 1), DEC(w7, 2),        \
+                                   DEC(w7, 3));                               \
+                acc2 += a0.x * vec4(DEC(w0, 4), DEC(w0, 5), DEC(w0, 6),       \
+                                    DEC(w0, 7)) +                             \
+                        a0.y * vec4(DEC(w1, 4), DEC(w1, 5), DEC(w1, 6),       \
+                                    DEC(w1, 7)) +                             \
+                        a1.x * vec4(DEC(w2, 4), DEC(w2, 5), DEC(w2, 6),       \
+                                    DEC(w2, 7)) +                             \
+                        a1.y * vec4(DEC(w3, 4), DEC(w3, 5), DEC(w3, 6),       \
+                                    DEC(w3, 7)) +                             \
+                        a2.x * vec4(DEC(w4, 4), DEC(w4, 5), DEC(w4, 6),       \
+                                    DEC(w4, 7)) +                             \
+                        a2.y * vec4(DEC(w5, 4), DEC(w5, 5), DEC(w5, 6),       \
+                                    DEC(w5, 7)) +                             \
+                        a3.x * vec4(DEC(w6, 4), DEC(w6, 5), DEC(w6, 6),       \
+                                    DEC(w6, 7)) +                             \
+                        a3.y * vec4(DEC(w7, 4), DEC(w7, 5), DEC(w7, 6),       \
+                                    DEC(w7, 7));                              \
+            }                                                                 \
+            for (; k < gk1; ++k) {                                            \
+                uint w = uInputB.data[(b_base + k * uPC.N) >> 3];             \
+                float a = load_a(a_off + k);                                  \
+                acc += a * vec4(DEC(w, 0), DEC(w, 1), DEC(w, 2),              \
+                                DEC(w, 3));                                   \
+                acc2 += a * vec4(DEC(w, 4), DEC(w, 5), DEC(w, 6),             \
+                                 DEC(w, 7));                                  \
+            }                                                                 \
+            s0 += acc * scale4(g * uPC.N + ja);                               \
+            s1 += acc2 * scale4(g * uPC.N + ja + 4);                          \
+        }
+
 void matmul16_w4_ksplit_wide() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
@@ -1508,91 +1601,10 @@ void matmul16_w4_ksplit_wide() {
     vec4 s0 = vec4(0.0);  // cols ja .. ja+3
     vec4 s1 = vec4(0.0);  // cols ja+4 .. ja+7
     if (ja < uPC.N) {
-        for (int g = k0 / group; g < ngroups && g * group < kend; ++g) {
-            int gk0 = max(k0, g * group);
-            int gk1 = min(kend, (g + 1) * group);
-            vec4 acc = vec4(0.0);
-            vec4 acc2 = vec4(0.0);
-            // Eight k's per trip, the same shape the int8 WIDE GEMV uses and
-            // for the same reason: the two-at-a-time form kept only two loads
-            // in flight per lane and stalled on DRAM latency (measured on
-            // Qwen2.5-0.5B int8: the large projections capped near 21 GB/s
-            // until the trip widened). Here each load is one uint32, so eight
-            // of them is 32 weight bytes in flight per lane against the single
-            // 4 the scalar loop had.
-            //
-            // The group boundary bounds the trip: an int4 scale covers
-            // `uPC.group` consecutive k, so the accumulator is flushed and
-            // scaled once per group. Group is even (host-checked) and the
-            // unrolled body takes 8 at a time, so a trip only runs while a
-            // whole group's worth of k remains -- the tail loop below handles
-            // the last few of each group.
-            int k = gk0;
-            for (; k + 7 < gk1; k += 8) {
-                uint w0 = uInputB.data[(b_base + (k + 0) * uPC.N) >> 3];
-                uint w1 = uInputB.data[(b_base + (k + 1) * uPC.N) >> 3];
-                uint w2 = uInputB.data[(b_base + (k + 2) * uPC.N) >> 3];
-                uint w3 = uInputB.data[(b_base + (k + 3) * uPC.N) >> 3];
-                uint w4 = uInputB.data[(b_base + (k + 4) * uPC.N) >> 3];
-                uint w5 = uInputB.data[(b_base + (k + 5) * uPC.N) >> 3];
-                uint w6 = uInputB.data[(b_base + (k + 6) * uPC.N) >> 3];
-                uint w7 = uInputB.data[(b_base + (k + 7) * uPC.N) >> 3];
-                vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
-                vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
-                vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
-                vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
-                // w4_at(word, e) is column e of the lane's octet, so the four
-                // low columns and the four high ones feed the two chains.
-                acc += a0.x * vec4(w4_at(w0, 0), w4_at(w0, 1), w4_at(w0, 2),
-                                   w4_at(w0, 3)) +
-                       a0.y * vec4(w4_at(w1, 0), w4_at(w1, 1), w4_at(w1, 2),
-                                   w4_at(w1, 3)) +
-                       a1.x * vec4(w4_at(w2, 0), w4_at(w2, 1), w4_at(w2, 2),
-                                   w4_at(w2, 3)) +
-                       a1.y * vec4(w4_at(w3, 0), w4_at(w3, 1), w4_at(w3, 2),
-                                   w4_at(w3, 3)) +
-                       a2.x * vec4(w4_at(w4, 0), w4_at(w4, 1), w4_at(w4, 2),
-                                   w4_at(w4, 3)) +
-                       a2.y * vec4(w4_at(w5, 0), w4_at(w5, 1), w4_at(w5, 2),
-                                   w4_at(w5, 3)) +
-                       a3.x * vec4(w4_at(w6, 0), w4_at(w6, 1), w4_at(w6, 2),
-                                   w4_at(w6, 3)) +
-                       a3.y * vec4(w4_at(w7, 0), w4_at(w7, 1), w4_at(w7, 2),
-                                   w4_at(w7, 3));
-                acc2 += a0.x * vec4(w4_at(w0, 4), w4_at(w0, 5), w4_at(w0, 6),
-                                    w4_at(w0, 7)) +
-                        a0.y * vec4(w4_at(w1, 4), w4_at(w1, 5), w4_at(w1, 6),
-                                    w4_at(w1, 7)) +
-                        a1.x * vec4(w4_at(w2, 4), w4_at(w2, 5), w4_at(w2, 6),
-                                    w4_at(w2, 7)) +
-                        a1.y * vec4(w4_at(w3, 4), w4_at(w3, 5), w4_at(w3, 6),
-                                    w4_at(w3, 7)) +
-                        a2.x * vec4(w4_at(w4, 4), w4_at(w4, 5), w4_at(w4, 6),
-                                    w4_at(w4, 7)) +
-                        a2.y * vec4(w4_at(w5, 4), w4_at(w5, 5), w4_at(w5, 6),
-                                    w4_at(w5, 7)) +
-                        a3.x * vec4(w4_at(w6, 4), w4_at(w6, 5), w4_at(w6, 6),
-                                    w4_at(w6, 7)) +
-                        a3.y * vec4(w4_at(w7, 4), w4_at(w7, 5), w4_at(w7, 6),
-                                    w4_at(w7, 7));
-            }
-            for (; k < gk1; ++k) {
-                // One word = this lane's eight columns at this k, low nibble
-                // first and column-ascending (see w4_val).
-                uint w = uInputB.data[(b_base + k * uPC.N) >> 3];
-                float a = load_a(a_off + k);
-                acc += a * vec4(w4_at(w, 0), w4_at(w, 1), w4_at(w, 2),
-                                w4_at(w, 3));
-                acc2 += a * vec4(w4_at(w, 4), w4_at(w, 5), w4_at(w, 6),
-                                 w4_at(w, 7));
-            }
-            // Two scale quads, not one: s1 covers columns ja+4..ja+7, and a
-            // column's group scale is its own -- reusing the ja..ja+3 quad for
-            // both halves multiplies the upper four columns by the lower
-            // four's scale, which is a silently wrong result whenever the two
-            // differ (they almost always do).
-            s0 += acc * scale4(g * uPC.N + ja);
-            s1 += acc2 * scale4(g * uPC.N + ja + 4);
+        if (w4_plain()) {
+            W4_WIDE_GROUPS(w4_val)
+        } else {
+            W4_WIDE_GROUPS(w4_at)
         }
     }
     ks_store_wide(s0, s1, row, ja);
