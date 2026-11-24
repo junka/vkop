@@ -74,7 +74,7 @@ else()
     set(PROBE_TU_SOURCES ${PROBE_SOURCES})
 endif()
 
-add_executable(vkop_probes main.cpp ${PROBE_TU_SOURCES})
+add_executable(vkop_probes EXCLUDE_FROM_ALL main.cpp ${PROBE_TU_SOURCES})
 set_source_files_properties(${PROBE_TU_SOURCES} PROPERTIES GENERATED TRUE)
 target_include_directories(vkop_probes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(vkop_probes PRIVATE vkop vload)
@@ -110,6 +110,6 @@ target_compile_definitions(vkop_probes PRIVATE
 add_dependencies(vkop_probes shader_archive)
 
 # Probes are diagnostics, not a ctest suite (see tests/CMakeLists.txt for the
-# reason). Build them on demand or through the `probes` target; they are not
-# part of `all`, so a header edit does not rebuild them.
+# reason). EXCLUDE_FROM_ALL above keeps them out of a plain `make`, so a header
+# edit does not rebuild them; build them with `make vkop_probes`.
 install(TARGETS vkop_probes RUNTIME DESTINATION bin OPTIONAL)
