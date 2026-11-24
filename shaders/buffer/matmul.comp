@@ -618,35 +618,31 @@ float e2m1_val(uint c) {
     return (c & 8u) != 0u ? -v : v;
 }
 
+// One nibble of `word` at position `e` (0..7), decoded by the payload's
+// meaning. The single-value form of unpack_w4, split out because the WIDE GEMV
+// reads one word and decodes eight columns from it: before this existed that
+// kernel called w4_val directly, which is the SIGNED nibble only -- so an nf4
+// or uint4 weight on the WIDE route (n >= wide_thr_fp16, i.e. every large
+// projection by default) was decoded as if it were int4. The nibble grid still
+// has plausible magnitudes, so the mismatch surfaced only as a wrong answer:
+// measured N=2048 on ARL, nf4 460.5 vs -25.5 expected, uint4 -8.16 vs -10.41.
+float w4_at(uint word, int e) {
+    if (uPC.nvfp4 != 0) return e2m1_val((word >> uint(e * 4)) & 15u);
+    if (uPC.uint4 != 0) return w4u_val(word, e);
+    if (uPC.nf4 != 0) return nf4_code(int((word >> uint(e * 4)) & 15u));
+    return w4_val(word, e);
+}
+
 // Four consecutive 4-bit weights starting at nibble `base` (0 or 4) of a word.
 vec4 unpack_w4(uint word, int base) {
-    if (uPC.nvfp4 != 0) {
-        word >>= base * 4;
-        return vec4(e2m1_val(word & 15u), e2m1_val((word >> 4) & 15u),
-                    e2m1_val((word >> 8) & 15u), e2m1_val(word >> 12));
-    }
-    if (uPC.nf4 != 0) {
-        word >>= base * 4;
-        return vec4(nf4_code(int(word & 15u)), nf4_code(int((word >> 4) & 15u)),
-                    nf4_code(int((word >> 8) & 15u)),
-                    nf4_code(int((word >> 12) & 15u)));
-    }
-    if (uPC.uint4 != 0) {
-        return vec4(w4u_val(word, base), w4u_val(word, base + 1),
-                    w4u_val(word, base + 2), w4u_val(word, base + 3));
-    }
-    return vec4(w4_val(word, base), w4_val(word, base + 1),
-                w4_val(word, base + 2), w4_val(word, base + 3));
+    return vec4(w4_at(word, base), w4_at(word, base + 1),
+                w4_at(word, base + 2), w4_at(word, base + 3));
 }
 
 // One weight by its index in the logical [K, N] matrix.
 float unpack_w4_at(int idx) {
     uint word = uInputB.data[idx >> 3];
-    int e = idx & 7;
-    if (uPC.nvfp4 != 0) return e2m1_val((word >> (e * 4)) & 15u);
-    if (uPC.uint4 != 0) return w4u_val(word, e);
-    return uPC.nf4 != 0 ? nf4_code(int((word >> (e * 4)) & 15u))
-                        : w4_val(word, e);
+    return w4_at(word, idx & 7);
 }
 
 // The fp32 factor NVFP4 multiplies every block scale by: the one level the
@@ -1484,7 +1480,7 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
 // changing the payload layout, the activation dtype, or the converter.
 //
 // The nibble order within the word is low-first and column-ascending, which is
-// what w4_val(word, e) decodes: e == 0 is the lowest column of the octet.
+// what w4_at(word, e) decodes: e == 0 is the lowest column of the octet.
 // ks_store_wide (eight columns, no column scale) is reused; the per-group
 // scale is applied where the group boundary falls, see the two loops.
 void matmul16_w4_ksplit_wide() {
@@ -1545,50 +1541,50 @@ void matmul16_w4_ksplit_wide() {
                 vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
                 vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
                 vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
-                // w4_val(word, e) is column e of the lane's octet, so the four
+                // w4_at(word, e) is column e of the lane's octet, so the four
                 // low columns and the four high ones feed the two chains.
-                acc += a0.x * vec4(w4_val(w0, 0), w4_val(w0, 1), w4_val(w0, 2),
-                                   w4_val(w0, 3)) +
-                       a0.y * vec4(w4_val(w1, 0), w4_val(w1, 1), w4_val(w1, 2),
-                                   w4_val(w1, 3)) +
-                       a1.x * vec4(w4_val(w2, 0), w4_val(w2, 1), w4_val(w2, 2),
-                                   w4_val(w2, 3)) +
-                       a1.y * vec4(w4_val(w3, 0), w4_val(w3, 1), w4_val(w3, 2),
-                                   w4_val(w3, 3)) +
-                       a2.x * vec4(w4_val(w4, 0), w4_val(w4, 1), w4_val(w4, 2),
-                                   w4_val(w4, 3)) +
-                       a2.y * vec4(w4_val(w5, 0), w4_val(w5, 1), w4_val(w5, 2),
-                                   w4_val(w5, 3)) +
-                       a3.x * vec4(w4_val(w6, 0), w4_val(w6, 1), w4_val(w6, 2),
-                                   w4_val(w6, 3)) +
-                       a3.y * vec4(w4_val(w7, 0), w4_val(w7, 1), w4_val(w7, 2),
-                                   w4_val(w7, 3));
-                acc2 += a0.x * vec4(w4_val(w0, 4), w4_val(w0, 5), w4_val(w0, 6),
-                                    w4_val(w0, 7)) +
-                        a0.y * vec4(w4_val(w1, 4), w4_val(w1, 5), w4_val(w1, 6),
-                                    w4_val(w1, 7)) +
-                        a1.x * vec4(w4_val(w2, 4), w4_val(w2, 5), w4_val(w2, 6),
-                                    w4_val(w2, 7)) +
-                        a1.y * vec4(w4_val(w3, 4), w4_val(w3, 5), w4_val(w3, 6),
-                                    w4_val(w3, 7)) +
-                        a2.x * vec4(w4_val(w4, 4), w4_val(w4, 5), w4_val(w4, 6),
-                                    w4_val(w4, 7)) +
-                        a2.y * vec4(w4_val(w5, 4), w4_val(w5, 5), w4_val(w5, 6),
-                                    w4_val(w5, 7)) +
-                        a3.x * vec4(w4_val(w6, 4), w4_val(w6, 5), w4_val(w6, 6),
-                                    w4_val(w6, 7)) +
-                        a3.y * vec4(w4_val(w7, 4), w4_val(w7, 5), w4_val(w7, 6),
-                                    w4_val(w7, 7));
+                acc += a0.x * vec4(w4_at(w0, 0), w4_at(w0, 1), w4_at(w0, 2),
+                                   w4_at(w0, 3)) +
+                       a0.y * vec4(w4_at(w1, 0), w4_at(w1, 1), w4_at(w1, 2),
+                                   w4_at(w1, 3)) +
+                       a1.x * vec4(w4_at(w2, 0), w4_at(w2, 1), w4_at(w2, 2),
+                                   w4_at(w2, 3)) +
+                       a1.y * vec4(w4_at(w3, 0), w4_at(w3, 1), w4_at(w3, 2),
+                                   w4_at(w3, 3)) +
+                       a2.x * vec4(w4_at(w4, 0), w4_at(w4, 1), w4_at(w4, 2),
+                                   w4_at(w4, 3)) +
+                       a2.y * vec4(w4_at(w5, 0), w4_at(w5, 1), w4_at(w5, 2),
+                                   w4_at(w5, 3)) +
+                       a3.x * vec4(w4_at(w6, 0), w4_at(w6, 1), w4_at(w6, 2),
+                                   w4_at(w6, 3)) +
+                       a3.y * vec4(w4_at(w7, 0), w4_at(w7, 1), w4_at(w7, 2),
+                                   w4_at(w7, 3));
+                acc2 += a0.x * vec4(w4_at(w0, 4), w4_at(w0, 5), w4_at(w0, 6),
+                                    w4_at(w0, 7)) +
+                        a0.y * vec4(w4_at(w1, 4), w4_at(w1, 5), w4_at(w1, 6),
+                                    w4_at(w1, 7)) +
+                        a1.x * vec4(w4_at(w2, 4), w4_at(w2, 5), w4_at(w2, 6),
+                                    w4_at(w2, 7)) +
+                        a1.y * vec4(w4_at(w3, 4), w4_at(w3, 5), w4_at(w3, 6),
+                                    w4_at(w3, 7)) +
+                        a2.x * vec4(w4_at(w4, 4), w4_at(w4, 5), w4_at(w4, 6),
+                                    w4_at(w4, 7)) +
+                        a2.y * vec4(w4_at(w5, 4), w4_at(w5, 5), w4_at(w5, 6),
+                                    w4_at(w5, 7)) +
+                        a3.x * vec4(w4_at(w6, 4), w4_at(w6, 5), w4_at(w6, 6),
+                                    w4_at(w6, 7)) +
+                        a3.y * vec4(w4_at(w7, 4), w4_at(w7, 5), w4_at(w7, 6),
+                                    w4_at(w7, 7));
             }
             for (; k < gk1; ++k) {
                 // One word = this lane's eight columns at this k, low nibble
                 // first and column-ascending (see w4_val).
                 uint w = uInputB.data[(b_base + k * uPC.N) >> 3];
                 float a = load_a(a_off + k);
-                acc += a * vec4(w4_val(w, 0), w4_val(w, 1), w4_val(w, 2),
-                                w4_val(w, 3));
-                acc2 += a * vec4(w4_val(w, 4), w4_val(w, 5), w4_val(w, 6),
-                                 w4_val(w, 7));
+                acc += a * vec4(w4_at(w, 0), w4_at(w, 1), w4_at(w, 2),
+                                w4_at(w, 3));
+                acc2 += a * vec4(w4_at(w, 4), w4_at(w, 5), w4_at(w, 6),
+                                 w4_at(w, 7));
             }
             // Two scale quads, not one: s1 covers columns ja+4..ja+7, and a
             // column's group scale is its own -- reusing the ja..ja+3 quad for

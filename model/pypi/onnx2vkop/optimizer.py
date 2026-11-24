@@ -8207,6 +8207,15 @@ class InitializerMerger:
         print(f"Converted {len(initializers_to_remove)} tensor inputs to attributes")
 
 
+# The ONNX element types a 4-bit weight-only payload can carry. INT4 is the
+# signed nibble, UINT4 is the storage for nf4 (its meaning rides vkop_dtype
+# metadata) and float4e2m1fn is NVFP4's E2M1 code. `_validate_folded_weights`
+# asks whether a folded MatMul's weight is one of these, which is a property of
+# the payload the converter emitted, not of any one quantizer.
+_FOUR_BIT_KINDS = (onnx.TensorProto.INT4, onnx.TensorProto.UINT4,
+                   onnx.TensorProto.FLOAT4E2M1)
+
+
 class Quantizer:
     """Class for quantizing model weights."""
 
@@ -9007,6 +9016,50 @@ class Quantizer:
                 f"{sorted(op_types - {'MatMul', 'Gemm'})}")
             return out
 
+        # A FOLDED MatMul is not a plain one, and a quantized weight must not
+        # reach either fold: both carry a weight ABI the weight-only kernels do
+        # not implement, and both failures land after the conversion has
+        # reported success.
+        #
+        #   down_act  -- three weights ([x, Wd, Wg, Wu]) read through ONE
+        #       concatenated [Sd | Sg | Su] scale table. ops/Matmul.hpp builds
+        #       that shape only for one-byte weights (`down_act_ &&
+        #       weight_byte`), so an fp8/int4/nvfp4 member produces a
+        #       five-input node no route accepts.
+        #   swiglu    -- one INTERLEAVED [K, 2*N_up] weight applied in the
+        #       kernel's epilogue. The kernel implements two weight forms: a
+        #       float [x, W], and a 4-bit [x, W, group_scale] (the nibble WIDE
+        #       GEMV stores through ks_store_wide, which carries the swiglu
+        #       arm). A BYTE weight is not one of them -- the int8/fp8 WIDE
+        #       kernels store through ks_store_wide_w8, whose epilogue has no
+        #       activation -- so int8/fp8 would silently write the plain
+        #       [M, 2*N] product.
+        #
+        # This used to be checked for 4-bit-only and for down_act-only, and
+        # int8 had its own copy in the pass; the byte formats had nothing, so
+        # `-q fp8e4m3` on a SwiGLU model shipped a graph that could not load.
+        # One check here covers every format that goes through this gate (the
+        # 4-bit, fp8/nvfp4 and AWQ passes all call it).
+        folded = set()
+        for node in per_column:
+            if node.attributes.get("down_act"):
+                folded.add("down_act")
+            elif node.attributes.get("swiglu"):
+                folded.add("swiglu")
+        if "down_act" in folded:
+            reasons.append(
+                "weight of a down_act fold (its kernel ABI reads a float "
+                "weight and has no dequant scale slot)")
+        if "swiglu" in folded and family != "4bit":
+            # 4-bit is the one quantized form the swiglu epilogue implements:
+            # the nibble WIDE GEMV stores through ks_store_wide, which carries
+            # the activation. Every other payload hits a store that has no
+            # swiglu arm (int8/fp8 through ks_store_wide_w8) or a node whose
+            # admission requires a float B.
+            reasons.append(
+                "weight of a swiglu fold (only the float and 4-bit forms of "
+                "its epilogue exist; this format has no dequant scale slot)")
+
         is_b_operand = all(
             len(node.inputs) > 1 and node.inputs[1]["name"] == name
             for node in per_column)
@@ -9027,16 +9080,6 @@ class Quantizer:
             # the row's minor axis.
             if transb_flags != {0}:
                 reasons.append("transB != 0 (only the [K, N] layout unpacks)")
-            # The SwiGLU down fold reads THREE weights through one MatMul with
-            # a single concatenated per-column scale table, and ops/Matmul.hpp
-            # builds that shape only for one-byte weights (down_act_byte is
-            # `down_act_ && weight_byte`). A 4-bit Wd would make a folded node
-            # the kernel rejects at load -- after the conversion has already
-            # reported success. Its group scales cannot express the fold's
-            # [Sd | Sg | Su] table anyway.
-            if any(node.attributes.get("down_act") for node in per_column):
-                reasons.append("weight of a SwiGLU down fold (its scale table "
-                               "ABI is one concatenated per-column vector)")
             k, n = dims
             if n % 8 != 0:
                 reasons.append(f"N={n} is not a multiple of 8 (a packed row "
@@ -9185,41 +9228,95 @@ class Quantizer:
         return converted
 
     @staticmethod
-    def _validate_down_act_nodes(dag_model):
-        """Refuse to emit a SwiGLU fold whose three weights disagree.
+    def _validate_folded_weights(dag_model):
+        """Refuse to emit a FOLDED MatMul whose weight the kernel cannot read.
 
-        The runtime has exactly two folded shapes: three float weights, or
-        three byte weights plus one concatenated fp32 scale table. Any other
-        combination converts into a model that cannot run -- and, before this
-        check existed, into one that crashed at the first down_proj.
+        Two folds exist and each has a weight ABI the quantizers do not
+        implement (see `_match_weight_only`, which is what keeps a `-q` run
+        from producing one):
+
+          down_act  -- [x, Wd, Wg, Wu] (or + one concatenated [Sd|Sg|Su] fp32
+              table for the int8 form). Three floats, or three int8 + scale.
+          swiglu    -- [x, W] with an interleaved [K, 2*N_up] B, applied in the
+              kernel epilogue; the admission gate in ops/Matmul.hpp requires a
+              float B with exactly two inputs.
+
+        Checked here rather than only inside the quantizer because a weight can
+        reach a fold on a quantization grid by a route the gate never sees:
+        PreQuantizedWeights imports somebody else's payload, and a streamed
+        weight is encoded on the way into the trailer. Both would otherwise
+        ship a graph that loads and then throws at the first execute.
+
+        `_validate_down_act_nodes` is the historical name and the shape of this
+        check; it grew the swiglu arm because that fold arrived later and had
+        no equivalent.
         """
         float_kinds = (onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16)
         for node in dag_model.nodes.values():
-            if not node.attributes.get("down_act"):
+            if node.attributes.get("down_act"):
+                kinds = []
+                for inp in node.inputs[1:4]:
+                    init = dag_model.initializers.get(inp["name"])
+                    kinds.append(None if init is None else init.data_type)
+                if len(node.inputs) == 5:
+                    scale_init = dag_model.initializers.get(
+                        node.inputs[4]["name"])
+                    ok = (
+                        all(k == onnx.TensorProto.INT8 for k in kinds)
+                        and scale_init is not None
+                        and scale_init.data_type == onnx.TensorProto.FLOAT
+                    )
+                    want = "three int8 weights plus one fp32 scale table"
+                else:
+                    ok = all(k in float_kinds for k in kinds)
+                    want = "three float weights"
+                if not ok:
+                    out_name = node.outputs[0]["name"] if node.outputs else "?"
+                    got = [onnx.TensorProto.DataType.Name(k) if k is not None
+                           else "?" for k in kinds]
+                    raise ValueError(
+                        f"vkop: SwiGLU-fold MatMul '{out_name}' has weight "
+                        f"types {got} but the runtime expects {want} "
+                        f"(see ops/Matmul.hpp's down_act gate)"
+                    )
                 continue
-            kinds = []
-            for inp in node.inputs[1:4]:
-                init = dag_model.initializers.get(inp["name"])
-                kinds.append(None if init is None else init.data_type)
-            if len(node.inputs) == 5:
-                scale_init = dag_model.initializers.get(node.inputs[4]["name"])
-                ok = (
-                    all(k == onnx.TensorProto.INT8 for k in kinds)
-                    and scale_init is not None
-                    and scale_init.data_type == onnx.TensorProto.FLOAT
-                )
-                want = "three int8 weights plus one fp32 scale table"
-            else:
-                ok = all(k in float_kinds for k in kinds)
-                want = "three float weights"
-            if not ok:
-                out_name = node.outputs[0]["name"] if node.outputs else "?"
-                raise ValueError(
-                    f"vkop: SwiGLU-fold MatMul '{out_name}' has weight types "
-                    f"{[onnx.TensorProto.DataType.Name(k) if k is not None else '?' for k in kinds]}"
-                    f" but the runtime expects {want} (see ops/Matmul.hpp's "
-                    f"down_act gate)"
-                )
+            if not node.attributes.get("swiglu"):
+                continue
+            # The swiglu epilogue applies silu(g) * u while it stores, so the
+            # weight it accepts is exactly one of two forms:
+            #   float  -- [x, W]                (where the fold started);
+            #   4-bit  -- [x, W, group_scale]   (the nibble WIDE GEMV stores
+            #             through ks_store_wide, which carries the same
+            #             swiglu arm; an nvfp4 node adds its global factor).
+            # A byte weight is neither: int8/fp8 store through
+            # ks_store_wide_w8, whose epilogue applies a per-column scale and
+            # no activation, so it would silently write the plain [M, 2*N].
+            payload = dag_model.initializers.get(node.inputs[1]["name"]) \
+                if len(node.inputs) > 1 else None
+            kinds_ok = payload is not None and payload.data_type in float_kinds
+            if (len(node.inputs) == 2 and kinds_ok) or (
+                    payload is not None
+                    and payload.data_type in _FOUR_BIT_KINDS
+                    and len(node.inputs) ==
+                    (4 if payload.data_type == onnx.TensorProto.FLOAT4E2M1
+                     else 3)):
+                continue
+            out_name = node.outputs[0]["name"] if node.outputs else "?"
+            got = (onnx.TensorProto.DataType.Name(payload.data_type)
+                   if payload is not None else "?")
+            raise ValueError(
+                f"vkop: SwiGLU-fold MatMul '{out_name}' has "
+                f"{len(node.inputs)} input(s) and a {got} weight, but the "
+                f"runtime's swiglu epilogue reads exactly [x, W] (float) or "
+                f"[x, W, group_scale] (4-bit; see ops/Matmul.hpp's swiglu "
+                f"gate). A byte format (int8/fp8) has no dequant scale slot "
+                f"there -- its store applies a per-column scale and no "
+                f"activation -- so a folded gate/up weight must stay float "
+                f"under those formats."
+            )
+
+    # Back-compat alias: callers and tests written before the swiglu arm.
+    _validate_down_act_nodes = _validate_folded_weights
 
     @staticmethod
     def _int8_conv_axis(consumers, dims):

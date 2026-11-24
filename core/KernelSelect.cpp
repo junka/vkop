@@ -228,6 +228,17 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
     // decode per output row, K walked serially per thread: 2.7 s for an
     // 800-token Qwen3-VL-2B prefill against int8's 0.41 s), so the tile takes
     // every shape the GEMV does not, with no row floor beyond that.
+    //
+    // EXCEPT when the node is also a SwiGLU gate/up fold. That combination
+    // measures wrong: with the same weights, the tiled route reports a handful
+    // of elements off by 13-56% (e.g. M=33 K=128 N=64 one element, M=33 K=512
+    // three) while the identical shape through the split-K GEMV is exact, and
+    // the tiled route is exact for the same weights WITHOUT swiglu. So it is
+    // the fold's scratch+pack half on a tiled shape, not the nibble decode.
+    // Until that is rooted out the tile steps aside: the GEMV route is slower
+    // at prefill but correct, and decode (batch*m <= 8) never reached the tile
+    // anyway. MatMulTest.MatMulW4SwigluGateUp covers all three nibble formats
+    // on both routes.
     if (c.weight_4bit) {
         c.tiled_min_m = 1;
     }
@@ -235,7 +246,8 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
         !c.weight_4bit ||
         (!f.transB && (s.n % 8 == 0) && f.group_size > 0 &&
          (s.k % f.group_size) == 0 &&
-         static_cast<long long>(s.batch) * s.m > 8);
+         static_cast<long long>(s.batch) * s.m > 8 &&
+         !(c.weight_4bit && f.swiglu));
     const bool tiled_ok_n = (s.n % 64 == 0) || (s.n % 8 == 0);
     c.tiled = c.fused && !kn.tile_disabled && w4_tile_ok &&
               (s.k % 16 == 0) && (s.m >= c.tiled_min_m) && !f.epi_bias &&

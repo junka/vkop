@@ -1017,12 +1017,30 @@ class MatMulBuffer : public BufferFactory {
         std::vector<int> out_shape = lead_shape;
         if (rank_a >= 2)
             out_shape.push_back(m);
+        // The SwiGLU gate/up fold's B is the interleaved [K, 2*N_up] weight.
+        // Two weight forms carry it:
+        //   float  -- [x, W], the original shape;
+        //   4-bit  -- [x, W_4bit, group_scale], decoded by the same nibble
+        //             kernels every other 4-bit MatMul uses. The epilogue that
+        //             applies silu(g) * u lives in the STORE (ks_store_wide for
+        //             the WIDE GEMV), which the 4-bit WIDE kernel also reaches,
+        //             so the activation is applied after the per-group scale --
+        //             the same order a float kernel would apply it in.
+        // int8/fp8 are deliberately absent: their WIDE kernels store through
+        // ks_store_wide_w8 (four 16-column groups and a per-column scale), a
+        // different epilogue that has no swiglu arm, so a byte weight would
+        // silently write the plain [M, 2*N] product.
+        const bool swiglu_float =
+            core::is_float_elem(inputs[1]->elem_kind()) &&
+            inputs.size() == 2;
+        const bool swiglu_4bit =
+            weight_4bit && inputs.size() == (weight_nvfp4 ? 4u : 3u);
         if (swiglu_ && (fp16_ == 0 || transB_ || rank_b < 2 || (n % 8) != 0 ||
-                        !core::is_float_elem(inputs[1]->elem_kind()) ||
-                        inputs.size() != 2)) {
+                        !(swiglu_float || swiglu_4bit))) {
             throw std::runtime_error(
-                "vkop: MatMul swiglu needs fp16, a plain [K, 2*N_up] fp16 B "
-                "with N_up % 4 == 0 and no transB (got N = " +
+                "vkop: MatMul swiglu needs fp16, a plain [K, 2*N_up] B "
+                "(float, or a 4-bit payload with its group scale) with "
+                "N_up % 4 == 0 and no transB (got N = " +
                 std::to_string(n) + ")");
         }
         const int n_out = swiglu_ ? n / 2 : n;
@@ -1740,8 +1758,15 @@ class MatMulBuffer : public BufferFactory {
         swiglu_coop8_ = false;
         swiglu_in_pack_ = false;
         if (swiglu_) {
+            // The 4-bit WIDE GEMV stores through ks_store_wide -- the same
+            // epilogue the fp16 WIDE route uses -- so it takes uPC.wide == 2
+            // exactly like kKsplitWide. Without it here the 4-bit route would
+            // fall into the scratch+pack branch below, which is correct but
+            // costs a second dispatch (and the nibble kernels write the plain
+            // [M, 2*N] product, which is what the pack pass expects).
             const bool gemv = plan.route == core::MatmulRoute::kKsplitWide ||
-                              plan.route == core::MatmulRoute::kKsplitWide512;
+                              plan.route == core::MatmulRoute::kKsplitWide512 ||
+                              plan.route == core::MatmulRoute::kKsplitW4Wide;
             if (gemv) {
                 para_.wide = 2;
             } else if (plan.route == core::MatmulRoute::kTiled &&

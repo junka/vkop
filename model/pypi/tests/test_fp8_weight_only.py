@@ -491,3 +491,35 @@ def test_writer_records_the_fp8_size_and_name():
         numpy_helper.from_array(numpy.zeros((2, 2), dtype=numpy.float32), "s")
     ) == "float32"
     print("  PASS (writer: fp8 size, dtype name, raw bytes, mismatch raises)")
+
+
+def test_folded_weights_stay_float():
+    """The two folded MatMul shapes have weight ABIs the fp8 kernels do not
+    implement, so their weights must keep their float type and input count.
+
+      * down_act reads [x, Wd, Wg, Wu] and, for the int8 form, ONE concatenated
+        [Sd | Sg | Su] scale table -- fp8 has no five-input form at all.
+      * swiglu reads [x, W] with an interleaved [K, 2*N_up] B and applies
+        silu(g)*u in its epilogue; a scale input turns it into a node the
+        admission gate in ops/Matmul.hpp rejects.
+
+    Both used to be converted: `-q fp8e4m3` shipped a graph that could not load.
+    """
+    numpy.random.seed(11)
+    m = build("W", numpy.random.randn(8, 16).astype(numpy.float32),
+              [("MatMul", "mm", {"transB": 0, "down_act": [1]}, ["x", "W"])])
+    out = quantize(m)
+    assert out.initializers["W"].data_type == TensorProto.FLOAT, \
+        "a down_act member was converted to fp8"
+    assert [i["name"] for i in out.nodes["mm"].inputs] == ["x", "W"], \
+        "a scale input was appended to the down_act fold"
+    print("  PASS (fp8 leaves a SwiGLU down-fold weight float)")
+
+    m = build("W", numpy.random.randn(8, 16).astype(numpy.float32),
+              [("MatMul", "mm", {"transB": 0, "swiglu": [1]}, ["x", "W"])])
+    out = quantize(m)
+    assert out.initializers["W"].data_type == TensorProto.FLOAT, \
+        "a swiglu gate/up weight was converted to fp8"
+    assert [i["name"] for i in out.nodes["mm"].inputs] == ["x", "W"], \
+        "a scale input was appended to the swiglu fold"
+    print("  PASS (fp8 leaves a SwiGLU gate/up weight float)")

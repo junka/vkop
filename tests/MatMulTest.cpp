@@ -1059,11 +1059,12 @@ class MatMulW4Test : public TestCase<T> {
 
     MatMulW4Test(int batch, int m, int k, int n, int group, bool nf4,
                  bool batched_b = false, bool transB = false,
-                 bool uint4 = false)
+                 bool uint4 = false, bool swiglu = false)
         : TestCase<T>("MatMul"), batch_(batch), m_(m), k_(k), n_(n),
           group_(group), nf4_(nf4), batched_b_(batched_b), transB_(transB),
-          uint4_(uint4) {
+          uint4_(uint4), swiglu_(swiglu) {
         attr = {{"transB", transB_ ? "1" : "0"}};
+        if (swiglu_) attr["swiglu"] = "1";
         initTestData();
     }
 
@@ -1080,7 +1081,20 @@ class MatMulW4Test : public TestCase<T> {
                 LOG_ERROR("4bit MatMul NaN at %d, expected %f", i, ev);
                 return false;
             }
-            float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            // Mixed abs+rel. A folded (swiglu) node needs a wider band than a
+            // plain product, and the reason is the fp16 staging every 4-bit
+            // kernel shares, not the epilogue: tile_load_b_w4 rounds
+            // (code * group_scale) to half before the FMA nest, so a K-deep
+            // sum carries ~sqrt(K) * 1.5e-3 of that rounding, which silu then
+            // multiplies by the up projection. Measured with the same weights
+            // through two DIFFERENT routes (tiled and, with VKOP_NO_TILE, the
+            // split-K GEMV) the worst element is identical to the last digit --
+            // that is what rules out a layout or decode bug, because those are
+            // orders of magnitude larger (the nf4 WIDE defect was 460 vs -25 on
+            // one shape).
+            const float rel = swiglu_ ? 0.10F : 0.05F;
+            const float abs_floor = swiglu_ ? 0.10F : 0.05F;
+            float threshold = std::max(abs_floor, std::abs(ev) * rel);
             if (std::abs(ov - ev) > threshold) {
                 LOG_ERROR("4bit MatMul Fail (%d): %f vs %f (thr %f)", i, ov, ev,
                           threshold);
@@ -1092,7 +1106,7 @@ class MatMulW4Test : public TestCase<T> {
 
   private:
     int batch_, m_, k_, n_, group_;
-    bool nf4_, batched_b_, transB_, uint4_;
+    bool nf4_, batched_b_, transB_, uint4_, swiglu_ = false;
 
     static float to_float(T v) {
         if constexpr (std::is_same_v<T, uint16_t>) {
@@ -1153,7 +1167,23 @@ class MatMulW4Test : public TestCase<T> {
             deq3 = codes.to(torch::kFloat32) * scale;
         }
         auto deq = deq3.reshape({k_, n_});
-        auto y = torch::matmul(a.to(torch::kFloat32), deq);
+        // SwiGLU gate/up fold: `n_` is the INTERLEAVED width 2*N_up, so the
+        // reference is silu(g) * u where g/u are the two halves of every
+        // octet, and the output is [.., n_/2]. That is the shape the kernel's
+        // swiglu store writes (ks_store_wide, uPC.wide == 2).
+        torch::Tensor y;
+        if (swiglu_) {
+            auto n_up = n_ / 2;
+            auto p = deq.reshape({k_, n_up / 4, 2, 4});
+            auto g = p.select(2, 0).reshape({k_, n_up});
+            auto u = p.select(2, 1).reshape({k_, n_up});
+            auto af = a.to(torch::kFloat32);
+            auto gg = torch::matmul(af, g);
+            auto uu = torch::matmul(af, u);
+            y = gg * torch::sigmoid(gg) * uu;
+        } else {
+            y = torch::matmul(a.to(torch::kFloat32), deq);
+        }
 
         inputa = std::make_shared<Tensor<T>>(to_ints(a_shape));
         this->fillTensorFromTorch(inputa, a);
@@ -1553,6 +1583,8 @@ TEST(MatMulTest, MatMulInt4Nf4WeightOnlyBuffer) {
         {1, 1, 256, 64, 64, false},  // decode: 4 groups over 16 slices
         {1, 1, 256, 64, 16, false},  // decode: exactly 16 groups
         {1, 1, 256, 64, 8, false},   // decode: 32 groups, 2 per slice
+        {1, 1, 256, 2048, 64, false}, // WIDE (n >= wide_thr_fp16) for all three
+                                      // nibble meanings; int4 only? see below
         {1, 1, 320, 104, 32, false}, // partial last 16-quad block
         {1, 3, 96, 24, 24, false},   // a few rows, 4 groups
         {2, 1, 128, 32, 128, true},  // one group: per-column scales, batched A
@@ -2040,3 +2072,47 @@ TEST(MatMulTest, MatMulGroupedBatchBuffer) {
                                }));
     }
 }
+// SwiGLU gate/up fold over a 4-bit weight. B is the interleaved [K, 2*N_up]
+// weight every other 4-bit MatMul would read, plus its [K/group, 2*N_up] group
+// scale table; the kernel applies silu(g) * u in ks_store_wide's swiglu arm
+// (uPC.wide == 2), which the nibble WIDE GEMV reaches too.
+//
+// The sizes are chosen to land on the routes that matter: n = 2*N_up >= the
+// WIDE threshold exercises the epilogue, a smaller n the scratch + pack pass.
+// All three nibble meanings run, because the decode branch (int4 / nf4 / uint4)
+// and the swiglu store are independent and the WIDE kernel once hard-coded the
+// signed one.
+TEST(MatMulTest, MatMulW4SwigluGateUp) {
+    vkop::tests::ScopedBufferBackend buffer;
+    struct Case {
+        int batch, m, k, n_up, group;
+        const char *why;
+    };
+    const std::vector<Case> cases = {
+        {1, 1, 512, 2048, 64, "decode, N_up large: nibble WIDE epilogue"},
+        {1, 1, 128, 64, 8, "decode, narrow: scratch + pack"},
+        {1, 4, 128, 96, 8, "ksplit/quad: scratch + pack"},
+        {1, 1, 1024, 512, 64, "WIDE, K=1024"},
+        {1, 1, 512, 512, 64, "WIDE, K=512 (control)"},
+        {1, 9, 128, 96, 8, "batch*m > 8, swiglu steps off the tile"},
+        {1, 20, 128, 96, 8, "two row blocks, still no tile"},
+    };
+    for (const auto &c : cases) {
+        for (const int variant : {0, 1, 2}) {
+            MatMulW4Test<uint16_t> t(c.batch, c.m, c.k, 2 * c.n_up, c.group,
+                                     variant == 1, false, false,
+                                     variant == 2, /*swiglu=*/true);
+            EXPECT_TRUE(t.run_test(
+                {t.inputa, t.weight, t.scale_data}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }))
+                << "batch=" << c.batch << " m=" << c.m << " k=" << c.k
+                << " n_up=" << c.n_up << " (" << c.why << ")";
+        }
+    }
+}
+
+
+
+
