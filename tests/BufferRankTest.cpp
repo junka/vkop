@@ -2779,6 +2779,31 @@ TEST(BufferRankTest, AttentionFp32AndFp16) {
     EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 1, 1, 1, false, true, true, true));
 }
 
+// Split-KV decode (attention.comp -DKV_SPLIT, AttentionBuffer::split_route):
+// a decode round over a long history is cut into KV slices, one workgroup per
+// (row, slice), merged by a second dispatch. Shapes are the Qwen3-VL decoder's
+// (16 heads, GQA 2, D=128) with a multi-tile history, so the round runs with
+// many slices -- 16 rows against a 512-workgroup target and 4001 positions
+// gives 16 slices of one tile. Covers the in-place cache (fresh-rows-only
+// copy), the two-buffer cache (full history copy) and the additive mask, and
+// a history that is not a whole number of tiles.
+TEST(BufferRankTest, AttentionSplitKvDecode) {
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(16, 128, 4000, 1, 2, false,
+                                                   true, true, true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(16, 128, 4000, 1, 2, false,
+                                                   true, true, false));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(16, 128, 1700, 1, 2, true,
+                                                   true, true, true));
+    // Two decode-shaped rounds: the second one's slices start from the
+    // history the first one appended in place.
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(16, 128, 1, 1, 2, false,
+                                                   true, true, true));
+    // More slices than rows can use at the target (4 rows -> up to 64
+    // slices; 600 positions -> 3 tiles caps it at 3).
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 600, 1, 1, false,
+                                                   true, true, true));
+}
+
 // The same kernel with `seq_major`: Q/K/V/Y are [B,S,H,D]. Every case above
 // gets its seq-major twin here — the addressing is a different arithmetic path
 // entirely (row base and kv step both change), so it needs its own coverage,

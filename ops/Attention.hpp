@@ -53,6 +53,11 @@ struct alignas(16) AttentionPC {
     // (the shader reads this slot as 0 when the PC is shorter, which is why it
     // is LAST).
     int dyn_ssbo;
+    // Split-KV decode build only (attention.comp -DKV_SPLIT): 1 = the partial
+    // pass over one KV slice, 2 = the combine pass; and the slice count (read
+    // from the parameter SSBO instead when dyn_ssbo is set).
+    int split_phase;
+    int kv_splits;
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
 
@@ -99,6 +104,10 @@ class AttentionBuffer : public BufferFactory {
                             // set layout is built from this list — the kernel
                             // reads it only when pc.dyn_ssbo != 0, and the
                             // no-cache form binds a dummy there.
+                            DESCRIPTOR_TYPE_STORAGE,
+                            // binding 8: split-KV partials (m, l, o[D]) per
+                            // (row, slice). Only the -DKV_SPLIT build declares
+                            // it; every other route binds a dummy.
                             DESCRIPTOR_TYPE_STORAGE},
                         sizeof(AttentionPC), fp16) {
         update_after_bind_ = true;
@@ -196,6 +205,20 @@ class AttentionBuffer : public BufferFactory {
         }
         if (const char *e = getenv("VKOP_ATTN_COOP8")) {
             flash_coop8_ = e[0] != '0';
+        }
+        // Split-KV decode (see split_route). `kv_split=0` or
+        // VKOP_ATTN_SPLIT=0 keeps the one-workgroup-per-row kernel;
+        // VKOP_ATTN_SPLIT_WGS=<n> sets the workgroup count it aims for.
+        if (attributes.find("kv_split") != attributes.end()) {
+            split_enabled_ =
+                static_cast<int>(std::stol(attributes.at("kv_split"))) != 0;
+        }
+        if (const char *e = getenv("VKOP_ATTN_SPLIT")) {
+            split_enabled_ = e[0] != '0';
+        }
+        if (const char *e = getenv("VKOP_ATTN_SPLIT_WGS")) {
+            const int v = std::atoi(e);
+            if (v > 0) split_target_wgs_ = v;
         }
         if (const char *e = getenv("VKOP_ATTN_FLASH_MIN")) {
             const int v = std::atoi(e);
@@ -304,7 +327,12 @@ class AttentionBuffer : public BufferFactory {
         }
         // The dispatch width: one workgroup per query row, plus the cache-copy
         // workgroups. Must mirror execute()'s arithmetic exactly.
-        const int attn_wgs = 1 * heads * seq; // batch is 1 with a cache
+        // Split route: rows * slices attention workgroups. Whether this op is
+        // on it was settled by execute() (a function of shapes that do not
+        // move during decode); the slice count follows kv_len.
+        const int splits = split_last_ ? kv_splits_for(heads * seq, kv_len) : 0;
+        const int attn_wgs =
+            1 * heads * seq * (splits > 0 ? splits : 1); // batch is 1 with a cache
         const int row_elems = 2 * kv_heads * head_dim;
         const auto &cache_dtype = inputs[3]->dtype();
         const int elem_bytes =
@@ -312,7 +340,11 @@ class AttentionBuffer : public BufferFactory {
                 ? 1
                 : (cache_dtype == typeid(uint16_t) ? 2 : 4);
         const int elems_per_word = 4 / elem_bytes;
-        const int64_t copy_rows = (ring_ != 0) ? kv_new : kv_len;
+        // Mirrors execute(): fresh rows only under the ring, or on the split
+        // route when present aliases the cache.
+        const bool fresh_only =
+            ring_ != 0 || (split_last_ && inplace_last_);
+        const int64_t copy_rows = fresh_only ? kv_new : kv_len;
         const int64_t words = static_cast<int64_t>(row_elems) * copy_rows /
                               elems_per_word;
         const int grid = attn_wgs + static_cast<int>((words + 255) / 256);
@@ -334,7 +366,7 @@ class AttentionBuffer : public BufferFactory {
                 }
             });
         }
-        return publish_dyn(kv_len, kv_past, ring_head, grid);
+        return publish_dyn(kv_len, kv_past, ring_head, grid, splits);
     }
 
   private:
@@ -696,6 +728,18 @@ class AttentionBuffer : public BufferFactory {
         int grid = use_flash ? batch * heads * flash_row_tiles(seq)
                              : batch * heads * seq;
         flash_cache_last_ = use_flash && has_cache;
+        // Split-KV decode: rows * slices workgroups + a combine pass.
+        const int rows = batch * heads * seq;
+        const bool use_split =
+            !use_flash && split_route(rows, head_dim, has_cache,
+                                      inputs[0]->dtype() == typeid(uint16_t));
+        split_last_ = use_split;
+        const int splits = use_split ? kv_splits_for(rows, kv_len) : 0;
+        if (use_split) {
+            grid = rows * splits;
+            pc.kv_splits = splits;
+            ensure_split_buf(rows, head_dim);
+        }
         // Y is written in the [B,S,H,D] order under seq_major whatever rank Q
         // arrived at, because its bytes always land at the rank-4 seq-major
         // offset: for rank 3 that is the [1,S,H,D] form the converter's fold
@@ -827,7 +871,12 @@ class AttentionBuffer : public BufferFactory {
                 // fresh rows are written — the same rows the kernel's copy
                 // covers — so the dispatch is sized to them rather than to the
                 // whole window.
-                const int64_t copy_rows = ring ? kv_new : kv_len;
+                // The split build also skips the history when present aliases
+                // the cache (see fresh_rows_only in the shader).
+                const bool fresh_only =
+                    ring || (use_split && pc.inplace != 0);
+                inplace_last_ = pc.inplace != 0;
+                const int64_t copy_rows = fresh_only ? kv_new : kv_len;
                 const int64_t words = static_cast<int64_t>(row_elems) *
                                       copy_rows / elems_per_word;
                 grid += static_cast<int>((words + 255) / 256);
@@ -842,7 +891,7 @@ class AttentionBuffer : public BufferFactory {
                 // reports it), so it leaves the parameter SSBO alone.
                 dyn_this_round_ =
                     has_cache && !use_flash &&
-                    publish_dyn(kv_len, kv_past, ring_head, grid);
+                    publish_dyn(kv_len, kv_past, ring_head, grid, splits);
                 if (dyn_this_round_) {
                     // binding 7: the parameter SSBO. The write above went
                     // through a HOST_COHERENT mapping; readBarrier sets the
@@ -857,9 +906,26 @@ class AttentionBuffer : public BufferFactory {
                 }
             });
         });
+        // binding 8: the split partials, or a dummy for every other route.
+        if (use_split) {
+            objs_.emplace_back(
+                std::static_pointer_cast<VulkanResource>(split_buf_));
+        } else {
+            objs_.emplace_back(dummy_buffer_);
+        }
 
         if (use_flash) {
             submit_flash(&pc, dyn_this_round_, grid);
+            if (dyn_this_round_) {
+                dyn_live_ = true;
+            }
+        } else if (use_split) {
+            if (dyn_this_round_) {
+                pc.kv_len = kv_len;
+                pc.kv_past = kv_past;
+                pc.ring_head = ring_head;
+            }
+            submit_split(&pc, dyn_this_round_, grid, rows);
             if (dyn_this_round_) {
                 dyn_live_ = true;
             }
@@ -999,6 +1065,106 @@ class AttentionBuffer : public BufferFactory {
         }
     }
 
+    // ---- split-KV decode route (attention.comp -DKV_SPLIT) ----
+    // Few query rows over a long history: the row kernel's grid is just the
+    // rows (16 for a GQA-16 decode step), each walking every KV tile serially,
+    // which measured ~1.05 ms/layer at a 12k context on the M5 Max -- ~10x the
+    // bandwidth floor. Cutting each row's tiles into slices fills the GPU.
+    static constexpr int kMaxSplits = 64;
+    static constexpr int kTileKv = 256; // TILE_KV in the shader
+
+    // Eligibility is a function of shapes that do not move between decode
+    // rounds (cache form, row count), so a recorded segment stays on one route;
+    // the slice count itself rides the parameter SSBO.
+    bool split_route(int rows, int head_dim, bool has_cache, bool fp16) {
+        if (!split_enabled_ || !has_cache || !fp16 || rows <= 0 ||
+            rows > split_max_rows_ || head_dim > 256) {
+            return false;
+        }
+        return split_pipeline() != nullptr;
+    }
+
+    int kv_splits_for(int rows, int kv_len) const {
+        const int n_tiles = (kv_len + kTileKv - 1) / kTileKv;
+        int ks = split_target_wgs_ / (rows > 0 ? rows : 1);
+        if (ks > n_tiles) ks = n_tiles;
+        if (ks > kMaxSplits) ks = kMaxSplits;
+        return ks < 1 ? 1 : ks;
+    }
+
+    void ensure_split_buf(int rows, int head_dim) {
+        const VkDeviceSize need = static_cast<VkDeviceSize>(rows) * kMaxSplits *
+                                  (head_dim + 2) * sizeof(float);
+        if (split_buf_ && split_buf_->getSize() >= need) return;
+        split_buf_ = std::make_shared<VulkanBuffer>(
+            m_dev_, need, STORAGE, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+
+    VulkanPipeline *split_pipeline() {
+        if (split_pipe_) return split_pipe_.get();
+        if (split_unavailable_ || m_dev_ == nullptr) return nullptr;
+        const bool use_uab = update_after_bind_ &&
+                             m_dev_->is_support_descriptor_update_after_bind();
+        std::vector<std::string> keys;
+        if (m_dev_->supportsSubgroupArithmetic()) {
+            keys.emplace_back("buffer_attention_split_fp16_sg");
+        }
+        keys.emplace_back("buffer_attention_split_fp16");
+        for (const auto &key : keys) {
+            std::pair<const uint32_t *, uint32_t> spv{nullptr, 0};
+            try {
+                spv = resolve_spv(key);
+            } catch (const std::exception &) {
+                continue; // converted before the key existed
+            }
+            if (spv.first == nullptr) continue;
+            try {
+                split_pipe_ = std::make_unique<VulkanPipeline>(
+                    m_dev_->getLogicalDevice(), types_, sizeof(AttentionPC),
+                    spv.first, static_cast<int>(spv.second), use_uab, 0,
+                    pipeline_cache_);
+                return split_pipe_.get();
+            } catch (const std::exception &e) {
+                split_pipe_.reset();
+                std::fprintf(stderr, "[vkop] %s rejected (%s)\n", key.c_str(),
+                             e.what());
+            }
+        }
+        split_unavailable_ = true;
+        std::fprintf(stderr, "[vkop] Attention: no split-KV decode kernel in "
+                             "this model (reconvert to ship it); decode keeps "
+                             "the row kernel\n");
+        return nullptr;
+    }
+
+    // Phase 1 (partials, grid from the parameter SSBO or `grid`), a
+    // shader-write barrier on the partials, then phase 2 (one workgroup per
+    // row). Both dispatches are fingerprinted, so a replayed segment carries
+    // the pair.
+    void submit_split(AttentionPC *pc, bool indirect, int grid, int rows) {
+        VulkanPipeline *pipe = split_pipe_.get();
+        if (!split_ds_[m_id_]) {
+            split_ds_[m_id_] = pipe->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(split_ds_[m_id_]);
+        pipe->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipe, split_ds_[m_id_]);
+        pc->split_phase = 1;
+        m_cmd_->push_constants(*pipe, static_cast<uint32_t>(sizeof(*pc)), pc);
+        if (indirect) {
+            m_cmd_->dispatch_indirect(dyn_buf_->getBuffer(), 16);
+            if (replay_enabled_) {
+                record_fingerprint(pc, 0, 0, 0);
+            }
+        } else {
+            dispatch_and_record(grid, 1, 1, pc);
+        }
+        split_buf_->shaderWriteBarrier(m_cmd_->get());
+        pc->split_phase = 2;
+        m_cmd_->push_constants(*pipe, static_cast<uint32_t>(sizeof(*pc)), pc);
+        dispatch_and_record(rows, 1, 1, pc);
+    }
+
     // Publish this round's kv_len / kv_past / ring_head and the dispatch grid
     // into the parameter SSBO, and (on the recording round) issue the first
     // write. Called from execute() while recording and from the runtime on
@@ -1012,7 +1178,8 @@ class AttentionBuffer : public BufferFactory {
     // append to an already-recorded segment. Run() waits for the last segment
     // at the end of every round, so the previous round's indirect read has
     // completed before this round's write.
-    bool publish_dyn(int kv_len, int kv_past, int ring_head, int grid) {
+    bool publish_dyn(int kv_len, int kv_past, int ring_head, int grid,
+                     int splits = 0) {
         if (!dyn_buf_) {
             dyn_buf_ = std::make_shared<VulkanBuffer>(
                 m_dev_, kDynBytes,
@@ -1033,7 +1200,7 @@ class AttentionBuffer : public BufferFactory {
         mem[0] = static_cast<uint32_t>(kv_len);
         mem[1] = static_cast<uint32_t>(kv_past);
         mem[2] = static_cast<uint32_t>(ring_head);
-        mem[3] = 0;
+        mem[3] = static_cast<uint32_t>(splits); // KV_SPLIT slice count
         mem[4] = static_cast<uint32_t>(grid);
         mem[5] = 1;
         mem[6] = 1;
@@ -1115,6 +1282,20 @@ class AttentionBuffer : public BufferFactory {
     bool flash_cache_last_ = false;
     std::unique_ptr<VulkanPipeline> flash_pipe_;
     VkDescriptorSet flash_ds_[vkop::kInflight] = {nullptr};
+    // Split-KV decode route state (split_route / split_pipeline /
+    // submit_split). Query rows up to which it is taken, and the workgroup
+    // count the slice count aims for.
+    bool split_enabled_ = true;
+    int split_max_rows_ = 64;
+    int split_target_wgs_ = 512;
+    // present aliased the cache on the last execute(); with split_last_ that
+    // makes the copy half fresh-rows-only, which refresh_dynamic_params mirrors.
+    bool inplace_last_ = false;
+    bool split_unavailable_ = false;
+    bool split_last_ = false;
+    std::shared_ptr<VulkanBuffer> split_buf_;
+    std::unique_ptr<VulkanPipeline> split_pipe_;
+    VkDescriptorSet split_ds_[vkop::kInflight] = {nullptr};
 };
 
 // PIMPL façade. Buffer-only (no image impl), like RMSNorm.

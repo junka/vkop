@@ -498,6 +498,10 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_attention_flash_fp16",
         # Its 8x8x8 coopmat build; only the MoltenVK driver builds it.
         "buffer_attention_flash_coop8",
+        # Split-KV decode (attention.comp -DKV_SPLIT): routed by
+        # AttentionBuffer::split_route for few-row cache-form rounds.
+        "buffer_attention_split_fp16",
+        "buffer_attention_split_fp16_sg",
     ],
     ("FusedElemwise", "buffer"): [
         "buffer_fused_elemwise_bda",

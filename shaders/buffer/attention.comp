@@ -115,7 +115,8 @@ layout(set = 0, binding = 6) buffer CacheOut {
 // The push-constant copies stay as the fallback for the no-cache form and for
 // graphs converted before this existed.
 struct DynParams {
-    // [0] kv_len, [1] kv_past, [2] ring_head, [3] unused
+    // [0] kv_len, [1] kv_past, [2] ring_head, [3] kv_splits (KV_SPLIT build;
+    // unused otherwise)
     ivec4 p;
     // VkDispatchIndirectCommand { x, y, z } — written by the host, read by
     // vkCmdDispatchIndirect. Kept in the same buffer so one update carries
@@ -161,7 +162,38 @@ layout(push_constant) uniform PC_ATTN {
                       // otherwise. K keeps the plain kv_step — only V is read
                       // as a component (see fuse_qkv_components).
     int dyn_ssbo;     // 1 = kv_len/kv_past/ring_head come from binding 7
+    // KV_SPLIT build only (other builds never read these two):
+    int split_phase;  // 1 = partial pass over one KV slice, 2 = combine
+    int kv_splits;    // slices per query row (dyn_ssbo: uDyn.p.w instead)
 } uA;
+
+#ifdef KV_SPLIT
+// Split-KV ("flash-decoding") form. The row kernel gives a decode step one
+// workgroup per query row, i.e. heads (16) workgroups, each walking the whole
+// history serially -- at a 12k-token context that left the GPU mostly idle and
+// ran ~10x over the KV-bandwidth floor. Here the KV axis of every row is cut
+// into `kv_splits` contiguous runs of whole tiles:
+//   phase 1: grid = rows*KS attention workgroups (+ the usual cache-copy
+//            workgroups); workgroup (row, k) sweeps its run with the same
+//            online softmax and writes (m, l, o[D]) to binding 8 instead of Y.
+//   phase 2: grid = rows; lanes merge the KS partials:
+//            M = max m_k, Y = sum o_k e^(m_k-M) / sum l_k e^(m_k-M).
+// The host records the two dispatches back to back with a shader-write barrier
+// on binding 8 between them. A slice with no tiles (never planned by the host,
+// but harmless) writes m = -1e30, l = 0 and drops out of the merge.
+layout(set = 0, binding = 8) buffer Partials {
+    float data[];
+} uPart;
+
+#ifdef BDA
+#error "KV_SPLIT reads its slice count from the binding-7 parameter SSBO"
+#endif
+
+int dyn_kv_splits() {
+    int k = (uA.dyn_ssbo != 0) ? uDyn.p.w : uA.kv_splits;
+    return max(k, 1);
+}
+#endif
 
 // The three per-round numbers. With dyn_ssbo == 0 they come from the push
 // constant (the form every pre-existing .vkopbin was converted with); with it
@@ -433,6 +465,19 @@ shared float sAcc[4][MAX_HD];
 // Layout of both caches: [1,2,nkv,<stride>,D] with K on dim-1 index 0 and V on
 // 1; the row stride (kv dimension pitch) is `src_stride`/`dst_stride`, which may
 // exceed the logical kv_len (that is what makes the append O(S)).
+// Whether the copy half covers only the fresh rows [kv_past, kv_len). Always
+// under the ring; in the KV_SPLIT build also whenever present aliases the
+// cache (inplace), where every history lane would be an early return -- at a
+// 14k-token decode that was ~116k idle workgroups per layer. The host sizes
+// the copy grid by the same rule (AttentionBuffer::copy_fresh_only).
+bool fresh_rows_only() {
+#ifdef KV_SPLIT
+    return uA.ring != 0 || uA.inplace != 0;
+#else
+    return uA.ring != 0;
+#endif
+}
+
 void copy_cache(int cwg) {
     int D = uA.head_dim;
     int nkv = uA.kv_heads;
@@ -441,8 +486,8 @@ void copy_cache(int cwg) {
     // on the host), so only the fresh rows [kv_past, kv_len) are written and the
     // dispatch is sized to them — otherwise every history lane would be a
     // wasted early-return.
-    int nrows = (uA.ring != 0) ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
-    int j0 = (uA.ring != 0) ? dyn_kv_past() : 0;
+    int nrows = fresh_rows_only() ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
+    int j0 = fresh_rows_only() ? dyn_kv_past() : 0;
     int total_words = 2 * nkv * nrows * R;
     int gid = cwg * 256 + int(gl_LocalInvocationID.x);
     if (gid >= total_words) {
@@ -477,8 +522,8 @@ void copy_cache_f8(int cwg) {
     int D = uA.head_dim;
     int nkv = uA.kv_heads;
     int R = D >> 2; // fp8: 4 bytes per uint word
-    int nrows = (uA.ring != 0) ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
-    int j0 = (uA.ring != 0) ? dyn_kv_past() : 0;
+    int nrows = fresh_rows_only() ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
+    int j0 = fresh_rows_only() ? dyn_kv_past() : 0;
     int total_words = 2 * nkv * nrows * R;
     int gid = cwg * 256 + int(gl_LocalInvocationID.x);
     if (gid >= total_words) {
@@ -527,7 +572,51 @@ void copy_cache_f8(int cwg) {
     uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
 }
 
-void main() {
+#ifdef KV_SPLIT
+// Phase 2: one workgroup per query row folds that row's KS partials into Y.
+// Lane t owns dims (2t, 2t+1), the same ownership as the row kernel's store.
+void combine_partials(int row) {
+    int lid = int(gl_LocalInvocationID.x);
+    int S = uA.seq;
+    int H = uA.heads;
+    int D = uA.head_dim;
+    int KS = dyn_kv_splits();
+    int PD = D + 2; // [m, l, o[0..D)]
+    int s = row % S;
+    int h = (row / S) % H;
+    int b = row / (S * H);
+    int q_base = (uA.seq_major != 0) ? ((b * S + s) * H + h) * D
+                                     : ((b * H + h) * S + s) * D;
+    if (lid < (D >> 1)) {
+        int d0 = lid * 2;
+        int base = row * KS * PD;
+        float M = -1e30;
+        for (int k = 0; k < KS; ++k) {
+            M = max(M, uPart.data[base + k * PD]);
+        }
+        float L = 0.0;
+        float a0 = 0.0;
+        float a1 = 0.0;
+        for (int k = 0; k < KS; ++k) {
+            int pk = base + k * PD;
+            float w = exp(uPart.data[pk] - M);
+            L += uPart.data[pk + 1] * w;
+            a0 += uPart.data[pk + 2 + d0] * w;
+            a1 += uPart.data[pk + 3 + d0] * w;
+        }
+        float inv = 1.0 / (L + 1e-30);
+        int y_off = q_base + d0;
+#ifdef FP16
+        uOutput.data[y_off >> 1] = packHalf2x16(vec2(a0 * inv, a1 * inv));
+#else
+        uOutput.data[y_off] = floatBitsToUint(a0 * inv);
+        uOutput.data[y_off + 1] = floatBitsToUint(a1 * inv);
+#endif
+    }
+}
+#endif
+
+void attend() {
     int wg = int(gl_WorkGroupID.x);
     int lid = int(gl_LocalInvocationID.x);
     int S = uA.seq;
@@ -545,7 +634,12 @@ void main() {
     int kv_past = (uA.has_cache != 0) ? dyn_kv_past() : 0;
 
     // extra workgroups, if any, are the cache copy
+#ifdef KV_SPLIT
+    int KS = dyn_kv_splits();
+    int attn_wgs = uA.batch * H * S * KS;
+#else
     int attn_wgs = uA.batch * H * S;
+#endif
     if (uA.has_cache != 0 && wg >= attn_wgs) {
         if (uA.cache_fp8 != 0) {
             copy_cache_f8(wg - attn_wgs);
@@ -555,6 +649,11 @@ void main() {
         return;
     }
 
+#ifdef KV_SPLIT
+    // Attention workgroup (row, ks): slices of one row are adjacent.
+    int ks = wg % KS;
+    wg = wg / KS;
+#endif
     int s = wg % S;
     int h = (wg / S) % H;
     int b = wg / (S * H);
@@ -627,7 +726,17 @@ void main() {
         t_end = min(kv, ((past + s) / TILE_KV + 1) * TILE_KV);
     }
 
-    for (int t0 = 0; t0 < t_end; t0 += TILE_KV) {
+    int t_begin = 0;
+#ifdef KV_SPLIT
+    {
+        // Whole tiles per slice, so a tile never straddles two workgroups and
+        // the sweep below is unchanged inside a slice.
+        int n_tiles = (t_end + TILE_KV - 1) / TILE_KV;
+        t_begin = ((ks * n_tiles) / KS) * TILE_KV;
+        t_end = min(t_end, (((ks + 1) * n_tiles) / KS) * TILE_KV);
+    }
+#endif
+    for (int t0 = t_begin; t0 < t_end; t0 += TILE_KV) {
         int tn = kv - t0;
         if (tn > TILE_KV) {
             tn = TILE_KV;
@@ -728,6 +837,20 @@ void main() {
         m = m_new;
     }
 
+#ifdef KV_SPLIT
+    // Unnormalized partial of slice ks: the merge rescales by e^(m - M).
+    {
+        int pk = (wg * KS + ks) * (D + 2);
+        if (lid == 0) {
+            uPart.data[pk] = m;
+            uPart.data[pk + 1] = l;
+        }
+        if (lid < n_pair) {
+            uPart.data[pk + 2 + lid * 2] = o0;
+            uPart.data[pk + 3 + lid * 2] = o1;
+        }
+    }
+#else
     if (lid < n_pair) {
         int d0 = lid * 2;
         float inv = 1.0 / (l + 1e-30);
@@ -739,4 +862,19 @@ void main() {
         uOutput.data[y_off + 1] = floatBitsToUint(o1 * inv);
 #endif
     }
+#endif
+}
+
+void main() {
+#ifdef KV_SPLIT
+    // if/else rather than an early return: see attend()'s note on top-of-kernel
+    // returns on Polaris + MoltenVK.
+    if (uA.split_phase == 2) {
+        combine_partials(int(gl_WorkGroupID.x));
+    } else {
+        attend();
+    }
+#else
+    attend();
+#endif
 }

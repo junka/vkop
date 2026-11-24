@@ -1013,6 +1013,12 @@ vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs8_bda buffer/matmul_coop1
 # VK_SUBGROUP_FEATURE_ARITHMETIC_BIT and the archive carries the key.
 vkop_shader_variant(buffer_attention_sg buffer/attention -DSUBGROUP)
 vkop_shader_variant(buffer_attention_fp16_sg buffer/attention -DFP16 -DSUBGROUP)
+# Split-KV decode builds (attention.comp -DKV_SPLIT): one workgroup per
+# (query row, KV slice) plus a combine pass. AttentionBuffer::split_pipeline
+# picks the _sg one where subgroup arithmetic exists and keeps the row kernel
+# when the archive has neither.
+vkop_shader_variant(buffer_attention_split_fp16 buffer/attention -DFP16 -DKV_SPLIT)
+vkop_shader_variant(buffer_attention_split_fp16_sg buffer/attention -DFP16 -DSUBGROUP -DKV_SPLIT)
 vkop_shader_variant(buffer_layernorm_sg buffer/layernorm -DSUBGROUP)
 vkop_shader_variant(buffer_layernorm_fp16_sg buffer/layernorm -DFP16 -DSUBGROUP)
 vkop_shader_variant(buffer_rmsnorm_sg buffer/rmsnorm -DSUBGROUP)
