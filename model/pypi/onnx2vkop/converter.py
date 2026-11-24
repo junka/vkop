@@ -139,6 +139,7 @@ def _io_dtype_override(model, vi):
 # arithmetic path a mid-graph bf16 activation could depend on.
 _BFLOAT16 = onnx.TensorProto.BFLOAT16
 _FLOAT16 = onnx.TensorProto.FLOAT16
+_FLOAT32 = onnx.TensorProto.FLOAT
 
 
 def _bf16_bytes_to_fp16(raw: bytes) -> bytes:
@@ -157,18 +158,126 @@ def _bf16_bytes_to_fp16(raw: bytes) -> bytes:
         return np.ascontiguousarray(f32.astype(np.float16)).tobytes()
 
 
+_FP32_ELEM_TYPES = {_FLOAT32, onnx.TensorProto.DOUBLE}
+
+
+def _consumer_runs_fp32(graph, init_names: set) -> set:
+    """Names of initializers that at least one consumer reads through an
+    fp32 data operand.
+
+    This is the same rule `Quantizer._match_weight_only` applies to a weight it
+    is about to convert (`consumer_runs_fp32` there): the shader dtype of an op
+    is decided by its DATA input (core/runtime.cpp's op_shader_fp16 reads
+    node_inputs[0]), never by the operand the weight happens to be. A 16-bit
+    buffer handed to such an op is not an accuracy loss -- the fp32 shader
+    reads it with uintBitsToFloat, so two neighbouring halves become one float
+    and the buffer is walked at half density. That is silent corruption, not
+    rounding, which is why the operand has to match the shader.
+
+    The data dtype has to be resolved here rather than read from
+    value_info: this runs BEFORE optimize_model, which is what runs
+    shape_inference and fills the value_info in. So follow the producer chain
+    back to something whose type is declared -- a graph input, another
+    initializer, or a Cast (whose `to` attribute is authoritative). An
+    unresolvable chain is treated as "not fp32", i.e. it downcasts, which is
+    the pre-existing behaviour for anything this cannot prove.
+
+    Only the FIRST non-initializer input is examined: that is the data operand
+    by definition (MatMul(x, W), Gemm(x, W, B), Add(x, bias), Mul(x, scale)).
+    """
+
+    producers = {}
+    for node in graph.node:
+        for out in node.output:
+            producers[out] = node
+    declared = {vi.name: vi.type.tensor_type.elem_type
+                for vi in graph.input}
+    for init in graph.initializer:
+        declared.setdefault(init.name, init.data_type)
+
+    def resolves_fp32(name, depth=0):
+        if depth > 16:
+            return False
+        elem = declared.get(name)
+        if elem is not None:
+            return elem in _FP32_ELEM_TYPES
+        node = producers.get(name)
+        if node is None:
+            return False
+        if node.op_type == "Cast":
+            to = next((a.i for a in node.attribute if a.name == "to"), None)
+            return to in _FP32_ELEM_TYPES
+        if node.op_type == "Constant":
+            val = next((a.t for a in node.attribute if a.name == "value"), None)
+            return val is not None and val.data_type in _FP32_ELEM_TYPES
+        # Any other producer is dtype-preserving from its own data operand.
+        for inp in node.input:
+            if inp not in init_names:
+                return resolves_fp32(inp, depth + 1)
+        return False
+
+    forced = set()
+    for node in graph.node:
+        data_operands = [i for i in node.input if i and i not in init_names]
+        if not data_operands:
+            continue
+        if not resolves_fp32(data_operands[0]):
+            continue
+        for inp in node.input:
+            if inp in init_names:
+                forced.add(inp)
+    return forced
+
+
+def _bf16_bytes_to_fp32(raw: bytes) -> bytes:
+    """Reinterpret a buffer of bf16 bit patterns as float32.
+
+    bf16 IS fp32 with the low 16 mantissa bits dropped, so widening each
+    uint16 into the high half of a uint32 recovers the exact value -- no
+    rounding at all. Used for a weight whose consumer computes in fp32 (see
+    _downcast_bfloat16)."""
+    u16 = np.frombuffer(raw, dtype=np.uint16)
+    return np.ascontiguousarray(u16.astype(np.uint32) << 16).tobytes()
+
+
+# Set by _downcast_bfloat16 so the caller can report the two outcomes apart:
+# `returned` counts the fp16 conversions, and this counts the fp32 widenings.
+_downcast_stats = {"widened": 0}
+
+
 def _downcast_bfloat16(model) -> int:
     """Rewrite every bfloat16 tensor in the model to float16, in place.
 
     Covers the three places a dtype is spelled: an initializer's payload, a
     ValueInfoProto's element type (graph input/output/value_info), and a node
-    attribute holding a tensor (Constant). Returns how many were converted."""
+    attribute holding a tensor (Constant). Returns how many were converted.
+
+    An initializer whose consumer reads it through an fp32 data operand is the
+    one exception: it is WIDENED to float32 instead. fp16 is not a storage type
+    the runtime can hand an fp32 shader -- see _consumer_runs_fp32. That is the
+    MiniMax-H3 case: the checkpoint stores adaln_proj.bias and every
+    LayerNorm/Mul scale as bf16, while the graph's arithmetic is fp32 (the
+    transformer is exported fp32 and only the weights are bf16), so converting
+    them to fp16 produced an artifact that computed garbage -- the entire
+    +96808-wide adaln bias read at half density, worth a 5144 absolute error on
+    a table whose own magnitudes are ~50.
+    """
     count = 0
+    init_names = {init.name for init in model.graph.initializer}
+    forced_fp32 = _consumer_runs_fp32(model.graph, init_names)
+    widened = 0
     for init in model.graph.initializer:
-        if init.data_type == _BFLOAT16:
-            init.raw_data = _bf16_bytes_to_fp16(init.raw_data)
-            init.data_type = _FLOAT16
-            count += 1
+        if init.data_type != _BFLOAT16:
+            continue
+        if init.name in forced_fp32:
+            init.raw_data = _bf16_bytes_to_fp32(init.raw_data)
+            init.data_type = _FLOAT32
+            widened += 1
+            continue
+        init.raw_data = _bf16_bytes_to_fp16(init.raw_data)
+        init.data_type = _FLOAT16
+        count += 1
+    _downcast_stats["widened"] = widened
     for vi in (list(model.graph.input) + list(model.graph.output)
                + list(model.graph.value_info)):
         if vi.type.tensor_type.elem_type == _BFLOAT16:
@@ -262,12 +371,18 @@ class ModelConverter:
 
         # Normalize bf16 away before anything reads a dtype: the runtime has no
         # bf16 kernel and no bf16 storage type, so a model that spells it has to
-        # become fp16 here or the loader rejects it at the format gate. Runs
-        # before optimize_model so the ConstantFolder and every fusion pass only
-        # ever see the fp16 form.
+        # become a type the loader accepts. Runs before optimize_model so the
+        # ConstantFolder and every fusion pass only ever see the normalized
+        # form.
+        #
+        # fp16 is the default target, but NOT for a tensor an fp32 shader reads:
+        # core/runtime.cpp decides an op's precision from its data input, so a
+        # 16-bit operand there is read at half density instead of rounded.
+        # _downcast_bfloat16 widens those to fp32 (see its docstring).
         bf16_count = _downcast_bfloat16(model)
-        if bf16_count:
-            print(f"[bf16] downcast {bf16_count} bfloat16 tensor(s) to float16")
+        if bf16_count or _downcast_stats["widened"]:
+            print(f"[bf16] {bf16_count} bfloat16 tensor(s) -> float16, "
+                  f"{_downcast_stats['widened']} -> float32 (fp32 consumers)")
 
         # Slots have to be declared in expert order *before* the passes run, and
         # the passes are not order-preserving: onnxoptimizer's
@@ -1059,6 +1174,17 @@ class ModelConverter:
                 "awq.", file=sys.stderr)
 
         numeric_audit.finish()
+
+        # The folded-weight ABI, checked once for every format.
+        #
+        # `_match_weight_only` refuses to quantize a weight that belongs to a
+        # fold, but it is only one of the ways a weight can arrive on a
+        # quantization grid: PreQuantizedWeights.fold imports somebody else's
+        # payload, and a streamed weight is encoded by weight_stream. Each of
+        # those ends up in a MatMul whose kernel predicts a float B with a
+        # fixed input count, so a disagreement has to be caught here rather
+        # than at the first execute on the target box.
+        Quantizer._validate_folded_weights(dag_model)
 
         # Byte weights are re-laid as [K, N] with transB=0 here, so the runtime
         # reaches the WIDE form of the split-K byte GEMV: 16 consecutive columns

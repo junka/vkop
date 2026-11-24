@@ -20,7 +20,8 @@ import numpy
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from onnx2vkop.converter import _bf16_bytes_to_fp16, _downcast_bfloat16
+from onnx2vkop.converter import (_bf16_bytes_to_fp16, _downcast_bfloat16,
+                                 _downcast_stats)
 
 # bf16 bit patterns for values that survive fp16 exactly (and one that
 # saturates), chosen to exercise sign, an exact fraction and the exponent edge.
@@ -104,3 +105,89 @@ def test_already_fp16_model_is_untouched():
     assert bytes(init.raw_data) == before
     assert init.data_type == TensorProto.FLOAT16
     print("  PASS (fp16 model untouched, zero conversions)")
+
+
+def test_fp32_consumer_widens_instead_of_downcasting():
+    """A bf16 weight whose consumer computes in fp32 must be WIDENED, not
+    downcast.
+
+    core/runtime.cpp decides an op's shader dtype from its DATA input, so an
+    Add(MatMul_fp32, bias) gets the fp32 shader whatever the bias holds. A
+    float16 buffer there is read with uintBitsToFloat -- two neighbouring
+    halves become one float, the buffer is walked at half density, and the
+    result is garbage rather than a rounding error. This is the MiniMax-H3
+    adaln defect: 5144 of absolute error on a table of magnitude 50.
+    """
+    w = bf16_tensor("W", [1.0, -2.5, 0.25, 4.0], dims=[4])
+    bias = bf16_tensor("B", [0.5, -0.25, 2.0, -1.0], dims=[4])
+    scale = bf16_tensor("S", [3.0, 3.0, 3.0, 3.0], dims=[4])
+    vi_x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])
+    vi_y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [4])
+    # x is declared FLOAT -> both MatMul and the following Add run fp32.
+    nodes = [
+        helper.make_node("MatMul", ["x", "W"], ["mm"]),
+        helper.make_node("Add", ["mm", "B"], ["sum"]),
+        helper.make_node("Mul", ["sum", "S"], ["y"]),
+    ]
+    graph = helper.make_graph(nodes, "g", [vi_x], [vi_y],
+                              initializer=[w, bias, scale])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+
+    n = _downcast_bfloat16(model)
+    assert n == 0, n                       # nothing downcast
+    assert _downcast_stats["widened"] == 3  # all three widened
+
+    # make_graph copies what it is handed, so read the model's own tensors.
+    got = {i.name: i for i in model.graph.initializer}
+    for name, want in (("W", [1.0, -2.5, 0.25, 4.0]),
+                       ("B", [0.5, -0.25, 2.0, -1.0]),
+                       ("S", [3.0, 3.0, 3.0, 3.0])):
+        assert got[name].data_type == TensorProto.FLOAT, name
+        assert list(numpy_helper.to_array(got[name])) == want, name
+    print("  PASS (fp32-consumed bf16 weights widened, values exact)")
+
+
+def test_fp16_consumer_still_downcasts():
+    """The widening must not leak: bf16 weights feeding an fp16 graph keep the
+    cheap float16 form. A graph whose data input is FLOAT16 gets fp16 shaders,
+    so a float32 weight there would be the mirror-image bug."""
+    w = bf16_tensor("W", [1.0, -2.5], dims=[2])
+    vi_x = helper.make_tensor_value_info("x", TensorProto.FLOAT16, [2])
+    vi_y = helper.make_tensor_value_info("y", TensorProto.FLOAT16, [2])
+    node = helper.make_node("Mul", ["x", "W"], ["y"])
+    graph = helper.make_graph([node], "g", [vi_x], [vi_y], initializer=[w])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+
+    assert _downcast_bfloat16(model) == 1
+    assert _downcast_stats["widened"] == 0
+    got = model.graph.initializer[0]
+    assert got.data_type == TensorProto.FLOAT16
+    assert list(numpy_helper.to_array(got)) == [1.0, -2.5]
+    print("  PASS (fp16-consumed weight still downcast)")
+
+
+def test_fp32_follows_a_cast_not_just_graph_inputs():
+    """The data dtype has to be resolved through the producer chain.
+
+    _downcast_bfloat16 runs BEFORE optimize_model, i.e. before shape_inference
+    fills value_info in, so the only dtype declarations available are graph
+    inputs, initializers and Cast attributes. A Cast(to=float) in the chain is
+    what makes the consumer fp32 -- the shape the H3 adaln prelude actually
+    reaches its MatMul through.
+    """
+    w = bf16_tensor("W", [2.0, -4.0], dims=[2])
+    vi_x = helper.make_tensor_value_info("x", TensorProto.BFLOAT16, [2])
+    vi_y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])
+    nodes = [
+        helper.make_node("Cast", ["x"], ["xf"], to=TensorProto.FLOAT),
+        helper.make_node("Mul", ["xf", "W"], ["y"]),
+    ]
+    graph = helper.make_graph(nodes, "g", [vi_x], [vi_y], initializer=[w])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+
+    assert _downcast_bfloat16(model) == 1   # the graph input
+    assert _downcast_stats["widened"] == 1  # the weight behind the Cast
+    got = model.graph.initializer[0]
+    assert got.data_type == TensorProto.FLOAT
+    assert list(numpy_helper.to_array(got)) == [2.0, -4.0]
+    print("  PASS (fp32 resolved through a producer chain with a Cast)")
