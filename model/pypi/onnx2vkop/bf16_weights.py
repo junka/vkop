@@ -45,8 +45,22 @@ copied verbatim instead of being converted to fp16 chunk-wise. Rows that encode
 something (a quantizing row, the SwiGLU interleave, a lane-major reorder, a
 transposed payload) keep their existing behaviour.
 
+Range scan (`TileScan`). Every MatMul route accumulates in fp32, and the GEMV
+and column-parallel routes decode a bf16 B straight to fp32, but the tile routes
+(the SIMT tile, tile-split-K and the Apple coop8 GEMM) stage B as half, which
+clamps |w| > 65504. Each emitted bf16 weight -- kept, rounded or streamed -- is
+scanned on its exact bits: with x = bits & 0x7FFF, x >= 0x4780 is past fp16's
+range (inf and NaN included) and 0 < x < 0x3880 is below fp16's smallest normal.
+A weight with any overflow element gets the node attribute `bf16_wide=1` on each
+consuming MatMul/Gemm (`BF16_WIDE_ATTR`), which keeps the runtime off the tile
+routes for it; nothing is written when the weight is in range, so such an
+artifact is byte-identical to one built without the scan. Both counts go into
+the numeric audit (WeightRow.tile_overflow / tile_subnormal); the subnormal
+count is informational only.
+
 Pure numpy on purpose (no ml_dtypes), like the rest of the bf16 handling.
 """
+import os
 from collections import defaultdict
 from typing import Dict, Optional, Set, Tuple
 
@@ -72,6 +86,119 @@ _VIEW_OPS = frozenset({"Transpose", "Reshape", "Squeeze", "Unsqueeze",
 # three weights, swiglu an interleaved one. v1 of the bf16 contract covers the
 # plain MatMul/Gemm B operand only.
 _FOLD_ATTRS = ("down_act", "swiglu")
+
+# The node attribute that tells the runtime a bf16 B holds an element past
+# fp16's range (ops/Matmul.hpp, core::MatmulFeatures::bf16_wide).
+BF16_WIDE_ATTR = "bf16_wide"
+
+# bf16 bit thresholds on x = bits & 0x7FFF (sign dropped).
+#   0x4780 = 65536, the first bf16 magnitude past fp16's max 65504 (0x477F is
+#            65280, exact in fp16); every inf/NaN pattern (>= 0x7F80) is above.
+#   0x3880 = 2**-14, fp16's smallest normal.
+_TILE_OVERFLOW_BITS = 0x4780
+_FP16_MIN_NORMAL_BITS = 0x3880
+# uint16 elements per scan slice: 8.4M elements -> 16 MiB slice plus one
+# same-size temporary, whatever the weight's size.
+_SCAN_CHUNK = 1 << 23
+
+
+# ---------------------------------------------------------------------------
+# range scan: which bf16 weights a half-staging tile would clamp
+# ---------------------------------------------------------------------------
+
+class TileScan:
+    """Counts over a bf16 payload's bits, fed in slices of any size.
+
+    `overflow`  -- elements with |w| > 65504, inf or NaN (x >= 0x4780).
+    `subnormal` -- nonzero elements below fp16's smallest normal
+                   (0 < x < 0x3880); informational.
+    A byte stream may be split anywhere (`add_bytes` carries an odd byte).
+    """
+
+    __slots__ = ("elements", "overflow", "subnormal", "_carry")
+
+    def __init__(self):
+        self.elements = 0
+        self.overflow = 0
+        self.subnormal = 0
+        self._carry = b""
+
+    def add_bits(self, bits) -> "TileScan":
+        u = np.asarray(bits)
+        if u.dtype != np.uint16:
+            u = u.view(np.uint16) if u.dtype.itemsize == 2 else u.astype(
+                np.uint16)
+        u = u.reshape(-1)
+        for i in range(0, u.size, _SCAN_CHUNK):
+            x = u[i:i + _SCAN_CHUNK] & np.uint16(0x7FFF)
+            self.elements += int(x.size)
+            self.overflow += int(np.count_nonzero(
+                x >= np.uint16(_TILE_OVERFLOW_BITS)))
+            self.subnormal += int(np.count_nonzero(
+                (x != 0) & (x < np.uint16(_FP16_MIN_NORMAL_BITS))))
+        return self
+
+    def add_bytes(self, block) -> "TileScan":
+        if self._carry:
+            block = self._carry + bytes(block)
+            self._carry = b""
+        n = len(block)
+        if n & 1:
+            self._carry = bytes(block[n - 1:])
+            n -= 1
+        if n:
+            self.add_bits(np.frombuffer(block, dtype="<u2", count=n // 2))
+        return self
+
+
+def scan_bits(bits) -> TileScan:
+    """TileScan over an in-memory payload (uint16 bits, any shape)."""
+    return TileScan().add_bits(bits)
+
+
+def scan_file(path: str, offset: int, length: int,
+              chunk_bytes: int = _SCAN_CHUNK * 2) -> TileScan:
+    """TileScan over `length` bytes of a bf16 payload at `offset` of `path`,
+    read in bounded chunks (a streamed weight's source in its external file)."""
+    scan = TileScan()
+    with open(path, "rb") as f:
+        f.seek(offset)
+        remaining = int(length)
+        while remaining:
+            block = f.read(min(chunk_bytes, remaining))
+            if not block:
+                raise ValueError(
+                    f"bf16 scan: {path} ends {remaining} byte(s) before the "
+                    f"{length} at offset {offset}")
+            scan.add_bytes(block)
+            remaining -= len(block)
+    return scan
+
+
+def _flag_wide(slots) -> None:
+    """bf16_wide=1 on each consuming MatMul/Gemm (Gather has no tile route)."""
+    for node, _i in slots:
+        if node.op_type in ("MatMul", "Gemm"):
+            node.attributes[BF16_WIDE_ATTR] = [1]
+
+
+def _record_scan(name, scan, slots, summary) -> None:
+    try:
+        from . import numeric_audit
+    except ImportError:  # flat-module layout (cli run from the dir)
+        import numeric_audit
+    via = ""
+    for node, _i in slots:
+        via = getattr(node, "name", "") or ""
+        if via:
+            break
+    numeric_audit.record_tile_scan(name, scan.elements, scan.overflow,
+                                   scan.subnormal, via=via)
+    if scan.overflow:
+        _flag_wide(slots)
+        summary["wide"].append(name)
+    summary["tile_overflow"] += scan.overflow
+    summary["tile_subnormal"] += scan.subnormal
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +485,8 @@ def apply(dag_model, *, keep: bool = False, quantize: bool = False,
                    set, so every payload the domain pass left wide is
                    rewritten and nothing else is).
     """
-    summary = {"kept": [], "rounded": [], "deferred": [], "fallback": []}
+    summary = {"kept": [], "rounded": [], "deferred": [], "fallback": [],
+               "wide": [], "tile_overflow": 0, "tile_subnormal": 0}
     if not (keep or quantize):
         return summary
     if sources is None:
@@ -372,15 +500,24 @@ def apply(dag_model, *, keep: bool = False, quantize: bool = False,
         init = dag_model.initializers[name]
         if name in deferred:
             if keep or quantize:
-                if _flip_deferred(deferred[name], init):
+                entry = deferred[name]
+                if _flip_deferred(entry, init):
                     _retag(slots)
                     summary["deferred"].append(name)
+                    # The payload is written after the graph, so the scan
+                    # reads the source bytes here, while the attribute can
+                    # still be emitted; write_payload re-checks them as they
+                    # pass (weight_stream.py).
+                    scan = _scan_deferred(entry)
+                    entry["bf16_tile_overflow"] = scan.overflow
+                    _record_scan(name, scan, slots, summary)
             continue
         bits = index.match(name, init) if sources else None
         if bits is not None:
             dag_model.initializers[name] = _make_bf16(name, init.dims, bits)
             _retag(slots)
             summary["kept"].append(name)
+            _record_scan(name, scan_bits(bits), slots, summary)
             continue
         if not quantize:
             if name in sources:
@@ -401,6 +538,7 @@ def apply(dag_model, *, keep: bool = False, quantize: bool = False,
             import numeric_audit
         numeric_audit.record_roundtrip(name, "bf16", src,
                                        bf16_bits_to_fp32(bits))
+        _record_scan(name, scan_bits(bits), slots, summary)
 
     # Freed: the stash is the second copy of every in-memory bf16 weight.
     if hasattr(dag_model, "bf16_sources"):
@@ -414,4 +552,29 @@ def apply(dag_model, *, keep: bool = False, quantize: bool = False,
                  f"by a pass and stay fp16/fp32: "
                  + ", ".join(summary["fallback"][:5])
                  if summary["fallback"] else ""))
+        n_bf16 = (len(summary["kept"]) + len(summary["rounded"])
+                  + len(summary["deferred"]))
+        if n_bf16:
+            print(tile_scan_line(summary))
     return summary
+
+
+def tile_scan_line(summary: dict) -> str:
+    """The one-line summary of the range scan over every emitted bf16 weight."""
+    wide = summary["wide"]
+    line = (f"[bf16] range scan: {len(wide)} weight(s) hold |w| > 65504 / "
+            f"inf / NaN ({summary['tile_overflow']} element(s))")
+    if wide:
+        line += (f" -> {BF16_WIDE_ATTR}=1 on their MatMul/Gemm, kept off the "
+                 f"half-staging tile routes: " + ", ".join(wide[:5])
+                 + (" ..." if len(wide) > 5 else ""))
+    line += (f"; {summary['tile_subnormal']} element(s) below fp16's "
+             f"smallest normal (informational)")
+    return line
+
+
+def _scan_deferred(entry: dict) -> TileScan:
+    path = entry["location"]
+    if not os.path.isabs(path):
+        path = os.path.join(entry.get("base_dir") or "", path)
+    return scan_file(path, int(entry["offset"]), int(entry["length"]))

@@ -114,6 +114,54 @@ inline uint16_t float_to_bf16(float f) {
     return static_cast<uint16_t>(u >> 16);
 }
 
+// fp16's range as a bf16 bit test. With x = bits & 0x7FFF, x >= 0x4780 is
+// |w| >= 65536 -- the first bf16 magnitude past fp16's largest finite 65504
+// (0x477F is 65280, exact in fp16) -- and also every inf and NaN. This is the
+// test onnx2vkop's bf16 scan writes into the bf16_wide node attribute
+// (bf16_weights.py): a bf16 B holding such an element must stay off the
+// MatMul routes that stage B as half (core::MatmulFeatures::bf16_wide).
+constexpr uint16_t kBf16PastFp16Bits = 0x4780;
+inline bool bf16_past_fp16(uint16_t h) {
+    return (h & 0x7FFFu) >= kBf16PastFp16Bits;
+}
+
+// The same test over a byte stream that may be split anywhere (LoadModel feeds
+// it the staging chunks a streamed upload writes, whose boundaries are not
+// promised to be even). Little-endian bf16, element 0 at byte 0.
+class Bf16RangeScan {
+  public:
+    void feed(const void *data, size_t len) {
+        const auto *p = static_cast<const uint8_t *>(data);
+        if (overflow_ || len == 0) {
+            return;
+        }
+        if (pending_ >= 0) {
+            const auto h = static_cast<uint16_t>(pending_ | (p[0] << 8));
+            overflow_ = bf16_past_fp16(h);
+            pending_ = -1;
+            ++p;
+            --len;
+        }
+        const size_t n = len / 2;
+        // Assembled from bytes, so an odd-aligned chunk is fine.
+        bool hit = false;
+        for (size_t i = 0; i < n; ++i) {
+            const uint16_t h = static_cast<uint16_t>(
+                p[2 * i] | (static_cast<uint16_t>(p[2 * i + 1]) << 8));
+            hit |= bf16_past_fp16(h);
+        }
+        overflow_ = overflow_ || hit;
+        if (len & 1) {
+            pending_ = p[len - 1];
+        }
+    }
+    bool overflow() const { return overflow_; }
+
+  private:
+    int pending_ = -1;
+    bool overflow_ = false;
+};
+
 // Bits per element. Sub-byte kinds are the reason byte counts and element
 // counts are separate quantities: 5 x kInt4 is 3 bytes, not 5.
 constexpr int elem_bits(ElemKind kind) {

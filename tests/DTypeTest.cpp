@@ -444,3 +444,45 @@ TEST(DTypeTest, Fp16ConversionKeepsMantissaCarry) {
 }
 
 } // namespace
+
+// The LoadModel fallback scan (core::Bf16RangeScan) must agree with the
+// converter's bit test (onnx2vkop bf16_weights.TileScan): |w| > 65504, inf or
+// NaN, on every one of the 65536 patterns, and on a byte stream cut at odd
+// offsets (a staging chunk boundary is not promised to be even).
+TEST(DTypeTest, Bf16RangeScanMatchesFp16Range) {
+    using vkop::core::bf16_past_fp16;
+    using vkop::core::bf16_to_float;
+    for (uint32_t b = 0; b < 65536; ++b) {
+        const auto h = static_cast<uint16_t>(b);
+        const float v = bf16_to_float(h);
+        ASSERT_EQ(bf16_past_fp16(h), !(std::fabs(v) <= 65504.0F)) << std::hex
+                                                                  << b;
+    }
+    EXPECT_FALSE(bf16_past_fp16(0x477F));
+    EXPECT_TRUE(bf16_past_fp16(0x4780));
+    EXPECT_TRUE(bf16_past_fp16(0xC780));
+    EXPECT_FALSE(bf16_past_fp16(0x8000));
+
+    std::vector<uint16_t> in_range = {0x3F80, 0x477F, 0xC77F, 0x8000, 0x0001};
+    const auto feed = [](const std::vector<uint16_t> &v,
+                         std::initializer_list<size_t> cuts) {
+        vkop::core::Bf16RangeScan s;
+        const auto *p = reinterpret_cast<const uint8_t *>(v.data());
+        size_t pos = 0;
+        for (size_t c : cuts) {
+            s.feed(p + pos, c);
+            pos += c;
+        }
+        s.feed(p + pos, v.size() * 2 - pos);
+        return s.overflow();
+    };
+    EXPECT_FALSE(feed(in_range, {}));
+    EXPECT_FALSE(feed(in_range, {1, 2, 3}));
+    auto hit = in_range;
+    hit[2] = 0x4780; // bytes 4..5
+    EXPECT_TRUE(feed(hit, {}));
+    EXPECT_TRUE(feed(hit, {5}));      // split inside the element
+    EXPECT_TRUE(feed(hit, {1, 2, 2})); // pending low byte carried twice
+    hit[2] = 0x7FC0;                   // NaN
+    EXPECT_TRUE(feed(hit, {3}));
+}

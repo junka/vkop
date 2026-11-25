@@ -784,8 +784,68 @@ void test_mvk_apple_routes() {
     CHECK(p.ksplit_q == 64);
 }
 
+// A bf16 weight holding |w| > 65504 (bf16_wide): every tile route stages B as
+// half and would clamp it, so none of them may be picked on any device, shape
+// or availability; the in-range bf16 weight still takes the tile.
+void test_bf16_wide_routes() {
+    const DeviceTraits devs[] = {traits_native_discrete(), traits_ada(),
+                                 traits_mvk_apple(), traits_mvk_amd(),
+                                 traits_mvk_intel()};
+    const MatmulAvailability avs[] = {fp16_only(), fp16_splitk(),
+                                      coop_modules()};
+    int checked = 0;
+    for (const auto &dev : devs) {
+        for (const auto &av : avs) {
+            for (int batch : {1, 3}) {
+                for (int m : {1, 4, 8, 9, 16, 33, 64, 130, 256, 1024}) {
+                    for (int k : {64, 256, 1024, 4096}) {
+                        for (int n : {64, 96, 192, 2048, 6144, 151936}) {
+                            for (bool tb : {false, true}) {
+                                MatmulFeatures f = fp16_w(tb);
+                                f.weight = WeightKind::kBf16;
+                                f.bf16_wide = true;
+                                MatmulPlan p = select_matmul(
+                                    dev, sh(batch, m, k, n), f, av);
+                                CHECK(!p.tiled);
+                                CHECK(p.route != MatmulRoute::kTiled);
+                                CHECK(p.route != MatmulRoute::kTiledKs);
+                                CHECK(p.route != MatmulRoute::kCoopmat);
+                                CHECK(p.ks_n == 0);
+                                ++checked;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CHECK(checked > 0);
+
+    // Prefill on Apple: in range the tile (coop8) takes it; wide falls to the
+    // column-parallel even-N kernel, which decodes bf16 to fp32.
+    const DeviceTraits apple = traits_mvk_apple();
+    MatmulFeatures in_range = fp16_w();
+    in_range.weight = WeightKind::kBf16;
+    MatmulPlan p = select_matmul(apple, sh(1, 64, 128, 64), in_range,
+                                 fp16_splitk());
+    CHECK(p.tiled);
+    MatmulFeatures wide = in_range;
+    wide.bf16_wide = true;
+    p = select_matmul(apple, sh(1, 64, 128, 64), wide, fp16_splitk());
+    CHECK_ROUTE(p, kFusedFp16);
+    // Decode is untouched: the split-K GEMV already reads bf16 as fp32.
+    p = select_matmul(apple, sh(1, 1, 2048, 6144), wide, fp16_splitk());
+    CHECK_ROUTE(p, kKsplitWide);
+    // The flag means nothing on a non-bf16 weight.
+    MatmulFeatures fp16_flagged = fp16_w();
+    fp16_flagged.bf16_wide = true;
+    p = select_matmul(apple, sh(1, 64, 128, 64), fp16_flagged, fp16_splitk());
+    CHECK(p.tiled);
+}
+
 int main() {
     test_profiles();
+    test_bf16_wide_routes();
     test_apple_coop8_gate();
     test_mvk_apple_routes();
     test_decode_shapes_native();

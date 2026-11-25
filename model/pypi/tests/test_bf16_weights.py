@@ -533,3 +533,236 @@ def test_keep_bf16_gemm_transb_weight_keeps_its_stored_layout(tmp_path):
     # The bias is an Add operand after lowering: default downcast.
     bias = [n for n in rows if n != "B"]
     assert all(rows[n] == dflt[n] for n in bias), bias
+
+
+# ---------------------------------------------------------------------------
+# range scan: which bf16 weights a half-staging MatMul tile would clamp
+# ---------------------------------------------------------------------------
+
+from onnx2vkop import numeric_audit  # noqa: E402
+
+
+@pytest.fixture
+def audits(monkeypatch):
+    """The NumericAudit(s) the converter's own begin/finish produced."""
+    got = []
+    real = numeric_audit.finish
+
+    def finish(mode=None):
+        a = real("off")
+        got.append(a)
+        return a
+    monkeypatch.setattr(numeric_audit, "finish", finish)
+    return got
+
+
+def _bits(*vals):
+    return numpy.asarray(vals, dtype=numpy.uint16)
+
+
+@pytest.mark.parametrize("pattern,over,sub", [
+    (0x477F, 0, 0),   # 65280: largest bf16 inside fp16's range
+    (0x4780, 1, 0),   # 65536: first past 65504
+    (0xC77F, 0, 0),   # -65280
+    (0xC780, 1, 0),   # -65536
+    (0x387F, 0, 1),   # just under 2**-14
+    (0x3880, 0, 0),   # 2**-14: fp16's smallest normal
+    (0xB87F, 0, 1),   # negative, under fp16 normal
+    (0x0001, 0, 1),   # bf16 subnormal
+    (0x7F80, 1, 0),   # +inf
+    (0xFF80, 1, 0),   # -inf
+    (0x7FC0, 1, 0),   # NaN
+    (0xFF81, 1, 0),   # negative signalling NaN
+    (0x8000, 0, 0),   # -0
+    (0x0000, 0, 0),   # +0
+])
+def test_tile_scan_boundary_bit_patterns(pattern, over, sub):
+    s = bf16_weights.scan_bits(_bits(pattern))
+    assert (s.elements, s.overflow, s.subnormal) == (1, over, sub)
+    # The bit thresholds are exactly fp16's range.
+    v = float(bf16_bits_to_fp32(_bits(pattern))[0])
+    if over:
+        assert not (abs(v) <= 65504.0)
+    else:
+        assert abs(v) <= 65504.0
+    if sub:
+        assert 0.0 < abs(v) < 2.0 ** -14
+
+
+def test_tile_scan_matches_a_float_reference_on_every_bit_pattern():
+    allbits = numpy.arange(1 << 16, dtype=numpy.uint32).astype(numpy.uint16)
+    v = bf16_bits_to_fp32(allbits)
+    with numpy.errstate(invalid="ignore"):
+        want_over = int(numpy.count_nonzero(~(numpy.abs(v) <= 65504.0)))
+        want_sub = int(numpy.count_nonzero(
+            (numpy.abs(v) > 0) & (numpy.abs(v) < 2.0 ** -14)))
+    s = bf16_weights.scan_bits(allbits)
+    assert (s.overflow, s.subnormal) == (want_over, want_sub)
+
+
+def test_tile_scan_chunking_and_odd_byte_splits(monkeypatch):
+    rng = numpy.random.RandomState(3)
+    bits = rng.randint(0, 1 << 16, size=10001).astype(numpy.uint16)
+    whole = bf16_weights.scan_bits(bits)
+    monkeypatch.setattr(bf16_weights, "_SCAN_CHUNK", 7)
+    chunked = bf16_weights.scan_bits(bits)
+    raw = bits.tobytes()
+    streamed = bf16_weights.TileScan()
+    pos = 0
+    for step in (1, 3, 5, 2, 9999, 7, 11):
+        streamed.add_bytes(raw[pos:pos + step])
+        pos += step
+    streamed.add_bytes(raw[pos:])
+    for s in (chunked, streamed):
+        assert (s.elements, s.overflow, s.subnormal) == (
+            whole.elements, whole.overflow, whole.subnormal)
+
+
+def _attrs(path):
+    return {n.get("name"): n.get("attributes") or {}
+            for n in ModelView(str(path)).nodes()}
+
+
+def test_keep_bf16_flags_only_the_overflowing_weight(tmp_path, audits):
+    rng = numpy.random.RandomState(0)
+    model, _ = _bf16_model(rng, big=True)
+    out, _ = _convert(tmp_path, model, "keep", keep_bf16=True)
+    audit = audits[-1]
+    attrs = _attrs(out)
+    assert attrs["proj"].get("bf16_wide") == [1]       # W holds 1e6
+    for other in ("back", "shared_mm", "s_as_a", "embed"):
+        assert "bf16_wide" not in attrs[other], other
+    rows = {r.tensor: r for r in audit.rows}
+    assert rows["W"].tile_overflow == 1
+    assert rows["W"].rel_l2 == 0.0                    # kept: lossless
+    assert rows["E"].tile_overflow == 0
+    assert "1 tile-overflow element(s) in 1 weight(s)" in audit.summary_line()
+    assert "tile-overflow 1" in rows["W"].line()
+
+
+def test_keep_bf16_in_range_emits_no_flag(tmp_path):
+    rng = numpy.random.RandomState(0)
+    model, _ = _bf16_model(rng, big=False)
+    out, _ = _convert(tmp_path, model, "keep", keep_bf16=True)
+    assert not any("bf16_wide" in a for a in _attrs(out).values())
+
+
+def test_quant_bf16_rounding_path_is_scanned(tmp_path, audits):
+    """-q bf16 over an fp32 weight past fp16's range: the ROUNDED bits are
+    what the scan sees, and the row record_roundtrip made carries the count."""
+    rng = numpy.random.RandomState(4)
+    W = _rand(rng, K, N)
+    W[2, 3] = -7.0e4
+    W2 = _rand(rng, N, K)
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["X", "W"], ["H"], name="mm0"),
+         helper.make_node("MatMul", ["H", "W2"], ["Y"], name="mm1")], "g",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, K])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, K])],
+        [numpy_helper.from_array(W, "W"), numpy_helper.from_array(W2, "W2")])
+    model = helper.make_model(graph, producer_name="test",
+                              opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    out, _ = _convert(tmp_path, model, "q", quant="bf16")
+    audit = audits[-1]
+    rows = _rows(out)
+    assert rows["W"][0] == "bfloat16"
+    attrs = _attrs(out)
+    assert attrs["mm0"].get("bf16_wide") == [1]
+    assert "bf16_wide" not in attrs["mm1"]
+    by = {r.tensor: r for r in audit.rows}
+    assert by["W"].tile_overflow == 1 and by["W"].rel_l2 > 0
+    assert by["W2"].tile_overflow == 0
+    # One row per weight: the scan joined the round-trip row.
+    assert [r.tensor for r in audit.rows].count("W") == 1
+
+
+@pytest.mark.parametrize("big", [False, True])
+def test_streamed_bf16_weight_is_scanned(tmp_path, monkeypatch, big,
+                                        audits):
+    monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1")
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "0")
+    model, W = _streamed_bf16_model(numpy.random.RandomState(2))
+    if big:
+        W = W.copy()
+        W[5, 7] = numpy.inf
+        W[6, 1] = 1.0e5
+        model.graph.initializer[0].CopyFrom(bf16_init("W", W))
+    out, dag = _convert(tmp_path, model, "s", keep_bf16=True,
+                        save_external=True)
+    audit = audits[-1]
+    assert "W" in dag.deferred_weights
+    dtype, _dims, payload = _rows(out)["W"]
+    assert dtype == "bfloat16" and payload == bf16_bits(W).tobytes()
+    flagged = _attrs(out)["mm"].get("bf16_wide") == [1]
+    assert flagged == big
+    row = [r for r in audit.rows if r.tensor == "W"]
+    assert len(row) == 1 and row[0].tile_overflow == (2 if big else 0)
+
+
+def test_streamed_source_changed_after_the_scan_is_refused(tmp_path,
+                                                           monkeypatch):
+    from onnx2vkop import weight_stream
+    monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1")
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "0")
+    model, _W = _streamed_bf16_model(numpy.random.RandomState(2))
+    # The graph-time scan reports the weight in range; the bytes then turn
+    # out to hold an overflow (simulates a source rewritten mid-conversion).
+    real = bf16_weights._scan_deferred
+
+    def lying(entry):
+        s = real(entry)
+        s.overflow = 0
+        return s
+    src = tmp_path / "s.bin"
+    orig_apply = bf16_weights.apply
+
+    def apply_then_corrupt(*a, **k):
+        out = orig_apply(*a, **k)
+        data = bytearray(src.read_bytes())
+        data[0:2] = numpy.asarray([0x7F80], dtype=numpy.uint16).tobytes()
+        src.write_bytes(bytes(data))
+        return out
+    monkeypatch.setattr(bf16_weights, "_scan_deferred", lying)
+    monkeypatch.setattr(bf16_weights, "apply", apply_then_corrupt)
+    with pytest.raises(weight_stream.DeferredWeightError, match="bf16_wide"):
+        _convert(tmp_path, model, "s", keep_bf16=True, save_external=True)
+
+
+def _keep_artifact(tmp_path, name, model, **kw):
+    d = tmp_path / name
+    d.mkdir()
+    out, _ = _convert(d, onnx.load_from_string(model.SerializeToString()),
+                      "m", keep_bf16=True, **kw)
+    return out.read_bytes()
+
+
+def test_no_overflow_artifact_is_byte_identical_without_the_scan(
+        tmp_path, monkeypatch):
+    """In range, the scan writes nothing: the artifact equals one built with
+    the scan stubbed out entirely (in-memory and streamed)."""
+    model, _ = _bf16_model(numpy.random.RandomState(0), big=False)
+    smodel, _ = _streamed_bf16_model(numpy.random.RandomState(2))
+
+    def both():
+        for k in ("VKOP_STREAM_WEIGHTS", "VKOP_STREAM_MIN_MIB",
+                  "VKOP_EXTERNAL_BLOB_MB"):
+            monkeypatch.delenv(k, raising=False)
+        mem = _keep_artifact(tmp_path, f"m{len(seen)}", model)
+        monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1")
+        monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+        monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "0")
+        streamed = _keep_artifact(tmp_path, f"s{len(seen)}", smodel,
+                                  save_external=True)
+        seen.append((mem, streamed))
+
+    seen = []
+    both()
+    monkeypatch.setattr(bf16_weights, "_record_scan", lambda *a, **k: None)
+    monkeypatch.setattr(bf16_weights, "_scan_deferred",
+                        lambda e: bf16_weights.TileScan())
+    both()
+    assert seen[0][0] == seen[1][0]
+    assert seen[0][1] == seen[1][1]

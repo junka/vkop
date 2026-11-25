@@ -34,6 +34,8 @@
 //      BENCH_BF16=1 marks the same [K, N] weight as bfloat16 (raw bf16 bits,
 //      elem_kind kBFloat16): same bytes and routes as fp16, only the B unpack
 //      differs, so the pair is the A/B for the bf16 read.
+//      BENCH_BF16_WIDE=1 (with BENCH_BF16) sets the bf16_wide attribute, which
+//      keeps the bf16 weight off the half-staging tile routes.
 //      BENCH_PATTERN=1 times the column-ramp weight instead of refilling it
 //      with incompressible bytes after the correctness probe. The A/B against
 //      the default; on a part that does not compress storage-buffer reads the
@@ -358,6 +360,12 @@ int main(int argc, char **argv) {
                                         /*backend_buffer=*/true);
         op->set_name(s.name);
         op->set_runtime_device(dev, cmdpool);
+        // BENCH_BF16_WIDE=1 (with BENCH_BF16): the converter's bf16_wide=1,
+        // i.e. the weight holds |w| > 65504, so the half-staging tile routes
+        // are off. The A/B for what that costs at a prefill BENCH_M.
+        if (bf16_mode && std::getenv("BENCH_BF16_WIDE") != nullptr) {
+            op->setAttribute({{"bf16_wide", "1"}});
+        }
         op->enable_replay(true);
         // GPU time comes from a timestamp pair recorded INSIDE the op's own
         // command buffer (Operator::set_prof_query -- the VKOP_SUBMIT_PROF

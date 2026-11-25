@@ -615,6 +615,30 @@ void Runtime::LoadModel() {
         conv_weight_layout[n.inputs[1].name] = {transpose, pack};
     }
 
+    // bf16 MatMul B weights to range-check while they upload. The converter
+    // writes bf16_wide=1 on a MatMul whose bf16 B holds |w| > 65504 (or
+    // inf/NaN), which keeps the half-staging tile routes away; it writes
+    // nothing when the weight is in range, so a missing attribute cannot tell
+    // "in range" from "written before the scan existed". The bytes pass through
+    // host memory anyway -- the mmap view, or the staging chunk / UMA mapping
+    // file_fill just wrote -- so the same bit test runs over them there, with no
+    // extra copy, and a hit sets the attribute on every consumer below.
+    // VKOP_BF16_SCAN=0 skips it (the converter's attribute still applies).
+    const bool bf16_scan_on = [] {
+        const char *e = std::getenv("VKOP_BF16_SCAN");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    std::unordered_set<std::string> bf16_scan_names;
+    std::unordered_set<std::string> bf16_wide_names;
+    if (bf16_scan_on) {
+        for (const auto &n : model.nodes) {
+            if (n.op_type == "MatMul" && n.inputs.size() >= 2 &&
+                n.attributes.find("bf16_wide") == n.attributes.end()) {
+                bf16_scan_names.insert(n.inputs[1].name);
+            }
+        }
+    }
+
     // Batched initializer upload. Every initializer otherwise gets its own
     // staging copy plus a submit and a fence wait, which measures 271 us
     // whatever the buffer holds: llm.vkopbin's 2846 entries are therefore
@@ -952,7 +976,9 @@ void Runtime::LoadModel() {
 
     auto handle_floating_point_tensor = [&](const load::Initializer &init,
                                             const uint8_t *src_base,
-                                            size_t blob_offset, auto &tensor) {
+                                            size_t blob_offset, auto &tensor,
+                                            Bf16RangeScan *bf16_scan =
+                                                nullptr) {
         using T =
             typename std::remove_reference_t<decltype(*tensor)>::value_type;
         auto *src = const_cast<T *>(reinterpret_cast<const T *>(src_base));
@@ -977,9 +1003,26 @@ void Runtime::LoadModel() {
             tensor->as_storage_buffer(dev);
             auto batch = batch_for(init.size);
             if (stream_blob) {
-                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset),
-                                  batch);
+                if (bf16_scan != nullptr) {
+                    // Scan each chunk where the read put it (staging, or the
+                    // UMA buffer's own mapping): the bytes are already there.
+                    auto inner = file_fill(blob_offset);
+                    tensor->copyToGPU(
+                        m_cmdpool_, nullptr,
+                        [inner, bf16_scan](void *dst, size_t len,
+                                           size_t done) {
+                            inner(dst, len, done);
+                            bf16_scan->feed(dst, len);
+                        },
+                        batch);
+                } else {
+                    tensor->copyToGPU(m_cmdpool_, nullptr,
+                                      file_fill(blob_offset), batch);
+                }
             } else {
+                if (bf16_scan != nullptr) {
+                    bf16_scan->feed(src, init.size);
+                }
                 tensor->copyToGPU(m_cmdpool_, src, nullptr, batch);
             }
         } else if (tensor->num_dims() <= 2) {
@@ -1245,7 +1288,15 @@ void Runtime::LoadModel() {
             }
             auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
             t->set_elem_kind(kind);
-            handle_floating_point_tensor(init, src_ptr, offset, t);
+            if (bf16_scan_names.count(init.name) != 0) {
+                Bf16RangeScan scan;
+                handle_floating_point_tensor(init, src_ptr, offset, t, &scan);
+                if (scan.overflow()) {
+                    bf16_wide_names.insert(init.name);
+                }
+            } else {
+                handle_floating_point_tensor(init, src_ptr, offset, t);
+            }
         } else if (elem_kind_packed(kind)) {
             // int4 / nf4 / float4e2m1 weight-only payloads: two values per
             // byte, so the tensor's byte count is elem_bytes(kind, prod(dims))
@@ -1811,11 +1862,26 @@ void Runtime::LoadModel() {
             }
             pipeline_prof_set_context(n.name.c_str());
             op->set_runtime_device(dev, m_cmdpool_, pipeline_cache_);
-            op->setAttribute(n.attributes);
+            // A bf16 B the upload scan found past fp16's range, on a node the
+            // converter did not flag (see bf16_scan_names above).
+            const bool add_bf16_wide =
+                type == ops::OpType::MATMUL && n.inputs.size() >= 2 &&
+                bf16_wide_names.count(n.inputs[1].name) != 0;
+            if (add_bf16_wide) {
+                auto attrs = n.attributes;
+                attrs["bf16_wide"] = "1";
+                LOG_INFO("bf16 weight %s holds |w| > 65504; MatMul %s keeps "
+                         "off the half-staging tile routes",
+                         n.inputs[1].name.c_str(), n.name.c_str());
+                op->setAttribute(attrs);
+                node_attrs_.push_back(std::move(attrs));
+            } else {
+                op->setAttribute(n.attributes);
+                node_attrs_.push_back(n.attributes);
+            }
 
             level_node_indices_[level_idx].push_back(global_node_index++);
             node_ops_.push_back(std::move(op));
-            node_attrs_.push_back(n.attributes);
             node_input_tensors_.push_back(std::move(node_inputs));
             node_output_tensors_.push_back(std::move(node_outputs));
             node_input_shapes_.push_back(std::move(node_input_shapes));

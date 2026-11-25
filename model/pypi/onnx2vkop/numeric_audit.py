@@ -249,6 +249,13 @@ class WeightRow:
     # zero). Not an error -- a zero channel stays a zero channel -- but it is
     # the one case where the stored scale table stops describing the weights.
     dead_slices: int = 0
+    # bf16 only (bf16_weights.TileScan, exact on the stored bits): elements a
+    # half-staging MatMul tile would clamp (|w| > 65504, inf, NaN) -- a
+    # nonzero count is what puts bf16_wide=1 on the consumer, so it is routed
+    # around rather than flagged -- and nonzero elements under fp16's smallest
+    # normal (informational).
+    tile_overflow: int = 0
+    tile_subnormal: int = 0
 
     @property
     def subnormal_share(self) -> float:
@@ -267,6 +274,10 @@ class WeightRow:
             extra += f" subnormal {self.subnormal_share:.1%}"
         if self.dead_slices:
             extra += f" dead-scale {self.dead_slices}"
+        if self.tile_overflow:
+            extra += f" tile-overflow {self.tile_overflow}"
+        if self.tile_subnormal:
+            extra += f" tile-subnormal {self.tile_subnormal}"
         mark = "WARN " if self.flagged else "     "
         via = f" via {self.via}" if self.via else ""
         return (f"[numeric-audit] {mark}{self.fmt:8s} {self.tensor}: "
@@ -297,12 +308,20 @@ class NumericAudit:
             errs = np.array([r.rel_l2 for r in rows], dtype=np.float64)
             over = sum(r.overflow for r in rows)
             dead = sum(r.dead_slices for r in rows)
+            tile_w = sum(1 for r in rows if r.tile_overflow)
+            tile_o = sum(r.tile_overflow for r in rows)
+            tile_s = sum(r.tile_subnormal for r in rows)
             p = (f"{fmt}: {len(rows)} weight(s), median relL2 "
                  f"{np.median(errs):.2e}, worst {errs.max():.2e}")
             if over:
                 p += f", {over} overflow"
             if dead:
                 p += f", {dead} dead-scale slice(s)"
+            if tile_o:
+                p += (f", {tile_o} tile-overflow element(s) in {tile_w} "
+                      f"weight(s) (bf16_wide)")
+            if tile_s:
+                p += f", {tile_s} below fp16 normal"
             parts.append(p)
         n_flag = len(self.flagged())
         tail = f" -- {n_flag} above threshold" if n_flag else ""
@@ -416,6 +435,27 @@ def record(tensor: str, fmt: str, stats: "RoundTrip", dead_slices: int = 0,
         rel_l2=stats.rel_l2, max_abs=stats.max_abs,
         overflow=stats.overflow, subnormals=stats.subnormals,
         dead_slices=dead_slices, via=via))
+
+
+def record_tile_scan(tensor: str, elements: int, overflow: int,
+                     subnormal: int, via: str = "") -> None:
+    """Attach a bf16 range scan's counts (bf16_weights.TileScan) to `tensor`.
+
+    A -q bf16 weight already has the row record_roundtrip appended just
+    before; the counts go on it. A weight that kept its bf16 source bits had no
+    round trip (rel_l2 0 is exactly what it cost), so it gets a row of its own.
+    """
+    if not _STACK:
+        return
+    rows = _STACK[-1].rows
+    if rows and rows[-1].tensor == tensor and rows[-1].fmt == "bf16":
+        rows[-1].tile_overflow = int(overflow)
+        rows[-1].tile_subnormal = int(subnormal)
+        return
+    rows.append(WeightRow(tensor=tensor, fmt="bf16", elements=int(elements),
+                          rel_l2=0.0, max_abs=0.0, via=via,
+                          tile_overflow=int(overflow),
+                          tile_subnormal=int(subnormal)))
 
 
 def report(audit: NumericAudit, mode: Optional[str] = None) -> NumericAudit:

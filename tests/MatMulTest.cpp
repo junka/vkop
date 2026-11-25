@@ -2294,3 +2294,120 @@ TEST(MatMulTest, MatMulBf16WeightBuffer) {
     LOG_INFO("bf16 MatMul, FP32 activations");
     run_matmul_bf16<float>(fp32_cases);
 }
+
+// A bf16 weight with one element past fp16's range, at a prefill shape (M=64,
+// K=128, N=64) that the selector sends to a tile route -- the Apple coop8 GEMM
+// on M-series, the SIMT 64x64 tile elsewhere -- both of which stage B as half.
+// The activations are small, so the true output (~1e3 at the spike's column)
+// fits fp16 comfortably: any error is the weight being clamped to 65504, not
+// the output overflowing.
+//
+// With bf16_wide=1 (what onnx2vkop writes for such a weight) the selector
+// keeps every tile route away and the result is exact. Without it the same op
+// is shown to pick a tile route and to come out wrong at the spike's column:
+// that is the evidence the attribute is load-bearing.
+namespace {
+class MatMulBf16WideTest : public TestCase<uint16_t> {
+  public:
+    std::shared_ptr<Tensor<uint16_t>> inputa;
+    std::shared_ptr<Tensor<uint16_t>> weight;
+    std::shared_ptr<Tensor<uint16_t>> output;
+    std::string route;
+    float worst = 0.0F; // largest |out - ref| seen
+    int bad = 0;
+
+    static constexpr int kM = 64, kK = 128, kN = 64;
+    static constexpr int kSpikeK = 5, kSpikeN = 17;
+    static constexpr float kSpike = 131072.0F; // 2^17, exact in bf16
+
+    MatMulBf16WideTest() : TestCase<uint16_t>("MatMul") { init(); }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int,
+                       const std::shared_ptr<vkop::core::ITensor> &out_t,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        route = op->route_tag();
+        auto out = vkop::core::as_tensor<uint16_t>(out_t);
+        auto exp = vkop::core::as_tensor<uint16_t>(expect);
+        bad = 0;
+        worst = 0.0F;
+        for (int i = 0; i < out->num_elements(); i++) {
+            const float ov = vkop::core::ITensor::fp16_to_fp32((*out)[i]);
+            const float ev = vkop::core::ITensor::fp16_to_fp32((*exp)[i]);
+            const float d = std::abs(ov - ev);
+            worst = std::max(worst, std::isfinite(d) ? d : 1e30F);
+            if (!(d <= std::abs(ev) * 4e-3F + 2e-2F)) {
+                ++bad;
+            }
+        }
+        return bad == 0;
+    }
+
+  private:
+    void init() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::manual_seed(11);
+        auto a = (torch::randn({kM, kK}, f32) * 0.01F)
+                     .to(torch::kFloat16)
+                     .to(torch::kFloat32);
+        auto wf = torch::randn({kK, kN}, f32);
+        wf.index_put_({kSpikeK, kSpikeN}, kSpike);
+        auto w = wf.to(torch::kBFloat16);
+        auto y = torch::matmul(a, w.to(torch::kFloat32));
+
+        inputa = std::make_shared<Tensor<uint16_t>>(std::vector<int>{kM, kK});
+        fillTensorFromTorch(inputa, a.to(torch::kFloat16));
+        auto bits = w.view(torch::kInt16).contiguous().flatten();
+        std::vector<uint16_t> raw(static_cast<size_t>(bits.numel()));
+        std::memcpy(raw.data(), bits.data_ptr<int16_t>(),
+                    raw.size() * sizeof(uint16_t));
+        weight = std::make_shared<Tensor<uint16_t>>(std::vector<int>{kK, kN});
+        weight->set_elem_kind(vkop::core::ElemKind::kBFloat16);
+        weight->fillToCPU(raw);
+        output = std::make_shared<Tensor<uint16_t>>(std::vector<int>{kM, kN});
+        fillTensorFromTorch(output, y.to(torch::kFloat16));
+    }
+};
+} // namespace
+
+TEST(MatMulTest, MatMulBf16WideWeightAvoidsTileRoutes) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const auto is_tile = [](const std::string &r) {
+        return r.rfind("tiled", 0) == 0 || r.rfind("coop8", 0) == 0;
+    };
+
+    MatMulBf16WideTest flagged;
+    const std::unordered_map<std::string, std::string> wide = {
+        {"transB", "0"}, {"bf16_wide", "1"}};
+    EXPECT_TRUE(flagged.run_test(
+        {flagged.inputa, flagged.weight}, {flagged.output},
+        [&](std::unique_ptr<vkop::ops::Operator> &op) {
+            op->setAttribute(wide);
+        }))
+        << "bf16_wide=1: route " << flagged.route << ", " << flagged.bad
+        << " bad element(s), worst |err| " << flagged.worst;
+    EXPECT_FALSE(is_tile(flagged.route)) << flagged.route;
+    LOG_INFO("bf16_wide=1: route %s, worst |err| %g", flagged.route.c_str(),
+             flagged.worst);
+
+    // Evidence: the same weight without the attribute.
+    MatMulBf16WideTest plain;
+    const std::unordered_map<std::string, std::string> no_flag = {
+        {"transB", "0"}};
+    const bool plain_ok = plain.run_test(
+        {plain.inputa, plain.weight}, {plain.output},
+        [&](std::unique_ptr<vkop::ops::Operator> &op) {
+            op->setAttribute(no_flag);
+        });
+    LOG_INFO("no attribute: route %s, %d bad element(s), worst |err| %g",
+             plain.route.c_str(), plain.bad, plain.worst);
+    if (is_tile(plain.route)) {
+        // The spike's column, all 64 rows: 0.01 * (131072 - 65504) ~ 650 off.
+        EXPECT_FALSE(plain_ok);
+        EXPECT_EQ(plain.bad, MatMulBf16WideTest::kM);
+        EXPECT_GT(plain.worst, 50.0F);
+    } else {
+        GTEST_LOG_(INFO) << "this device does not tile M=64 (route "
+                         << plain.route << "); clamping not demonstrated";
+    }
+}

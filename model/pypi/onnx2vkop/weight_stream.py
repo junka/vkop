@@ -1004,6 +1004,18 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
     # runtime reads bf16 from) copies the source bits verbatim instead.
     to_fp16 = (entry.get("src_dtype") == TensorProto.BFLOAT16
                and not entry.get("keep_bf16"))
+    # A kept bf16 row was range-scanned from this same source when the graph
+    # was built (bf16_weights.apply), because its bf16_wide attribute had to be
+    # decided before the payload is written. The bytes pass through here
+    # anyway, so the scan is repeated on them: a source that changed in
+    # between would otherwise ship a weight the attribute misdescribes.
+    tile_scan = None
+    if entry.get("keep_bf16") and "bf16_tile_overflow" in entry:
+        try:
+            from .bf16_weights import TileScan
+        except ImportError:  # flat-module layout
+            from bf16_weights import TileScan
+        tile_scan = TileScan()
     with open(path, "rb") as src:
         src.seek(entry["offset"])
         while remaining:
@@ -1022,8 +1034,18 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
                     # bf16 normalization.
                     block = np.ascontiguousarray(
                         f32.astype(np.float16)).tobytes()
+            elif tile_scan is not None:
+                tile_scan.add_bytes(block)
             out_f.write(block)
             remaining -= len(block)
+    if tile_scan is not None and (bool(tile_scan.overflow)
+                                  != bool(entry["bf16_tile_overflow"])):
+        raise DeferredWeightError(
+            f"deferred bf16 weight '{entry['name']}': {path} now holds "
+            f"{tile_scan.overflow} element(s) past fp16's range where the "
+            f"graph was built from {entry['bf16_tile_overflow']}; the source "
+            f"changed during the conversion, so its bf16_wide attribute is "
+            f"wrong. Re-run the conversion.")
     return entry["length"] - remaining
 
 

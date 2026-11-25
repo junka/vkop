@@ -688,6 +688,17 @@ class MatMulBuffer : public BufferFactory {
             auto list = parse_attr_list<int>(sw->second);
             swiglu_ = !list.empty() ? list[0] != 0 : std::stol(sw->second) != 0;
         }
+        // bf16 B with at least one element past fp16's range (the converter's
+        // bit scan, or LoadModel's for a file written without it). Keeps the
+        // fp16-staging tile routes away (core::MatmulFeatures::bf16_wide and
+        // coop8_eligible). Same bare-int spelling as down_act; inert unless B
+        // is actually bf16.
+        auto bw = attributes.find("bf16_wide");
+        if (bw != attributes.end() && !bw->second.empty()) {
+            auto list = parse_attr_list<int>(bw->second);
+            bf16_wide_ =
+                !list.empty() ? list[0] != 0 : std::stol(bw->second) != 0;
+        }
     }
 
   private:
@@ -1316,6 +1327,7 @@ class MatMulBuffer : public BufferFactory {
         // cooperative-matrix GEMM) does it in the pack pass. Only the
         // self-packing coop module cannot, so coop_n_ok() steers away from it.
         sel_feat.swiglu = swiglu_;
+        sel_feat.bf16_wide = weight_bf16 && bf16_wide_;
 
         // Modules set_runtime_device() already built are facts. The ones built
         // on first use (WIDE GEMV, 512-lane split-K, tile-split-K, the down
@@ -3825,9 +3837,13 @@ class MatMulBuffer : public BufferFactory {
     // tile in charge. VKOP_COOP8=0 turns it off.
     // The plain fp16 shape matmul_coop8.comp serves (see the tile route).
     bool coop8_eligible(int m, int n, int k) const {
+        // A bf16_wide B would be clamped by the half staging (see
+        // core::MatmulFeatures::bf16_wide); the selector already keeps the
+        // tile route away, this keeps the swiglu probe honest too.
         return fp16_ != 0 && para_.weight_int8 == 0 &&
                para_.epi_bias == 0 && para_.attn_softmax == 0 &&
-               para_.w4 == 0 && n % 64 == 0 && k % 16 == 0 && m >= 64;
+               para_.w4 == 0 && !(para_.bf16 != 0 && bf16_wide_) &&
+               n % 64 == 0 && k % 16 == 0 && m >= 64;
     }
 
     // The SwiGLU fold's pack pass (matmul_swiglu_pack.comp) for routes whose
@@ -4162,6 +4178,8 @@ class MatMulBuffer : public BufferFactory {
     // The pipeline the chunk sets were allocated from (see above).
     VulkanPipeline *down_act_chunk_ds_pipe_ = nullptr;
     bool down_act_ = false;
+    // Node attribute bf16_wide: the bf16 B holds |w| > 65504 (or inf/NaN).
+    bool bf16_wide_ = false;
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
     // Split-K GEMV geometry, mirrored from the plan so set_route can report

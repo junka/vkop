@@ -274,6 +274,15 @@ struct MatmulFeatures {
     // cooperative-matrix GEMM -- gets it from the pack pass instead
     // (matmul_pack.comp's swiglu mode), so selection does not exclude it.
     bool swiglu = false;
+    // A bf16 weight (weight == kBf16) that holds at least one element past
+    // fp16's range (|w| > 65504, inf or NaN): the converter's bit scan sets the
+    // node attribute bf16_wide=1 (onnx2vkop/bf16_weights.py), and LoadModel
+    // sets it too for a file written without the attribute. The tile routes
+    // (kTiled, kTiledKs and the Apple coop8 GEMM reached through kTiled) stage
+    // B as half, which would clamp those elements, so they reject it; the GEMV
+    // and column-parallel routes decode bf16 straight to fp32 and take it.
+    // Ignored for every other weight kind.
+    bool bf16_wide = false;
 };
 
 // What the op actually managed to build. A route whose module is missing (driver

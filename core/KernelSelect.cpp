@@ -252,7 +252,14 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
          (s.k % f.group_size) == 0 &&
          static_cast<long long>(s.batch) * s.m > 8);
     const bool tiled_ok_n = (s.n % 64 == 0) || (s.n % 8 == 0);
-    c.tiled = c.fused && !kn.tile_disabled && w4_tile_ok &&
+    // A bf16 weight with elements past fp16's range: every tile route (the
+    // SIMT tile, tile-split-K and the Apple coop8 GEMM, which the op reaches
+    // through kTiled) converts B to half while staging and would clamp them to
+    // +-65504. Keeping c.tiled off drops the shape onto the split-K GEMV
+    // (batch*m <= 8) or the column-parallel fused/reduce kernels, which read
+    // bf16 straight to fp32. ks_n and tile128 both hang off c.tiled.
+    const bool bf16_wide = f.weight == WeightKind::kBf16 && f.bf16_wide;
+    c.tiled = c.fused && !kn.tile_disabled && w4_tile_ok && !bf16_wide &&
               (s.k % 16 == 0) && (s.m >= c.tiled_min_m) && !f.epi_bias &&
               tiled_ok_n && (!c.weight_byte || (!f.transB && (s.n % 4 == 0)));
     // The 128x128 / 8x8-per-thread tile (MatMul's uPC.tile == 2) is worth about
