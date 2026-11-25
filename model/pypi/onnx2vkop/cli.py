@@ -284,9 +284,12 @@ Examples:
         "-o", "--output", help="Output VKOP binary file path (default: input_name.vkopbin)"
     )
     parser.add_argument(
-        "-q", "--quant", choices=["fp16", "int8", "fp8e4m3", "fp8e5m2",
+        "-q", "--quant", choices=["fp32", "fp16", "int8", "fp8e4m3", "fp8e5m2",
                                   "int4", "nf4", "nvfp4", "awq"],
-        help="Quantization type: fp16 (an FP16 artifact: the FP16 domain "
+        help="Quantization type: fp32 (keep the export's activation width; "
+             "every other format defaults its activations to an FP16 domain, "
+             "see onnx2vkop/fp16_graph.py), fp16 (an FP16 artifact: the FP16 "
+             "domain "
              "pass rewrites the activations' declarations and the weights' "
              "bytes together, and an op whose shader build does not follow "
              "the tensor dtype stays FP32 along with every tensor it "

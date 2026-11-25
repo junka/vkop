@@ -9584,6 +9584,67 @@ class Quantizer:
         return flipped
 
     @staticmethod
+    def collect_quantizable_names(dag_model, fmt: str, group_size: int = 64,
+                                  exclude=None) -> set:
+        """Names a weight-only pass will replace the payload of.
+
+        Used to keep the FP16 domain pass off those bytes: quantization reads
+        the stored values, so re-rounding them to fp16 first moves every code
+        that sits on a boundary (measured: one int8 code 33 -> 34). The
+        declaration can still flip -- the op runs fp16 and the payload is
+        replaced outright -- only the bytes must be left alone.
+
+        Mirrors the loops in the per-format passes: the same exclusion filter,
+        the same deferral (a streamed weight has no bytes here at all, and
+        weight_stream encodes it from the source file), and the same
+        `_match_weight_only` gate.
+        """
+        family = {"fp8e4m3": "fp8", "fp8e5m2": "fp8",
+                  "int4": "4bit", "nf4": "4bit", "nvfp4": "4bit",
+                  "int8": "int8", "awq": "4bit"}.get(fmt)
+        if family is None:
+            return set()
+        gate_fmt = "int4" if fmt == "awq" else fmt
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
+        consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                consumers[inp["name"]].append(node)
+
+        out = set()
+        for name, init in dag_model.initializers.items():
+            if Quantizer._is_excluded(name, exclude):
+                continue
+            if name in deferred:
+                # A streamed weight still carries its source bytes in the DAG
+                # at this point (prepare has recorded where they live, not
+                # removed them), and the trailer payload is encoded from that
+                # source. Re-rounding it to fp16 here would change what
+                # weight_stream reads, so the bytes must be left alone even
+                # though the quantizer itself has nothing to decode.
+                # Its scale table is already in the graph (prepare appended
+                # it) and is part of the same payload ABI -- also fp32.
+                out.add(name)
+                out.add(name + "_scale")
+                continue
+            try:
+                gate = Quantizer._match_weight_only(
+                    name, init, consumers.get(name, []), gate_fmt, group_size)
+            except ValueError:
+                continue
+            if gate["eligible"]:
+                out.add(name)
+                # The per-column/per-group scale initializer the quantizer
+                # appends is part of the payload ABI: the kernels read it as
+                # fp32 (`scale4`/`scale1` do uintBitsToFloat). It is a 1-D
+                # tensor, so `_match_weight_only` refuses it as "not the B
+                # operand", which would leave it in the FP16 domain and halve
+                # the table under the kernel. Names follow `_pack_*` below:
+                # "<weight>_scale".
+                out.add(name + "_scale")
+        return out
+
+    @staticmethod
     def quantize_to_4bit_weight_only(dag_model, group_size: int = 64,
                                      fmt: str = "int4", exclude=None):
         """
@@ -10520,16 +10581,34 @@ class KnWeightLayout:
             readers = uses.get(name, [])
             if not readers:
                 continue
-            ops = {n.op_type for n, _ in readers}
+            # Follow the pure-VIEW chain before asking about the consumer.
+            #
+            # The checkpoint's weights are stored [N, K] and reach their MatMul
+            # either directly (constant folding folded the Transpose away) or
+            # through an explicit `Transpose`. Both spell the SAME matrix, and
+            # the 4-bit encoder handles both -- but this gate used to look only
+            # at the direct consumer, so a weight whose Transpose survived (any
+            # graph that did not come out of the folder: the sliced adaLN
+            # prelude, `model.proj_out`, a hand-edited export) was rejected as
+            # "consumed by ['Transpose']" and its deferred entry never got the
+            # flip recorded. `weight_stream` then refused to encode it, so
+            # `-q int4` aborted on a graph whose parts are individually fine.
+            from . import weight_stream as _ws
+            chain = _ws.view_chain_to_weight(uses, name)
+            if chain is None:
+                ops = {n.op_type for n, _ in readers}
+                skipped[f"consumed by {sorted(ops - {'MatMul', 'Gemm'})}"] += 1
+                continue
+            node, operand = chain[-1]
+            ops = {node.op_type}
             if not ops <= {"MatMul", "Gemm"}:
                 skipped[f"consumed by {sorted(ops - {'MatMul', 'Gemm'})}"] += 1
                 continue
-            if len(readers) != 1 or readers[0][1] != 1:
+            if operand != 1:
                 # One initializer read in several places (or from A) has no
                 # single B layout to choose.
                 skipped["shared or not the B operand"] += 1
                 continue
-            node = readers[0][0]
             if node.attributes.get("down_act"):
                 skipped["SwiGLU fold (its own scale table ABI)"] += 1
                 continue

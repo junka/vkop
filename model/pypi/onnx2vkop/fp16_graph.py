@@ -370,13 +370,25 @@ class GraphFp16:
 
     @staticmethod
     def apply(dag_model, target_backend: str = "buffer",
-              verbose: bool = True) -> dict:
+              verbose: bool = True, skip_weights=None) -> dict:
         """Declare and store the FP16 domain; returns what it did.
+
+        `skip_weights` names initializers whose BYTES must not be rewritten
+        even when their tensor is in the domain. A weight-only quantization
+        pass (-q int8/int4/fp8/nf4/nvfp4/awq) computes its scale and codes from
+        the stored values, so downcasting it here first would move every code
+        that sits on a rounding boundary: measured as a single int8 code
+        flipping 33 -> 34 in test_kn_weight_layout, and it would equally change
+        what the streamed and in-memory payloads agree on. The DECLARATION
+        still flips -- the op runs fp16 -- and the quantizer then replaces the
+        payload outright, so the width of the intermediate never reaches the
+        artifact.
 
         Nothing is written when the domain is empty or the audit finds a
         conflict, so a graph that cannot be flipped stays exactly the model it
         arrived as.
         """
+        skip_weights = skip_weights or set()
         summary = {"converted": 0, "declared": 0, "skipped_backend": False,
                    "refused": False, "out_of_range": [], "bytes_before": 0,
                    "bytes_after": 0, "domain": set(), "forced": set(),
@@ -421,6 +433,10 @@ class GraphFp16:
 
         deferred = getattr(dag_model, "deferred_weights", {}) or {}
         for name in sorted(plan["domain"]):
+            if name in skip_weights:
+                # A weight-only pass owns this payload; see the docstring.
+                summary.setdefault("deferred_to_quantizer", []).append(name)
+                continue
             init = dag_model.initializers.get(name)
             if init is None or int(init.data_type) != _FLOAT:
                 continue

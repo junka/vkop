@@ -1113,6 +1113,45 @@ class ModelConverter:
         # bad at still computes, and refusing the conversion would set the
         # model's accuracy budget without being asked to.
         numeric_audit.begin()
+
+        # Activations default to FP16, whatever the weight format.
+        #
+        # The FP16 domain is a property of the GRAPH, not of the weight
+        # encoding: which ops can run half-typed and where a Cast is needed is
+        # decided by the data flow alone. Weight-only formats (-q int4/int8/
+        # fp8/nf4/...) leave the activations exactly as the export declared
+        # them, so an fp32-traced export spends 2x the activation VRAM it needs
+        # -- and on a card that cannot hold it, does not run at all. Measured on
+        # MiniMax-H3's denoiser: ~58 MiB of activation per sequence row, i.e.
+        # ~60 GB at the real 1024-row geometry, of which half was pure width.
+        #
+        # So the domain pass runs for every float weight format; only an
+        # explicit request to keep the export's width (-q fp32) skips it. A
+        # REFUSED pass is reported and the conversion continues: for a
+        # weight-only format, leaving the graph at its exported width is the
+        # artifact the user already had. -q fp16 turns the refusal into an
+        # error below, because there the flip IS the request.
+        want_fp16_domain = args.quant != "fp32"
+        fp16_summary = {"converted": 0, "declared": 0, "skipped_backend": False,
+                        "refused": False, "out_of_range": [], "domain": set(),
+                        "forced": set(), "blockers": {}, "conflicts": []}
+        if want_fp16_domain:
+            # The weight-only passes compute their scale and codes from the
+            # stored values, so the domain pass must not re-round those bytes
+            # first: one code on a boundary moves (33 -> 34 measured in
+            # test_kn_weight_layout) and the streamed and in-memory payloads
+            # stop agreeing. The DECLARATION still flips -- the op runs fp16 --
+            # and the quantizer replaces the payload outright.
+            skip = set()
+            if args.quant not in ("fp16", "fp32", None):
+                skip = self.quantizer.collect_quantizable_names(
+                    dag_model, args.quant,
+                    group_size=getattr(args, "group_size", 64),
+                    exclude=excluded_weights)
+            fp16_summary = GraphFp16.apply(
+                dag_model, getattr(args, "target_backend", "buffer"),
+                skip_weights=skip)
+
         if args.quant == "fp16":
             if excluded_weights:
                 print("[exclude] WARNING: -q fp16 ignores the exclusion "
@@ -1122,13 +1161,10 @@ class ModelConverter:
                       "wide weight beside fp16 activations is a Cast node, not "
                       "a precision knob, and fp16_graph.py refuses the rewrite "
                       "rather than shipping one.", file=sys.stderr)
-            # An FP32 export becomes an FP16 ARTIFACT here: the domain pass
-            # rewrites the declarations and the weight bytes together, because
-            # the runtime picks each op's shader from the dtype of the tensors
-            # it is handed and a weight flipped on its own would leave the op
-            # reading half-typed storage with the FP32 kernel.
-            fp16_summary = GraphFp16.apply(
-                dag_model, getattr(args, "target_backend", "buffer"))
+            # The domain pass already ran above (it runs for every float
+            # format); here only the refusal is fatal, because for -q fp16 the
+            # flip is the request rather than an optimization beside it.
+            #
             # A REFUSED domain pass must not fall through to the weight pass
             # below. The domain pass declines when some node would end up with
             # an FP32 operand beside an FP16 one -- a width mix one shader
