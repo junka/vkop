@@ -396,21 +396,19 @@ def test_the_parser_records_what_the_pass_reads():
         assert m.inputs[0]["dtype"] == "float16"
 
 
-# ------------------------------------------ the RMSNorm variance chain is FP32 --
-def test_rmsnorm_variance_chain_stays_fp32():
-    """`Pow(x, 2)` overflows fp16 on its own, so its result must be stored wide.
+# ------------------------------------- the RMSNorm variance chain runs FP32 --
+def test_rmsnorm_variance_chain_gets_a_cast_before_the_square():
+    """`Pow(x, 2)` overflows fp16, and it is fixed with a Cast, not a force.
 
-    fp16's largest finite value is 65504, and a hidden state whose magnitude is
-    ~890 squares to ~7.9e5. Measured on MiniMax-H3's denoiser at seq=160
-    (VKOP_NAN_SCAN=1): the packed store saturated to +Inf and every downstream
-    value became NaN, which is why an all-fp16 artifact produced NaN output at
-    geometries an fp32 one handled.
+    fp16's largest finite value is 65504 and a hidden state of magnitude ~890
+    squares to ~7.9e5, so the packed store saturates to +Inf and every
+    downstream value becomes NaN (measured with VKOP_NAN_SCAN=1 on MiniMax-H3's
+    denoiser at seq=160: `Pow_5416 in[0] min=-889.5 max=462.5 out=7c00`).
 
-    The chain is matched in the LOWERED spelling (Pow -> Reduce ->
-    FusedElemwise: the optimizer turns ReduceMean into Reduce and folds
-    Add(eps)+Sqrt together), not the exported one -- matching on the export's
-    Pow -> ReduceMean -> Add -> Sqrt found zero chains and silently left the
-    square in fp16.
+    Forcing the square's input wide is not an option: that input IS the hidden
+    state, shared across the graph, so one forced activation collapses the
+    whole domain (measured: 110 conflicts, domain REFUSED). A Cast is the
+    boundary this pass is allowed to create.
     """
     nodes = [
         node("Pow", "sq", ["x", "two"], ["xsq"]),
@@ -421,27 +419,30 @@ def test_rmsnorm_variance_chain_stays_fp32():
     m = build(nodes, inputs=["x"], outputs=["y"],
               initializers={"two": numpy.asarray(2.0, dtype=numpy.float32),
                             "w": numpy.ones(4, dtype=numpy.float32)})
-    # x is a graph input; the chain's four tensors are what the rule must hold.
     apply(m)
 
-    # The square, the reduction over it, and the square's own input stay wide
-    # (one op cannot straddle two widths)...
-    assert dtype_of(m, "xsq") == F, dtype_of(m, "xsq")
-    assert dtype_of(m, "var") == F, dtype_of(m, "var")
-    assert dtype_of(m, "x") == F, dtype_of(m, "x")
-    # ...while Sqrt's result, already back in the hidden state's range, and
-    # everything downstream of it flip.
+    # A Cast to FP32 was inserted in front of the square, and the activation
+    # itself stayed half (which is what keeps the domain from collapsing).
+    casts = [n for n in m.nodes.values() if n.op_type == "Cast"]
+    assert len(casts) == 1, [c.name for c in casts]
+    assert casts[0].inputs[0]["name"] == "x"
+    assert casts[0].outputs[0]["dtype"] == F
+    assert dtype_of(m, "x") == F16, dtype_of(m, "x")
+
+    # The squared magnitude and everything that carries it are wide...
+    assert dtype_of(m, "xsq") == F
+    assert dtype_of(m, "var") == F
+    # ...while Sqrt's result, back in range, and its consumers are half again.
     assert dtype_of(m, "normed") == F16, dtype_of(m, "normed")
     assert dtype_of(m, "y") == F16, dtype_of(m, "y")
-    print("  PASS (Pow(x,2)/Reduce/normalize held FP32, the rest goes fp16)")
 
 
-def test_a_lone_pow_is_not_the_variance_chain():
-    """`Pow(x, 2)` outside a norm is an ordinary elementwise op and must flip.
+def test_a_lone_pow_gets_no_cast():
+    """A square that is not a variance chain has no overflow and must flip.
 
-    The rule is a recognised pattern, not "any Pow goes wide": a graph that
-    squares for a scale factor has no overflow (its input is already in range)
-    and holding it FP32 would cost domain coverage for nothing.
+    The rule is one recognised pattern, not "any Pow goes wide": a scale-factor
+    square takes an input that is already in range, and widening it would cost
+    domain coverage for nothing.
     """
     nodes = [
         node("Pow", "sq", ["x", "two"], ["xsq"]),
@@ -451,5 +452,5 @@ def test_a_lone_pow_is_not_the_variance_chain():
               initializers={"two": numpy.asarray(2.0, dtype=numpy.float32),
                             "w": numpy.ones(4, dtype=numpy.float32)})
     apply(m)
+    assert not [n for n in m.nodes.values() if n.op_type == "Cast"]
     assert dtype_of(m, "xsq") == F16, dtype_of(m, "xsq")
-    print("  PASS (a Pow that is not a variance chain still flips)")

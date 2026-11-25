@@ -93,27 +93,18 @@ _STATE_NAME_PREFIXES = ("conv_state", "recurrent_state")
 # follows the terminal OUTPUT, not input[0] (core/runtime.cpp's op_shader_fp16).
 _MIXED_WIDTH_OPS = {"FusedElemwise"}
 
-# The RMSNorm variance chain, held in FP32 while everything around it is half.
+# The RMSNorm variance chain, whose square has to run in FP32:
 #
-#     Pow(x, 2) -> Reduce -> Sqrt        (ONNX: ReduceMean -> Add(eps) -> Sqrt)
+#     Pow(x, 2) -> Reduce -> FusedElemwise      (Add(eps)+Sqrt, fused)
 #
-# Only Pow's OUTPUT is a problem, and it is a range problem, not a precision
-# one: x**2 on a hidden state whose own magnitude is ~890 is ~7.9e5, past
-# fp16's 65504, so the packed store saturates to +Inf and every downstream
-# value becomes NaN. Measured on MiniMax-H3's denoiser at seq=160
-# (VKOP_NAN_SCAN=1): "FIRST NaN/Inf at Pow_5416, in[0] min=-889.5 max=462.5,
-# out=7c00". fp32 holds it trivially and Sqrt brings the value back to the
-# normal range, so the chain's consumers can be half again.
+# `x**2` on a hidden state of magnitude ~890 is ~7.9e5, past fp16's 65504, so
+# the packed store saturates to +Inf and everything downstream is NaN.
+# Measured on MiniMax-H3's denoiser at seq=160 with VKOP_NAN_SCAN=1:
+#   FIRST NaN/Inf at Pow_5416, in[0] min=-889.5 max=462.5, out=7c00
 #
-# The shape is the one the LOWERED graph has, not the exported one: the
-# optimizer turns ReduceMean into Reduce and folds Add(eps)+Sqrt into one
-# FusedElemwise (measured: Pow -> Reduce -> FusedElemwise -> Transpose|MatMul).
-# Matching on the exported spelling silently found zero chains.
-#
-# This is deliberately NOT a general "keep wide values wide" heuristic -- the
-# statistic only covers the square, because that is the one place a graph
-# squares a raw activation. Any other op that overflows fp16 has to be named
-# here with its own measured bound.
+# The shape is the LOWERED spelling, not the exported one: the optimizer turns
+# ReduceMean into Reduce and folds Add(eps)+Sqrt into one FusedElemwise.
+# Matching the export's Pow -> ReduceMean -> Add -> Sqrt found zero chains.
 _VARIANCE_CHAIN = ("Pow", "Reduce", "FusedElemwise")
 
 # Largest finite half. Past this a value rounds to Inf, and the fp16 kernels
@@ -292,59 +283,6 @@ class GraphFp16:
                     else f"{node.op_type}: no dual FP16 buffer build")
                 force(group, blockers[node.name])
 
-        # The RMSNorm variance chain: Pow(x,2) overflows fp16 before the mean
-        # brings it back down (see _VARIANCE_CHAIN). Force the chain's OUTPUTS
-        # wide, and leave the propagation queue alone so the ops on either
-        # side keep the domain -- the square alone is what does not fit.
-        consumers_of: Dict[str, List[str]] = {}
-        for node in dag_model.nodes.values():
-            for inp in node.inputs:
-                consumers_of.setdefault(inp.get("name"), []).append(node.name)
-        for node in dag_model.nodes.values():
-            if node.op_type != "Pow":
-                continue
-            chain = [node]
-            while len(chain) < len(_VARIANCE_CHAIN):
-                outs = {o.get("name") for o in chain[-1].outputs}
-                nxt = [dag_model.nodes[nm] for nm in
-                       consumers_of.get(next(iter(outs), ""), [])]
-                if len(nxt) != 1:
-                    break
-                chain.append(nxt[0])
-            ops = tuple(n.op_type for n in chain)
-            if ops != _VARIANCE_CHAIN:
-                continue
-            # Pow reads a half activation and writes a squared value that does
-            # not fit in half: one op cannot straddle the two widths, so its
-            # INPUT has to be wide as well. Only the Pow's own inputs -- the
-            # tensors feeding the norm from outside stay in the domain, which
-            # is the difference between widening a chain and widening a graph.
-            # Only the values that carry the squared magnitude: Pow's output,
-            # the reduction over it, and the input to the square. The chain's
-            # LAST node writes the normalised result, which Sqrt has already
-            # brought back to the hidden state's own range -- holding it wide
-            # would push the fp32 boundary into every consumer instead of
-            # ending it here.
-            for n in chain[:-1]:
-                for o in n.outputs:
-                    name = o.get("name")
-                    if name in candidates and name not in forced:
-                        forced.add(name)
-                        reasons.setdefault(
-                            name,
-                            "RMSNorm variance chain: x**2 overflows fp16")
-            for i in chain[0].inputs:
-                name = i.get("name")
-                if name in candidates and name not in forced:
-                    forced.add(name)
-                    reasons.setdefault(
-                        name,
-                        "RMSNorm variance chain: input of x**2, which "
-                        "overflows fp16")
-            blockers.setdefault(
-                node.name,
-                "RMSNorm variance chain: x**2 overflows fp16 (held FP32)")
-
         # Ops whose operands are independent widths: a forced input says
         # nothing about the others, so it must not propagate.
         #   FusedElemwise  -- exists to straddle a Cast; the shader reads each
@@ -385,9 +323,102 @@ class GraphFp16:
                 force(group_of[node_name], blockers[node_name])
 
         domain = candidates - forced
+        GraphFp16._widen_variance_chains(dag_model, candidates, forced,
+                                         reasons, blockers)
+        domain = candidates - forced
         return {"decls": decls, "domain": domain, "forced": forced,
                 "reasons": reasons, "blockers": blockers,
                 "conflicts": GraphFp16._audit(dag_model, decls, domain)}
+
+    @staticmethod
+    def _widen_variance_chains(dag_model, candidates, forced, reasons,
+                               blockers) -> int:
+        """Run each RMSNorm variance chain in FP32 behind a Cast, in place.
+
+            x(fp16) -> Cast(to=fp32) -> Pow -> Reduce -> FusedElemwise -> ...
+
+        `Pow(x, 2)` overflows fp16 on its own and BOTH ends of it are decided
+        by its input's dtype (core/runtime.cpp's op_shader_fp16 reads
+        node_inputs[0], and the shader's fp16 build is a compile-time `#ifdef`
+        with no mixed form), so the only way to have the square computed wide
+        is to hand Pow a wide input.
+
+        Forcing that input wide directly is not an option -- it IS the hidden
+        state, shared by half the graph, so one forced activation collapses the
+        whole domain back to FP32 (measured: 110 conflicts, REFUSED). A Cast is
+        the boundary the pass is allowed to create, and after it the chain's
+        consumers are free to be half again because Sqrt has already brought
+        the value back into range.
+
+        Returns the number of chains widened.
+        """
+        consumers_of: Dict[str, List[str]] = {}
+        producer_of: Dict[str, str] = {}
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                consumers_of.setdefault(inp.get("name"), []).append(node.name)
+            for out in node.outputs:
+                producer_of[out.get("name")] = node.name
+
+        widened = 0
+        for node in list(dag_model.nodes.values()):
+            if node.op_type != "Pow":
+                continue
+            chain = [node]
+            while len(chain) < len(_VARIANCE_CHAIN):
+                outs = [o.get("name") for o in chain[-1].outputs]
+                nxt = [dag_model.nodes[nm]
+                       for nm in consumers_of.get(outs[0] if outs else "", [])]
+                if len(nxt) != 1:
+                    break
+                chain.append(nxt[0])
+            if tuple(n.op_type for n in chain) != _VARIANCE_CHAIN:
+                continue
+            src = node.inputs[0].get("name")
+            if src not in candidates:
+                # Already wide (or untyped): nothing to insert.
+                continue
+            wide = src + "__fp32"
+            producer = dag_model.nodes.get(producer_of.get(src, ""))
+            cast = type(node)(
+                "Cast", src + "__to_fp32",
+                {"to": _FLOAT},
+                [dict(node.inputs[0], dtype=_FLOAT16)],
+                [{"name": wide, "shape": node.inputs[0].get("shape"),
+                  "dtype": _FLOAT}])
+            dag_model.nodes[cast.name] = cast
+            node.inputs[0]["name"] = wide
+            node.inputs[0]["dtype"] = _FLOAT
+            # The Cast's input must be declared half so the boundary is real.
+            if producer is not None:
+                for out in producer.outputs:
+                    if out.get("name") == src:
+                        out["dtype"] = _FLOAT16
+            # Everything Pow and Reduce write is wide: they are the two ops
+            # that carry the squared magnitude, and a node cannot straddle the
+            # two widths. The chain's last node (the fused Add+Sqrt) writes the
+            # normalised result, which Sqrt has already brought back into the
+            # hidden state's range -- leaving IT half is what keeps the fp32
+            # boundary from spreading to every consumer downstream.
+            for n in chain[:-1]:
+                for out in n.outputs:
+                    reasons.setdefault(
+                        out.get("name"),
+                        "RMSNorm variance chain: x**2 overflows fp16")
+                    if out.get("name") in candidates:
+                        forced.add(out.get("name"))
+            # Pow's exponent operand rides the same node, so it must be wide
+            # too (a one-element constant, so it costs nothing).
+            for extra in node.inputs[1:]:
+                nm = extra.get("name")
+                if nm in candidates:
+                    forced.add(nm)
+                    reasons.setdefault(nm, "operand of the fp32 x**2")
+            blockers.setdefault(
+                node.name,
+                "RMSNorm variance chain: x**2 overflows fp16 (Cast to FP32)")
+            widened += 1
+        return widened
 
     @staticmethod
     def _audit(dag_model, decls: Dict[str, dict], domain: Set[str]) -> List[str]:
