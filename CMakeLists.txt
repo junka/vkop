@@ -1449,6 +1449,11 @@ if (ENABLE_IMAGE_GEN)
     target_link_libraries(image_gen PRIVATE vkop vload tokenizer)
     target_include_directories(image_gen PRIVATE
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)
+    # Resident line-protocol server over the same pipeline (qwen_image.hpp).
+    add_executable(image_serve image/exporter/image_serve.cpp)
+    target_link_libraries(image_serve PRIVATE vkop vload tokenizer)
+    target_include_directories(image_serve PRIVATE
+        ${CMAKE_SOURCE_DIR}/llm/tokenizer)
     add_executable(vae_gen image/exporter/vae_gen.cpp)
     target_link_libraries(vae_gen PRIVATE vkop vload)
     add_executable(te_gen image/exporter/te_gen.cpp)
