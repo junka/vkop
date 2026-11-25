@@ -284,8 +284,8 @@ Examples:
         "-o", "--output", help="Output VKOP binary file path (default: input_name.vkopbin)"
     )
     parser.add_argument(
-        "-q", "--quant", choices=["fp32", "fp16", "int8", "fp8e4m3", "fp8e5m2",
-                                  "int4", "nf4", "nvfp4", "awq"],
+        "-q", "--quant", choices=["fp32", "fp16", "bf16", "int8", "fp8e4m3",
+                                  "fp8e5m2", "int4", "nf4", "nvfp4", "awq"],
         help="Quantization type: fp32 (keep the export's activation width; "
              "every other format defaults its activations to an FP16 domain, "
              "see onnx2vkop/fp16_graph.py), fp16 (an FP16 artifact: the FP16 "
@@ -299,11 +299,29 @@ Examples:
              "one byte per value), a 4-bit weight-only MatMul payload with a "
              "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index, "
              "nvfp4 = E2M1 nibble with an fp8 e4m3 scale per 16 values plus a "
-             "per-tensor fp32 factor), or awq (activation-aware rescaling in "
+             "per-tensor fp32 factor), bf16 (FP16 activation domain; every "
+             "float MatMul/Gemm B weight and Gather table becomes bfloat16, "
+             "rounded to nearest even -- a bf16 source keeps its exact bits; "
+             "no scale tensor; implies --keep-bf16), or awq (activation-aware "
+             "rescaling in "
              "front of the format named by --awq-format). Every byte format "
-             "here, awq included, skips the weights named by --exclude-node / "
+             "here, awq and bf16 included, skips the weights named by "
+             "--exclude-node / "
              "--exclude-scope / --exclude-downstream-of; fp16 does not, see "
              "onnx2vkop/exclusion.py.",
+    )
+    parser.add_argument(
+        "--keep-bf16", action="store_true",
+        help="Keep a bfloat16 source weight as bfloat16 instead of "
+             "normalizing it to float16, where the runtime reads bf16: a "
+             "constant initializer feeding only MatMul/Gemm's B input or "
+             "Gather's table input. Every other bf16 tensor (graph I/O, "
+             "norm scales, biases, a weight shared with another consumer, a "
+             "weight a fusion rewrote) is converted exactly as without the "
+             "flag, so the artifact either carries the source bits or what "
+             "the default conversion would have. Combines with any -q; a "
+             "weight a byte format quantizes is quantized as usual. Not "
+             "compatible with --unify/--rgba.",
     )
     parser.add_argument(
         "--group-size", type=int, default=64,
@@ -396,7 +414,7 @@ Examples:
         dest="exclude_nodes",
         help="Node name glob whose weights stay at the dtype they arrived "
              "with (fnmatch: '*', '?', '[0-9]'). Repeatable, or "
-             "comma-separated. Only -q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/awq "
+             "comma-separated. Only -q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/awq/bf16 "
              "honour it: the named node runs its wide kernel while the rest of "
              "the model is byte-quantized, which is how a lost percentage "
              "point gets localized to a layer. A pattern that matches no node "
@@ -576,6 +594,11 @@ def _force_payloads_for_exclusion(args) -> None:
 def main():
     """Main entry point for the CLI."""
     args = parse_args()
+    if (args.keep_bf16 or args.quant == "bf16") and (args.unify or args.rgba):
+        sys.exit("Error: --keep-bf16 / -q bf16 cannot be combined with "
+                 "--unify or --rgba (both repack weight payloads; the bf16 "
+                 "weight contract covers plain MatMul/Gemm B and Gather table "
+                 "initializers only).")
     _force_payloads_for_exclusion(args)
     _apply_build_knobs(args)
 
@@ -607,13 +630,15 @@ def main():
         dag_model = converter.parse_onnx_model(
             str(input_path), args.batch, quant=args.quant,
             unify=args.unify, rgba=args.rgba,
-            group_size=getattr(args, "group_size", 0))
+            group_size=getattr(args, "group_size", 0),
+            keep_bf16=args.keep_bf16)
 
         # Create a simple args object for apply_optimizations
         class Args:
             def __init__(self, quant, unify, rgba, group_size, awq_format,
                          awq_stats, awq_alpha, awq_grid, exclude_nodes,
-                         exclude_scopes, exclude_downstream_of, w8a8):
+                         exclude_scopes, exclude_downstream_of, w8a8,
+                         keep_bf16):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
@@ -626,13 +651,15 @@ def main():
                 self.exclude_scopes = exclude_scopes
                 self.exclude_downstream_of = exclude_downstream_of
                 self.w8a8 = w8a8
+                self.keep_bf16 = keep_bf16
 
         converter.apply_optimizations(
             dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
                             args.awq_format, args.awq_stats, args.awq_alpha,
                             args.awq_grid, args.exclude_nodes,
                             args.exclude_scopes,
-                            args.exclude_downstream_of, args.w8a8))
+                            args.exclude_downstream_of, args.w8a8,
+                            args.keep_bf16))
 
         # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can
         # neither create nor remove them: the extra census is set after the

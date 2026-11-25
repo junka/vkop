@@ -1000,7 +1000,10 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
         return _write_interleave(entry, out_f, base_dir)
     path = source_read_path(entry, out_f, base_dir)
     remaining = entry["length"]
-    to_fp16 = entry.get("src_dtype") == TensorProto.BFLOAT16
+    # A row bf16_weights flipped (--keep-bf16: the weight lands in a slot the
+    # runtime reads bf16 from) copies the source bits verbatim instead.
+    to_fp16 = (entry.get("src_dtype") == TensorProto.BFLOAT16
+               and not entry.get("keep_bf16"))
     with open(path, "rb") as src:
         src.seek(entry["offset"])
         while remaining:

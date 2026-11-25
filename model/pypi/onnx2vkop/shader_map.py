@@ -388,6 +388,11 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_gather_int64_bda",
         "buffer_gather_bda",
         "buffer_gather_bda_fp16",
+        # bf16 embedding table (-DBF16_TABLE), fp32 / fp16 output. Gather picks
+        # these from the table's elem_kind at load, which the op-type plan
+        # cannot see, so they ride along with every buffer Gather.
+        "buffer_gather_bf16",
+        "buffer_gather_bf16_fp16",
     ],
     ("Equal", "buffer"): [
         "buffer_equal_int64",

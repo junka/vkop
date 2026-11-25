@@ -24,6 +24,7 @@ try:
     from . import numeric_audit
     from . import exclusion
     from . import quant_payload
+    from . import bf16_weights
     from .fp16_graph import GraphFp16
     from .optimizer import (
         FusionOptimizer,
@@ -53,6 +54,7 @@ except ImportError:
     import numeric_audit
     import exclusion
     import quant_payload
+    import bf16_weights
     from fp16_graph import GraphFp16
     from optimizer import (
         FusionOptimizer,
@@ -348,7 +350,8 @@ class ModelConverter:
     def parse_onnx_model(self, onnx_path: str, batch_size: int = 1, *,
                          quant: str = None, unify: bool = False,
                          rgba: bool = False,
-                         group_size: int = 0) -> DAGBasedModel:
+                         group_size: int = 0,
+                         keep_bf16: bool = False) -> DAGBasedModel:
         """Parse and convert ONNX model to DAG format.
 
         `group_size` is the 4-bit K group (`-q int4`'s knob). It is needed
@@ -356,6 +359,13 @@ class ModelConverter:
         table is `[K / group, N]` and the row records the grouping so the
         writer and the runtime can derive the same table length. The other
         formats ignore it.
+
+        `keep_bf16` (--keep-bf16) stashes the original bits of every bf16
+        initializer that could land in a MatMul/Gemm B or Gather table slot,
+        before the fp16 normalization below rewrites them, so
+        apply_optimizations can emit them as bf16 (bf16_weights.py). `-q bf16`
+        stashes them too, so a bf16 source is not re-rounded off its fp16
+        downcast.
         """
         model = onnx.load(onnx_path, load_external_data=False)
         # Load external weights (llm.weights.bin) so the optimized model can be
@@ -422,6 +432,12 @@ class ModelConverter:
         # core/runtime.cpp decides an op's precision from its data input, so a
         # 16-bit operand there is read at half density instead of rounded.
         # _downcast_bfloat16 widens those to fp32 (see its docstring).
+        bf16_sources = {}
+        if keep_bf16 or quant == "bf16":
+            bf16_sources = bf16_weights.stash_sources(model)
+            if bf16_sources:
+                print(f"[bf16] {len(bf16_sources)} bf16 weight source(s) "
+                      f"stashed for the bf16 weight slots")
         bf16_count = _downcast_bfloat16(model)
         if bf16_count or _downcast_stats["widened"]:
             print(f"[bf16] {bf16_count} bfloat16 tensor(s) -> float16, "
@@ -493,6 +509,9 @@ class ModelConverter:
         # written. save_to_binary verifies it before writing anything.
         dag_model.deferred_weights = deferred_weights
         dag_model.weight_base_dir = base_dir
+        # Original bf16 bits by name (empty unless --keep-bf16 / -q bf16);
+        # consumed and freed by bf16_weights.apply in apply_optimizations.
+        dag_model.bf16_sources = bf16_sources
         # Graph-level declarations that no amount of staring at the graph can
         # recover — today just "this tensor is the standard causal attention
         # bias". Model-level metadata_props is the only channel that survives
@@ -1132,6 +1151,7 @@ class ModelConverter:
         # artifact the user already had. -q fp16 turns the refusal into an
         # error below, because there the flip IS the request.
         want_fp16_domain = args.quant != "fp32"
+        bf16_only = None
         fp16_summary = {"converted": 0, "declared": 0, "skipped_backend": False,
                         "refused": False, "out_of_range": [], "domain": set(),
                         "forced": set(), "blockers": {}, "conflicts": []}
@@ -1143,7 +1163,14 @@ class ModelConverter:
             # stop agreeing. The DECLARATION still flips -- the op runs fp16 --
             # and the quantizer replaces the payload outright.
             skip = set()
-            if args.quant not in ("fp16", "fp32", None):
+            if args.quant == "bf16":
+                # Same contract as the byte formats: the domain pass flips the
+                # declaration, the bf16 pass below rounds the payload ONCE
+                # from its source width.
+                skip = bf16_weights.collect_names(dag_model,
+                                                  exclude=excluded_weights)
+                bf16_only = set(skip)
+            elif args.quant not in ("fp16", "fp32", None):
                 skip = self.quantizer.collect_quantizable_names(
                     dag_model, args.quant,
                     group_size=getattr(args, "group_size", 64),
@@ -1229,6 +1256,10 @@ class ModelConverter:
                 getattr(args, "awq_grid", 20),
                 exclude=excluded_weights,
             )
+        elif args.quant == "bf16":
+            # Weight-only bf16 for the MatMul/Gemm B and Gather table slots;
+            # see bf16_weights.py. Run below together with --keep-bf16.
+            pass
         elif excluded_weights:
             # No -q at all (or a value the byte passes do not answer to): the
             # exclusion resolved to weights that no quantizer was going to
@@ -1238,7 +1269,25 @@ class ModelConverter:
                 f"quantizer, so the {len(excluded_weights)} excluded weight(s) "
                 "were already staying at their source dtype. The flags only "
                 "select anything for -q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/"
-                "awq.", file=sys.stderr)
+                "awq/bf16.", file=sys.stderr)
+
+        # bf16 weights (opt-in). After every weight quantizer, so a weight a
+        # byte format took is no longer a float and is left alone; before
+        # KnWeightLayout and the layout audit, which only key on byte dtypes.
+        # --keep-bf16 restores the source bits of an unmodified bf16 weight in
+        # a qualifying slot (lossless: anything else keeps today's payload);
+        # -q bf16 additionally rounds every other qualifying float weight.
+        keep_bf16 = bool(getattr(args, "keep_bf16", False))
+        if keep_bf16 or args.quant == "bf16":
+            if getattr(args, "unify", False) or getattr(args, "rgba", False):
+                raise ValueError(
+                    "onnx2vkop: --keep-bf16 / -q bf16 cannot be combined with "
+                    "--unify or --rgba: both repack weight payloads, and the "
+                    "bf16 weight contract covers only a plain MatMul/Gemm B or "
+                    "Gather table initializer.")
+            bf16_weights.apply(
+                dag_model, keep=True, quantize=args.quant == "bf16",
+                exclude=excluded_weights, only=bf16_only)
 
         numeric_audit.finish()
 

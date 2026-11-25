@@ -63,6 +63,8 @@ _MODES = ("off", "summary", "full")
 # (optimizer.py's _FP8_FORMATS), which already refuses a bad code outright.
 _MIN_NORMAL: Dict[str, Optional[float]] = {
     "fp16": 2.0 ** -14,
+    # bf16 shares fp32's exponent range (-q bf16, bf16_weights.py).
+    "bf16": 2.0 ** -126,
     "fp8e4m3": 2.0 ** -6,
     "fp8e5m2": 2.0 ** -14,
 }

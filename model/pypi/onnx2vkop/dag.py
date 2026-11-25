@@ -87,7 +87,11 @@ _PACKED_BITS = 4
 # only if ml_dtypes is installed, which the converter must not depend on. Their
 # raw_data is already the byte string the blob wants, so they go the same
 # pass-through route as the packed types and only get length-checked.
-_RAW_ONLY_DATA_TYPES = _PACKED_DATA_TYPES | frozenset((17, 19))
+# BFLOAT16 (16) is here for the same reason: numpy has no native bf16, and a bf16
+# weight (bf16_weights.py, --keep-bf16 / -q bf16) is always built with its raw
+# little-endian uint16 bits in raw_data, which is exactly the payload the
+# runtime reads.
+_RAW_ONLY_DATA_TYPES = _PACKED_DATA_TYPES | frozenset((16, 17, 19))
 
 # The extension channel a quantizer uses to name a payload whose ONNX element
 # type is only its storage (nf4 rides on UINT4).
