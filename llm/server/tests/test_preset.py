@@ -174,7 +174,8 @@ refused("_comment is case-sensitive",
 src = open(os.path.join(HERE, os.pardir, "anthropic_server.py"),
            encoding="utf-8").read()
 import re as _re
-declared = set(_re.findall(r'ap\.add_argument\("--([a-z-]+)"', src))
+# `g` is the "image generation" argument group, which presets set the same way.
+declared = set(_re.findall(r'(?:ap|g)\.add_argument\("--([a-z-]+)"', src))
 declared -= {"config", "preset"}
 missing = declared - set(m._PRESET_OPTIONS)
 check("every parser option is settable from a preset", not missing,
@@ -183,11 +184,15 @@ extra = set(m._PRESET_OPTIONS) - declared
 check("the table invents no option", not extra, "unknown: %s" % sorted(extra))
 # Every path-flagged key must really be a path, and vice versa: a wrong flag
 # would resolve a model name against the config dir or leave a path unrooted.
-PATHY = {"bin", "model", "embed", "tokenizer", "kv-cache"}
+LLM_PATHS = {"bin", "model", "embed", "tokenizer", "kv-cache"}
+PATHY = LLM_PATHS | {"image-bin", "image-prefill", "image-decode",
+                     "image-text-encoder", "image-embeds", "image-tokenizer",
+                     "image-vae"}
 flagged = {k for k, (is_path, _) in m._PRESET_OPTIONS.items() if is_path}
 check("path keys are exactly the file arguments", flagged == PATHY,
       "flagged=%s expected=%s" % (sorted(flagged), sorted(PATHY)))
-env_missing = PATHY - set(m._PRESET_ENV)
+# The image paths never had env vars, so only the LLM's are held to this.
+env_missing = LLM_PATHS - set(m._PRESET_ENV)
 check("every file argument documents its env var", not env_missing,
       "missing: %s" % sorted(env_missing))
 # _PRESET_ENV is keyed by the option spelling and looked up with the argparse

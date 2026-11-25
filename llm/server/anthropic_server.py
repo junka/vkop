@@ -32,6 +32,7 @@ Limits that are deliberate
 import argparse
 import base64
 import collections
+import contextlib
 import itertools
 import json
 import os
@@ -125,11 +126,16 @@ def _dump_request(path, raw):
 # Backend: one llm_serve process, one request at a time.
 # --------------------------------------------------------------------------
 class Backend:
+    # Resident-memory estimate for model_manager.ModelManager (weights + KV +
+    # scratch at peak). build_backend sets it from --llm-mem-gb.
+    mem_gb = 12.0
+
     def __init__(self, argv, env=None, max_kv=8192):
         self.max_kv = max_kv
         self.argv = argv
         self.env = env
         self.abi = 1
+        self._evicted = False
         self._lock = threading.Lock()
         self._spawn()
 
@@ -179,8 +185,12 @@ class Backend:
                 stream.close()
             except OSError:
                 pass
-        print(f"[serve] backend exited with {code}; relaunching and "
-              "reloading the model", file=sys.stderr)
+        if self._evicted:
+            print("[serve] reloading the evicted backend", file=sys.stderr)
+        else:
+            print(f"[serve] backend exited with {code}; relaunching and "
+                  "reloading the model", file=sys.stderr)
+        self._evicted = False
         self._spawn()
         self.wait_ready()
 
@@ -277,6 +287,20 @@ class Backend:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+
+    # -- ModelManager worker interface -------------------------------------
+    @property
+    def resident(self):
+        return self.proc.poll() is None
+
+    def evict(self):
+        """Give the memory back: llm_serve cannot drop its weights and keep
+        running, so it exits (BYE also writes the --kv-cache prefix file) and
+        the next request relaunches it through _ensure_alive."""
+        with self._lock:
+            if self.proc.poll() is None:
+                self._evicted = True
+                self.close()
 
 
 def _decode_err(rest):
@@ -1050,6 +1074,12 @@ class Handler(BaseHTTPRequestHandler):
 
     backend: Backend = None
     metrics: Metrics = None
+    # Set when the gateway fronts more than the LLM (see main()).
+    manager = None          # model_manager.ModelManager
+    llm_model = "llm"       # the LLM's name in the manager
+    image_model = None      # the image backend's name, or None
+    image_name = None       # its public model id
+    image_steps = 40
     default_model = "vkop-qwen3-vl-2b"
     max_output = 1024
 
@@ -1137,11 +1167,16 @@ class Handler(BaseHTTPRequestHandler):
             if self.metrics is None:
                 self._error(503, "api_error", "metrics not initialised")
                 return
-            self._json(200, self.metrics.snapshot(limit))
+            snap = self.metrics.snapshot(limit)
+            if self.manager is not None:
+                snap["models"] = self.manager.status()
+            self._json(200, snap)
         elif path.startswith("/v1/models"):
-            self._json(200, {"data": [{"id": self.default_model,
-                                       "type": "model"}],
-                             "has_more": False})
+            data = [{"id": self.default_model, "type": "model"}]
+            if self.image_model:
+                data.append({"id": self.image_name, "type": "model",
+                             "capabilities": ["images.generations"]})
+            self._json(200, {"data": data, "has_more": False})
         elif path == "/api/hello":
             # Not an Anthropic endpoint; probe traffic just needs "reachable".
             self._json(200, {"ok": True})
@@ -1156,10 +1191,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         path = self._path_only()
-        if path == "/v1/messages/count_tokens":
-            self._count_tokens(req)
-        elif path == "/v1/messages":
-            self._messages(req)
+        if path == "/v1/images/generations":
+            import image_backend
+            image_backend.handle_generation(self, req)
+        elif path in ("/v1/messages/count_tokens", "/v1/messages"):
+            # The LLM holds the GPU (and its memory) for the whole request; an
+            # image model that does not fit beside it is unloaded first.
+            slot = (self.manager.use(self.llm_model) if self.manager is not None
+                    else contextlib.nullcontext())
+            with slot:
+                if path == "/v1/messages":
+                    self._messages(req)
+                else:
+                    self._count_tokens(req)
         else:
             self._error(404, "not_found_error", self.path)
 
@@ -1399,7 +1443,35 @@ def build_backend(args):
     # "auto" is resolved by the backend after it loads the model; until its
     # READY line says the real number, trim against the model's context.
     guess = args.max_kv if args.max_kv != "auto" else (args.context_length or 8192)
-    return Backend(argv, env, max_kv=int(guess))
+    be = Backend(argv, env, max_kv=int(guess))
+    be.mem_gb = args.llm_mem_gb
+    return be
+
+
+def build_image_backend(args):
+    import image_backend
+    argv = [args.image_bin, args.image_prefill, args.image_decode,
+            "--text-encoder", args.image_text_encoder,
+            "--embeds", args.image_embeds,
+            "--tokenizer", args.image_tokenizer,
+            "--vae", args.image_vae,
+            "--steps", str(args.image_steps),
+            "--keep", args.image_keep]
+    return image_backend.ImageBackend(argv, mem_gb=args.image_mem_gb)
+
+
+def _default_budget_gb():
+    """70% of physical memory: what the resident models may add up to.
+
+    The rest is the OS, the page cache the weights stream through, and every
+    other process. 36 GB -> 25 GB, which keeps Qwen-Image (~22 GB) and the LLM
+    from sharing the machine -- the OOM reboot this budget exists to prevent.
+    """
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 24.0
+    return round(0.7 * total / 2**30, 1)
 
 
 # Every option a preset may set: long name -> (does it name a file, converter).
@@ -1436,6 +1508,20 @@ _PRESET_OPTIONS = {
     "repetition-penalty": (False, float),
     "seed": (False, int),
     "max-output": (False, int),
+    "llm-mem-gb": (False, float),
+    "mem-budget-gb": (False, float),
+    "image": (False, bool),
+    "image-bin": (True, str),
+    "image-prefill": (True, str),
+    "image-decode": (True, str),
+    "image-text-encoder": (True, str),
+    "image-embeds": (True, str),
+    "image-tokenizer": (True, str),
+    "image-vae": (True, str),
+    "image-steps": (False, int),
+    "image-keep": (False, str),
+    "image-mem-gb": (False, float),
+    "image-model-name": (False, str),
 }
 
 # The environment variable each option already honoured, so a preset that takes
@@ -1635,6 +1721,42 @@ def main():
                     help="ceiling on generated tokens per reply (the model "
                          "runs at ~5 tok/s on this class of GPU)")
     ap.add_argument("--model-name", default="vkop-qwen3-vl-2b")
+    img_dir = os.path.join(ROOT, "image", "exporter")
+    g = ap.add_argument_group(
+        "image generation",
+        "--image adds Qwen-Image behind POST /v1/images/generations. It shares "
+        "the GPU with the LLM: requests are serialised, and a model whose "
+        "memory estimate does not fit --mem-budget-gb beside the others makes "
+        "the least recently used one unload (the LLM process exits and is "
+        "relaunched on its next request; the image process just drops its "
+        "graphs).")
+    g.add_argument("--image", action="store_true",
+                   default=os.environ.get("VKOP_IMAGE", "") not in ("", "0"))
+    g.add_argument("--image-bin", default=os.path.join(ROOT, "build", "image_serve"))
+    g.add_argument("--image-prefill",
+                   default=os.path.join(img_dir, "dit_prefill_static.vkopbin"))
+    g.add_argument("--image-decode",
+                   default=os.path.join(img_dir, "dit_decode_static.vkopbin"))
+    g.add_argument("--image-text-encoder",
+                   default=os.path.join(img_dir, "text_encoder.vkopbin"))
+    g.add_argument("--image-embeds",
+                   default=os.path.join(img_dir, "text_encoder_embeds.bin"))
+    g.add_argument("--image-tokenizer", default=os.path.join(
+        ROOT, "llm", "tokenizer", "qwen3_vl.bin"))
+    g.add_argument("--image-vae",
+                   default=os.path.join(img_dir, "vae_decoder_512.vkopbin"))
+    g.add_argument("--image-steps", type=int, default=40,
+                   help="denoising steps when a request does not say")
+    g.add_argument("--image-keep", choices=("decode", "none"), default="decode",
+                   help="keep the denoising graph + VAE loaded between image "
+                        "requests (decode) or release them after each (none)")
+    g.add_argument("--image-model-name", default="vkop-qwen-image")
+    g.add_argument("--image-mem-gb", type=float, default=22.0,
+                   help="resident estimate for the image model (its peak)")
+    g.add_argument("--llm-mem-gb", type=float, default=12.0,
+                   help="resident estimate for the LLM (weights + KV window; the 2B model under --max-kv auto measured ~11 GB)")
+    g.add_argument("--mem-budget-gb", type=float, default=_default_budget_gb(),
+                   help="what resident models may add up to (default 70%% of RAM)")
     ap.add_argument("--config", metavar="FILE",
                     default=os.environ.get("VKOP_SERVE_CONFIG", ""),
                     help="JSON preset file, so a model setup stops being five "
@@ -1670,7 +1792,12 @@ def main():
         raise SystemExit("--preset needs --config (or VKOP_SERVE_CONFIG)")
     args = ap.parse_args()
 
-    for path in (args.bin, args.model, args.embed, args.tokenizer):
+    need = [args.bin, args.model, args.embed, args.tokenizer]
+    if args.image:
+        need += [args.image_bin, args.image_prefill, args.image_decode,
+                 args.image_text_encoder, args.image_embeds,
+                 args.image_tokenizer, args.image_vae]
+    for path in need:
         if not os.path.exists(path):
             raise SystemExit(f"missing: {path}")
     if preset_name:
@@ -1699,6 +1826,23 @@ def main():
 
     Handler.backend = backend
     Handler.metrics = Metrics()
+    image = None
+    if args.image:
+        from model_manager import ModelManager
+        mm = ModelManager(args.mem_budget_gb)
+        mm.add("llm", backend)
+        image = build_image_backend(args)
+        image.wait_ready()
+        mm.add("image", image)
+        Handler.manager = mm
+        Handler.image_model = "image"
+        Handler.image_name = args.image_model_name
+        Handler.image_steps = args.image_steps
+        print(f"[serve] image: POST http://{args.host}:{args.port}"
+              f"/v1/images/generations ({image.width}x{image.height}, prompt "
+              f"<= {image.max_prompt_tokens} tokens); memory budget "
+              f"{args.mem_budget_gb:g} GB, llm {args.llm_mem_gb:g} GB, image "
+              f"{args.image_mem_gb:g} GB", file=sys.stderr)
     Handler.default_model = args.model_name
     Handler.max_output = args.max_output
     print(f"[serve] metrics: http://{args.host}:{args.port}/metrics",
@@ -1712,6 +1856,8 @@ def main():
     finally:
         httpd.server_close()
         backend.close()
+        if image is not None:
+            image.close()
 
 
 if __name__ == "__main__":

@@ -24,6 +24,26 @@
       "kv-cache": "../exporter/kv_prefix.bin"
     },
 
+    "qwen3-vl-2b-image": {
+      "_comment": "The 2B LLM plus Qwen-Image behind POST /v1/images/generations (OpenAI Images shape). One GPU queue for both; with the default memory budget (70% of RAM) the two do not fit together on a 36 GB machine, so whichever ran less recently is unloaded first -- the LLM process exits (writing its kv-cache file) and relaunches warm on its next request, the image process drops its graphs but keeps its per-prompt cache.",
+      "model": "../exporter/llm.vkopbin",
+      "embed": "../exporter/embed_tokens.bin",
+      "tokenizer": "../tokenizer/qwen3_vl.bin",
+      "model-name": "vkop-qwen3-vl-2b",
+      "context-length": 262144,
+      "max-kv": "auto",
+      "prefill-chunk": 256,
+      "max-output": 1024,
+      "kv-cache": "../exporter/kv_prefix.bin",
+      "image": true,
+      "image-prefill": "../../image/exporter/dit_prefill_static.vkopbin",
+      "image-decode": "../../image/exporter/dit_decode_static.vkopbin",
+      "image-text-encoder": "../../image/exporter/text_encoder.vkopbin",
+      "image-embeds": "../../image/exporter/text_encoder_embeds.bin",
+      "image-vae": "../../image/exporter/vae_decoder_512.vkopbin",
+      "image-steps": 40
+    },
+
     "qwen3-vl-2b-fp8kv": {
       "_comment": "Same model, e4m3 KV cache: half the bytes per row, so max-kv auto fits twice the rows. Needs the fp8 variant artifact (llm/exporter/make_kv_variant.py --fp8), not just this preset -- if it is not built the server says 'missing:' and stops.",
       "model": "../exporter/llm_fp8_kv.vkopbin",

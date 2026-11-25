@@ -12,6 +12,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 |---|---|---|
 | Python | `llm/server/anthropic_server.py` | HTTP 路由、Anthropic schema、SSE 帧、tool_use 解析、历史裁剪 |
 | C++ | `llm/exporter/driver/llm_serve.cpp` | 加载 vkop 图、prefill/decode、KV cache、token 流 |
+| Python | `llm/server/image_backend.py`、`model_manager.py` | 出图路由（`--image`）、多模型的 GPU 排队与内存预算 |
+| C++ | `image/exporter/image_serve.cpp` | Qwen-Image 常驻出图，按 prompt 缓存文本 KV |
 
 Python 通过两条继承的 fd 和 `llm_serve` 说一套行协议（见 `llm_serve.cpp` 顶部的注释）：请求是
 `role` / base64 文本对，响应是 `DELTA` / `DONE`。选这套而不是在 C++ 里解 JSON，是因为
@@ -348,6 +350,51 @@ chunk 是一轮，decode 每步一轮），`VKOP_SUBMITPROF_TOPN=N` 控制最慢
 同一进程里 decode 一步的 MatMul 合计约 11.9ms、TOTAL 约 12.6ms。它和 `[req]` 的
 `decode=21ms/tok` 之差就是 host 侧开销（record + logits 回读做 argmax），不是 GPU 空转。
 `VKOP_OPPROF=1` 是 host 侧的对应物，另外还打 `[rbprof]` 的同步回读计数。
+
+## 出图（`--image`）：一个网关，两类模型
+
+`--image`（或 preset `qwen3-vl-2b-image`）在同一个端口上再挂一个 Qwen-Image 后端
+`image_serve`（`image/exporter/image_serve.cpp`，和 `llm_serve` 同一套行协议，协议写在
+它的文件头里），对外是 OpenAI Images 的形状：
+
+```bash
+make llm_serve image_serve
+python3 llm/server/anthropic_server.py --config llm/server/presets.json --preset qwen3-vl-2b-image
+
+curl -s http://127.0.0.1:8787/v1/images/generations -H 'content-type: application/json' \
+  -d '{"prompt": "A red fox sitting on a wooden bench in a sunlit park", "steps": 40, "seed": 7}' \
+  | python3 -c 'import sys,json,base64; d=json.load(sys.stdin); open("fox.png","wb").write(base64.b64decode(d["data"][0]["b64_json"])); print(d["vkop"])'
+```
+
+- 请求：`prompt`、`n`（1..16，第 k 张种子是 `seed+k`）、`size`（只有图导出时的
+  `512x512`）、`response_format`（只有 `b64_json`，这里不托管文件）；扩展字段 `steps`
+  （默认 `--image-steps` 40）和 `seed`（缺省随机，回包里带回实际用的）。prompt 超过文本塔的
+  64 token 直接 400，不排队、不碰 GPU。
+- `"stream": true` 走 SSE：`progress`（阶段 + 每个去噪步）、`image`（每出一张就发）、
+  `done`（带 `vkop` 计时）、出错时 `error`。客户端中途断开，服务端在下一次写失败时发 STOP，
+  几步之内停下，后面的请求不用等它跑完。
+- `GET /v1/models` 列出两个模型；`GET /metrics` 多一个 `models` 字段，显示谁常驻。
+
+**调度**（`model_manager.py`）：一块 GPU、一池统一内存，所以
+
+1. 所有 GPU 请求排一个队，LLM 和出图不并发 —— 并发不会更快，而每个模型的峰值内存都是按
+   独占设备估的；
+2. 每个模型有一个常驻内存估计（`--llm-mem-gb` 12，`--image-mem-gb` 22），加起来不能超过
+   `--mem-budget-gb`（默认物理内存的 70%，36 GB 机器上是 25.2 GB）。要跑的模型放不下时，
+   **最久没用**的那个先让位：`llm_serve` 退出（BYE 顺手写 `--kv-cache`，下次请求时重新拉起、
+   从文件热启动），`image_serve` 收到 `UNLOAD` 只释放图，进程和按 prompt 缓存的文本 KV 都留着。
+
+实测（M5 Max 36 GB，512×512，8 步）：
+
+| 请求 | 墙钟 | 说明 |
+|---|---|---|
+| 首张图 | 20.8 s | 先让 LLM 退出（0.8 s）；文本塔 3.1 + prefill 2.9 + 装 decode 2.1 + 去噪 10.4 + VAE 1.3 s。PNG 与 `image_gen` 同参数输出**逐字节相同** |
+| 紧接一条 LLM 请求 | 1.9 s | 先 UNLOAD 出图（0.13 s），`llm_serve` 重新加载 + 回答 |
+| 同 prompt 再出图（4 步，stream） | 8.7 s | prompt 缓存命中：没有文本塔和 prefill，只重装 decode 1.7 s |
+| 同 prompt、decode 还常驻（2 步） | 3.2 s | 只有去噪 + VAE |
+
+所以在这台机器上 LLM 和出图来回切的代价是每次切换 2–3 s（LLM 2B 重载很快；7B 级的 LLM
+会更贵）。批量出图时尽量攒在一起发。
 
 ## 协议细节
 
