@@ -42,6 +42,7 @@ set(PROBE_SOURCES
     image_layout_probe.cpp
     min_max_probe.cpp
     readback_probe.cpp
+    weight_paging_probe.cpp
 )
 
 # A bucket count of 1 would be fastest but puts all 26 in one TU. Four keeps
