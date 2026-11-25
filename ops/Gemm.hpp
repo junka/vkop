@@ -4,6 +4,8 @@
 
 #include "ops/Conv2d.hpp"
 #include "ops/Operator.hpp"
+#include <algorithm>
+#include <cstdint>
 #include <numeric>
 #include <string>
 
@@ -270,8 +272,21 @@ class Gemm : public Operator {
             outputs[0]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
         para_.weight_int8 = weight_int8 ? 1 : 0;
 
-        if (para_.fp16o == 1) {
+        if (para_.fp16o == 1 && n % 2 == 0) {
+            // Each thread owns one half2 word = columns (2x, 2x+1) of row y.
             submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), 1);
+        } else if (para_.fp16o == 1) {
+            // Odd N: rows do not start on word boundaries, so gemm16 walks the
+            // flat Y one half2 word per thread, 256 words per workgroup.
+            // Spread the groups over x/y to stay under the spec-guaranteed
+            // maxComputeWorkGroupCount of 65535 per dimension.
+            const int64_t words =
+                (static_cast<int64_t>(m) * static_cast<int64_t>(n) + 1) / 2;
+            const int64_t groups = (words + 255) / 256;
+            constexpr int64_t kMaxGroups = 65535;
+            const int gx = static_cast<int>(std::min(groups, kMaxGroups));
+            const int gy = static_cast<int>((groups + gx - 1) / gx);
+            submit(&para_, gx, gy, 1);
         } else {
             submit(&para_, UP_DIV(n, 16), UP_DIV(m, 16), 1);
         }

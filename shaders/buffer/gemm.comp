@@ -123,14 +123,10 @@ float w8(uint word, int lane) {
         b1i += b_step;                                     \
     }
 
-// Y = alpha * A' * B' (+ bias), fp32 output, one thread per element.
-void gemm32()
+// One element of Y before the store: alpha * A'[i,:] . B'[:,j] (+ bias),
+// then the fused activation.
+float gemm_elem(int i, int j)
 {
-    int j = int(gl_GlobalInvocationID.x); // column index in Y
-    int i = int(gl_GlobalInvocationID.y); // row index in Y
-
-    if (i >= uParams.M || j >= uParams.N) return;
-
     // transA: A is stored K x M, row i of A' is the strided walk i + k*M.
     // transB: B is stored N x K, column j of B' is the contiguous walk j*K + k.
     int ai = (uParams.transA == 1) ? i : i * uParams.K;
@@ -167,41 +163,73 @@ void gemm32()
         sum += c_val * uParams.beta;
     }
 
-    sum = activation(sum, uParams.activation);
-    bufferY.data[i * uParams.N + j] = floatBitsToUint(sum);
+    return activation(sum, uParams.activation);
 }
 
-// fp16 output: one thread owns the half2 word of two adjacent columns
-// (j*2, j*2+1). NOTE (pre-existing): word-aligned stores assume even N;
-// odd N would race across row boundaries.
-void gemm16() {
-    int j = int(gl_GlobalInvocationID.x); // column-pair index in Y
+// Y = alpha * A' * B' (+ bias), fp32 output, one thread per element.
+void gemm32()
+{
+    int j = int(gl_GlobalInvocationID.x); // column index in Y
     int i = int(gl_GlobalInvocationID.y); // row index in Y
-    int j0 = j * 2;
 
-    if (i >= uParams.M || j0 >= uParams.N) return;
+    if (i >= uParams.M || j >= uParams.N) return;
 
+    bufferY.data[i * uParams.N + j] = floatBitsToUint(gemm_elem(i, j));
+}
+
+// fp16 output: one thread owns one half2 word w of the flat row-major Y, i.e.
+// flat elements e0 = 2w and e1 = 2w + 1, so no word is written by two
+// threads. Gemm::execute picks the thread -> word mapping by N's parity:
+//   even N: 2-D, x = column pair, y = row (w = i * N/2 + x). Both halves of
+//           every word sit in the same row; this is the original tiling.
+//   odd N:  1-D over words, w = linear workgroup id * 256 + local index
+//           (workgroups spread over x/y to respect maxComputeWorkGroupCount).
+//           A word can straddle two rows (j0 = N-1, then row i+1 column 0),
+//           and Y's last word may hold only its low half.
+void gemm16() {
+    int w, i, j0;
+    if ((uParams.N & 1) == 0) {
+        j0 = int(gl_GlobalInvocationID.x) * 2; // first column of the pair
+        i = int(gl_GlobalInvocationID.y);      // row index in Y
+        if (i >= uParams.M || j0 >= uParams.N) return;
+        w = (i * uParams.N + j0) >> 1;
+    } else {
+        int wg = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+        w = wg * 256 + int(gl_LocalInvocationIndex);
+        int MN = uParams.M * uParams.N;
+        int e0 = w * 2;
+        if (e0 >= MN) return;
+        i = e0 / uParams.N;
+        j0 = e0 - i * uParams.N;
+        if (j0 == uParams.N - 1) {
+            // The high half is row i+1, column 0 (or past the end of Y):
+            // each half gets its own A row walk.
+            vec2 v = vec2(gemm_elem(i, j0), 0.0);
+            if (e0 + 1 < MN) {
+                v.y = gemm_elem(i + 1, 0);
+            }
+            bufferY.data[w] = packHalf2x16(v);
+            return;
+        }
+    }
+
+    // Both halves in row i, columns j0 and j0+1: share the A walk.
     int ai = (uParams.transA == 1) ? i : i * uParams.K;
     int a_step = (uParams.transA == 1) ? uParams.M : 1;
     int b_step = (uParams.transB == 1) ? 1 : uParams.N;
     int b0i, b1i;
     if (uParams.transB == 1) {
         b0i = j0 * uParams.K;
-        // Last column when N is odd: b1i aliases b0i; sum.y is computed from
-        // valid memory then masked out on store.
-        b1i = (j0 + 1 < uParams.N) ? (j0 + 1) * uParams.K : b0i;
+        b1i = (j0 + 1) * uParams.K;
     } else {
         b0i = j0;
-        b1i = (j0 + 1 < uParams.N) ? j0 + 1 : b0i;
+        b1i = j0 + 1;
     }
 
     vec2 sum = vec2(0.0);
     if (uParams.weight_int8 == 1) {
-        // One scale per column; the odd-N tail aliases b1i onto b0i, so its
-        // scale index is clamped to stay inside bufferS (the value is dropped
-        // on store anyway).
-        vec2 wsc = vec2(LDF(bufferS, j0),
-                        j0 + 1 < uParams.N ? LDF(bufferS, j0 + 1) : 0.0);
+        // One scale per column.
+        vec2 wsc = vec2(LDF(bufferS, j0), LDF(bufferS, j0 + 1));
         if (A16) {
             KLOOP2(LDH(bufferA, ai), LD8(bufferB, b0i), LD8(bufferB, b1i), sum)
         } else {
@@ -234,22 +262,14 @@ void gemm16() {
         c_val.x = (uParams.fp16c == 1)
                       ? unpackHalf2x16(bufferC.data[j0 / 2])[j0 % 2]
                       : uintBitsToFloat(bufferC.data[j0]);
-        if (bcol1 < uParams.N) {
-            c_val.y = (uParams.fp16c == 1)
-                          ? unpackHalf2x16(bufferC.data[bcol1 / 2])[bcol1 % 2]
-                          : uintBitsToFloat(bufferC.data[bcol1]);
-        } else {
-            c_val.y = 0.0;
-        }
+        c_val.y = (uParams.fp16c == 1)
+                      ? unpackHalf2x16(bufferC.data[bcol1 / 2])[bcol1 % 2]
+                      : uintBitsToFloat(bufferC.data[bcol1]);
         sum += c_val * uParams.beta;
     }
 
     sum = activation(sum, uParams.activation);
-
-    if (j0 + 1 >= uParams.N) {
-        sum.y = 0.0; // odd-N tail: drop the aliased column
-    }
-    bufferY.data[(i * uParams.N + j0) / 2] = packHalf2x16(sum);
+    bufferY.data[w] = packHalf2x16(sum);
 }
 
 void main() {

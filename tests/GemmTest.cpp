@@ -158,9 +158,14 @@ private:
 };
 }
 
+namespace {
+using GemmCase = std::tuple<std::vector<int>, std::vector<int>, float, float, bool, bool>;
+void run_gemm_cases(const std::vector<GemmCase> &testcases);
+} // namespace
+
 TEST(GemmTest, GemmComprehensiveTest) {
 
-    const std::vector<std::tuple<std::vector<int>, std::vector<int>, float, float, bool, bool>> testcases = {
+    const std::vector<GemmCase> testcases = {
         {{1, 20}, {20, 16}, 1.0F, 1.0F, false, false},
         {{1, 2048}, {1000, 2048}, 1.0F, 1.0F, false, true},
         // M>1 fp16 transB + bias case: the existing fp16 transB case only used
@@ -168,7 +173,30 @@ TEST(GemmTest, GemmComprehensiveTest) {
         // [N] broadcast) never surfaced there. Small M/N/K keeps it fast.
         {{8, 64}, {128, 64}, 1.0F, 1.0F, false, true},
     };
+    run_gemm_cases(testcases);
+}
 
+// Odd N with an fp16 output: rows of Y do not start on half2-word boundaries,
+// so gemm16 must own words of the FLAT output (a word can straddle two rows).
+// The old per-row column-pair mapping shifted every odd row one half to the
+// left and raced on the shared boundary words; M=1 never showed it.
+TEST(GemmTest, GemmOddNFp16Buffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<GemmCase> testcases = {
+        {{5, 20}, {20, 9}, 1.0F, 1.0F, false, false},
+        {{5, 20}, {9, 20}, 1.0F, 1.0F, false, true},
+        {{20, 5}, {20, 9}, 1.0F, 1.0F, true, false},   // transA
+        {{20, 3}, {7, 20}, 1.0F, 1.0F, true, true},    // transA + transB
+        {{1, 20}, {20, 9}, 1.0F, 1.0F, false, false},  // M=1 odd N
+        {{4, 16}, {16, 1}, 1.0F, 1.0F, false, false},  // N=1: every word straddles
+        // Several 256-word workgroups (37*127/2 = 2350 words).
+        {{37, 64}, {127, 64}, 1.0F, 1.0F, false, true},
+    };
+    run_gemm_cases(testcases);
+}
+
+namespace {
+void run_gemm_cases(const std::vector<GemmCase> &testcases) {
     for (const auto &testcase : testcases) {
         auto [inshapeA, inshapeB, alpha, beta, transA, transB] = testcase;
 
@@ -197,6 +225,7 @@ TEST(GemmTest, GemmComprehensiveTest) {
             }));
     }
 }
+} // namespace
 
 namespace {
 // int8 weight-only Gemm (buffer backend, where the int8 kernel lives). B is the
@@ -339,9 +368,6 @@ private:
 
 template <typename T>
 void run_gemm_int8(const std::vector<std::tuple<int, int, int, bool, bool>> &cases) {
-    // fp16 output packs two columns per word, so every N here is even (the
-    // odd-N tail is a known pre-existing limitation of gemm16, not something
-    // the int8 path introduces).
     for (const auto &tc : cases) {
         auto [m, k, n, transB, has_bias] = tc;
         GemmInt8Test<T> t(m, k, n, transB, has_bias);
@@ -370,6 +396,9 @@ TEST(GemmTest, GemmInt8WeightOnlyBuffer) {
         {8, 64, 128, true, true},     // transB=1 with bias
         {4, 32, 16, false, false},    // [K, N] layout, no bias
         {5, 20, 18, false, true},     // [K, N] layout with bias, odd M
+        // Odd N: fp16 output rows straddle half2 words.
+        {5, 20, 9, false, true},
+        {5, 20, 9, true, false},
     };
     LOG_INFO("int8 Gemm, FP32");
     run_gemm_int8<float>(cases);
@@ -444,9 +473,9 @@ TEST(GemmTest, GemmBf16WeightBuffer) {
     for (const bool transB : {false, true}) {
         EXPECT_TRUE(run_gemm_bf16<float>(5, 40, 9, transB)) << transB;
         EXPECT_TRUE(run_gemm_bf16<uint16_t>(5, 40, 10, transB)) << transB;
-        // Odd K. (Odd N with an fp16 output is gemm16's pre-existing
-        // half2-word race across rows -- see its NOTE in gemm.comp -- and
-        // fails with an fp16 B too, so it is not a bf16 case.)
+        // Odd N with an fp16 output (rows straddle half2 words).
+        EXPECT_TRUE(run_gemm_bf16<uint16_t>(5, 40, 9, transB)) << transB;
+        // Odd K.
         EXPECT_TRUE(run_gemm_bf16<uint16_t>(3, 33, 8, transB)) << transB;
     }
 }
