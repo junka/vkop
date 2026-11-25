@@ -33,10 +33,34 @@ std::atomic<int> ops::Operator::instance_count_{0};
 std::atomic<long> ops::Operator::replay_total_hits_{0};
 namespace core {
 
+// v1 bfloat16 scope: which (op, input slot) pairs have a bf16 read. A bf16
+// tensor is a constant weight, and only three kernels decode it: the buffer
+// MatMul's and Gemm's B (input 1, see para_.bf16 / gemm.comp fp16b == 2) and
+// Gather's table (input 0, gather.comp -DBF16_TABLE). Every other op treats a
+// uint16_t container as fp16, so handing it a bf16 tensor is a silent wrong
+// answer; LoadModel refuses the graph instead.
+bool bf16_consumer_ok(ops::OpType type, size_t input_index) {
+    switch (type) {
+    case ops::OpType::MATMUL:
+    case ops::OpType::GEMM:
+        return input_index == 1;
+    case ops::OpType::GATHER:
+        return input_index == 0;
+    default:
+        return false;
+    }
+}
+
 int op_shader_fp16(ops::OpType type, const ITensor *data_input,
                    const ITensor *output, int precision) {
     if (data_input == nullptr) {
         return precision;
+    }
+    // A bfloat16 data input is a constant weight (Gather's embedding table):
+    // its uint16_t container is NOT an fp16 activation, so the build follows
+    // the output -- the activation dtype the converter recorded.
+    if (data_input->elem_kind() == ElemKind::kBFloat16 && output != nullptr) {
+        return output->dtype() == typeid(uint16_t) ? 1 : 0;
     }
     switch (type) {
     case ops::OpType::MATMUL:
@@ -1100,7 +1124,10 @@ void Runtime::LoadModel() {
                 auto t = std::make_shared<Tensor<float>>(init.dims);
                 t->set_elem_kind(kind);
                 handle_unified_tensors(init, src_ptr, t, meta, buffer);
-            } else if (kind == ElemKind::kFloat16) {
+            } else if (kind == ElemKind::kFloat16 ||
+                       kind == ElemKind::kBFloat16) {
+                // bf16 shares fp16's 2-byte uint16_t container; the kind is
+                // what keeps it from being read as fp16.
                 auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
                 t->set_elem_kind(kind);
                 handle_unified_tensors(init, src_ptr, t, meta, buffer);
@@ -1201,6 +1228,21 @@ void Runtime::LoadModel() {
             t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);
         } else if (kind == ElemKind::kFloat16) {
+            auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
+            t->set_elem_kind(kind);
+            handle_floating_point_tensor(init, src_ptr, offset, t);
+        } else if (kind == ElemKind::kBFloat16) {
+            // Raw little-endian bf16 bits on fp16's uint16_t container. The
+            // elem_kind is the only thing that says "bf16": every reader keys
+            // on it (MatMul/Gemm B, Gather's table) and LoadModel refuses any
+            // other consumer (bf16_consumer_ok). The image backend has no bf16
+            // read at all, so a bf16 weight there must not become an image.
+            if (!backend_buffer_) {
+                throw std::runtime_error(
+                    "vkop: initializer " + init.name +
+                    " is bfloat16, which only the buffer backend reads "
+                    "(no bf16 image kernel)");
+            }
             auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
             t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);
@@ -1330,6 +1372,22 @@ void Runtime::LoadModel() {
                     printf("we should not reach here %s\n",
                            in_shape.name.c_str());
                     assert(false);
+                }
+                // Every branch above pushes exactly one entry (or asserts), so
+                // this input's slot is node_inputs.size() - 1 when the two
+                // lists agree.
+                const auto *added = node_inputs.size() == node_input_shapes.size()
+                                        ? node_inputs.back().get()
+                                        : nullptr;
+                if (added && added->elem_kind() == ElemKind::kBFloat16 &&
+                    !bf16_consumer_ok(type, node_inputs.size() - 1)) {
+                    throw std::runtime_error(
+                        "vkop: no bf16 kernel for " + n.op_type + " (node '" +
+                        n.name + "', input " +
+                        std::to_string(node_inputs.size() - 1) + " '" +
+                        in_shape.name +
+                        "' is bfloat16; only MatMul/Gemm input 1 and Gather "
+                        "input 0 read bf16)");
                 }
             }
 
@@ -1469,6 +1527,20 @@ void Runtime::LoadModel() {
                         dtype_marker = (out_shape.dtype == "float32")
                                            ? "_f32_"
                                            : "_f16_";
+                    } else if (!node_inputs.empty() &&
+                               node_inputs[0] != nullptr &&
+                               node_inputs[0]->elem_kind() ==
+                                   ElemKind::kBFloat16) {
+                        // A bf16 table (Gather; the only op allowed a bf16
+                        // input 0): the result is an ACTIVATION, so it takes
+                        // the recorded output dtype rather than the table's
+                        // uint16_t container, which would make it fp16 even
+                        // in an fp32 graph. No recorded dtype: precision_.
+                        const auto &odt = out_shape.dtype;
+                        dtype_marker = odt == "float32"   ? "_f32_"
+                                       : odt == "float16" ? "_f16_"
+                                       : precision_ == 1  ? "_f16_"
+                                                          : "_f32_";
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(int64_t)) {

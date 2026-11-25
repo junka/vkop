@@ -2120,3 +2120,177 @@ TEST(MatMulTest, MatMulW4SwigluGateUp) {
 
 
 
+
+// bfloat16 weight-only MatMul (buffer backend). B is a bf16 weight on a
+// uint16_t container -- fp16's storage, bf16's encoding -- told apart only by
+// set_elem_kind(kBFloat16); there is no scale input, a bf16 weight is a real
+// float. The reference is fp32 over the SAME bf16-rounded B (torch's own
+// fp32 -> bfloat16 rounding, independent of vkop's) and the same T-rounded A,
+// so the only tolerance is accumulation order and the fp16 output rounding.
+//
+// `big` scales B by 2^17 (|w| up to ~5e5, past fp16's 65504) and A down by the
+// same factor: the GEMV / even-N / reduce routes read bf16 straight to fp32,
+// so a bf16 weight outside fp16's range must come out exact there. Only the
+// fp16-staged routes (the SIMT tile, Apple coop8) narrow to half, so `big` is
+// only run on shapes that do not reach them.
+namespace {
+template <typename T>
+class MatMulBf16Test : public TestCase<T> {
+  public:
+    std::unordered_map<std::string, std::string> attr;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<uint16_t>> weight;
+    std::shared_ptr<Tensor<T>> output;
+
+    MatMulBf16Test(int batch, int m, int k, int n, bool transB, bool big)
+        : TestCase<T>("MatMul"), batch_(batch), m_(m), k_(k), n_(n),
+          transB_(transB), big_(big) {
+        attr = {{"transB", transB_ ? "1" : "0"}};
+        initTestData();
+    }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &out_t,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        auto out = vkop::core::as_tensor<T>(out_t);
+        auto exp = vkop::core::as_tensor<T>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = to_float((*out)[i]);
+            float ev = to_float((*exp)[i]);
+            // fp16 output: one half ulp of the result plus accumulation-order
+            // noise; fp32 output: accumulation-order noise only.
+            const float rel = std::is_same_v<T, uint16_t> ? 4e-3F : 1e-4F;
+            const float thr = std::abs(ev) * rel + 2e-2F;
+            if (!(std::abs(ov - ev) <= thr)) {
+                LOG_ERROR("bf16 MatMul Fail (%d): %f vs %f (thr %f)", i, ov,
+                          ev, thr);
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    int batch_, m_, k_, n_;
+    bool transB_, big_;
+
+    static float to_float(T v) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return vkop::core::ITensor::fp16_to_fp32(v);
+        } else {
+            return v;
+        }
+    }
+
+    // fillTensorFromTorch wants the container's own torch dtype.
+    static torch::Tensor store(const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    }
+
+    void initTestData() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::manual_seed(7);
+        const double scale = big_ ? 131072.0 : 1.0;
+        std::vector<int64_t> a_shape =
+            batch_ == 1 ? std::vector<int64_t>{m_, k_}
+                        : std::vector<int64_t>{batch_, m_, k_};
+        auto a = torch::randn(a_shape, f32) / scale;
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            a = a.to(torch::kFloat16).to(torch::kFloat32);
+        }
+        auto w = (torch::randn(transB_ ? std::vector<int64_t>{n_, k_}
+                                       : std::vector<int64_t>{k_, n_},
+                               f32) *
+                  scale)
+                     .to(torch::kBFloat16);
+        auto b = w.to(torch::kFloat32);
+        auto y = torch::matmul(a, transB_ ? b.t() : b);
+
+        inputa = std::make_shared<Tensor<T>>(
+            std::vector<int>(a_shape.begin(), a_shape.end()));
+        this->fillTensorFromTorch(inputa, store(a));
+
+        // The raw bf16 bit patterns, low byte first: what the converter writes.
+        auto bits = w.view(torch::kInt16).contiguous().flatten();
+        std::vector<uint16_t> raw(static_cast<size_t>(bits.numel()));
+        std::memcpy(raw.data(), bits.data_ptr<int16_t>(),
+                    raw.size() * sizeof(uint16_t));
+        weight = std::make_shared<Tensor<uint16_t>>(
+            transB_ ? std::vector<int>{n_, k_} : std::vector<int>{k_, n_});
+        weight->set_elem_kind(vkop::core::ElemKind::kBFloat16);
+        weight->fillToCPU(raw);
+
+        std::vector<int> y_shape;
+        for (auto d : y.sizes()) {
+            y_shape.push_back(static_cast<int>(d));
+        }
+        output = std::make_shared<Tensor<T>>(y_shape);
+        this->fillTensorFromTorch(output, store(y));
+        LOG_INFO("bf16 MatMul batch %d M %d K %d N %d transB %d big %d fp16 %d",
+                 batch_, m_, k_, n_, transB_ ? 1 : 0, big_ ? 1 : 0,
+                 std::is_same_v<T, uint16_t> ? 1 : 0);
+    }
+};
+
+struct Bf16Case {
+    int batch, m, k, n;
+    bool transB;
+    bool big;
+    const char *why;
+};
+
+template <typename T> void run_matmul_bf16(const std::vector<Bf16Case> &cases) {
+    for (const auto &c : cases) {
+        MatMulBf16Test<T> t(c.batch, c.m, c.k, c.n, c.transB, c.big);
+        EXPECT_TRUE(t.run_test({t.inputa, t.weight}, {t.output},
+                               [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                   op->setAttribute(t.attr);
+                               }))
+            << "batch=" << c.batch << " m=" << c.m << " k=" << c.k
+            << " n=" << c.n << " transB=" << c.transB << " big=" << c.big
+            << " (" << c.why << ")";
+    }
+}
+} // namespace
+
+TEST(MatMulTest, MatMulBf16WeightBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<Bf16Case> fp16_cases = {
+        {1, 1, 512, 256, false, false, "decode: split-K GEMV"},
+        {1, 1, 258, 260, false, false, "decode: K tail of the split-K GEMV"},
+        {1, 1, 512, 4096, false, false, "decode: WIDE split-K GEMV"},
+        {1, 1, 1024, 2048, false, true, "WIDE GEMV, |w| past fp16's range"},
+        {1, 1, 512, 256, false, true, "split-K GEMV, |w| past fp16's range"},
+        {1, 3, 64, 12, false, false, "even N, K < 256: fused even-N kernel"},
+        {1, 3, 64, 12, false, true, "even-N kernel, |w| past fp16's range"},
+        {1, 4, 64, 7, false, false, "odd N: reduce + pack"},
+        {1, 4, 64, 7, true, true, "odd N transB, |w| past fp16's range"},
+        {1, 2, 64, 12, true, false, "transB GEMV: even-N [N, K] walk"},
+        {2, 3, 32, 10, false, false, "batched A, shared 2-D weight"},
+        {1, 20, 128, 96, false, false, "SIMT 64x64 tile"},
+        {1, 20, 128, 96, true, false, "SIMT tile, transB"},
+        {1, 16, 1024, 64, false, false, "few blocks, deep K: tile split-K"},
+        {1, 130, 256, 192, false, false, "M >= 64: Apple coop8 (else tile)"},
+        {3, 70, 128, 64, false, false, "coop8, batched A, shared weight"},
+        {1, 130, 256, 192, true, false, "coop8 transB"},
+        {1, 256, 64, 2056, false, false, "128x128 tile (N % 64 != 0)"},
+    };
+    LOG_INFO("bf16 MatMul, FP16 activations");
+    run_matmul_bf16<uint16_t>(fp16_cases);
+
+    // fp32 activations: the fp32 build has one kernel (matmul32), which reads
+    // the bf16 B by half-word. Cover both layouts, odd N and the range case.
+    const std::vector<Bf16Case> fp32_cases = {
+        {1, 4, 64, 12, false, false, "fp32 reduce"},
+        {1, 3, 33, 7, true, false, "fp32 reduce, transB, odd K and N"},
+        {2, 5, 40, 9, false, true, "fp32 batched, |w| past fp16's range"},
+        {1, 1, 512, 256, false, false, "fp32 decode row"},
+    };
+    LOG_INFO("bf16 MatMul, FP32 activations");
+    run_matmul_bf16<float>(fp32_cases);
+}

@@ -133,7 +133,52 @@ class Gather : public Operator {
     // When in int64 mode, bind the int64 pipeline + its descriptor sets
     // instead of the base fp32/fp16 pipeline. The base submit() hardcodes
     // pipeline_/m_ds_; this override redirects them for the int64 dispatch.
+    // A bfloat16 table (a bf16 embedding weight) reads through its own module
+    // (gather.comp -DBF16_TABLE): the table words are bf16 pairs, the output
+    // the activation dtype. The key follows the OUTPUT's storage, not fp16_,
+    // because the table's uint16_t container says nothing about the result.
+    void ensure_bf16_pipeline(bool out_fp16) {
+        auto &pipe = out_fp16 ? pipeline_bf16_h_ : pipeline_bf16_f_;
+        auto &dss = out_fp16 ? m_ds_bf16_h_ : m_ds_bf16_f_;
+        if (pipe) {
+            return;
+        }
+        auto spv = resolve_spv(out_fp16 ? "buffer_gather_bf16_fp16"
+                                        : "buffer_gather_bf16");
+        if (spv.first == nullptr) {
+            throw std::runtime_error(
+                "vkop: no bf16 kernel for Gather: the shader archive has no "
+                "buffer_gather_bf16 build (rebuild the shaders)");
+        }
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        pipe = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_, spv.first,
+            spv.second, use_uab, required_subgroup_size_);
+        for (auto &ds : dss) {
+            ds = pipe->allocDescriptorSets();
+        }
+    }
+
     void submit(void *ptr, int width, int height, int layers) override {
+        if (bf16_pipe_ != nullptr) {
+            VkDescriptorSet &ds = (*bf16_ds_)[m_id_];
+            if (!ds) {
+                ds = bf16_pipe_->allocDescriptorSets();
+            }
+            fillWriteDescriptorSets(ds);
+            bf16_pipe_->updateDescriptorSets(writes_);
+            m_cmd_->bind(*bf16_pipe_, ds);
+            if (ptr) {
+                m_cmd_->push_constants(*bf16_pipe_,
+                                       static_cast<uint32_t>(pc_size_), ptr);
+            }
+            m_cmd_->dispatch(width, height, layers);
+            if (replay_enabled_) {
+                record_fingerprint(ptr, width, height, layers);
+            }
+            return;
+        }
         if (!int64_mode_) {
             Operator::submit(ptr, width, height, layers);
             return;
@@ -457,6 +502,25 @@ class Gather : public Operator {
         // (core::require_word_movable_elem) so a byte-typed gather (an fp8 KV
         // slice) would mis-slice silently. int64 data has its own path below.
         core::require_word_movable_elem(inputs[0]->elem_kind(), "Gather");
+        // The indices are never bf16; only the table may be (v1: a constant
+        // embedding weight). Everything about it except the element read is
+        // the fp16 path's, so the dispatch below is shared.
+        if (inputs[1]->elem_kind() == core::ElemKind::kBFloat16) {
+            throw std::runtime_error("vkop: no bf16 kernel for Gather indices");
+        }
+        const bool table_bf16 =
+            inputs[0]->elem_kind() == core::ElemKind::kBFloat16;
+        bf16_pipe_ = nullptr;
+        bf16_ds_ = nullptr;
+        if (table_bf16) {
+            core::require_float_elem(outputs[0]->elem_kind(), "Gather",
+                                     "output (of a bf16 table)");
+            const bool out_fp16 = outputs[0]->dtype() == typeid(uint16_t);
+            ensure_bf16_pipeline(out_fp16);
+            bf16_pipe_ = out_fp16 ? pipeline_bf16_h_.get()
+                                  : pipeline_bf16_f_.get();
+            bf16_ds_ = out_fp16 ? &m_ds_bf16_h_ : &m_ds_bf16_f_;
+        }
 
         // int64 data: GPU shader path (gather_int64.comp). Previously this was
         // a synchronous CPU path (cpuComputeInt64: 2× copyToCPU + host loop +
@@ -484,7 +548,10 @@ class Gather : public Operator {
         // tensor (embedding lookups, the KV gathers) falls straight through to
         // the dispatch. Fires on the ViT vision tower's [33024] fp32 row runs.
         // Needs a GPU data buffer and an aligned offset (device + fp16 parity).
-        if (inputs[1]->get_host_authoritative() && param_.axis >= 0 &&
+        // The zero-copy alias hands the table's bytes over unconverted, so it
+        // is only an option when table and output share one encoding.
+        if (!table_bf16 && inputs[1]->get_host_authoritative() &&
+            param_.axis >= 0 &&
             param_.axis < rank &&
             (inputs[0]->dtype() == typeid(uint16_t) ||
              inputs[0]->dtype() == typeid(float))) {
@@ -601,6 +668,15 @@ class Gather : public Operator {
     BdaTableModule bda_i64_;
     VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
     bool int64_mode_ = false;
+    // bf16-table modules, one per output dtype, built on first use. bf16_pipe_
+    // / bf16_ds_ point at the pair the current execute() dispatches on (null
+    // for every other table), which is what routes submit() to them.
+    std::unique_ptr<VulkanPipeline> pipeline_bf16_h_;
+    std::unique_ptr<VulkanPipeline> pipeline_bf16_f_;
+    VkDescriptorSet m_ds_bf16_h_[vkop::kInflight] = {nullptr};
+    VkDescriptorSet m_ds_bf16_f_[vkop::kInflight] = {nullptr};
+    VulkanPipeline *bf16_pipe_ = nullptr;
+    VkDescriptorSet (*bf16_ds_)[vkop::kInflight] = nullptr;
     // Whether the last execute() took the CPU int64 path. did_host_work_last_round
     // keys on it so the GPU int64 path and the fp paths stay replayable.
     bool int64_host_path_taken_ = false;

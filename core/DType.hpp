@@ -76,19 +76,43 @@ enum class ElemKind : uint8_t {
     // it.
     kUint4,
 
-    // Spelled in a model file, but no kernel reads them yet. They are listed so
-    // the loader can name the format and say "no kernel" instead of falling
-    // into a storage guess.
-    //
-    // kBFloat16 is never meant to reach the runtime: every 16-bit-float buffer
-    // shader unpacks with unpackHalf2x16 (fp16's layout, not bf16's), so the
-    // converter normalizes a bf16 model to fp16 up front
-    // (converter._downcast_bfloat16) rather than growing a second 16-bit float
-    // format through every op. This case stays so a bf16 tensor that somehow
-    // reaches the loader is named and rejected, not silently read as fp16.
+    // An unsigned byte, riding int8_t storage (see elem_kind_supported).
     kUint8,
+    // bfloat16: the top 16 bits of an fp32 (same sign and 8-bit exponent, 7
+    // mantissa bits). Held in a uint16_t container -- the same storage type as
+    // fp16, little-endian raw bits -- which is exactly why elem_kind() exists:
+    // the container cannot tell the two apart, and a kernel that read bf16 bits
+    // with unpackHalf2x16 would return a plausible wrong answer.
+    //
+    // v1 scope is constant WEIGHTS only, read natively (shaders/common/
+    // bf16.comp): the B input of the buffer MatMul and Gemm kernels, and the
+    // table of Gather (an embedding). Activations stay fp16/fp32, so every
+    // other op still refuses a bf16 tensor -- the runtime checks every node
+    // input at LoadModel (see bf16_consumer_ok in core/runtime.cpp) and the
+    // three readers check their own operands at execute.
     kBFloat16,
 };
+
+// Host mirror of shaders/common/bf16.comp, line for line, so a host test can
+// pin the arithmetic the shaders use (and host code can build bf16 payloads).
+// bf16 -> float is exact (a shift); float -> bf16 is round-to-nearest-even
+// with a NaN kept NaN (quiet bit forced, sign and top payload bits kept).
+inline float bf16_to_float(uint16_t h) {
+    const uint32_t u = static_cast<uint32_t>(h) << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+inline uint16_t float_to_bf16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) {
+        return static_cast<uint16_t>((u >> 16) | 0x0040u);
+    }
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return static_cast<uint16_t>(u >> 16);
+}
 
 // Bits per element. Sub-byte kinds are the reason byte counts and element
 // counts are separate quantities: 5 x kInt4 is 3 bytes, not 5.
@@ -182,6 +206,10 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     // quantizer emits uint8 weights by default, so this must clear the loader
     // or the most common QDQ graph is rejected at graph-input creation.
     case ElemKind::kUint8:
+    // bfloat16 weights: read natively by the buffer MatMul/Gemm kernels (B)
+    // and by Gather (the table), on uint16_t storage with elem_kind recording
+    // the encoding. Any other consumer is refused at LoadModel.
+    case ElemKind::kBFloat16:
         return true;
     default:
         return false;
@@ -195,6 +223,8 @@ template <typename T> constexpr ElemKind elem_kind_of_storage() {
     if constexpr (std::is_same_v<T, float>) {
         return ElemKind::kFloat32;
     } else if constexpr (std::is_same_v<T, uint16_t>) {
+        // The DEFAULT meaning of a uint16_t container. A bf16 tensor shares
+        // this storage and must have set_elem_kind(kBFloat16) pinned on it.
         return ElemKind::kFloat16;
     } else if constexpr (std::is_same_v<T, int8_t>) {
         return ElemKind::kInt8;

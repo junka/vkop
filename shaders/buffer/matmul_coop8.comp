@@ -12,7 +12,8 @@
 // Same plain fp16 shape as matmul.comp's 128x128 tile (uPC.tile == 2):
 //   A [batch, M, K], B [batch', K, N] (or [batch', N, K] under transB),
 //   C [batch, M, N], packed
-//   half2 words, no byte weight, no epilogue.
+//   half2 words, no byte weight, no epilogue. B may be bf16 (uPC.bf16): it is
+//   re-encoded to half in the shared-memory stage, so the MMA stays fp16.
 // Host gates: K % BK == 0, N % BN == 0 (whole-tile columns), any M (rows past
 // M are zero-filled on load and skipped on store).
 //
@@ -99,7 +100,15 @@ layout(push_constant) uniform PC {
     int epi_bias_batch;
     int attn_softmax;
     int b_shared;
+    int ks_part;
+    // 1 = B is a bfloat16 weight (GpuMatMulParam::bf16, offset 124). Same
+    // packing as fp16, so only the B stage changes: each staged word is
+    // re-encoded bf16 -> half before it lands in shB (see bf16x2_to_half2 for
+    // the range clamp), and the fp16 coopmat fragments read it as before.
+    int bf16;
 } uPC;
+
+#include "../common/bf16.comp"
 
 int bmap(int n) {
     if (uPC.b_shared != 0) {
@@ -216,7 +225,11 @@ void main() {
     for (int t = 0; t < nk; ++t) {
         barrier();
         for (int i = 0; i < A_V; ++i) store8(a_sh[i], ra[i]);
-        for (int i = 0; i < B_V; ++i) store8b(b_sh[i], rb[i]);
+        if (uPC.bf16 != 0) {
+            for (int i = 0; i < B_V; ++i) store8b(b_sh[i], bf16x8_to_half8(rb[i]));
+        } else {
+            for (int i = 0; i < B_V; ++i) store8b(b_sh[i], rb[i]);
+        }
         barrier();
         if (t + 1 < nk) {
             for (int i = 0; i < A_V; ++i) {

@@ -182,7 +182,21 @@ struct alignas(16) GpuMatMulParam {
     // Sits at the struct tail (offset 120): sizeof stays 128 after the
     // alignas(16) rounding, so the pushed range is unchanged.
     int ks_part = 0;
+    // 1 = B is a bfloat16 weight: fp16's storage (two 16-bit values per word,
+    // element 0 low) with bf16's encoding, so it rides every fp16-B kernel and
+    // only the 16-bit -> float step changes (unpackB2 / stageB2 in
+    // shaders/buffer/matmul.comp, the B stage of matmul_coop8.comp). No scale
+    // tensor: a bf16 weight is a real float, not a quantized code. Offset 124,
+    // the last int of the 128-byte block: sizeof is unchanged. Buffer path
+    // only.
+    int bf16 = 0;
 };
+static_assert(offsetof(GpuMatMulParam, ks_part) == 120,
+              "GpuMatMulParam drift: matmul.comp's uPC reads ks_part at 120");
+static_assert(offsetof(GpuMatMulParam, bf16) == 124,
+              "GpuMatMulParam drift: matmul.comp's uPC reads bf16 at 124");
+static_assert(sizeof(GpuMatMulParam) == 128,
+              "GpuMatMulParam must stay inside the 128-byte push range");
 
 // Address table for the -DBDA MatMul builds. The push constant is already
 // 128 B, so the table is bound as ONE storage descriptor and holds every data
@@ -751,6 +765,10 @@ class MatMulBuffer : public BufferFactory {
         const bool weight_int8 = bkind == core::ElemKind::kInt8;
         const bool weight_fp8 = bkind == core::ElemKind::kFloat8E4M3FN ||
                                 bkind == core::ElemKind::kFloat8E5M2;
+        // A bf16 weight is a real 16-bit float with fp16's packing, so it takes
+        // the fp16 [A, B] contract and the fp16 kernels; only the B unpack
+        // differs (para_.bf16). It is not a quantized payload: no scale input.
+        const bool weight_bf16 = bkind == core::ElemKind::kBFloat16;
         // int8 and fp8 are one byte per value and scale per column, so they
         // share every gate, every kernel and the scale-length check below.
         const bool weight_byte = weight_int8 || weight_fp8;
@@ -809,9 +827,21 @@ class MatMulBuffer : public BufferFactory {
             core::require_float_elem(inputs[a_index]->elem_kind(), "MatMul",
                                      "input 0");
         }
-        if (!weight_byte && !weight_4bit) {
+        if (!weight_byte && !weight_4bit && !weight_bf16) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
+        }
+        if (weight_bf16) {
+            // v1 scope: bf16 is a constant weight. The SwiGLU down fold reads
+            // Wd/Wg/Wu through its own module (matmul_down_act.comp), and the
+            // fused-softmax QK^T kernel takes an activation as B; neither has a
+            // bf16 read, so refuse them instead of decoding bf16 as half.
+            if (down_act_) {
+                throw std::runtime_error(
+                    "vkop: no bf16 kernel for MatMul " + get_name() +
+                    " (down_act SwiGLU fold); reconvert without "
+                    "fuse_swiglu_down_proj or with fp16 weights");
+            }
         }
         core::require_float_elem(outputs[0]->elem_kind(), "MatMul", "output");
         const std::string weight_label = weight_int8    ? "int8"
@@ -1259,6 +1289,7 @@ class MatMulBuffer : public BufferFactory {
                           : weight_fp8   ? core::WeightKind::kFp8
                           : weight_nvfp4 ? core::WeightKind::kNvfp4
                           : weight_4bit  ? core::WeightKind::kInt4
+                          : weight_bf16  ? core::WeightKind::kBf16
                                          : core::WeightKind::kFp16;
         sel_feat.group_size = weight_4bit ? group_size : 0;
         sel_feat.epi_bias = epi_bias_;
@@ -1720,6 +1751,7 @@ class MatMulBuffer : public BufferFactory {
         para_.weight_int8 = weight_byte ? 1 : 0;
         para_.fp8 = weight_fp8 ? 1 : 0;
         para_.fp8_e5m2 = bkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
+        para_.bf16 = weight_bf16 ? 1 : 0;
         para_.w8_quad = (w8_quad && !ksplit && !tiled) ? 1 : 0;
         // main() tests uPC.ksplit before uPC.tile, so raising both flags makes
         // the host's tile dispatch (y = UP_DIV(m,64)) run the split-K GEMV,

@@ -229,6 +229,15 @@ enum class WeightKind {
     kFp8,
     kInt4,
     kNvfp4,
+    // A bfloat16 weight. Same storage as fp16 (two 16-bit values per word) and
+    // no scale, so it shares every fp16 GEMV / tile / reduce route and its
+    // gates (the shader swaps the B unpack, uPC.bf16). The rows that test
+    // `weight == kFp16` exclude it on purpose: the KHR cooperative-matrix
+    // modules (matmul_coop*.comp other than the Apple coop8) and the fused
+    // softmax have no bf16 read, and the down_act fold row refuses it
+    // explicitly. The Apple coop8 GEMM is reached through the tiled route and
+    // does convert a bf16 B in its shared-memory stage.
+    kBf16,
 };
 
 struct MatmulShape {

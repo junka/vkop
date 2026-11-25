@@ -135,7 +135,11 @@ class Gemm : public Operator {
                                      "scale]");
         }
         core::require_float_elem(inputs[0]->elem_kind(), "Gemm", "input 0");
-        if (!weight_int8) {
+        // A bfloat16 B is a real float weight read by gemm.comp's LDBF
+        // (fp16b == 2); any transB layout works, the walk is shared with fp16.
+        const bool weight_bf16 =
+            inputs[1]->elem_kind() == core::ElemKind::kBFloat16;
+        if (!weight_int8 && !weight_bf16) {
             core::require_float_elem(inputs[1]->elem_kind(), "Gemm", "input 1");
         }
         if (has_bias) {
@@ -255,8 +259,9 @@ class Gemm : public Operator {
         para_.has_bias = has_bias ? 1 : 0;
         para_.fp16a =
             inputs[0]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
-        para_.fp16b =
-            inputs[1]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
+        para_.fp16b = inputs[1]->elem_kind() == core::ElemKind::kFloat16 ? 1
+                      : weight_bf16                                     ? 2
+                                                                        : 0;
         para_.fp16c = has_bias && inputs[bias_index]->elem_kind() ==
                                       core::ElemKind::kFloat16
                           ? 1

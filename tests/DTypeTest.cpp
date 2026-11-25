@@ -38,17 +38,95 @@ TEST(DTypeTest, RecognizesSupportedNames) {
     }
 }
 
-// Quantized formats are named so the loader can say "no kernel yet" instead of
-// picking a storage type for them. They parse, but nothing may compute on them.
-// uint8 used to live here but now has a kernel (the QuantizeLinear/
-// DequantizeLinear QDQ op decodes it for externally-quantized models), so it
-// graduated to the supported set in RecognizesUint8QDQ below.
-TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
-    for (const char *name : {"bfloat16"}) {
-        const ElemKind kind = elem_kind_from_name(name);
-        EXPECT_NE(kind, ElemKind::kInvalid) << name;
-        EXPECT_FALSE(elem_kind_supported(kind)) << name;
-        EXPECT_STREQ(elem_name(kind), name);
+// bfloat16 weights: read natively by the buffer MatMul/Gemm B and Gather's
+// table. It shares fp16's uint16_t container -- which is the point of
+// elem_kind: storage alone says "fp16", and only the recorded kind keeps a
+// kernel from reading bf16 bits with unpackHalf2x16.
+TEST(DTypeTest, RecognizesBFloat16Weights) {
+    const ElemKind kind = elem_kind_from_name("bfloat16");
+    EXPECT_EQ(kind, ElemKind::kBFloat16);
+    EXPECT_TRUE(elem_kind_supported(kind));
+    EXPECT_NO_THROW(require_supported_elem("bfloat16", "initializer w"));
+    EXPECT_FALSE(elem_kind_packed(kind));
+    EXPECT_EQ(elem_bits(kind), 16);
+    EXPECT_EQ(elem_bytes(kind, 5), 10u);
+    EXPECT_STREQ(elem_name(kind), "bfloat16");
+    EXPECT_TRUE(storage_matches_kind(typeid(uint16_t), kind));
+    EXPECT_FALSE(storage_matches_kind(typeid(float), kind));
+    EXPECT_FALSE(storage_matches_kind(typeid(int8_t), kind));
+    // The container's default meaning is still fp16; bf16 must be pinned.
+    Tensor<uint16_t> t(std::vector<int>{4});
+    EXPECT_EQ(t.elem_kind(), ElemKind::kFloat16);
+    t.set_elem_kind(ElemKind::kBFloat16);
+    EXPECT_EQ(t.elem_kind(), ElemKind::kBFloat16);
+    EXPECT_EQ(t.size(), 8);
+    // A bf16 weight is not a float the generic float-only kernels may read.
+    EXPECT_FALSE(vkop::core::is_float_elem(kind));
+    EXPECT_THROW(require_float_elem(kind, "Add", "input 0"),
+                 std::runtime_error);
+}
+
+// The host mirror of shaders/common/bf16.comp (core::float_to_bf16 /
+// bf16_to_float). The shader's float_to_bf16 is the same three lines, so this
+// is what pins its rounding: ties to even, NaN kept NaN (quiet), Inf and the
+// largest-finite overflow, signed zero, and denormals, which stay exact bit
+// truncations/roundings on the integer path (no flush).
+TEST(DTypeTest, BFloat16RoundToNearestEven) {
+    using vkop::core::bf16_to_float;
+    using vkop::core::float_to_bf16;
+    auto bits = [](uint32_t u) {
+        float f;
+        std::memcpy(&f, &u, sizeof(f));
+        return f;
+    };
+    // Exact values pass through.
+    EXPECT_EQ(float_to_bf16(1.0F), 0x3F80);
+    EXPECT_EQ(float_to_bf16(-2.0F), 0xC000);
+    EXPECT_EQ(float_to_bf16(0.0F), 0x0000);
+    EXPECT_EQ(float_to_bf16(-0.0F), 0x8000);
+    // Below / above half an ulp.
+    EXPECT_EQ(float_to_bf16(bits(0x3F807FFFu)), 0x3F80);
+    EXPECT_EQ(float_to_bf16(bits(0x3F808001u)), 0x3F81);
+    // Exact ties: even lsb stays, odd lsb rounds up to even.
+    EXPECT_EQ(float_to_bf16(bits(0x3F808000u)), 0x3F80);
+    EXPECT_EQ(float_to_bf16(bits(0x3F818000u)), 0x3F82);
+    EXPECT_EQ(float_to_bf16(bits(0xBF818000u)), 0xBF82);
+    // A tie that carries through the mantissa into the exponent.
+    EXPECT_EQ(float_to_bf16(bits(0x3FFF8000u)), 0x4000);
+    // Inf stays Inf; the largest finite bf16 stays; past it rounds to Inf.
+    EXPECT_EQ(float_to_bf16(bits(0x7F800000u)), 0x7F80);
+    EXPECT_EQ(float_to_bf16(bits(0xFF800000u)), 0xFF80);
+    EXPECT_EQ(float_to_bf16(bits(0x7F7F0000u)), 0x7F7F);
+    EXPECT_EQ(float_to_bf16(bits(0x7F7FFFFFu)), 0x7F80);
+    // NaN: a payload only in the low 16 bits would truncate to Inf; it must
+    // come out a quiet NaN with its sign.
+    EXPECT_EQ(float_to_bf16(bits(0x7F800001u)), 0x7FC0);
+    EXPECT_EQ(float_to_bf16(bits(0xFF800001u)), 0xFFC0);
+    EXPECT_EQ(float_to_bf16(bits(0x7FC00000u)), 0x7FC0);
+    EXPECT_EQ(float_to_bf16(bits(0x7FA50000u)), 0x7FE5);
+    EXPECT_TRUE(std::isnan(bf16_to_float(float_to_bf16(std::nanf("")))));
+    // fp32 denormals: rounded like any other value; the smallest round to
+    // (signed) zero, a tie on the denormal grid goes to even, and a carry
+    // out of the denormal mantissa produces the smallest normal.
+    EXPECT_EQ(float_to_bf16(bits(0x00000001u)), 0x0000);
+    EXPECT_EQ(float_to_bf16(bits(0x80000001u)), 0x8000);
+    EXPECT_EQ(float_to_bf16(bits(0x00018000u)), 0x0002);
+    EXPECT_EQ(float_to_bf16(bits(0x00010000u)), 0x0001);
+    EXPECT_EQ(float_to_bf16(bits(0x007FC000u)), 0x0080);
+    // Decode is exact, denormals included.
+    EXPECT_EQ(bf16_to_float(0x3F80), 1.0F);
+    EXPECT_EQ(bf16_to_float(0xC040), -3.0F);
+    EXPECT_EQ(bf16_to_float(0x0001), bits(0x00010000u));
+    EXPECT_TRUE(std::isinf(bf16_to_float(0x7F80)));
+    // Every finite bf16 round-trips through fp32 unchanged.
+    for (uint32_t h = 0; h < 0x10000u; ++h) {
+        const uint16_t b = static_cast<uint16_t>(h);
+        const float f = bf16_to_float(b);
+        if (std::isnan(f)) {
+            EXPECT_TRUE(std::isnan(bf16_to_float(float_to_bf16(f))));
+            continue;
+        }
+        ASSERT_EQ(float_to_bf16(f), b) << std::hex << h;
     }
 }
 
@@ -126,18 +204,9 @@ TEST(DTypeTest, RequireSupportedElemThrowsLoudly) {
     EXPECT_THROW(require_supported_elem("float64", "initializer w"),
                  std::runtime_error);
     // The two failure modes read differently on purpose.
-    try {
-        // bfloat16 stays rejected here on purpose: the runtime has no bf16
-        // kernel and no bf16 storage type (every 16-bit-float buffer shader
-        // unpacks half2). The converter normalizes a bf16 model to fp16 before
-        // it is written (converter._downcast_bfloat16), so a bf16 name reaching
-        // the loader means that normalization was bypassed and this is the
-        // error that says so.
-        require_supported_elem("bfloat16", "initializer w");
-        FAIL() << "a format with no kernel must not load";
-    } catch (const std::runtime_error &e) {
-        EXPECT_NE(std::string(e.what()).find("no kernel"), std::string::npos);
-    }
+    // Every recognized format now has a reader (bfloat16, the last one, is
+    // read by the MatMul/Gemm/Gather kernels), so the "recognized, no kernel"
+    // branch has no name left to reach it. The unrecognized branch stays.
     try {
         require_supported_elem("weird", "initializer w");
         FAIL() << "an unrecognized dtype must not load";

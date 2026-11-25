@@ -9,7 +9,21 @@
 #define DTYPE float
 #endif
 
+// -DBF16_TABLE: the data (table) input is a bfloat16 weight -- the embedding
+// lookup of a bf16 checkpoint -- while the output stays in the activation
+// dtype (fp32, or fp16 under -DFP16). The table is read as raw uint words,
+// two bf16 per word with element 0 low, and each gathered value is widened to
+// fp32 (exact) and then stored as DTYPE. Built as buffer_gather_bf16 /
+// buffer_gather_bf16_fp16; ops/Gather.hpp binds it on its own pipeline. There
+// is no -DBDA form of this build.
+#ifdef BF16_TABLE
+#include "../common/bf16.comp"
+#endif
+
 #ifdef BDA
+#ifdef BF16_TABLE
+#error "buffer/gather.comp has no -DBDA -DBF16_TABLE build"
+#endif
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 // The data buffer is float16_t under -DFP16 and float otherwise; 4 covers the
@@ -31,7 +45,11 @@ layout(set=0, binding=0) readonly buffer BdaTable {
 #define uIndex (uBdaTable.b2)
 #else
 layout(set=0, binding=0) writeonly buffer outputBuffer { DTYPE data[]; } uOutput;
+#ifdef BF16_TABLE
+layout(set=0, binding=1) readonly buffer inputBuffer { uint data[]; } uInput;
+#else
 layout(set=0, binding=1) readonly buffer inputBuffer { DTYPE data[]; } uInput;
+#endif
 // int64 indices: each element is 8 bytes; bound as ivec2[] and only the low
 // 32 bits (.x) are read — correct for the model's small non-negative index
 // values (reading as int[] would stride by 4 bytes and misread every element).
@@ -146,6 +164,11 @@ void main()
     int input_linear_idx =
         gather_nd_to_linear(in_coord, uGatherPara.inShape, uGatherPara.idims);
     if (input_linear_idx >= 0) {
+#ifdef BF16_TABLE
+        uOutput.data[gid] = DTYPE(bf16_to_float(
+            uInput.data[input_linear_idx >> 1] >> ((input_linear_idx & 1) * 16)));
+#else
         uOutput.data[gid] = uInput.data[input_linear_idx];
+#endif
     }
 }

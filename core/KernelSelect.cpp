@@ -603,7 +603,10 @@ bool down_act_applies(const Ctx &c) {
     const MatmulFeatures &f = *c.f;
     // No N cap: the down/reduce passes walk N in 2048-column strides (see
     // the MatMul host's sel_feat.down_act note).
-    return f.down_act && c.av->down_act && f.fp16 && !f.transB && s.n_up >= 0 &&
+    // No bf16 read in matmul_down_act.comp: a bf16 fold must not match (the
+    // op refuses it before selection; this keeps the table honest on its own).
+    return f.down_act && c.av->down_act && f.fp16 && !f.transB &&
+           f.weight != WeightKind::kBf16 && s.n_up >= 0 &&
            (s.n % 4 == 0) && (s.n_up % 4 == 0) && s.k >= 1;
 }
 

@@ -354,3 +354,106 @@ TEST(GatherTest, Int64NegativeIndexOutOfRangeGpuShader) {
     setenv("VKOP_HOST_SHAPE", "0", 1);
     EXPECT_TRUE(run_gather_int64_oob_case());
 }
+
+// ---------------------------------------------------------------------------
+// bfloat16 table (a bf16 embedding weight)
+// ---------------------------------------------------------------------------
+//
+// The table is a Tensor<uint16_t> holding raw bf16 bits -- fp16's container --
+// marked kBFloat16; the output is the activation dtype (fp32 or fp16), so the
+// op must widen each gathered value instead of copying 16-bit words. The
+// expected output is torch's own bf16 -> fp32 (-> fp16) of the same bits.
+// Run once with device-resident indices (the gather.comp -DBF16_TABLE
+// dispatch) and once with host-authoritative consecutive indices: the latter is
+// the zero-copy alias fast path for fp16/fp32 tables, which would hand the raw
+// bf16 bytes through as "fp16" -- it must stay off for a bf16 table.
+namespace {
+template <typename T>
+bool run_gather_bf16_case(const std::vector<int> &shape, int axis,
+                          const std::vector<int> &ind_shape,
+                          const std::vector<int> &ind, bool host_indices) {
+    TestCase<T> tc("Gather");
+    std::vector<int64_t> s64(shape.begin(), shape.end());
+    // Values past fp16's range are kept small enough to fit an fp16 output;
+    // the fp32 output gets a wide spread so a half-precision path would show.
+    auto src = torch::randn(s64, torch::TensorOptions().dtype(torch::kFloat32));
+    if constexpr (std::is_same_v<T, float>) {
+        src = src * 1.0e6;
+    }
+    auto wbf = src.to(torch::kBFloat16);
+    auto bits = wbf.view(torch::kInt16).contiguous().flatten();
+    std::vector<uint16_t> raw(static_cast<size_t>(bits.numel()));
+    std::memcpy(raw.data(), bits.data_ptr<int16_t>(),
+                raw.size() * sizeof(uint16_t));
+    auto table = std::make_shared<Tensor<uint16_t>>(shape);
+    table->set_elem_kind(vkop::core::ElemKind::kBFloat16);
+    table->fillToCPU(raw);
+
+    std::vector<int64_t> i64(ind.begin(), ind.end());
+    auto indices = std::make_shared<Tensor<int64_t>>(ind_shape);
+    indices->fillToCPU(i64);
+    if (host_indices) {
+        indices->set_host_authoritative();
+    }
+
+    std::vector<int64_t> is64(ind_shape.begin(), ind_shape.end());
+    auto tind = torch::tensor(ind, torch::TensorOptions().dtype(torch::kInt64))
+                    .reshape(is64);
+    auto ref = wbf.to(torch::kFloat32).index_select(axis, tind.flatten());
+    // index_select flattens the index block; restore ONNX Gather's shape.
+    std::vector<int64_t> out_shape;
+    for (int d = 0; d < axis; ++d) out_shape.push_back(s64[d]);
+    for (auto d : is64) out_shape.push_back(d);
+    for (size_t d = axis + 1; d < s64.size(); ++d) out_shape.push_back(s64[d]);
+    ref = ref.reshape(out_shape);
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        ref = ref.to(torch::kFloat16);
+    }
+    auto output = std::make_shared<Tensor<T>>(
+        std::vector<int>(out_shape.begin(), out_shape.end()));
+    tc.fillTensorFromTorch(output, ref);
+
+    const auto aliases_before =
+        vkop::core::ITensor::shape_view_stats().buffer_aliases;
+    const bool ok = tc.run_test(
+        {table, indices}, {output},
+        [axis](std::unique_ptr<vkop::ops::Operator> &op) {
+            op->setAttribute({{"axis", std::to_string(axis)}});
+        });
+    EXPECT_EQ(vkop::core::ITensor::shape_view_stats().buffer_aliases,
+              aliases_before)
+        << "a bf16 table must never be aliased as the output";
+    return ok;
+}
+} // namespace
+
+TEST(GatherTest, GatherBf16Table) {
+    vkop::tests::ScopedBufferBackend buffer;
+    struct Case {
+        std::vector<int> shape;
+        int axis;
+        std::vector<int> ind_shape;
+        std::vector<int> ind;
+    };
+    const std::vector<Case> cases = {
+        // An embedding lookup: [vocab, hidden] table, [batch, seq] token ids.
+        {{37, 24}, 0, {2, 3}, {5, 0, 36, 7, 7, 12}},
+        // Odd hidden size: every other row starts in the high half of a word.
+        {{9, 7}, 0, {4}, {1, 8, 3, 2}},
+        // Inner axis.
+        {{3, 5, 6}, 1, {2}, {4, 0}},
+        // Consecutive rows: the alias fast path's shape, exercised below with
+        // host-authoritative indices too.
+        {{16, 8}, 0, {3}, {4, 5, 6}},
+    };
+    for (const auto &c : cases) {
+        for (const bool host : {false, true}) {
+            EXPECT_TRUE(run_gather_bf16_case<float>(c.shape, c.axis,
+                                                    c.ind_shape, c.ind, host))
+                << "fp32 out, axis " << c.axis << " host " << host;
+            EXPECT_TRUE(run_gather_bf16_case<uint16_t>(
+                c.shape, c.axis, c.ind_shape, c.ind, host))
+                << "fp16 out, axis " << c.axis << " host " << host;
+        }
+    }
+}

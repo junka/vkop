@@ -74,9 +74,12 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind) {
         return storage == typeid(int32_t);
     case ElemKind::kInt64:
         return storage == typeid(int64_t);
+    // bf16 rides a uint16_t container -- the same one as fp16, which is why
+    // the kind (not the storage) is what a kernel must branch on.
+    case ElemKind::kBFloat16:
+        return storage == typeid(uint16_t);
     case ElemKind::kInvalid:
     case ElemKind::kUint8:
-    case ElemKind::kBFloat16:
     // No C++ type means "one fp8 value", so these ride an int8_t container the
     // same way a bool mask does: the bytes are a payload only the shader
     // decodes, and elem_kind() is what records that. Kept false so that a

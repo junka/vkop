@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
@@ -390,4 +391,62 @@ TEST(GemmTest, GemmInt8WrongAxisScaleThrows) {
                                 op->setAttribute(t.attr);
                             }),
                  std::runtime_error);
+}
+// bfloat16 B (gemm.comp fp16b == 2): raw bf16 bits on a uint16_t container
+// marked kBFloat16, both layouts, with a bias, fp32 and fp16 activations. The
+// reference is fp32 over torch's own bf16 rounding of the same weight.
+namespace {
+template <typename T>
+bool run_gemm_bf16(int m, int k, int n, bool transB) {
+    TestCase<T> tc("Gemm");
+    auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+    torch::manual_seed(11);
+    auto a = torch::randn({m, k}, f32);
+    auto c = torch::randn({n}, f32);
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        a = a.to(torch::kFloat16).to(torch::kFloat32);
+        c = c.to(torch::kFloat16).to(torch::kFloat32);
+    }
+    auto wbf = (transB ? torch::randn({n, k}, f32) : torch::randn({k, n}, f32))
+                   .to(torch::kBFloat16);
+    auto b = wbf.to(torch::kFloat32);
+    auto y = torch::matmul(a, transB ? b.t() : b) + c;
+    auto store = [](const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    };
+    auto ta = std::make_shared<Tensor<T>>(std::vector<int>{m, k});
+    tc.fillTensorFromTorch(ta, store(a));
+    auto tcb = std::make_shared<Tensor<T>>(std::vector<int>{n});
+    tc.fillTensorFromTorch(tcb, store(c));
+    auto bits = wbf.view(torch::kInt16).contiguous().flatten();
+    std::vector<uint16_t> raw(static_cast<size_t>(bits.numel()));
+    std::memcpy(raw.data(), bits.data_ptr<int16_t>(), raw.size() * 2);
+    auto tb = std::make_shared<Tensor<uint16_t>>(
+        transB ? std::vector<int>{n, k} : std::vector<int>{k, n});
+    tb->set_elem_kind(vkop::core::ElemKind::kBFloat16);
+    tb->fillToCPU(raw);
+    auto ty = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
+    tc.fillTensorFromTorch(ty, store(y));
+    return tc.run_test({ta, tb, tcb}, {ty},
+                       [transB](std::unique_ptr<vkop::ops::Operator> &op) {
+                           op->setAttribute(
+                               {{"transB", transB ? "1" : "0"}});
+                       });
+}
+} // namespace
+
+TEST(GemmTest, GemmBf16WeightBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    for (const bool transB : {false, true}) {
+        EXPECT_TRUE(run_gemm_bf16<float>(5, 40, 9, transB)) << transB;
+        EXPECT_TRUE(run_gemm_bf16<uint16_t>(5, 40, 10, transB)) << transB;
+        // Odd K. (Odd N with an fp16 output is gemm16's pre-existing
+        // half2-word race across rows -- see its NOTE in gemm.comp -- and
+        // fails with an fp16 B too, so it is not a bf16 case.)
+        EXPECT_TRUE(run_gemm_bf16<uint16_t>(3, 33, 8, transB)) << transB;
+    }
 }

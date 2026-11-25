@@ -10,7 +10,8 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // The K loop carries NO data-dependent branches: transA/transB are
 // hoisted into walk start + stride, and each (A dtype x B dtype) pair
 // gets its own specialized loop instance via macro expansion.
-// fp16a/fp16b/fp16c/fp16o are 0 (fp32) or 1 (fp16) only, and B's format
+// fp16a/fp16c/fp16o are 0 (fp32) or 1 (fp16); fp16b is additionally 2 for a
+// bfloat16 B (fp16's two-per-word packing, bf16's encoding). B's format
 // is picked once by weight_int8: 0 = float/half, 1 = int8 weight-only.
 // Gemm::execute rejects anything else, because reading a quantized
 // payload through LDF would reinterpret its bytes as exponents and
@@ -77,7 +78,7 @@ layout(push_constant) uniform paraBuffer {
     float alpha;
     float beta;
     int fp16a;
-    int fp16b;
+    int fp16b;  // 0 fp32, 1 fp16, 2 bf16
     int fp16c;
     int fp16o;
     int activation;
@@ -86,10 +87,13 @@ layout(push_constant) uniform paraBuffer {
 
 #define A16 (uParams.fp16a == 1)
 #define B16 (uParams.fp16b == 1)
+#define BBF (uParams.fp16b == 2)
 
 // Element loaders parameterized by the walk-index variable.
 #define LDF(buf, idx) uintBitsToFloat(buf.data[idx])
 #define LDH(buf, idx) unpackHalf2x16(buf.data[idx >> 1])[idx & 1]
+#include "../common/bf16.comp"
+#define LDBF(buf, idx) bf16_to_float(buf.data[idx >> 1] >> ((idx & 1) * 16))
 
 // int8 weight-only payload: four signed bytes per uint word. Same decode as
 // buffer/conv2d.comp's int8 nest — mask the byte, then fold the sign bit by
@@ -145,11 +149,13 @@ void gemm32()
         else     { KLOOP1(LDF(bufferA, ai), LD8(bufferB, bi), sum) }
         sum *= wsc;
     } else if (A16) {
-        if (B16) { KLOOP1(LDH(bufferA, ai), LDH(bufferB, bi), sum) }
-        else     { KLOOP1(LDH(bufferA, ai), LDF(bufferB, bi), sum) }
+        if (B16)      { KLOOP1(LDH(bufferA, ai), LDH(bufferB, bi), sum) }
+        else if (BBF) { KLOOP1(LDH(bufferA, ai), LDBF(bufferB, bi), sum) }
+        else          { KLOOP1(LDH(bufferA, ai), LDF(bufferB, bi), sum) }
     } else {
-        if (B16) { KLOOP1(LDF(bufferA, ai), LDH(bufferB, bi), sum) }
-        else     { KLOOP1(LDF(bufferA, ai), LDF(bufferB, bi), sum) }
+        if (B16)      { KLOOP1(LDF(bufferA, ai), LDH(bufferB, bi), sum) }
+        else if (BBF) { KLOOP1(LDF(bufferA, ai), LDBF(bufferB, bi), sum) }
+        else          { KLOOP1(LDF(bufferA, ai), LDF(bufferB, bi), sum) }
     }
 
     sum *= uParams.alpha;
@@ -205,12 +211,16 @@ void gemm16() {
     } else if (A16) {
         if (B16) {
             KLOOP2(LDH(bufferA, ai), LDH(bufferB, b0i), LDH(bufferB, b1i), sum)
+        } else if (BBF) {
+            KLOOP2(LDH(bufferA, ai), LDBF(bufferB, b0i), LDBF(bufferB, b1i), sum)
         } else {
             KLOOP2(LDH(bufferA, ai), LDF(bufferB, b0i), LDF(bufferB, b1i), sum)
         }
     } else {
         if (B16) {
             KLOOP2(LDF(bufferA, ai), LDH(bufferB, b0i), LDH(bufferB, b1i), sum)
+        } else if (BBF) {
+            KLOOP2(LDF(bufferA, ai), LDBF(bufferB, b0i), LDBF(bufferB, b1i), sum)
         } else {
             KLOOP2(LDF(bufferA, ai), LDF(bufferB, b0i), LDF(bufferB, b1i), sum)
         }

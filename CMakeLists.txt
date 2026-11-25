@@ -758,6 +758,11 @@ endforeach()
 vkop_shader_variant(buffer_concat_int64_bda buffer/concat_int64 -DBDA)
 vkop_shader_variant(buffer_equal_int64_bda buffer/equal_int64 -DBDA)
 vkop_shader_variant(buffer_gather_int64_bda buffer/gather_int64 -DBDA)
+# Gather over a bfloat16 table (a bf16 embedding weight): the table is read as
+# raw bf16 words and the output is the activation dtype, fp32 or -DFP16. Keys
+# the op resolves by name (ops/Gather.hpp ensure_bf16_pipeline); no BDA form.
+vkop_shader_variant(buffer_gather_bf16 buffer/gather -DBF16_TABLE)
+vkop_shader_variant(buffer_gather_bf16_fp16 buffer/gather -DFP16 -DBF16_TABLE)
 vkop_shader_variant(buffer_where_int64_bda buffer/where_int64 -DBDA)
 vkop_shader_variant(buffer_expand_int64_bda buffer/expand_int64 -DBDA)
 # int64 -> fp32 Cast (position ids). Needs shaderInt64 for the ARITHMETIC, not

@@ -1,0 +1,77 @@
+#ifndef BF16_COMP
+#define BF16_COMP
+
+// bfloat16 <-> float, pure 32-bit integer ops.
+//
+// bf16 is the top half of an IEEE fp32: same sign bit, same 8-bit exponent and
+// bias, mantissa cut to 7 bits. So the decode is a shift, and the encode is a
+// rounding of the low 16 bits away. No GL_EXT_bfloat16 / shaderBFloat16Type is
+// needed (and MoltenVK has neither): the payload rides plain uint words, two
+// values per word, element 0 in the LOW half -- the same little-endian packing
+// unpackHalf2x16 assumes for fp16, so every index computation written for an
+// fp16 buffer is also correct for a bf16 one. Only the 16-bit -> float step
+// differs, which is why the kernels swap this unpack in for unpackHalf2x16 and
+// change nothing else.
+//
+// The host mirror (core::bf16_to_float / core::float_to_bf16 in DType.hpp)
+// is the same arithmetic line for line; tests/DTypeTest.cpp pins it on the
+// rounding edge cases (ties, NaN, Inf, denormals). Keep the two in step.
+
+// One bf16 (low 16 bits of h; the high bits are ignored) as a float. Exact:
+// every bf16 value is an fp32 value. A bf16 denormal decodes to an fp32
+// denormal, which a device that flushes denormals in arithmetic will then
+// treat as zero -- the same behaviour as an fp32 denormal weight.
+float bf16_to_float(uint h) { return uintBitsToFloat((h & 0xFFFFu) << 16); }
+
+// Two bf16 of one 32-bit word, element 0 in the low half (x).
+vec2 unpackBF16x2(uint w) {
+    return vec2(uintBitsToFloat(w << 16), uintBitsToFloat(w & 0xFFFF0000u));
+}
+
+// Four bf16 of two words, (w0.lo, w0.hi, w1.lo, w1.hi).
+vec4 unpackBF16x4(uint w0, uint w1) {
+    return vec4(unpackBF16x2(w0), unpackBF16x2(w1));
+}
+
+// float -> bf16 bits (low 16 of the result), round-to-nearest-even.
+// NaN stays NaN: truncating a NaN whose payload sits only in the low 16
+// mantissa bits would leave an all-zero mantissa, i.e. Inf, so the quiet bit
+// (bit 6 of the bf16 mantissa) is forced on instead of rounding. Sign and the
+// payload's top bits are kept. +-Inf has a zero mantissa and passes through the
+// rounding unchanged; a finite value at or past the largest bf16 rounds up to
+// Inf, which is what RNE says to do.
+uint float_to_bf16(float f) {
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (u >> 16) | 0x0040u;
+    }
+    // Add 0x7FFF plus the lsb that survives: below the half-way point this
+    // never carries into bit 16, above it always does, and exactly at half
+    // way it carries only when the kept lsb is odd -- ties to even.
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    return u >> 16;
+}
+
+// Two floats into one word, x in the low half (the unpackBF16x2 layout).
+uint packBF16x2(vec2 v) {
+    return float_to_bf16(v.x) | (float_to_bf16(v.y) << 16);
+}
+
+// bf16 pair -> fp16 pair, for kernels whose shared-memory stage (or coopmat
+// fragment) is fp16. Exact inside fp16's normal range: bf16 keeps 8 significant
+// bits, fp16 11. Past +-65504 the value is clamped to the largest finite half
+// (an Inf weight would turn every output it touches into Inf/NaN), and below
+// 2^-14 it lands on fp16's subnormal grid (absolute error <= 2^-25, under any
+// weight's contribution to an fp16 activation). This is the ONE lossy step on
+// the bf16 path, and only the fp16-staged kernels (the SIMT tile and the
+// coopmat GEMMs) take it; the GEMVs read bf16 straight to fp32.
+uint bf16x2_to_half2(uint w) {
+    return packHalf2x16(clamp(unpackBF16x2(w), vec2(-65504.0), vec2(65504.0)));
+}
+
+uvec4 bf16x8_to_half8(uvec4 w) {
+    return uvec4(bf16x2_to_half2(w.x), bf16x2_to_half2(w.y),
+                 bf16x2_to_half2(w.z), bf16x2_to_half2(w.w));
+}
+
+#endif // BF16_COMP

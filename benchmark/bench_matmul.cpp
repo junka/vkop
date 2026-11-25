@@ -31,6 +31,9 @@
 //      BENCH_INT8=1 swaps B for a byte int8 weight + a per-column fp32 scale,
 //      which is the only way to exercise the byte WIDE (16 cols/lane) GEMV
 //      without a whole quantized model on disk.
+//      BENCH_BF16=1 marks the same [K, N] weight as bfloat16 (raw bf16 bits,
+//      elem_kind kBFloat16): same bytes and routes as fp16, only the B unpack
+//      differs, so the pair is the A/B for the bf16 read.
 //      BENCH_PATTERN=1 times the column-ramp weight instead of refilling it
 //      with incompressible bytes after the correctness probe. The A/B against
 //      the default; on a part that does not compress storage-buffer reads the
@@ -200,6 +203,7 @@ int main(int argc, char **argv) {
 
     const int reps = (argc > 3) ? std::atoi(argv[3]) : 30;
     const bool int8_mode = std::getenv("BENCH_INT8") != nullptr;
+    const bool bf16_mode = std::getenv("BENCH_BF16") != nullptr;
     if (int8_mode) {
         printf("weight: int8 (byte WIDE path)\n");
     }
@@ -332,10 +336,15 @@ int main(int argc, char **argv) {
                 std::vector<int>{s.K, s.N});
             B->reserveOnCPU();
             for (int j = 0; j < s.N; ++j) {
-                uint16_t v = core::ITensor::fp32_to_fp16(static_cast<float>(wpat(j)));
+                const float wv = static_cast<float>(wpat(j));
+                uint16_t v = bf16_mode ? core::float_to_bf16(wv)
+                                       : core::ITensor::fp32_to_fp16(wv);
                 for (int k = 0; k < s.K; ++k) {
                     B->data()[k * s.N + j] = v;
                 }
+            }
+            if (bf16_mode) {
+                B->set_elem_kind(core::ElemKind::kBFloat16);
             }
             B->as_storage_buffer(dev);
             B->copyToGPU(cmdpool);
