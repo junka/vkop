@@ -338,6 +338,24 @@ def test_int4_blocked_reproduces_the_q_int4_twin():
     numpy.testing.assert_array_equal(arr(m.initializers["W_scale"]), arr(scale))
 
 
+def test_int4_block_size_as_the_onnx_int_attribute():
+    """ONNX declares block_size as ONE int, and that is how the converter's
+    loader hands it over from a real file; the list form above is only what a
+    hand-built DAG uses. Both must fold to the same bytes."""
+    w = randn(8, 16, 6)
+    group = 4
+    twin = quantize_4bit(float_weight_graph(
+        w, [("MatMul", "mm", {"transB": 0}, ["x", "W"])]), "int4", group)
+    payload, scale = twin.initializers["W"], twin.initializers["W_scale"]
+
+    m = fold(dq_graph(payload, scale, matmul_consumer(),
+                      attrs={"axis": 0, "block_size": group}))
+
+    assert [i["name"] for i in m.nodes["mm"].inputs] == ["x", "W", "W_scale"]
+    assert _init_bytes(m.initializers["W"]) == _init_bytes(payload)
+    numpy.testing.assert_array_equal(arr(m.initializers["W_scale"]), arr(scale))
+
+
 def test_int4_transposed_export_is_normalized_to_K_N():
     """A third-party Linear arrives [N, K] and the fusion pass has already folded
     its Transpose into the MatMul as transB=1 — a layout the nibble kernel
