@@ -4,26 +4,39 @@
     {"prompt": "...", "n": 1, "size": "512x512",
      "response_format": "b64_json",           # the only format: nothing hosts files
      "steps": 40, "seed": 7,                  # vkop extensions, both optional
+     "enhance": false,                        # vkop: let the LLM rewrite it first
      "stream": false}                         # true: SSE progress, see below
   -> {"created": 1732500000,
-      "data": [{"b64_json": "...", "seed": 7}],
+      "data": [{"b64_json": "...", "seed": 7,
+                "revised_prompt": "..."}],    # only with "enhance": true
       "usage": {"input_tokens": 21},
       "vkop": {<per-stage timings from image_serve>}}
 
 With "stream": true the reply is an event stream:
+  event: progress   data: {"stage": "enhance", "revised_prompt": "..."}
   event: progress   data: {"stage": "denoise", "image": 0, "step": 3, "steps": 40}
   event: image      data: {"index": 0, "seed": 7, "b64_json": "..."}
   event: done       data: {"stop_reason": "done", "vkop": {...}}
   event: error      data: {"error": {...}}
 A client that disconnects mid-stream stops the generation within one step.
+
+"enhance": true runs the prompt through the gateway's LLM first (see
+enhance_prompt): a short idea becomes a detailed scene description, and a long
+one is condensed, so the original may exceed the text tower's 64-token limit.
+The rewrite is greedy and cached, so the same request gets the same revised
+prompt -- and with it image_serve's prompt cache -- without asking the LLM
+again.
 """
 import base64
+import collections
 import json
 import os
+import re
 import secrets
 import shutil
 import sys
 import tempfile
+import threading
 import time
 
 from anthropic_server import Backend, _decode_err
@@ -156,7 +169,135 @@ def parse_request(req, backend, default_steps):
         seed = secrets.randbelow(2**31)
     if not isinstance(seed, int) or not 0 <= seed < 2**32 - 16:
         raise BadImageRequest("seed must be a non-negative 32-bit integer")
-    return prompt, n, steps, seed, bool(req.get("stream"))
+    enhance = req.get("enhance", False)
+    if not isinstance(enhance, bool):
+        raise BadImageRequest("enhance must be a boolean")
+    if enhance and len(prompt) > MAX_ENHANCE_CHARS:
+        raise BadImageRequest(
+            f"prompt is {len(prompt)} characters; enhance takes at most "
+            f"{MAX_ENHANCE_CHARS}")
+    return prompt, n, steps, seed, bool(req.get("stream")), enhance
+
+# --------------------------------------------------------------------------
+# Prompt enhancement: the LLM rewrites the prompt before the image model runs
+# --------------------------------------------------------------------------
+MAX_ENHANCE_CHARS = 4000
+# Small instruct models ignore "at most N words" (the 2B LLM wrote ~110
+# tokens for a 40-word request), so the length is also capped where it is
+# cheap to cap: at generation. The LLM and the text tower share the Qwen
+# tokenizer, so a few tokens over the tower's limit leaves room to cut back
+# to a sentence end in fit_tokens.
+ENHANCE_SLACK_TOKENS = 16
+
+ENHANCE_SYSTEM = (
+    "You write prompts for a text-to-image model. Rewrite the user's request "
+    "as one vivid, concrete description of the image: subject, setting, "
+    "composition, lighting, colours and style. Keep every detail the user "
+    "asked for and invent nothing that contradicts it. Write in the user's "
+    "language. One or two sentences, under 35 words (or 50 Chinese "
+    "characters). No lists, no quotes, no preamble -- output only the "
+    "description.")
+
+_THINK = re.compile(r"<think>.*?(</think>|$)", re.S)
+_LABEL = re.compile(r"^\s*(prompt|description|image prompt|提示词|描述)\s*[:：]\s*",
+                    re.I)
+
+
+def clean_rewrite(text):
+    """The LLM's reply -> one line of prompt text."""
+    text = _THINK.sub("", text)
+    text = " ".join(text.split())
+    text = _LABEL.sub("", text)
+    return text.strip().strip('"\'“”「」`').strip()
+
+
+def fit_tokens(text, limit, count):
+    """Longest prefix of `text` that `count` puts at <= `limit` tokens, cut
+    at a word or clause boundary when there is one. The LLM is asked for a
+    short reply, not trusted to give one; the text tower rejects anything
+    longer outright."""
+    if count(text) <= limit:
+        return text
+    lo, hi = 0, len(text)  # count(text[:lo]) <= limit < count(text[:hi])
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if count(text[:mid]) <= limit:
+            lo = mid
+        else:
+            hi = mid
+    cut = text[:lo]
+    for seps in (".!?。！？", ",;，；、", " "):
+        i = max(cut.rfind(c) for c in seps)
+        if i >= len(cut) // 2:
+            keep = cut[:i + 1] if seps == ".!?。！？" else cut[:i]
+            return keep.rstrip(" ,;，；、")
+    return cut.rstrip(" ,;，；、")
+
+
+class _RewriteCache:
+    def __init__(self, capacity=64):
+        self.capacity = capacity
+        self._d = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            if key in self._d:
+                self._d.move_to_end(key)
+                return self._d[key]
+        return None
+
+    def put(self, key, value):
+        with self._lock:
+            self._d[key] = value
+            self._d.move_to_end(key)
+            while len(self._d) > self.capacity:
+                self._d.popitem(last=False)
+
+
+_rewrites = _RewriteCache()
+
+
+def enhance_prompt(handler, prompt, image):
+    """Rewrite `prompt` with the gateway's LLM; return (revised, info).
+
+    Takes the GPU for the LLM only for the rewrite. With both models over the
+    memory budget this costs a swap each way, which is why rewrites are
+    cached: a repeated request goes straight to the image model.
+    """
+    t0 = time.time()
+    revised = _rewrites.get(prompt)
+    if revised is not None:
+        return revised, {"enhance_cached": True, "enhance_s": 0.0}
+    msgs = [("system", ENHANCE_SYSTEM), ("user", prompt)]
+    text, out_tokens = [], 0
+    with handler.manager.use(handler.llm_model) as llm:
+        for fr in llm.generate(msgs, image.max_prompt_tokens + ENHANCE_SLACK_TOKENS,
+                               rid="enh_" + secrets.token_hex(6)):
+            if fr[0] == "delta":
+                text.append(fr[1])
+            elif fr[0] == "done":
+                out_tokens = fr[2]
+    revised = clean_rewrite("".join(text))
+    if not revised:
+        raise RuntimeError("the LLM returned an empty rewrite")
+    revised = fit_tokens(revised, image.max_prompt_tokens, image.count)
+    _rewrites.put(prompt, revised)
+    return revised, {"enhance_cached": False,
+                     "enhance_s": round(time.time() - t0, 3),
+                     "enhance_tokens": out_tokens}
+
+
+class _ClientGone(Exception):
+    pass
+
+
+def _try_event(event, kind, payload):
+    try:
+        event(kind, payload)
+        return True
+    except OSError:
+        return False
 
 
 def handle_generation(handler, req):
@@ -166,16 +307,19 @@ def handle_generation(handler, req):
         handler._error(404, "not_found_error", "no image model configured")
         return
     backend = mm.workers[name]
+    tokens = None
     try:
-        prompt, n, steps, seed, stream = parse_request(req, backend,
-                                                       handler.image_steps)
-        # Tokenizer only, no GPU, so it runs before taking the GPU lock: an
-        # over-long prompt is a 400 at once rather than after the queue.
-        tokens = backend.count(prompt)
-        if tokens > backend.max_prompt_tokens:
-            raise BadImageRequest(
-                f"prompt is {tokens} tokens; the text tower takes at most "
-                f"{backend.max_prompt_tokens}")
+        prompt, n, steps, seed, stream, enhance = parse_request(
+            req, backend, handler.image_steps)
+        if not enhance:
+            # Tokenizer only, no GPU, so it runs before taking the GPU lock:
+            # an over-long prompt is a 400 at once rather than after the queue.
+            tokens = backend.count(prompt)
+            if tokens > backend.max_prompt_tokens:
+                raise BadImageRequest(
+                    f"prompt is {tokens} tokens; the text tower takes at most "
+                    f"{backend.max_prompt_tokens} (or send \"enhance\": true "
+                    f"to have it condensed)")
     except BadImageRequest as e:
         handler._error(400, "invalid_request_error", str(e))
         return
@@ -183,6 +327,7 @@ def handle_generation(handler, req):
     rid = "img_" + secrets.token_hex(8)
     t0 = time.time()
     images, metrics, reason, err = [], {}, None, None
+    revised, enh_info = None, {}
     if stream:
         handler._sse_start()
 
@@ -191,6 +336,21 @@ def handle_generation(handler, req):
         handler._sse_write(data)
 
     try:
+        if enhance:
+            gone = False
+            if stream:
+                gone = not _try_event(event, "progress", {"stage": "enhance"})
+            if not gone:
+                revised, enh_info = enhance_prompt(handler, prompt, backend)
+                prompt = revised
+            if stream and not gone:
+                gone = not _try_event(event, "progress", {
+                    "stage": "enhance", "revised_prompt": revised, **enh_info})
+            if gone:
+                # Nobody is reading: do not load the image model for them.
+                raise _ClientGone()
+        if tokens is None:
+            tokens = backend.count(prompt)
         with mm.use(name) as be:
             gen = be.generate(prompt, steps, seed, n, rid)
             stopping = False
@@ -220,6 +380,8 @@ def handle_generation(handler, req):
                     err = "client disconnected"
                     stopping = True
                     be.stop(rid)
+    except _ClientGone:
+        err = "client disconnected"
     except Exception as e:  # backend error: report, and log below
         err = str(e)
         if stream:
@@ -236,6 +398,9 @@ def handle_generation(handler, req):
             f"wall={time.time() - t0:.2f}s stop={reason or 'error'} "
             f"cache_hit={metrics.get('prompt_cache_hit')} "
             f"s/step={metrics.get('s_per_step')}"
+            + (f" enhance={enh_info.get('enhance_s')}s"
+               f"{' cached' if enh_info.get('enhance_cached') else ''}"
+               if enhance else "")
             + (f" error={err}" if err else "") + "\n")
         if stream:
             try:
@@ -244,10 +409,14 @@ def handle_generation(handler, req):
                 pass
     if stream or reason is None:
         return
+    data = [{"b64_json": base64.b64encode(png).decode(), "seed": s}
+            for _, _, s, png in images]
+    if revised is not None:
+        for d in data:
+            d["revised_prompt"] = revised
     handler._json(200, {
         "created": int(t0),
-        "data": [{"b64_json": base64.b64encode(png).decode(), "seed": s}
-                 for _, _, s, png in images],
+        "data": data,
         "usage": {"input_tokens": tokens},
-        "vkop": metrics,
+        "vkop": {**metrics, **enh_info},
     })

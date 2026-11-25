@@ -157,10 +157,11 @@ def _bad(req):
 
 
 def test_image_request_validation():
-    p, n, steps, seed, stream = image_backend.parse_request(
+    p, n, steps, seed, stream, enhance = image_backend.parse_request(
         {"prompt": "a fox"}, _Img, 40)
-    check("defaults: n=1, server steps, random seed, sync",
-          (p, n, steps, stream) == ("a fox", 1, 40, False) and 0 <= seed < 2**31)
+    check("defaults: n=1, server steps, random seed, sync, no enhance",
+          (p, n, steps, stream, enhance) == ("a fox", 1, 40, False, False)
+          and 0 <= seed < 2**31)
     check("explicit steps/seed kept",
           image_backend.parse_request({"prompt": "x", "steps": 8, "seed": 7},
                                       _Img, 40)[2:4] == (8, 7))
@@ -174,6 +175,74 @@ def test_image_request_validation():
     check("steps out of range refused", _bad({"prompt": "x", "steps": 0}) is not None)
     check("negative seed refused", _bad({"prompt": "x", "seed": -1}) is not None)
     check("non-int n refused", _bad({"prompt": "x", "n": "2"}) is not None)
+    check("non-bool enhance refused", _bad({"prompt": "x", "enhance": 1}) is not None)
+    check("huge prompt refused for enhance",
+          _bad({"prompt": "x" * 5000, "enhance": True}) is not None)
+
+
+def test_clean_rewrite():
+    c = image_backend.clean_rewrite
+    check("think block and label dropped",
+          c("<think>hmm\nok</think>\n\nPrompt: A fox, golden light.")
+          == "A fox, golden light.", c("<think>hmm</think>Prompt: A fox."))
+    check("quotes and newlines", c('"A fox\non a bench"') == "A fox on a bench")
+    check("unterminated think is empty", c("<think>still going") == "")
+    check("chinese label", c("提示词：一只狐狸") == "一只狐狸")
+
+
+def test_fit_tokens():
+    words = lambda t: len(t.split())  # noqa: E731
+    fit = image_backend.fit_tokens
+    check("short text untouched", fit("a b c", 5, words) == "a b c")
+    out = fit("A fox sits. It is on a bench in a park at dusk", 6, words)
+    check("cut at the sentence end", out == "A fox sits.", out)
+    out = fit("one two three four five six seven eight", 5, words)
+    check("cut at a word boundary", out == "one two three four five", out)
+    chars = len
+    out = fit("一只红色的狐狸，坐在公园的长椅上，阳光明媚", 12, chars)
+    check("cjk cut at a clause, separator dropped", out == "一只红色的狐狸", out)
+
+
+class _Llm:
+    mem_gb, resident = 1, True
+
+    def __init__(self, reply):
+        self.reply, self.calls = reply, 0
+
+    def evict(self):
+        pass
+
+    def generate(self, msgs, max_new, rid="0", sample=None):
+        self.calls += 1
+        assert msgs[0][0] == "system" and msgs[1] == ("user", "fox")
+        yield ("tokens_in", 50)
+        for w in self.reply:
+            yield ("delta", w)
+        yield ("done", "stop", len(self.reply))
+
+
+def test_enhance_prompt():
+    llm = _Llm(["A red fox ", "on a bench, ", "golden hour light, ",
+                "shallow depth of field, ", "photorealistic."])
+    mm = mm_with(100, llm=llm)
+
+    class H:
+        manager, llm_model = mm, "llm"
+
+    class Img:
+        max_prompt_tokens = 6
+
+        @staticmethod
+        def count(t):
+            return len(t.split())
+
+    image_backend._rewrites = image_backend._RewriteCache()
+    out, info = image_backend.enhance_prompt(H, "fox", Img)
+    check("rewrite fitted to the token limit",
+          out == "A red fox on a bench" and not info["enhance_cached"], out)
+    out2, info2 = image_backend.enhance_prompt(H, "fox", Img)
+    check("second call is cached, LLM not asked again",
+          out2 == out and info2["enhance_cached"] and llm.calls == 1)
 
 
 for fn in [test_too_big_together_evicts_the_other,
@@ -184,7 +253,10 @@ for fn in [test_too_big_together_evicts_the_other,
            test_over_budget_alone_still_runs,
            test_unknown_model,
            test_requests_are_serialised,
-           test_image_request_validation]:
+           test_image_request_validation,
+           test_clean_rewrite,
+           test_fit_tokens,
+           test_enhance_prompt]:
     fn()
 
 print(f"\n{len(fails)} failure(s)")

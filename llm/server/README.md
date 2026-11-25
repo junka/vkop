@@ -396,6 +396,31 @@ curl -s http://127.0.0.1:8787/v1/images/generations -H 'content-type: applicatio
 所以在这台机器上 LLM 和出图来回切的代价是每次切换 2–3 s（LLM 2B 重载很快；7B 级的 LLM
 会更贵）。批量出图时尽量攒在一起发。
 
+### `"enhance": true`：先让 LLM 改写 prompt
+
+请求里带 `"enhance": true`，网关先用同一个 LLM 把 prompt 改写成一段具体的画面描述（主体、
+场景、构图、光线、色彩、风格，保持用户的语言），再拿改写结果出图。回包每张图多一个
+`revised_prompt`（和 OpenAI 同名）；stream 时多两条 `progress`：`{"stage": "enhance"}`
+和带 `revised_prompt` 的那条。
+
+- 原 prompt 可以超过 64 token（上限 4000 字符），改写本来就会压短 —— 长描述想直接用，就加
+  `enhance`。不带 `enhance` 的超长 prompt 仍然直接 400。
+- 长度两道闸：系统提示要求“两句以内、35 词 / 50 字以内”，但 2B 模型并不听（实测一次写了
+  116 token），所以生成时硬上限是文本塔上限 + 16 token，超出的部分由 `fit_tokens` 用文本塔
+  的分词器二分截到 64 token 以内，优先截在句号、其次逗号、再次空格处。
+- 改写是 greedy 的，按原 prompt 缓存最近 64 条：同一个请求再来，不再叫 LLM（也就不用把 LLM
+  换进来），改写结果一样，于是还能命中 `image_serve` 的 prompt 缓存。
+- 两个模型放不下时，一次带 `enhance` 的请求要换两次模型（LLM 进、出图进），各 1 s 左右。
+
+实测（同上，8 步）：
+
+| 请求 | 墙钟 | 改写 | 说明 |
+|---|---|---|---|
+| `"a fox"`，LLM 正常驻 | 20.0 s | 0.6 s | 改写 37 token；再换出 LLM 出图 |
+| 同一请求、换个 seed | 11.4 s | 缓存 | 不碰 LLM，出图端 prompt 缓存也命中 |
+| 中文一句话 | 21.6 s | 2.5 s | 含把 LLM 换回来；改写仍是中文 |
+| 83 token 的长描述 | 22.4 s | 3.0 s | 不带 `enhance` 是 400；改写后 57 token，细节都在 |
+
 ## 协议细节
 
 - **流式**：`stream: true` 走 chunked SSE，事件顺序是
