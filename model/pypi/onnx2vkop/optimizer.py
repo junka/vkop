@@ -9352,13 +9352,21 @@ class Quantizer:
     # extreme codes are exactly -1 and +1. matmul.comp holds the same table:
     # a weight is codebook[q] * group_absmax, so the fp32 scale the shader binds
     # is the group absmax itself rather than absmax/7.
+    #
+    # These are bitsandbytes' NF4 values (functional.create_normal_map with
+    # offset 0.9677083, the table QLoRA publishes), bit-for-bit as float32 --
+    # the same 16 floats onnxruntime's MatMulBnb4 decodes with, which is what
+    # lets a bnb checkpoint import without touching a code
+    # (PreQuantizedWeights._fold_bnb4). An earlier copy of this table had six
+    # entries off (codes 3, 5, 6, 9, 10, 11; worst |diff| 1.7e-3 at code 11),
+    # so vkop's "nf4" was a private 16-level grid that only agreed with itself.
     _NF4_CODEBOOK = np.array(
         [
-            -1.0, -0.6961928009986877, -0.5250730514526367, -0.3949174189567566,
-            -0.2844413814544678, -0.1847814998626709, -0.0910967006323811, 0.0,
-            0.0795802986717224, 0.1601973110246658, 0.2447470557689667,
-            0.3361703515052795, 0.4407098295211792, 0.5626170039176941,
-            0.7229568369388580, 1.0,
+            -1.0, -0.6961928009986877, -0.5250730514526367,
+            -0.39491748809814453, -0.28444138169288635, -0.18477343022823334,
+            -0.09105003625154495, 0.0, 0.07958029955625534,
+            0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
         ],
         dtype=np.float32,
     )
