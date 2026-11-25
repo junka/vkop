@@ -10774,6 +10774,8 @@ class PreQuantizedWeights:
       * a UINT4 payload that does not name itself nf4 in its vkop_dtype metadata
         — the ONNX element type says how the nibbles are stored, not what they
         mean, and only the codebook kernel reads a nibble as an index.
+        A real NF4 checkpoint arrives as onnxruntime's MatMulBnb4 instead (ONNX
+        has no NF4 type), which _fold_bnb4 imports code-for-code.
 
     Constant folding runs before this on the ONNX proto and does NOT evaluate
     DequantizeLinear (ConstantFolder._FOLDABLE_OPS), so the payload arrives as
@@ -10820,7 +10822,16 @@ class PreQuantizedWeights:
 
         Returns the number of weights imported. An activation QDQ pair is not a
         weight and is not counted: it stays in the graph, and the runtime executes
-        both halves (ops/QuantizeLinear.hpp)."""
+        both halves (ops/QuantizeLinear.hpp).
+
+        onnxruntime's com.microsoft::MatMulBnb4 (the bitsandbytes 4-bit export)
+        is imported here too, first: it is the one way an ONNX file can carry
+        NF4 codes, since ONNX has no NF4 element type. See _fold_bnb4."""
+        imported = PreQuantizedWeights._fold_bnb4(dag_model)
+        return imported + PreQuantizedWeights._fold_dq(dag_model)
+
+    @staticmethod
+    def _fold_dq(dag_model) -> int:
         dq_nodes = [
             node for node in dag_model.nodes.values()
             if node.op_type == "DequantizeLinear"
@@ -10894,6 +10905,250 @@ class PreQuantizedWeights:
             f"MatMul/Gemm/Conv inputs"
         )
         return len(weights)
+
+    # onnxruntime's MatMulBnb4 `quant_type` values (Bnb_DataType_t in
+    # blockwise_quant_block_bnb4.h; MatMulBnb4Quantizer.FP4 / .NF4).
+    _BNB_FP4 = 0
+    _BNB_NF4 = 1
+
+    @staticmethod
+    def _fold_bnb4(dag_model) -> int:
+        """Import every com.microsoft::MatMulBnb4 as vkop's native nf4 MatMul.
+
+        This is the 4-bit analog of --keep-bf16: the codes a bitsandbytes NF4
+        checkpoint ships are COPIED (re-ordered, never re-quantized), and the
+        node lands on exactly the [A, W_nf4, scale] input list `-q nf4` emits.
+
+        The MatMulBnb4 contract, as onnxruntime 1.19 defines and executes it
+        (verified against the CPU kernel; tests/test_bnb4_import.py pins each
+        point against a session):
+
+          * B is uint8 [ceil(N*K/2)]: the weight TRANSPOSED to [N, K] (what a
+            torch Linear stores), flattened row-major and packed two codes per
+            byte with the FIRST element in the HIGH nibble -- the opposite of an
+            ONNX INT4/UINT4 tensor, whose even element is the low nibble.
+          * absmax is [ceil(N*K/block_size)], element type T1 (= A's: float,
+            float16 or bfloat16), one per block_size-run of that flattened
+            [N, K] stream. With K % block_size == 0 a block is one output
+            column's run of K -- exactly a vkop group -- so absmax[n*K/bs + g]
+            is vkop's scale[g, n].
+          * a weight is codebook[q] * absmax with bitsandbytes' NF4 codebook,
+            which is Quantizer._NF4_CODEBOOK bit-for-bit (float32).
+          * Y = A @ W for W the [K, N] matrix; A may carry leading batch dims.
+
+        Every value the import has to trust is checked and every shape vkop's
+        nibble kernel cannot read raises (see _fold_one_bnb4). Returns the number
+        of nodes imported.
+
+        External data: a uint8 B is not a pass-through dtype for weight_stream,
+        so it is hydrated (read into memory, one tensor at a time) like every
+        other 4-bit import, never streamed from its file -- the re-lay needs the
+        bytes. The nf4 payload is half the size of the fp16 weight it replaces.
+        """
+        nodes = [n for n in dag_model.nodes.values()
+                 if n.op_type == "MatMulBnb4"]
+        if not nodes:
+            return 0
+        consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                consumers[inp["name"]].append(node)
+
+        # payload name -> (contract signature, scale name), so a B shared by two
+        # MatMulBnb4 nodes is re-laid once and both point at the result.
+        done = {}
+        for node in nodes:
+            PreQuantizedWeights._fold_one_bnb4(dag_model, node, consumers, done)
+
+        # absmax tables were only ever these nodes' inputs; the scale table each
+        # import wrote replaces them.
+        for absmax_name in {sig[3] for sig, _ in done.values()}:
+            readers = consumers.get(absmax_name, [])
+            if all(r in nodes for r in readers):
+                dag_model.initializers.pop(absmax_name, None)
+
+        dag_model.build_dependencies()
+        print(f"Imported {len(nodes)} MatMulBnb4 NF4 weight(s) as nf4 "
+              f"weight-only MatMul inputs (codes copied, not re-quantized)")
+        return len(nodes)
+
+    @staticmethod
+    def _fold_one_bnb4(dag_model, node, consumers, done):
+        attrs = node.attributes
+        where = f"MatMulBnb4 '{node.name}'"
+        missing = [a for a in ("K", "N", "block_size", "quant_type")
+                   if attrs.get(a) is None]
+        if missing:
+            raise ValueError(
+                f"{where} is missing required attribute(s) {missing}; the "
+                f"packed stream cannot be laid out without them.")
+        k, n = int(attrs["K"]), int(attrs["N"])
+        block = int(attrs["block_size"])
+        qt = int(attrs["quant_type"])
+
+        if qt == PreQuantizedWeights._BNB_FP4:
+            raise ValueError(
+                f"{where}: quant_type=0 is bitsandbytes FP4, which has no vkop "
+                f"kernel. It is NOT the E2M1 grid the nvfp4 kernel decodes: "
+                f"bnb's FP4 table (normalized to absmax) is {{0, 1/192, 1/6, "
+                f"1/4, 1/3, 1/2, 2/3, 1}} in its own code order -- E2M1/6's "
+                f"smallest non-zero is 1/12, not 1/192 -- and nvfp4 also needs "
+                f"16-value e4m3 block scales plus a per-tensor fp32 scale. Only "
+                f"quant_type=1 (NF4) imports; re-export the checkpoint as NF4 "
+                f"or convert the float weights with -q nf4.")
+        if qt != PreQuantizedWeights._BNB_NF4:
+            raise ValueError(
+                f"{where}: quant_type={qt} is neither bitsandbytes FP4 (0) nor "
+                f"NF4 (1).")
+        transb = int(attrs.get("transB", 1))
+        if transb != 1:
+            # The schema defaults transB to 1 and onnxruntime's shape inference
+            # refuses transB=0 for a [M, K] A; whatever a 0 would mean is a
+            # layout nobody has run, so it is not guessed at.
+            raise ValueError(
+                f"{where}: transB={transb}. Only the schema default (1: B packs "
+                f"the [N, K] transposed weight) is a layout onnxruntime "
+                f"executes.")
+        if len(node.inputs) != 3:
+            raise ValueError(
+                f"{where} has {len(node.inputs)} inputs; the op is [A, B, "
+                f"absmax].")
+        if k <= 0 or n <= 0:
+            raise ValueError(f"{where}: K={k}, N={n} is not a matrix.")
+
+        a_shape = node.inputs[0].get("shape") or []
+        if a_shape and isinstance(a_shape[-1], int) and a_shape[-1] > 0 \
+                and a_shape[-1] != k:
+            raise ValueError(
+                f"{where}: A's last dim is {a_shape[-1]} but K={k}.")
+
+        b_name = node.inputs[1]["name"]
+        s_name = node.inputs[2]["name"]
+        payload = dag_model.initializers.get(b_name)
+        if payload is None:
+            raise ValueError(
+                f"{where}: B '{b_name}' is computed at run time; only a constant "
+                f"packed payload can be imported.")
+        absmax_init = dag_model.initializers.get(s_name)
+        if absmax_init is None:
+            raise ValueError(
+                f"{where}: absmax '{s_name}' is computed at run time; the nf4 "
+                f"kernel binds a constant scale table.")
+
+        signature = (k, n, block, s_name)
+        if b_name in done:
+            if done[b_name][0] != signature:
+                raise ValueError(
+                    f"{where}: B '{b_name}' is shared with another MatMulBnb4 "
+                    f"that reads it as (K, N, block_size, absmax)="
+                    f"{done[b_name][0]}, not {signature}; one payload cannot "
+                    f"be re-laid two ways.")
+            PreQuantizedWeights._bnb4_rewire(dag_model, node, b_name, k, n,
+                                             done[b_name][1], n_groups=k // block)
+            return
+        others = [c for c in consumers.get(b_name, [])
+                  if c.op_type != "MatMulBnb4"]
+        if others:
+            raise ValueError(
+                f"{where}: B '{b_name}' is also read by "
+                f"{sorted({c.op_type for c in others})}; the import re-lays the "
+                f"payload in place, which those readers would then misread.")
+
+        if payload.data_type != TensorProto.UINT8:
+            raise ValueError(
+                f"{where}: B is {PreQuantizedWeights._dt_name(payload.data_type)}"
+                f"; MatMulBnb4 packs its codes into uint8.")
+        # Gates the nibble kernel applies (ops/Matmul.hpp, Quantizer.
+        # _match_weight_only): a group is a run of K inside ONE output column,
+        # even, and a packed [K, N] row starts on a 32-bit word.
+        if block <= 0 or block % 2:
+            raise ValueError(
+                f"{where}: block_size={block}; a vkop 4-bit group must be a "
+                f"positive EVEN number of K values (the fp16 kernels read A two "
+                f"halves per word).")
+        if k % block:
+            raise ValueError(
+                f"{where}: K={k} is not a multiple of block_size={block}, so a "
+                f"bnb block (a run of the flattened [N, K] stream) spans the end "
+                f"of one output column and the start of the next. A vkop group "
+                f"scales one column's run of K; such a block has no equivalent "
+                f"scale table.")
+        if n % 8:
+            raise ValueError(
+                f"{where}: N={n} is not a multiple of 8, so a packed [K, N] row "
+                f"would not start on a 32-bit word (the nibble kernel's unit).")
+
+        raw = numpy_helper.to_array(payload).reshape(-1)
+        want_bytes = (n * k + 1) // 2
+        if raw.size != want_bytes:
+            raise ValueError(
+                f"{where}: B holds {raw.size} bytes, but K={k} x N={n} at two "
+                f"codes per byte is {want_bytes}.")
+        n_groups = k // block
+        if absmax_init.data_type == TensorProto.BFLOAT16:
+            # bf16 IS the top half of an fp32, so widening is exact.
+            bits = np.frombuffer(absmax_init.raw_data, dtype=np.uint16) \
+                if absmax_init.raw_data else \
+                np.asarray(absmax_init.int32_data, dtype=np.uint16)
+            absmax = (bits.astype(np.uint32) << 16).view(np.float32)
+        elif absmax_init.data_type in (TensorProto.FLOAT, TensorProto.FLOAT16):
+            # fp16 -> fp32 is exact as well.
+            absmax = numpy_helper.to_array(absmax_init).astype(np.float32)
+        else:
+            raise ValueError(
+                f"{where}: absmax is "
+                f"{PreQuantizedWeights._dt_name(absmax_init.data_type)}; the op "
+                f"types it as A's float/float16/bfloat16.")
+        absmax = absmax.reshape(-1)
+        if absmax.size != n * n_groups:
+            raise ValueError(
+                f"{where}: absmax has {absmax.size} entries, but N={n} x "
+                f"K/block_size={n_groups} blocks is {n * n_groups}.")
+        PreQuantizedWeights._require_finite(absmax, b_name, "MatMulBnb4 nf4")
+
+        if f"{b_name}_scale" in dag_model.initializers:
+            raise ValueError(
+                f"{where}: the scale table's name '{b_name}_scale' is already "
+                f"an initializer in this graph.")
+
+        codes = PreQuantizedWeights._bnb4_codes_kn(raw, k, n)
+        scale = np.ascontiguousarray(absmax.reshape(n, n_groups).T)
+
+        # Same writer -q nf4 uses, so the payload bytes, the UINT4 + vkop_dtype
+        # declaration and the `<B>_scale` table are one contract by construction.
+        node.op_type = "MatMul"
+        node.attributes = {}
+        node.inputs = node.inputs[:2]
+        node.inputs[1] = {"name": b_name, "shape": [k, n],
+                          "dtype": TensorProto.UINT4, "value_dynamic": False}
+        scale_name = Quantizer._pack_4bit_weight(
+            dag_model, b_name, [node], [k, n], codes, scale, "nf4")
+        done[b_name] = (signature, scale_name)
+
+    @staticmethod
+    def _bnb4_rewire(dag_model, node, b_name, k, n, scale_name, n_groups):
+        """A second MatMulBnb4 over an already-imported payload."""
+        node.op_type = "MatMul"
+        node.attributes = {}
+        node.inputs = [
+            node.inputs[0],
+            {"name": b_name, "shape": [k, n], "dtype": TensorProto.UINT4,
+             "value_dynamic": False},
+            {"name": scale_name, "shape": [n_groups, n]},
+        ]
+
+    @staticmethod
+    def _bnb4_codes_kn(raw, k, n):
+        """bnb's packed [N, K] stream -> the [K, N] grid of NF4 indices.
+
+        The first element of each byte is its HIGH nibble (bitsandbytes'
+        order). The transpose moves each code to its [K, N] slot; the values are
+        untouched, which is the whole point of the import."""
+        raw = np.asarray(raw, dtype=np.uint8)
+        nib = np.empty(raw.size * 2, dtype=np.uint8)
+        nib[0::2] = raw >> 4
+        nib[1::2] = raw & 0x0F
+        return np.ascontiguousarray(nib[: n * k].reshape(n, k).T)
 
     @staticmethod
     def _is_activation_pair(node, producers) -> bool:
@@ -11876,7 +12131,9 @@ class PreQuantizedWeights:
             f"'{payload.name}': a UINT4 payload names itself nf4 in its vkop_dtype "
             f"metadata or nothing does. ONNX's element type records the nibbles' "
             f"storage, not their meaning, and a plain 0..15 grid has no kernel. "
-            f"(metadata: {names})"
+            f"An NF4 checkpoint from bitsandbytes is spelled "
+            f"com.microsoft::MatMulBnb4 (quant_type=1) in ONNX, and that op "
+            f"imports as nf4 directly. (metadata: {names})"
         )
 
     @staticmethod

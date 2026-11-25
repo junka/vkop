@@ -310,6 +310,11 @@ def _downcast_bfloat16(model) -> int:
     count = 0
     init_names = {init.name for init in model.graph.initializer}
     forced_fp32 = _consumer_runs_fp32(model.graph, init_names)
+    # A bf16 MatMulBnb4 absmax becomes the fp32 nf4 scale table
+    # (PreQuantizedWeights._fold_bnb4); rounding it through fp16 first would
+    # make the import lossy, while bf16 -> fp32 is exact.
+    forced_fp32 |= {node.input[2] for node in model.graph.node
+                    if node.op_type == "MatMulBnb4" and len(node.input) > 2}
     widened = 0
     for init in model.graph.initializer:
         if init.data_type != _BFLOAT16:
