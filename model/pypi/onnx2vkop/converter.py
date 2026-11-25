@@ -1205,7 +1205,8 @@ class ModelConverter:
                     exclude=excluded_weights)
             fp16_summary = GraphFp16.apply(
                 dag_model, getattr(args, "target_backend", "buffer"),
-                skip_weights=skip)
+                skip_weights=skip,
+                half=getattr(args, "half_precision", "fp16"))
         elif (args.quant == "fp32"
               and getattr(args, "target_backend", "buffer") == "buffer"):
             # -q fp32 keeps the export's widths, so a node the export already

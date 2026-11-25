@@ -22,8 +22,15 @@ namespace core {
 // The fp16 flag only affects names: an op whose buffer variant is not in the
 // DUAL_FP16_SHADERS list falls back to the non-fp16 key even when fp16 is
 // requested.
+//
+// `bf16` selects the bf16 module instead of the fp16 one. It is a separate
+// argument rather than a third value of `fp16` because `fp16` is threaded
+// through every op's constructor as the "is this graph half-width" flag
+// (Operator::fp16_), and bf16 IS half-width for all of those decisions: the
+// storage width, the two-per-word packing, the dispatch geometry and the
+// 32-bit arithmetic are all fp16's. Only the archive key differs.
 inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
-                                  int fp16) {
+                                  int fp16, bool bf16 = false) {
     using T = vkop::ops::OpType;
     struct Spec {
         const char *image;
@@ -211,7 +218,12 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
     }
     std::string key = backend_buffer ? "buffer_" : "image_";
     key += base;
-    if (fp16 && dual) {
+    if (bf16 && dual) {
+        // The bf16 build is compiled from the identical source with -DFP16
+        // -DBF16 (shaders/common/buffer_common.comp shadows the pack/unpack
+        // built-ins), so it exists exactly where the fp16 one does.
+        key += "_bf16";
+    } else if (fp16 && dual) {
         key += "_fp16";
     }
     return key;

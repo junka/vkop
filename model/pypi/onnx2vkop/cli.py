@@ -395,6 +395,18 @@ Examples:
              "buffer/image only shrinks the file.",
     )
     parser.add_argument(
+        "--half-precision", choices=["fp16", "bf16"], default="fp16",
+        help="Which 16-bit float the FP16 domain writes (see fp16_graph.py). "
+             "fp16 is the default: 5 exponent bits, 11 significand bits. bf16 "
+             "has 8 exponent bits and 7 significand bits -- fp32's RANGE with "
+             "less precision -- for a model whose activations legitimately "
+             "exceed fp16's 65504: MiniMax-H3's hidden states reach ~4200 and a "
+             "14336-wide FFN accumulation crosses the ceiling, which poisons "
+             "the graph with Inf/NaN. Both use the same storage, packing, "
+             "dispatch geometry and 32-bit arithmetic, so this only changes "
+             "which shader module the ops resolve to (<key>_bf16).",
+    )
+    parser.add_argument(
         "--extra-shaders", metavar="A,B,C", default=None,
         help="Comma-separated op types whose kernels belong in the embedded "
              "archive and kernel_plans even though the graph has no such node "
@@ -660,7 +672,8 @@ def main():
             def __init__(self, quant, unify, rgba, group_size, awq_format,
                          awq_stats, awq_alpha, awq_grid, exclude_nodes,
                          exclude_scopes, exclude_downstream_of, w8a8,
-                         keep_bf16, emit_ort_onnx, ort_keep_dtype):
+                         keep_bf16, emit_ort_onnx, ort_keep_dtype,
+                         half_precision="fp16", target_backend="auto"):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
@@ -676,6 +689,13 @@ def main():
                 self.keep_bf16 = keep_bf16
                 self.emit_ort_onnx = emit_ort_onnx
                 self.ort_keep_dtype = ort_keep_dtype
+                # The FP16 domain's target width (fp16_graph.py) and the
+                # backend whose shader names this artifact embeds. Both are
+                # plain attributes read with getattr() downstream; a knob that
+                # is NOT forwarded here silently takes its default, which is
+                # how --half-precision bf16 produced a float16 artifact.
+                self.half_precision = half_precision
+                self.target_backend = target_backend
 
         converter.apply_optimizations(
             dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
@@ -684,7 +704,9 @@ def main():
                             args.exclude_scopes,
                             args.exclude_downstream_of, args.w8a8,
                             args.keep_bf16, args.emit_ort_onnx,
-                            args.ort_keep_dtype))
+                            args.ort_keep_dtype,
+                            getattr(args, "half_precision", "fp16"),
+                            getattr(args, "target_backend", "auto")))
 
         # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can
         # neither create nor remove them: the extra census is set after the

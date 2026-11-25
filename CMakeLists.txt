@@ -399,6 +399,34 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
         COMMENT "Compiling ${DUAL_NAME} (fp16) to SPIR-V"
     )
     list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_FP16})
+
+    # The bf16 build: the same 16-bit storage and 32-bit arithmetic, with
+    # bf16's 8-bit exponent instead of fp16's 5. It exists because a model
+    # whose activations legitimately exceed fp16's 65504 (MiniMax-H3's do:
+    # hidden states ~4200, and a 14336-wide accumulation crosses the ceiling)
+    # otherwise has no half-width storage at all. See the BF16 block in
+    # shaders/common/buffer_common.comp -- it shadows the two pack/unpack
+    # built-ins, so this is one define over the identical source, not a second
+    # kernel.
+    #
+    # buffer/gather is excluded: its bf16 build is a DIFFERENT thing, keyed
+    # `buffer_gather_bf16` / `buffer_gather_bf16_fp16` further down this file
+    # with -DBF16_TABLE (a bf16 TABLE read as raw words, output in the
+    # activation dtype). Compiling it again here with -DFP16 -DBF16 would
+    # produce the same archive name, and that name already means the table
+    # role -- `spv_to_archive` refuses the duplicate entry.
+    if(NOT DUAL_NAME STREQUAL "buffer/gather")
+    set(SPIRV_FILE_BF16 ${SPIRV_DIR}/${DUAL_BASE}_bf16.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_BF16}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/${DUAL_NAME}.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_BF16} -DFP16 -DBF16
+        DEPENDS ${SHADER_DIR}/${DUAL_NAME}.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling ${DUAL_NAME} (bf16) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_BF16})
+    endif()
 endforeach()
 
 # A second fp16 build of buffer/matmul.comp, entered through that file's
@@ -1082,6 +1110,13 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     list(APPEND ARCHIVE_ARGS
          --spv ${DUAL_BASE}_fp16:${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
     list(APPEND ARCHIVE_DEPS ${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
+    # Same exclusion as the compile loop above: gather's bf16 module is the
+    # -DBF16_TABLE table build, archived under its own name later.
+    if(NOT DUAL_NAME STREQUAL "buffer/gather")
+    list(APPEND ARCHIVE_ARGS
+         --spv ${DUAL_BASE}_bf16:${SPIRV_DIR}/${DUAL_BASE}_bf16.spv)
+    list(APPEND ARCHIVE_DEPS ${SPIRV_DIR}/${DUAL_BASE}_bf16.spv)
+    endif()
 endforeach()
 # The -DW8_WIDE build above is neither its own .comp nor a DUAL_FP16_SHADERS
 # entry (it is a second define over buffer/matmul.comp), so neither loop picks it

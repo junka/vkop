@@ -62,6 +62,12 @@ except ImportError:  # run as a flat script from inside onnx2vkop/, as converter
 
 _FLOAT = onnx.TensorProto.FLOAT
 _FLOAT16 = onnx.TensorProto.FLOAT16
+# The other half-width float. Same 16-bit storage and 32-bit arithmetic as
+# fp16, but 8 exponent bits instead of 5: fp32's range, ~3 significant decimal
+# digits. MiniMax-H3 needs it because its activations legitimately exceed
+# fp16's 65504 (hidden states reach ~4200 and a 14336-wide FFN accumulation
+# crosses the ceiling).
+_BFLOAT16 = onnx.TensorProto.BFLOAT16
 _DOUBLE = onnx.TensorProto.DOUBLE
 _FLOAT_FAMILY = (_FLOAT, _FLOAT16, _DOUBLE)
 
@@ -168,7 +174,8 @@ class GraphFp16:
             dtype = entry.get("dtype")
             if name is None or dtype is None:
                 continue
-            elem = {"float32": _FLOAT, "float16": _FLOAT16}.get(dtype)
+            elem = {"float32": _FLOAT, "float16": _FLOAT16,
+                    "bfloat16": _BFLOAT16}.get(dtype)
             if elem is None and isinstance(dtype, int):
                 elem = dtype
             note(name, elem if elem is not None else 0,
@@ -561,7 +568,8 @@ class GraphFp16:
 
     @staticmethod
     def apply(dag_model, target_backend: str = "buffer",
-              verbose: bool = True, skip_weights=None) -> dict:
+              verbose: bool = True, skip_weights=None,
+              half: str = "fp16") -> dict:
         """Declare and store the FP16 domain; returns what it did.
 
         `skip_weights` names initializers whose BYTES must not be rewritten
@@ -613,13 +621,25 @@ class GraphFp16:
             for node_name, why in sorted(plan["blockers"].items()):
                 print(f"[fp16-domain] stays FP32: {node_name}: {why}")
 
+        # The half-width target: fp16 by default, bf16 when the caller asked
+        # for the wider exponent (see _BFLOAT16). Everything downstream --
+        # the archive keys, the loader's ElemKind, the panel's shader builds --
+        # follows from the dtype this writes.
+        # A name in the domain is rewritten FROM the exported width, which is
+        # always FLOAT -- a slot already spelled bfloat16 or float16 was put
+        # there by an earlier decision (an op that must stay wide, a Cast's
+        # `to` attribute) and is not this pass's to change. Widening every
+        # _FLOAT here would have rewritten a Cast(to=fp32) output to bf16,
+        # i.e. silently inverted the boundary it exists to provide.
+        half_elem = _BFLOAT16 if half == "bf16" else _FLOAT16
+        half_name = "bfloat16" if half == "bf16" else "float16"
         for name in plan["domain"]:
             for slot, key in plan["decls"][name]["slots"]:
                 if slot.get(key) == _FLOAT:
-                    slot[key] = _FLOAT16
+                    slot[key] = half_elem
                     summary["declared"] += 1
                 elif slot.get(key) == "float32":
-                    slot[key] = "float16"
+                    slot[key] = half_name
                     summary["declared"] += 1
 
         deferred = getattr(dag_model, "deferred_weights", {}) or {}

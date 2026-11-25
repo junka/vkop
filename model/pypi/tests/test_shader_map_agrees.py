@@ -372,10 +372,13 @@ def _parse_fp16_dispatch_switch(path: str) -> set:
     """{OpType enum} whose fp16 build is chosen from the tensor dtype.
 
     The switch's fall-through groups each end in a return; a group is
-    dtype-driven when the statement that produced it reads
-    `typeid(uint16_t)` off a tensor and not when it hands back `precision`.
-    Comment lines are skipped because the explanations in that switch talk
-    about fp16 without deciding anything.
+    dtype-driven when the statement that produced it reads the tensor's
+    storage (`typeid(uint16_t)`) and not when it hands back `precision`.
+    Reading it through `half_width_kind()` counts too: that helper is the same
+    query one level down, made to distinguish fp16 from bf16 -- both ride
+    uint16_t storage, so its body is `dtype() == typeid(uint16_t)` plus an
+    `elem_kind()` discriminator. Comment lines are skipped because the
+    explanations in that switch talk about fp16 without deciding anything.
     """
     with open(path) as f:
         text = f.read()
@@ -383,8 +386,11 @@ def _parse_fp16_dispatch_switch(path: str) -> set:
     assert m, "could not locate op_shader_fp16 in core/runtime.cpp"
     driven, pending, chunk = set(), [], []
 
+    def reads_the_dtype(line: str) -> bool:
+        return "typeid(uint16_t)" in line or "half_width_kind(" in line
+
     def flush():
-        if pending and any("typeid(uint16_t)" in line for line in chunk):
+        if pending and any(reads_the_dtype(line) for line in chunk):
             driven.update(pending)
         del pending[:]
         del chunk[:]

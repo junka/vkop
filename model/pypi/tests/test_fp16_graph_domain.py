@@ -513,3 +513,36 @@ def test_a_variance_chain_behind_an_fp32_cast_gets_no_second_cast():
     assert [c.name for c in casts] == ["up"]
     assert dtype_of(m, "x") == F
     assert m.nodes["sq"].inputs[0]["name"] == "x"
+
+
+# ------------------------------------------------------- bf16 as the half --
+def test_bf16_writes_a_bfloat16_domain():
+    """--half-precision bf16 writes BFLOAT16 declarations instead of FLOAT16.
+
+    Same storage width, packing and arithmetic as fp16; 8 exponent bits instead
+    of 5. That is what a graph whose activations exceed fp16's 65504 needs, and
+    the checkpoint itself is bf16 (626 of MiniMax-H3's 638 tensors).
+    """
+    from onnx2vkop.fp16_graph import _BFLOAT16
+
+    nodes = [
+        node("Mul", "m", ["x", "w"], ["y"]),
+    ]
+    m = build(nodes, inputs=["x"], outputs=["y"],
+              initializers={"w": numpy.ones(4, dtype=numpy.float32)})
+    with contextlib.redirect_stdout(io.StringIO()):
+        GraphFp16.apply(m, "buffer", half="bf16")
+
+    assert dtype_of(m, "y") == _BFLOAT16, dtype_of(m, "y")
+    assert dtype_of(m, "x") == _BFLOAT16, dtype_of(m, "x")
+    print("  PASS (bf16 writes BFLOAT16 declarations)")
+
+
+def test_bf16_is_not_the_default():
+    """The default stays fp16: bf16 trades precision for range, and a model
+    that fits fp16 should not pay for the trade."""
+    nodes = [node("Mul", "m", ["x", "w"], ["y"])]
+    m = build(nodes, inputs=["x"], outputs=["y"],
+              initializers={"w": numpy.ones(4, dtype=numpy.float32)})
+    apply(m)
+    assert dtype_of(m, "y") == F16, dtype_of(m, "y")

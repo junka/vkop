@@ -61,6 +61,11 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind) {
     case ElemKind::kFloat32:
         return storage == typeid(float);
     case ElemKind::kFloat16:
+    // bf16 rides a uint16_t container -- the same one as fp16, which is why
+    // the kind (not the storage) is what a kernel must branch on: fp16 and
+    // bf16 share storage, packing and arithmetic and differ only in bit layout
+    // (see the BF16 block in shaders/common/buffer_common.comp).
+    case ElemKind::kBFloat16:
         return storage == typeid(uint16_t);
     case ElemKind::kInt8:
         return storage == typeid(int8_t);
@@ -74,10 +79,6 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind) {
         return storage == typeid(int32_t);
     case ElemKind::kInt64:
         return storage == typeid(int64_t);
-    // bf16 rides a uint16_t container -- the same one as fp16, which is why
-    // the kind (not the storage) is what a kernel must branch on.
-    case ElemKind::kBFloat16:
-        return storage == typeid(uint16_t);
     case ElemKind::kInvalid:
     case ElemKind::kUint8:
     // No C++ type means "one fp8 value", so these ride an int8_t container the

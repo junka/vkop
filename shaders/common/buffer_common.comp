@@ -44,6 +44,50 @@
 #define FLOAT4  vec4
 #endif
 
+// ---- bfloat16 as a drop-in replacement for fp16 storage ------------------
+//
+// A bf16 build is the FP16 build with a different 16-bit float in the same
+// two-per-word slots: same packing, same strides, same dispatch geometry, same
+// arithmetic -- 16-bit storage and 32-bit compute, exactly like fp16. Only the
+// bit layout differs, so this shadows the two built-ins the whole shader tree
+// already calls rather than teaching 371 call sites a second format.
+//
+// Why it is worth the second format: fp16's five exponent bits cap it at
+// 65504, and MiniMax-H3 overflows that. Its hidden states reach ~4200 and a
+// 14336-wide FFN accumulation crosses the ceiling on a handful of elements,
+// which then poison the whole graph (measured: `MatMul_5969 out ne=860160
+// inf=4` at seq=160, and NaN in the output while the fp32 artifact on the same
+// weights and shape is finite). bf16 spends the mantissa instead of the
+// exponent -- 8 exponent bits, fp32's range, ~3 decimal digits of precision --
+// which is what the checkpoint itself uses (626 of its 638 tensors are bf16).
+//
+// Rounding: round-to-nearest-even on the 16 dropped mantissa bits. Truncation
+// would be one instruction cheaper and biased, and the converter's own bf16
+// path (converter._bf16_bytes_to_fp32) is used only in the widening direction,
+// so this is the only place a rounding choice is made.
+//
+// Inf/NaN survive the round trip: 0x7F80/0x7FC0 in and out, because the
+// exponent field is copied verbatim and only the mantissa is rounded.
+#ifdef BF16
+uint bf16_bits(float v) {
+    uint u = floatBitsToUint(v);
+    // NaN must stay NaN rather than round its mantissa into the exponent.
+    if ((u & 0x7F800000u) == 0x7F800000u) return u >> 16;
+    uint lsb = (u >> 16) & 1u;
+    return (u + 0x7FFFu + lsb) >> 16;
+}
+float bf16_to_float(uint h) { return uintBitsToFloat(h << 16); }
+vec2 unpackBf16x2(uint w) {
+    return vec2(bf16_to_float(w & 0xFFFFu), bf16_to_float(w >> 16));
+}
+uint packBf16x2(vec2 v) {
+    return (bf16_bits(v.x) & 0xFFFFu) | (bf16_bits(v.y) << 16);
+}
+#define unpackHalf2x16(w) unpackBf16x2(w)
+#define packHalf2x16(v)   packBf16x2(v)
+#endif
+
+
 // 8-int struct used for dims/coords in push constants and local helpers.
 struct IArr8 { int v[8]; };
 

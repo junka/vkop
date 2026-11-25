@@ -30,6 +30,11 @@ namespace core {
 // `data_input` is the node's first input (nullptr when it has none);
 // `output` is its first output (only FUSED_ELEMWISE reads it). Ops not listed
 // in the table keep `precision`.
+//
+// Returns 0 for fp32, 1 for fp16 and 2 for bf16. bf16 is a third value rather
+// than a separate query because it is the same decision -- the width of the
+// graph's activations -- and every caller either compares against 0 or uses
+// the value to pick an archive key.
 int op_shader_fp16(ops::OpType type, const ITensor *data_input,
                    const ITensor *output, int precision);
 

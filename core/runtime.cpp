@@ -33,7 +33,7 @@ std::atomic<int> ops::Operator::instance_count_{0};
 std::atomic<long> ops::Operator::replay_total_hits_{0};
 namespace core {
 
-// v1 bfloat16 scope: which (op, input slot) pairs have a bf16 read. A bf16
+// v1 bfloat16 WEIGHT scope: which (op, input slot) pairs have a bf16 read. A bf16
 // tensor is a constant weight, and only three kernels decode it: the buffer
 // MatMul's and Gemm's B (input 1, see para_.bf16 / gemm.comp fp16b == 2) and
 // Gather's table (input 0, gather.comp -DBF16_TABLE). Every other op treats a
@@ -51,16 +51,42 @@ bool bf16_consumer_ok(ops::OpType type, size_t input_index) {
     }
 }
 
+// The half-width family a tensor's storage stands for: 1 for fp16, 2 for bf16,
+// 0 for anything else. Both occupy uint16_t storage, so `dtype()` alone cannot
+// tell them apart -- elem_kind() is the discriminator, and it is what the
+// loader sets from the file's dtype string.
+//
+// This is the ACTIVATION-side query and is orthogonal to bf16_consumer_ok
+// above, which whitelists the weight slots that decode bf16 bytes. A graph may
+// carry bf16 activations (--half-precision bf16) whose every half-width op has
+// a _bf16 build; LoadModel's consumer check is what still refuses a bf16
+// WEIGHT reaching a kernel that would read it as fp16.
+int half_width_kind(const ITensor *t) {
+    if (t == nullptr || t->dtype() != typeid(uint16_t)) {
+        return 0;
+    }
+    return t->elem_kind() == core::ElemKind::kBFloat16 ? 2 : 1;
+}
+
 int op_shader_fp16(ops::OpType type, const ITensor *data_input,
                    const ITensor *output, int precision) {
     if (data_input == nullptr) {
         return precision;
     }
-    // A bfloat16 data input is a constant weight (Gather's embedding table):
-    // its uint16_t container is NOT an fp16 activation, so the build follows
-    // the output -- the activation dtype the converter recorded.
+    // bf16 shows up in two roles and they resolve differently:
+    //
+    //  * as a WEIGHT -- Gather's embedding table, a MatMul/Gemm's B. The
+    //    storage is bf16 but it is not the activation width, so the build
+    //    follows the OUTPUT's dtype: an fp16/fp32 build that decodes the
+    //    table itself (gather.comp's -DBF16_TABLE, para_.bf16).
+    //  * as an ACTIVATION (--half-precision bf16). Then the output is bf16
+    //    too, and the build is the _bf16 module (2).
+    //
+    // half_width_kind(output) says both: 1/0 for the weight role exactly as
+    // before (a loader-created activation output defaults to kFloat16), and 2
+    // only when the output really is a bf16 activation.
     if (data_input->elem_kind() == ElemKind::kBFloat16 && output != nullptr) {
-        return output->dtype() == typeid(uint16_t) ? 1 : 0;
+        return half_width_kind(output);
     }
     switch (type) {
     case ops::OpType::MATMUL:
@@ -71,7 +97,7 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
         if (data_input->dtype() == typeid(int8_t) && output != nullptr) {
             return output->dtype() == typeid(uint16_t) ? 1 : 0;
         }
-        return data_input->dtype() == typeid(uint16_t) ? 1 : 0;
+        return half_width_kind(data_input);
     case ops::OpType::ADD:
     case ops::OpType::SUB:
     case ops::OpType::MUL:
@@ -126,20 +152,17 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
         // constant's thread count follows the same choice, so a precision_ that
         // disagrees with the tensor is an out-of-bounds write, not just bad
         // numbers.
-        return (data_input->dtype() == typeid(uint16_t)) ? 1 : 0;
+        return half_width_kind(data_input);
     case ops::OpType::ATTENTION:
         // Q/K/V share one dtype (fp16 on the LLM path, fp32 in tests); the
         // build follows input[0] (Q) like RMSNorm.
-        return (data_input->dtype() == typeid(uint16_t)) ? 1 : 0;
+        return half_width_kind(data_input);
     case ops::OpType::FUSED_ELEMWISE:
         // Fusion across Cast: the chain's leaf inputs may be mixed fp16/fp32
         // (a Cast crosses dtype inside the chain). The build dtype follows the
         // OUTPUT (terminal) dtype, not input[0], so the output packing matches
         // the terminal.
-        if (output != nullptr && output->dtype() == typeid(uint16_t)) {
-            return 1;
-        }
-        return 0;
+        return half_width_kind(output);
     default:
         return precision;
     }
@@ -447,7 +470,21 @@ Runtime::kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
         const auto &p = kernel_plans_[n.plan_index];
         if (!p.empty() && (p.op_type.empty() || p.op_type == n.op_type)) {
             *plan = &p;
-            return p.key(backend_buffer_, op_fp16);
+            // op_fp16 == 2 is bf16: the plan's _fp16 cell names the module,
+            // and the bf16 build of that module carries the _bf16 suffix (the
+            // archive holds both, see the DUAL_FP16_SHADERS loop in
+            // CMakeLists.txt).
+            std::string k = p.key(backend_buffer_, op_fp16 == 2 ? 1 : op_fp16);
+            if (op_fp16 == 2 && !k.empty()) {
+                static const std::string fp16_suffix = "_fp16";
+                if (k.size() > fp16_suffix.size() &&
+                    k.compare(k.size() - fp16_suffix.size(),
+                              fp16_suffix.size(), fp16_suffix) == 0) {
+                    k.replace(k.size() - fp16_suffix.size(),
+                              fp16_suffix.size(), "_bf16");
+                }
+            }
+            return k;
         }
         std::fprintf(stderr,
                      "[load] node %s (op_type=%s) points at kernel plan %d "
@@ -455,7 +492,8 @@ Runtime::kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
                      n.name.c_str(), n.op_type.c_str(), n.plan_index,
                      p.empty() ? "no op" : p.op_type.c_str());
     }
-    return shader_key_for(type, backend_buffer_, op_fp16);
+    return shader_key_for(type, backend_buffer_,
+                          op_fp16 == 2 ? 1 : op_fp16, op_fp16 == 2);
 }
 
 void Runtime::LoadModel() {
