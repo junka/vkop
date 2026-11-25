@@ -93,6 +93,29 @@ _STATE_NAME_PREFIXES = ("conv_state", "recurrent_state")
 # follows the terminal OUTPUT, not input[0] (core/runtime.cpp's op_shader_fp16).
 _MIXED_WIDTH_OPS = {"FusedElemwise"}
 
+# The RMSNorm variance chain, held in FP32 while everything around it is half.
+#
+#     Pow(x, 2) -> Reduce -> Sqrt        (ONNX: ReduceMean -> Add(eps) -> Sqrt)
+#
+# Only Pow's OUTPUT is a problem, and it is a range problem, not a precision
+# one: x**2 on a hidden state whose own magnitude is ~890 is ~7.9e5, past
+# fp16's 65504, so the packed store saturates to +Inf and every downstream
+# value becomes NaN. Measured on MiniMax-H3's denoiser at seq=160
+# (VKOP_NAN_SCAN=1): "FIRST NaN/Inf at Pow_5416, in[0] min=-889.5 max=462.5,
+# out=7c00". fp32 holds it trivially and Sqrt brings the value back to the
+# normal range, so the chain's consumers can be half again.
+#
+# The shape is the one the LOWERED graph has, not the exported one: the
+# optimizer turns ReduceMean into Reduce and folds Add(eps)+Sqrt into one
+# FusedElemwise (measured: Pow -> Reduce -> FusedElemwise -> Transpose|MatMul).
+# Matching on the exported spelling silently found zero chains.
+#
+# This is deliberately NOT a general "keep wide values wide" heuristic -- the
+# statistic only covers the square, because that is the one place a graph
+# squares a raw activation. Any other op that overflows fp16 has to be named
+# here with its own measured bound.
+_VARIANCE_CHAIN = ("Pow", "Reduce", "FusedElemwise")
+
 # Largest finite half. Past this a value rounds to Inf, and the fp16 kernels
 # have no saturation path -- the reference exporter does the same and calls it
 # a lossy conversion.
@@ -268,6 +291,59 @@ class GraphFp16:
                     "dtype" if node.op_type in shader_map._FP16_DTYPE_DRIVEN
                     else f"{node.op_type}: no dual FP16 buffer build")
                 force(group, blockers[node.name])
+
+        # The RMSNorm variance chain: Pow(x,2) overflows fp16 before the mean
+        # brings it back down (see _VARIANCE_CHAIN). Force the chain's OUTPUTS
+        # wide, and leave the propagation queue alone so the ops on either
+        # side keep the domain -- the square alone is what does not fit.
+        consumers_of: Dict[str, List[str]] = {}
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                consumers_of.setdefault(inp.get("name"), []).append(node.name)
+        for node in dag_model.nodes.values():
+            if node.op_type != "Pow":
+                continue
+            chain = [node]
+            while len(chain) < len(_VARIANCE_CHAIN):
+                outs = {o.get("name") for o in chain[-1].outputs}
+                nxt = [dag_model.nodes[nm] for nm in
+                       consumers_of.get(next(iter(outs), ""), [])]
+                if len(nxt) != 1:
+                    break
+                chain.append(nxt[0])
+            ops = tuple(n.op_type for n in chain)
+            if ops != _VARIANCE_CHAIN:
+                continue
+            # Pow reads a half activation and writes a squared value that does
+            # not fit in half: one op cannot straddle the two widths, so its
+            # INPUT has to be wide as well. Only the Pow's own inputs -- the
+            # tensors feeding the norm from outside stay in the domain, which
+            # is the difference between widening a chain and widening a graph.
+            # Only the values that carry the squared magnitude: Pow's output,
+            # the reduction over it, and the input to the square. The chain's
+            # LAST node writes the normalised result, which Sqrt has already
+            # brought back to the hidden state's own range -- holding it wide
+            # would push the fp32 boundary into every consumer instead of
+            # ending it here.
+            for n in chain[:-1]:
+                for o in n.outputs:
+                    name = o.get("name")
+                    if name in candidates and name not in forced:
+                        forced.add(name)
+                        reasons.setdefault(
+                            name,
+                            "RMSNorm variance chain: x**2 overflows fp16")
+            for i in chain[0].inputs:
+                name = i.get("name")
+                if name in candidates and name not in forced:
+                    forced.add(name)
+                    reasons.setdefault(
+                        name,
+                        "RMSNorm variance chain: input of x**2, which "
+                        "overflows fp16")
+            blockers.setdefault(
+                node.name,
+                "RMSNorm variance chain: x**2 overflows fp16 (held FP32)")
 
         # Ops whose operands are independent widths: a forced input says
         # nothing about the others, so it must not propagate.

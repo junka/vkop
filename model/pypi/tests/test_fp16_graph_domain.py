@@ -394,3 +394,62 @@ def test_the_parser_records_what_the_pass_reads():
         assert m.initializers["W"].data_type == F16
         assert m.initializers["b"].data_type == F16
         assert m.inputs[0]["dtype"] == "float16"
+
+
+# ------------------------------------------ the RMSNorm variance chain is FP32 --
+def test_rmsnorm_variance_chain_stays_fp32():
+    """`Pow(x, 2)` overflows fp16 on its own, so its result must be stored wide.
+
+    fp16's largest finite value is 65504, and a hidden state whose magnitude is
+    ~890 squares to ~7.9e5. Measured on MiniMax-H3's denoiser at seq=160
+    (VKOP_NAN_SCAN=1): the packed store saturated to +Inf and every downstream
+    value became NaN, which is why an all-fp16 artifact produced NaN output at
+    geometries an fp32 one handled.
+
+    The chain is matched in the LOWERED spelling (Pow -> Reduce ->
+    FusedElemwise: the optimizer turns ReduceMean into Reduce and folds
+    Add(eps)+Sqrt together), not the exported one -- matching on the export's
+    Pow -> ReduceMean -> Add -> Sqrt found zero chains and silently left the
+    square in fp16.
+    """
+    nodes = [
+        node("Pow", "sq", ["x", "two"], ["xsq"]),
+        node("Reduce", "mean", ["xsq"], ["var"]),
+        node("FusedElemwise", "rsqrt", ["var"], ["normed"]),
+        node("Mul", "scale", ["normed", "w"], ["y"]),
+    ]
+    m = build(nodes, inputs=["x"], outputs=["y"],
+              initializers={"two": numpy.asarray(2.0, dtype=numpy.float32),
+                            "w": numpy.ones(4, dtype=numpy.float32)})
+    # x is a graph input; the chain's four tensors are what the rule must hold.
+    apply(m)
+
+    # The square, the reduction over it, and the square's own input stay wide
+    # (one op cannot straddle two widths)...
+    assert dtype_of(m, "xsq") == F, dtype_of(m, "xsq")
+    assert dtype_of(m, "var") == F, dtype_of(m, "var")
+    assert dtype_of(m, "x") == F, dtype_of(m, "x")
+    # ...while Sqrt's result, already back in the hidden state's range, and
+    # everything downstream of it flip.
+    assert dtype_of(m, "normed") == F16, dtype_of(m, "normed")
+    assert dtype_of(m, "y") == F16, dtype_of(m, "y")
+    print("  PASS (Pow(x,2)/Reduce/normalize held FP32, the rest goes fp16)")
+
+
+def test_a_lone_pow_is_not_the_variance_chain():
+    """`Pow(x, 2)` outside a norm is an ordinary elementwise op and must flip.
+
+    The rule is a recognised pattern, not "any Pow goes wide": a graph that
+    squares for a scale factor has no overflow (its input is already in range)
+    and holding it FP32 would cost domain coverage for nothing.
+    """
+    nodes = [
+        node("Pow", "sq", ["x", "two"], ["xsq"]),
+        node("Mul", "m", ["xsq", "w"], ["y"]),
+    ]
+    m = build(nodes, inputs=["x"], outputs=["y"],
+              initializers={"two": numpy.asarray(2.0, dtype=numpy.float32),
+                            "w": numpy.ones(4, dtype=numpy.float32)})
+    apply(m)
+    assert dtype_of(m, "xsq") == F16, dtype_of(m, "xsq")
+    print("  PASS (a Pow that is not a variance chain still flips)")
