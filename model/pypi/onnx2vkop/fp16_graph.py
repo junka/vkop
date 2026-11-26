@@ -56,9 +56,11 @@ from onnx import numpy_helper
 try:
     from . import shader_map
     from . import numeric_audit
+    from . import bf16_weights
 except ImportError:  # run as a flat script from inside onnx2vkop/, as converter.py supports
     import shader_map
     import numeric_audit
+    import bf16_weights
 
 _FLOAT = onnx.TensorProto.FLOAT
 _FLOAT16 = onnx.TensorProto.FLOAT16
@@ -193,7 +195,7 @@ class GraphFp16:
         return decls
 
     @staticmethod
-    def plan(dag_model) -> dict:
+    def plan(dag_model, half: str = "fp16") -> dict:
         """{domain, forced, reasons, blockers, conflicts} for this DAG.
 
         Computes, writes nothing. `blockers` maps a node name to why it cannot
@@ -339,7 +341,7 @@ class GraphFp16:
 
         domain = candidates - forced
         GraphFp16._widen_variance_chains(dag_model, candidates, forced,
-                                         reasons, blockers)
+                                         reasons, blockers, half)
         domain = candidates - forced
         return {"decls": decls, "domain": domain, "forced": forced,
                 "reasons": reasons, "blockers": blockers,
@@ -406,7 +408,7 @@ class GraphFp16:
 
     @staticmethod
     def _widen_variance_chains(dag_model, candidates, forced, reasons,
-                               blockers) -> int:
+                               blockers, half: str = "fp16") -> int:
         """Run each RMSNorm variance chain in FP32 behind a Cast, in place.
 
             x(fp16) -> Cast(to=fp32) -> Pow -> Reduce -> FusedElemwise -> ...
@@ -426,6 +428,7 @@ class GraphFp16:
 
         Returns the number of chains widened.
         """
+        half_elem = _BFLOAT16 if half == "bf16" else _FLOAT16
         consumers_of: Dict[str, List[str]] = {}
         producer_of: Dict[str, str] = {}
         for node in dag_model.nodes.values():
@@ -461,17 +464,23 @@ class GraphFp16:
             cast = type(node)(
                 "Cast", src + "__to_fp32",
                 {"to": _FLOAT},
-                [dict(node.inputs[0], dtype=_FLOAT16)],
+                [dict(node.inputs[0], dtype=half_elem)],
                 [{"name": wide, "shape": node.inputs[0].get("shape"),
                   "dtype": _FLOAT}])
             dag_model.nodes[cast.name] = cast
             node.inputs[0]["name"] = wide
             node.inputs[0]["dtype"] = _FLOAT
-            # The Cast's input must be declared half so the boundary is real.
+            # The Cast's input must be declared at the graph's own half width
+            # so the boundary is real -- bf16 under --half-precision bf16.
+            # Writing FLOAT16 here unconditionally gave one tensor two
+            # declarations (the producer said bfloat16, this Cast said
+            # float16), and the loader took the Cast's side: measured as an Add
+            # whose inputs were bf16 and whose declared output was float16,
+            # resolved to buffer_add_fp16 while its bytes were bfloat16.
             if producer is not None:
                 for out in producer.outputs:
                     if out.get("name") == src:
-                        out["dtype"] = _FLOAT16
+                        out["dtype"] = half_elem
             # Everything Pow and Reduce write is wide: they are the two ops
             # that carry the squared magnitude, and a node cannot straddle the
             # two widths. The chain's last node (the fused Add+Sqrt) writes the
@@ -601,7 +610,7 @@ class GraphFp16:
                       "is nothing to declare here.")
             return summary
 
-        plan = GraphFp16.plan(dag_model)
+        plan = GraphFp16.plan(dag_model, half)
         (summary["domain"], summary["forced"], summary["blockers"],
          summary["conflicts"]) = (plan["domain"], plan["forced"],
                                   plan["blockers"], plan["conflicts"])
@@ -664,6 +673,21 @@ class GraphFp16:
                 peak = float(np.abs(arr).max())
                 if peak > _FP16_MAX:
                     summary["out_of_range"].append((name, peak))
+            if half == "bf16":
+                # REAL bf16 payload bits, not float16 bytes under a bf16
+                # declaration. The declaration alone is not enough: the loader
+                # keys on the initializer's own dtype string, and a bf16 tensor
+                # declared bf16 but holding fp16 bytes decodes as noise. (The
+                # merge left exactly that shape behind -- declared BFLOAT16,
+                # still wrote float16 -- which is why this branch exists.)
+                bits = np.ascontiguousarray(
+                    bf16_weights.fp32_to_bf16_bits(arr).astype(np.uint16))
+                packed = numpy_helper.from_array(bits, name)
+                packed.data_type = _BFLOAT16
+                dag_model.initializers[name] = packed
+                summary["bytes_after"] += len(packed.raw_data)
+                summary["converted"] += 1
+                continue
             with np.errstate(over="ignore"):
                 # Past 65504 a value saturates to Inf. numpy would warn, and
                 # the report above already names the tensor: this is the

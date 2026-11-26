@@ -6,6 +6,7 @@
 #endif
 
 #include "../common/subgroup_reduce.comp"
+#include "../common/bf16.comp"
 
 // RMSNorm SSBO op. Normalizes over the last `inner_size` elements (the
 // trailing dims, e.g. head_dim). One workgroup per outer slice. Reduce of
@@ -65,10 +66,30 @@ layout(push_constant) uniform PC_RMSN {
 shared float s_sumsq[256];
 
 #ifdef FP16
-// half2 load/store helpers (packed in uint words).
-float unpack_lo(uint w) { return unpackHalf2x16(w).x; }
-float unpack_hi(uint w) { return unpackHalf2x16(w).y; }
-uint pack2(float lo, float hi) { return packHalf2x16(vec2(lo, hi)); }
+// half2 load/store helpers (packed in uint words). Both 16-bit float formats
+// share this packing, so -DBF16 only swaps WHICH two-to-float decode runs;
+// every index computation above stays valid (see common/bf16.comp).
+float unpack_lo(uint w) {
+#ifdef BF16
+    return unpackBF16x2(w).x;
+#else
+    return unpackHalf2x16(w).x;
+#endif
+}
+float unpack_hi(uint w) {
+#ifdef BF16
+    return unpackBF16x2(w).y;
+#else
+    return unpackHalf2x16(w).y;
+#endif
+}
+uint pack2(float lo, float hi) {
+#ifdef BF16
+    return packBF16x2(vec2(lo, hi));
+#else
+    return packHalf2x16(vec2(lo, hi));
+#endif
+}
 #endif
 
 void main() {

@@ -1,6 +1,29 @@
 #version 450 core
 #extension GL_EXT_control_flow_attributes : enable
 
+// This kernel has no common header: its fp16 decode is inlined at every load
+// site. The helpers below are that decode in ONE place so -DBF16 can swap it
+// wholesale -- both 16-bit float formats use the same two-per-word packing, so
+// only the two-to-float step differs (see common/bf16.comp).
+#include "../common/bf16.comp"
+
+#if defined(FP16)
+vec2 dec2(uint w) {
+#ifdef BF16
+    return unpackBF16x2(w);
+#else
+    return unpackHalf2x16(w);
+#endif
+}
+uint enc2(vec2 v) {
+#ifdef BF16
+    return packBF16x2(v);
+#else
+    return packHalf2x16(v);
+#endif
+}
+#endif
+
 // Tiled ("flash") fused Attention for MANY query rows (prefill, ViT towers,
 // DiT blocks). Same op, bindings and push constant as attention.comp; the host
 // (ops/Attention.hpp, AttentionBuffer::flash_route) routes here only when the
@@ -328,16 +351,16 @@ void main() {
                 uvec4 qa3 = sQ[(ty * 4 + 3) * 2 + kq];
                 [[unroll]] for (int k4 = 0; k4 < 4; ++k4) {
                     int kt = kq * 4 + k4;
-                    vec2 a0 = unpackHalf2x16(qa0[k4]);
-                    vec2 a1 = unpackHalf2x16(qa1[k4]);
-                    vec2 a2 = unpackHalf2x16(qa2[k4]);
-                    vec2 a3 = unpackHalf2x16(qa3[k4]);
+                    vec2 a0 = dec2(qa0[k4]);
+                    vec2 a1 = dec2(qa1[k4]);
+                    vec2 a2 = dec2(qa2[k4]);
+                    vec2 a3 = dec2(qa3[k4]);
                     uvec2 kb01 = sKt[(kt * KT_PITCH + 2 * tx) >> 1];
                     uvec2 kb23 = sKt[(kt * KT_PITCH + 32 + 2 * tx) >> 1];
-                    vec2 b0 = unpackHalf2x16(kb01.x);
-                    vec2 b1 = unpackHalf2x16(kb01.y);
-                    vec2 b2 = unpackHalf2x16(kb23.x);
-                    vec2 b3 = unpackHalf2x16(kb23.y);
+                    vec2 b0 = dec2(kb01.x);
+                    vec2 b1 = dec2(kb01.y);
+                    vec2 b2 = dec2(kb23.x);
+                    vec2 b3 = dec2(kb23.y);
                     acc[0] += a0.x * b0.x + a0.y * b0.y;
                     acc[1] += a0.x * b1.x + a0.y * b1.y;
                     acc[2] += a0.x * b2.x + a0.y * b2.y;
@@ -369,25 +392,25 @@ void main() {
                 int mrow = (b * S + s) * kv;
                 if ((kv & 1) == 0) {
                     if (jA < kv) {
-                        vec2 mv = unpackHalf2x16(uMask.data[(mrow + jA) >> 1]);
+                        vec2 mv = dec2(uMask.data[(mrow + jA) >> 1]);
                         mk0 = mv.x;
                         mk1 = mv.y;
                     }
                     if (jB < kv) {
-                        vec2 mv = unpackHalf2x16(uMask.data[(mrow + jB) >> 1]);
+                        vec2 mv = dec2(uMask.data[(mrow + jB) >> 1]);
                         mk2 = mv.x;
                         mk3 = mv.y;
                     }
                 } else {
                     int e;
                     e = mrow + jA;
-                    if (jA < kv) mk0 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    if (jA < kv) mk0 = dec2(uMask.data[e >> 1])[e & 1];
                     e = mrow + jA + 1;
-                    if (jA + 1 < kv) mk1 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    if (jA + 1 < kv) mk1 = dec2(uMask.data[e >> 1])[e & 1];
                     e = mrow + jB;
-                    if (jB < kv) mk2 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    if (jB < kv) mk2 = dec2(uMask.data[e >> 1])[e & 1];
                     e = mrow + jB + 1;
-                    if (jB + 1 < kv) mk3 = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+                    if (jB + 1 < kv) mk3 = dec2(uMask.data[e >> 1])[e & 1];
                 }
             }
             int lim = (uA.causal != 0) ? (past + s) : 0x7fffffff;
@@ -425,11 +448,11 @@ void main() {
                             exp2(acc[r * 4 + 1] - m_new));
             vec2 p23 = vec2(exp2(acc[r * 4 + 2] - m_new),
                             exp2(acc[r * 4 + 3] - m_new));
-            uint w01 = packHalf2x16(p01);
-            uint w23 = packHalf2x16(p23);
+            uint w01 = enc2(p01);
+            uint w23 = enc2(p23);
             // Sum what P·V will actually multiply by (the fp16-rounded P).
-            vec2 q01 = unpackHalf2x16(w01);
-            vec2 q23 = unpackHalf2x16(w23);
+            vec2 q01 = dec2(w01);
+            vec2 q23 = dec2(w23);
             l[r] = l[r] * alpha + ((q01.x + q01.y) + (q23.x + q23.y));
             [[unroll]] for (int c = 0; c < 4; ++c) {
                 o[r][c] *= alpha;
@@ -477,19 +500,19 @@ void main() {
                 uvec2 pq2 = sP[((ty * 4 + 2) * 32 + pw) >> 1];
                 uvec2 pq3 = sP[((ty * 4 + 3) * 32 + pw) >> 1];
                 [[unroll]] for (int jh = 0; jh < 2; ++jh) {
-                    vec2 p0 = unpackHalf2x16(pq0[jh]);
-                    vec2 p1 = unpackHalf2x16(pq1[jh]);
-                    vec2 p2 = unpackHalf2x16(pq2[jh]);
-                    vec2 p3 = unpackHalf2x16(pq3[jh]);
+                    vec2 p0 = dec2(pq0[jh]);
+                    vec2 p1 = dec2(pq1[jh]);
+                    vec2 p2 = dec2(pq2[jh]);
+                    vec2 p3 = dec2(pq3[jh]);
                     int jj = j4 + 2 * jh;
                     [[unroll]] for (int c2 = 0; c2 < 2; ++c2) {
                         int w = 2 * tx + 32 * c2;
                         uvec2 va = sV[(jj * VSTRIDE + w) >> 1];
                         uvec2 vb = sV[((jj + 1) * VSTRIDE + w) >> 1];
-                        vec2 va0 = unpackHalf2x16(va.x);
-                        vec2 va1 = unpackHalf2x16(va.y);
-                        vec2 vb0 = unpackHalf2x16(vb.x);
-                        vec2 vb1 = unpackHalf2x16(vb.y);
+                        vec2 va0 = dec2(va.x);
+                        vec2 va1 = dec2(va.y);
+                        vec2 vb0 = dec2(vb.x);
+                        vec2 vb1 = dec2(vb.y);
                         o[0][2 * c2] += p0.x * va0 + p0.y * vb0;
                         o[0][2 * c2 + 1] += p0.x * va1 + p0.y * vb1;
                         o[1][2 * c2] += p1.x * va0 + p1.y * vb0;
@@ -524,7 +547,7 @@ void main() {
             [[unroll]] for (int c = 0; c < 4; ++c) {
                 int w = 2 * tx + (c & 1) + 32 * (c >> 1);
                 if (w < HW) {
-                    uOutput.data[yw + w] = packHalf2x16(o[r][c] * inv);
+                    uOutput.data[yw + w] = enc2(o[r][c] * inv);
                 }
             }
         }

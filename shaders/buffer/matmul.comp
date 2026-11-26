@@ -316,6 +316,28 @@ layout(push_constant) uniform PC {
                  // 124: the last int of the 128-byte block. See GpuMatMulParam.
 } uPC;
 
+// bf16's decode/encode. Included here because kernels ABOVE matmul.comp's
+// first helper use it (the coopmat store), so it cannot wait for the
+// unpackA2 block further down.
+#include "../common/bf16.comp"
+
+// The OUTPUT word follows the ACTIVATION width (uPC.bf16 bit 1), never the
+// weight's format: an int4 or fp8 B beside a bf16 activation still writes bf16
+// words. Packing the fp32 accumulator with packHalf2x16 there produced bit
+// patterns the consumer decoded as bf16 -- measured as MatMul_5280 emitting
+// 4e8 from inputs of magnitude 1, where the fp32 twin emitted +-22.9 from the
+// same bytes.
+#define ENC2(v) ((uPC.bf16 & 2) != 0 ? packBF16x2(v) : packHalf2x16(v))
+
+// bf16's decode/encode, and the output's encode. Both are needed by kernels
+// ABOVE matmul.comp's first helper (the coopmat store), so this sits right
+// after the push constant rather than next to unpackA2.
+
+// The OUTPUT word follows the ACTIVATION width (uPC.bf16 bit 1), never the
+// weight's format: an int4 or fp8 B beside a bf16 activation still writes bf16
+// words. Packing the fp32 accumulator with packHalf2x16 there produced bit
+// patterns the consumer decoded as bf16 -- measured as MatMul_5280 emitting
+// 4e8 from inputs of magnitude 1, where the fp32 twin emitted +-22.9.
 // ---------------------------------------------------------------------------
 // Tile-split-K: the tiled GEMM's K dimension, split across workgroups.
 //
@@ -477,9 +499,9 @@ void ks_fold_tiles() {
             v1 *= vec2(scale1(c + 2), scale1(c + 3));
         }
         if (col0 + lc + 1 < uPC.N)
-            uOutput.data[base >> 1] = packHalf2x16(v0);
+            uOutput.data[base >> 1] = ENC2(v0);
         if (col0 + lc + 3 < uPC.N)
-            uOutput.data[(base + 2) >> 1] = packHalf2x16(v1);
+            uOutput.data[(base + 2) >> 1] = ENC2(v1);
     }
 }
 
@@ -534,17 +556,40 @@ float epi_bias_at(int n, int i, int j) {
 //   unpackB2  -- a B word straight to fp32 (the GEMVs and the scalar paths).
 //   stageB2/8 -- a B word into an fp16 shared-memory stage (the SIMT tile):
 //                bf16 is re-encoded as half there, see bf16x2_to_half2.
-#include "../common/bf16.comp"
 
+// The OUTPUT word follows the ACTIVATION width (uPC.bf16 bit 1), never the
+// weight's format: an int4 or fp8 B beside a bf16 activation still writes bf16
+// words. Packing the fp32 accumulator with packHalf2x16 there produced bit
+// patterns the consumer decoded as bf16 -- measured as MatMul_5280 emitting
+// 4e8 from inputs of magnitude 1, where the fp32 twin emitted +-22.9.
+
+// A and B DECODE INDEPENDENTLY, from the two bits of uPC.bf16 (see below).
+// They differ whenever the weight is quantized: a 4-bit or fp8 B beside a bf16
+// activation leaves bit 0 clear while the A rows are still bf16. A single
+// shared flag made load_a unpack bf16 bits as fp16 -- measured as an
+// all-1/8 softmax feeding a MatMul whose output was 1056 NaN in a
+// 57344-element tile.
 vec2 unpackB2(uint w) {
-    return uPC.bf16 != 0 ? unpackBF16x2(w) : unpackHalf2x16(w);
+    return (uPC.bf16 & 1) != 0 ? unpackBF16x2(w) : unpackHalf2x16(w);
 }
-uint stageB2(uint w) { return uPC.bf16 != 0 ? bf16x2_to_half2(w) : w; }
-uvec4 stageB8(uvec4 w) { return uPC.bf16 != 0 ? bf16x8_to_half8(w) : w; }
+// uPC.bf16 is a BITFIELD: bit 0 = B is bf16, bit 1 = A is bf16. The push
+// constant is exactly 128 bytes (bf16 is the last int), so a second field is
+// not available; and the two really are independent -- a 4-bit weight beside a
+// bf16 activation clears bit 0 while bit 1 stays set.
+vec2 unpackA2(uint w) {
+    return (uPC.bf16 & 2) != 0 ? unpackBF16x2(w) : unpackHalf2x16(w);
+}
+uint stageB2(uint w) { return (uPC.bf16 & 1) != 0 ? bf16x2_to_half2(w) : w; }
+uvec4 stageB8(uvec4 w) { return (uPC.bf16 & 1) != 0 ? bf16x8_to_half8(w) : w; }
 
 #ifdef FP16
+// A and B are decoded SEPARATELY, and that is the whole point: a graph can run
+// bf16 activations against an fp16 weight (or the reverse). A single global
+// decision would be wrong for one of them -- measured on the merge: applying
+// the bf16 unpack to both made an fp16 weight decode through bf16's bit layout
+// and produce plausible wrong numbers.
 float load_a(int idx) {
-    return unpackHalf2x16(uInputA.data[idx >> 1])[idx & 1];
+    return unpackA2(uInputA.data[idx >> 1])[idx & 1];
 }
 float load_b(int idx) {
     return unpackB2(uInputB.data[idx >> 1])[idx & 1];
@@ -768,7 +813,7 @@ void matmul16_w8_quad() {
             vec4 w0 = unpack_w8(uInputB.data[(b_row + k * uPC.N) >> 2]);
             vec4 w1 =
                 unpack_w8(uInputB.data[(b_row + (k + 1) * uPC.N) >> 2]);
-            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
             s += a.x * w0 + a.y * w1;
         }
     } else {
@@ -780,8 +825,8 @@ void matmul16_w8_quad() {
 
     vec4 v = s * wsc;
     int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
-    uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
-    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+    uOutput.data[out_idx >> 1] = ENC2(v.xy);
+    uOutput.data[(out_idx + 2) >> 1] = ENC2(v.zw);
 }
 
 // 4-bit weight-only (int4 or nf4), N % 8 == 0, B is [batch, K, N]: one thread
@@ -817,15 +862,15 @@ void matmul16_w4_quad() {
             vec4 w0 = unpack_w4(uInputB.data[(b_row + k * uPC.N) >> 3], nib);
             vec4 w1 =
                 unpack_w4(uInputB.data[(b_row + (k + 1) * uPC.N) >> 3], nib);
-            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
             acc += a.x * w0 + a.y * w1;
         }
         s += acc * scale4(g * uPC.N + ja);
     }
 
     int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
-    uOutput.data[out_idx >> 1] = packHalf2x16(s.xy);
-    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(s.zw);
+    uOutput.data[out_idx >> 1] = ENC2(s.xy);
+    uOutput.data[(out_idx + 2) >> 1] = ENC2(s.zw);
 }
 
 #ifndef DOWN_ACT
@@ -866,8 +911,8 @@ void ks_store(vec4 s, int row, int ja) {
                   uintBitsToFloat(uScale.data[ja + 2]),
                   uintBitsToFloat(uScale.data[ja + 3]));
     }
-    uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
-    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+    uOutput.data[out_idx >> 1] = ENC2(v.xy);
+    uOutput.data[(out_idx + 2) >> 1] = ENC2(v.zw);
 }
 
 // int8 weight-only, B is [batch, K, N], N % 4 == 0.
@@ -927,8 +972,8 @@ void ks_store_flat_at(vec4 s, int row, int ja, int quad, int slice) {
                   uintBitsToFloat(uScale.data[cja + 2]),
                   uintBitsToFloat(uScale.data[cja + 3]));
     }
-    uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
-    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+    uOutput.data[out_idx >> 1] = ENC2(v.xy);
+    uOutput.data[(out_idx + 2) >> 1] = ENC2(v.zw);
 }
 
 void ks_store_flat(vec4 s, int row, int ja) {
@@ -1056,10 +1101,10 @@ void matmul16_w8_ksplit_transb(int row, int lane, int q, int n_slice) {
         uint r7 = uInputB.data[(b_c0 + 3 * uPC.K + k2) >> 2];
         uint aw = (a_off + k) >> 1;
         uint aw2 = (a_off + k2) >> 1;
-        vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
-        vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
-        vec2 a2 = unpackHalf2x16(uInputA.data[aw2]);
-        vec2 a3 = unpackHalf2x16(uInputA.data[aw2 + 1]);
+        vec2 a0 = unpackA2(uInputA.data[aw]);
+        vec2 a1 = unpackA2(uInputA.data[aw + 1]);
+        vec2 a2 = unpackA2(uInputA.data[aw2]);
+        vec2 a3 = unpackA2(uInputA.data[aw2 + 1]);
         // unpack_w8 is low byte first: .x is k, .w is k+3.
         vec4 w0 = unpack_w8(r0);
         vec4 w1 = unpack_w8(r1);
@@ -1089,8 +1134,8 @@ void matmul16_w8_ksplit_transb(int row, int lane, int q, int n_slice) {
         uint r2 = uInputB.data[(b_c0 + 2 * uPC.K + k) >> 2];
         uint r3 = uInputB.data[(b_c0 + 3 * uPC.K + k) >> 2];
         uint aw = (a_off + k) >> 1;
-        vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
-        vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
+        vec2 a0 = unpackA2(uInputA.data[aw]);
+        vec2 a1 = unpackA2(uInputA.data[aw + 1]);
         vec4 w0 = unpack_w8(r0);
         s.x += a0.x * w0.x + a0.y * w0.y + a1.x * w0.z + a1.y * w0.w;
         vec4 w1 = unpack_w8(r1);
@@ -1158,10 +1203,10 @@ void matmul16_w8_ksplit() {
             uint r6 = uInputB.data[(b_row + (k + 6) * uPC.N) >> 2];
             uint r7 = uInputB.data[(b_row + (k + 7) * uPC.N) >> 2];
             uint aw = (a_off + k) >> 1;
-            vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
-            vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
-            vec2 a2 = unpackHalf2x16(uInputA.data[aw + 2]);
-            vec2 a3 = unpackHalf2x16(uInputA.data[aw + 3]);
+            vec2 a0 = unpackA2(uInputA.data[aw]);
+            vec2 a1 = unpackA2(uInputA.data[aw + 1]);
+            vec2 a2 = unpackA2(uInputA.data[aw + 2]);
+            vec2 a3 = unpackA2(uInputA.data[aw + 3]);
             s += a0.x * unpack_w8(r0) + a0.y * unpack_w8(r1) +
                  a1.x * unpack_w8(r2) + a1.y * unpack_w8(r3) +
                  a2.x * unpack_w8(r4) + a2.y * unpack_w8(r5) +
@@ -1170,7 +1215,7 @@ void matmul16_w8_ksplit() {
         for (; k + 1 < kend; k += 2) {
             vec4 w0 = unpack_w8(uInputB.data[(b_row + k * uPC.N) >> 2]);
             vec4 w1 = unpack_w8(uInputB.data[(b_row + (k + 1) * uPC.N) >> 2]);
-            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
             s += a.x * w0 + a.y * w1;
         }
     }
@@ -1377,7 +1422,7 @@ void matmul16_w4_ksplit() {
                 vec4 w0 = unpack_w4(uInputB.data[(b_row + k * uPC.N) >> 3], nib);
                 vec4 w1 =
                     unpack_w4(uInputB.data[(b_row + (k + 1) * uPC.N) >> 3], nib);
-                vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
                 acc += a.x * w0 + a.y * w1;
             }
             s += acc * scale4(g * uPC.N + ja);
@@ -1426,10 +1471,10 @@ void matmul16_ksplit() {
             int bw5 = (b_row + (k + 5) * uPC.N) >> 1;
             int bw6 = (b_row + (k + 6) * uPC.N) >> 1;
             int bw7 = (b_row + (k + 7) * uPC.N) >> 1;
-            vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
-            vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
-            vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
-            vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+            vec2 a0 = unpackA2(uInputA.data[(a_off + k) >> 1]);
+            vec2 a1 = unpackA2(uInputA.data[(a_off + k + 2) >> 1]);
+            vec2 a2 = unpackA2(uInputA.data[(a_off + k + 4) >> 1]);
+            vec2 a3 = unpackA2(uInputA.data[(a_off + k + 6) >> 1]);
             s += a0.x * vec4(unpackB2(uInputB.data[bw0]),
                              unpackB2(uInputB.data[bw0 + 1])) +
                  a0.y * vec4(unpackB2(uInputB.data[bw1]),
@@ -1453,7 +1498,7 @@ void matmul16_ksplit() {
                            unpackB2(uInputB.data[bw + 1]));
             vec4 w1 = vec4(unpackB2(uInputB.data[bw + uPC.N / 2]),
                            unpackB2(uInputB.data[bw + uPC.N / 2 + 1]));
-            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
             s += a.x * w0 + a.y * w1;
         }
     }
@@ -1503,15 +1548,21 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
         // up columns (v1). The output is [rows, N/2].
         vec4 h = v0 / (1.0 + exp(-v0)) * v1;
         int o = row * (uPC.N >> 1) + (c >> 1);
-        uOutput.data[o >> 1] = packHalf2x16(h.xy);
-        uOutput.data[(o >> 1) + 1] = packHalf2x16(h.zw);
+        uOutput.data[o >> 1] = ENC2(h.xy);
+        uOutput.data[(o >> 1) + 1] = ENC2(h.zw);
         return;
     }
     int out_idx = row * uPC.N + c;
-    uOutput.data[out_idx >> 1] = packHalf2x16(v0.xy);
-    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v0.zw);
-    uOutput.data[(out_idx + 4) >> 1] = packHalf2x16(v1.xy);
-    uOutput.data[(out_idx + 6) >> 1] = packHalf2x16(v1.zw);
+    // The RESULT's width, not the weight's: an int4 weight beside a bf16
+    // activation writes bf16 words. Packing this fp32 accumulator with
+    // packHalf2x16 under -DBF16 produced bit patterns the consumer then
+    // decoded as bf16 -- measured as MatMul_5280 emitting 4e8 from inputs of
+    // magnitude 1, on a graph whose fp32 twin emitted +-22.9 from the same
+    // bytes.
+    uOutput.data[out_idx >> 1] = ENC2(v0.xy);
+    uOutput.data[(out_idx + 2) >> 1] = ENC2(v0.zw);
+    uOutput.data[(out_idx + 4) >> 1] = ENC2(v1.xy);
+    uOutput.data[(out_idx + 6) >> 1] = ENC2(v1.zw);
 }
 
 // int4 weight-only WIDE GEMV: eight columns per lane, one uint32 per k.
@@ -1567,10 +1618,10 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
                 uint w5 = uInputB.data[(b_base + (k + 5) * uPC.N) >> 3];      \
                 uint w6 = uInputB.data[(b_base + (k + 6) * uPC.N) >> 3];      \
                 uint w7 = uInputB.data[(b_base + (k + 7) * uPC.N) >> 3];      \
-                vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);     \
-                vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]); \
-                vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]); \
-                vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]); \
+                vec2 a0 = unpackA2(uInputA.data[(a_off + k) >> 1]);     \
+                vec2 a1 = unpackA2(uInputA.data[(a_off + k + 2) >> 1]); \
+                vec2 a2 = unpackA2(uInputA.data[(a_off + k + 4) >> 1]); \
+                vec2 a3 = unpackA2(uInputA.data[(a_off + k + 6) >> 1]); \
                 acc += a0.x * vec4(DEC(w0, 0), DEC(w0, 1), DEC(w0, 2),        \
                                    DEC(w0, 3)) +                              \
                        a0.y * vec4(DEC(w1, 0), DEC(w1, 1), DEC(w1, 2),        \
@@ -1699,10 +1750,10 @@ void matmul16_ksplit_wide() {
             uvec4 w5 = uInputB4.data4[(b_base + (k + 5) * uPC.N) >> 3];
             uvec4 w6 = uInputB4.data4[(b_base + (k + 6) * uPC.N) >> 3];
             uvec4 w7 = uInputB4.data4[(b_base + (k + 7) * uPC.N) >> 3];
-            vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
-            vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
-            vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
-            vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+            vec2 a0 = unpackA2(uInputA.data[(a_off + k) >> 1]);
+            vec2 a1 = unpackA2(uInputA.data[(a_off + k + 2) >> 1]);
+            vec2 a2 = unpackA2(uInputA.data[(a_off + k + 4) >> 1]);
+            vec2 a3 = unpackA2(uInputA.data[(a_off + k + 6) >> 1]);
             s0 += a0.x * vec4(unpackB2(w0.x), unpackB2(w0.y)) +
                   a0.y * vec4(unpackB2(w1.x), unpackB2(w1.y)) +
                   a1.x * vec4(unpackB2(w2.x), unpackB2(w2.y)) +
@@ -1723,7 +1774,7 @@ void matmul16_ksplit_wide() {
         for (; k + 1 < kend; k += 2) {
             uvec4 w0 = uInputB4.data4[(b_base + k * uPC.N) >> 3];
             uvec4 w1 = uInputB4.data4[(b_base + (k + 1) * uPC.N) >> 3];
-            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
             s0 += a.x * vec4(unpackB2(w0.x), unpackB2(w0.y)) +
                   a.y * vec4(unpackB2(w1.x), unpackB2(w1.y));
             s1 += a.x * vec4(unpackB2(w0.z), unpackB2(w0.w)) +
@@ -1793,14 +1844,14 @@ void ks_store_wide_w8(vec4 s0, vec4 s1, vec4 s2, vec4 s3, int row, int c) {
                    uintBitsToFloat(uScale.data[c + 14]),
                    uintBitsToFloat(uScale.data[c + 15]));
     int out_idx = row * uPC.N + c;
-    uOutput.data[out_idx >> 1] = packHalf2x16(v0.xy);
-    if (c + 3 < uPC.N) uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v0.zw);
-    if (c + 5 < uPC.N) uOutput.data[(out_idx + 4) >> 1] = packHalf2x16(v1.xy);
-    if (c + 7 < uPC.N) uOutput.data[(out_idx + 6) >> 1] = packHalf2x16(v1.zw);
-    if (c + 9 < uPC.N) uOutput.data[(out_idx + 8) >> 1] = packHalf2x16(v2.xy);
-    if (c + 11 < uPC.N) uOutput.data[(out_idx + 10) >> 1] = packHalf2x16(v2.zw);
-    if (c + 13 < uPC.N) uOutput.data[(out_idx + 12) >> 1] = packHalf2x16(v3.xy);
-    if (c + 15 < uPC.N) uOutput.data[(out_idx + 14) >> 1] = packHalf2x16(v3.zw);
+    uOutput.data[out_idx >> 1] = ENC2(v0.xy);
+    if (c + 3 < uPC.N) uOutput.data[(out_idx + 2) >> 1] = ENC2(v0.zw);
+    if (c + 5 < uPC.N) uOutput.data[(out_idx + 4) >> 1] = ENC2(v1.xy);
+    if (c + 7 < uPC.N) uOutput.data[(out_idx + 6) >> 1] = ENC2(v1.zw);
+    if (c + 9 < uPC.N) uOutput.data[(out_idx + 8) >> 1] = ENC2(v2.xy);
+    if (c + 11 < uPC.N) uOutput.data[(out_idx + 10) >> 1] = ENC2(v2.zw);
+    if (c + 13 < uPC.N) uOutput.data[(out_idx + 12) >> 1] = ENC2(v3.xy);
+    if (c + 15 < uPC.N) uOutput.data[(out_idx + 14) >> 1] = ENC2(v3.zw);
 }
 
 // Reached only from the -DW8_WIDE module build's entry at the end of this file;
@@ -1842,10 +1893,10 @@ void matmul16_w8_ksplit_wide() {
             uvec4 w5 = uInputB4.data4[(b_base + (k + 5) * uPC.N) >> 4];
             uvec4 w6 = uInputB4.data4[(b_base + (k + 6) * uPC.N) >> 4];
             uvec4 w7 = uInputB4.data4[(b_base + (k + 7) * uPC.N) >> 4];
-            vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
-            vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
-            vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
-            vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+            vec2 a0 = unpackA2(uInputA.data[(a_off + k) >> 1]);
+            vec2 a1 = unpackA2(uInputA.data[(a_off + k + 2) >> 1]);
+            vec2 a2 = unpackA2(uInputA.data[(a_off + k + 4) >> 1]);
+            vec2 a3 = unpackA2(uInputA.data[(a_off + k + 6) >> 1]);
             s0 += a0.x * unpack_w8(w0.x) + a0.y * unpack_w8(w1.x) +
                   a1.x * unpack_w8(w2.x) + a1.y * unpack_w8(w3.x) +
                   a2.x * unpack_w8(w4.x) + a2.y * unpack_w8(w5.x) +
@@ -1866,7 +1917,7 @@ void matmul16_w8_ksplit_wide() {
         for (; k + 1 < kend; k += 2) {
             uvec4 w0 = uInputB4.data4[(b_base + k * uPC.N) >> 4];
             uvec4 w1 = uInputB4.data4[(b_base + (k + 1) * uPC.N) >> 4];
-            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
             s0 += a.x * unpack_w8(w0.x) + a.y * unpack_w8(w1.x);
             s1 += a.x * unpack_w8(w0.y) + a.y * unpack_w8(w1.y);
             s2 += a.x * unpack_w8(w0.z) + a.y * unpack_w8(w1.z);
@@ -1911,8 +1962,8 @@ void matmul16_w8_even_n() {
         for (int k = 0; k < uPC.K; k += 4) {
             vec4 w0 = unpack_w8(uInputB.data[(b0 + k) >> 2]);
             vec4 w1 = unpack_w8(uInputB.data[(b1 + k) >> 2]);
-            vec2 a01 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
-            vec2 a23 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
+            vec2 a01 = unpackA2(uInputA.data[(a_off + k) >> 1]);
+            vec2 a23 = unpackA2(uInputA.data[(a_off + k + 2) >> 1]);
             s0 += a01.x * w0.x + a01.y * w0.y + a23.x * w0.z + a23.y * w0.w;
             s1 += a01.x * w1.x + a01.y * w1.y + a23.x * w1.z + a23.y * w1.w;
         }
@@ -1927,7 +1978,7 @@ void matmul16_w8_even_n() {
     }
 
     int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
-    uOutput.data[out_idx >> 1] = packHalf2x16(vec2(s0 * wsc0, s1 * wsc1));
+    uOutput.data[out_idx >> 1] = ENC2(vec2(s0 * wsc0, s1 * wsc1));
 }
 
 // One thread owns output word (n, i, {ja, ja+1}) of an even-N C. ja is even
@@ -1964,7 +2015,7 @@ void matmul16_even_n() {
     if ((uPC.K & 1) == 0) {
         if (uPC.transB != 0) {
             for (; k < uPC.K; k += 2) {
-                vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
                 vec2 v0 = unpackB2(uInputB.data[(b0 + k) >> 1]);
                 vec2 v1 = unpackB2(uInputB.data[(b1 + k) >> 1]);
                 s0a += a.x * v0.x;
@@ -1974,7 +2025,7 @@ void matmul16_even_n() {
             }
         } else {
             for (; k < uPC.K; k += 2) {
-                vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                vec2 a = unpackA2(uInputA.data[(a_off + k) >> 1]);
                 s0a += a.x * load_b(b0);
                 s0b += a.y * load_b(b0 + uPC.N);
                 s1a += a.x * load_b(b1);
@@ -2000,7 +2051,7 @@ void matmul16_even_n() {
         r0 = r0 * uPC.epi_scale + epi_bias_at(n, i, ja);
         r1 = r1 * uPC.epi_scale + epi_bias_at(n, i, ja + 1);
     }
-    uOutput.data[out_idx >> 1] = packHalf2x16(vec2(r0, r1));
+    uOutput.data[out_idx >> 1] = ENC2(vec2(r0, r1));
 }
 
 // Fused MatMul + scale/bias epilogue + Softmax for attention QK^T. One
@@ -2124,11 +2175,11 @@ void matmul16_softmax() {
             float r1 = exp(owned[idx] - row_max) / row_sum;
             idx++;
             uOutput.data[(n * uPC.M * uPC.N + i * uPC.N + ja) >> 1] =
-                packHalf2x16(vec2(r0, r1));
+                ENC2(vec2(r0, r1));
         } else {
             // odd tail column (N even should avoid this, but be safe)
             uOutput.data[(n * uPC.M * uPC.N + i * uPC.N + ja) >> 1] =
-                packHalf2x16(vec2(r0, 0.0));
+                ENC2(vec2(r0, 0.0));
         }
     }
 }
@@ -2342,10 +2393,10 @@ void tile_fma_n_w4(inout float acc[4][4], int lr, int lc) {
     for (int kt = 0; kt < TILE_K; ++kt) {
         // sA holds two k per word; take the half this kt selects.
         int aw = kt >> 1;
-        vec2 a0 = unpackHalf2x16(sA[(lr + 0) * SROW + aw]);
-        vec2 a1 = unpackHalf2x16(sA[(lr + 1) * SROW + aw]);
-        vec2 a2 = unpackHalf2x16(sA[(lr + 2) * SROW + aw]);
-        vec2 a3 = unpackHalf2x16(sA[(lr + 3) * SROW + aw]);
+        vec2 a0 = unpackA2(sA[(lr + 0) * SROW + aw]);
+        vec2 a1 = unpackA2(sA[(lr + 1) * SROW + aw]);
+        vec2 a2 = unpackA2(sA[(lr + 2) * SROW + aw]);
+        vec2 a3 = unpackA2(sA[(lr + 3) * SROW + aw]);
         bool hi = (kt & 1) != 0;
         float av0 = hi ? a0.y : a0.x;
         float av1 = hi ? a1.y : a1.x;
@@ -2380,10 +2431,10 @@ void tile_fma_n_w4(inout float acc[4][4], int lr, int lc) {
 void tile_fma_t(inout float acc[4][4], int lr, int lc) {
 #pragma unroll
     for (int kt = 0; kt < TILE_K / 2; ++kt) {
-        vec2 a0 = unpackHalf2x16(sA[(lr + 0) * SROW + kt]);
-        vec2 a1 = unpackHalf2x16(sA[(lr + 1) * SROW + kt]);
-        vec2 a2 = unpackHalf2x16(sA[(lr + 2) * SROW + kt]);
-        vec2 a3 = unpackHalf2x16(sA[(lr + 3) * SROW + kt]);
+        vec2 a0 = unpackA2(sA[(lr + 0) * SROW + kt]);
+        vec2 a1 = unpackA2(sA[(lr + 1) * SROW + kt]);
+        vec2 a2 = unpackA2(sA[(lr + 2) * SROW + kt]);
+        vec2 a3 = unpackA2(sA[(lr + 3) * SROW + kt]);
         vec2 b0 = unpackHalf2x16(sB[(lc + 0) * SROW + kt]);
         vec2 b1 = unpackHalf2x16(sB[(lc + 1) * SROW + kt]);
         vec2 b2 = unpackHalf2x16(sB[(lc + 2) * SROW + kt]);
@@ -2405,10 +2456,10 @@ void tile_fma_n(inout float acc[4][4], int lr, int lc) {
     int cp = lc >> 1;
 #pragma unroll
     for (int kt = 0; kt < TILE_K / 2; ++kt) {
-        vec2 a0 = unpackHalf2x16(sA[(lr + 0) * SROW + kt]);
-        vec2 a1 = unpackHalf2x16(sA[(lr + 1) * SROW + kt]);
-        vec2 a2 = unpackHalf2x16(sA[(lr + 2) * SROW + kt]);
-        vec2 a3 = unpackHalf2x16(sA[(lr + 3) * SROW + kt]);
+        vec2 a0 = unpackA2(sA[(lr + 0) * SROW + kt]);
+        vec2 a1 = unpackA2(sA[(lr + 1) * SROW + kt]);
+        vec2 a2 = unpackA2(sA[(lr + 2) * SROW + kt]);
+        vec2 a3 = unpackA2(sA[(lr + 3) * SROW + kt]);
         int w0 = (2 * kt) * SBROW + cp;
         int w1 = (2 * kt + 1) * SBROW + cp;
         vec2 p0 = unpackHalf2x16(sB[w0]);
@@ -2554,9 +2605,9 @@ void matmul16_tiled() {
             v1 *= vec2(scale1(c + 2), scale1(c + 3));
         }
         if (col0 + lc + 1 < uPC.N)
-            uOutput.data[base >> 1] = packHalf2x16(v0);
+            uOutput.data[base >> 1] = ENC2(v0);
         if (col0 + lc + 3 < uPC.N)
-            uOutput.data[(base + 2) >> 1] = packHalf2x16(v1);
+            uOutput.data[(base + 2) >> 1] = ENC2(v1);
     }
 }
 
@@ -2690,14 +2741,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[0][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[0][0].zw);
+            uOutput.data[base] = ENC2(acc[0][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[0][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[0][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[0][1].zw);
+            uOutput.data[base] = ENC2(acc[0][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[0][1].zw);
         }
       }
     }
@@ -2706,14 +2757,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[1][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[1][0].zw);
+            uOutput.data[base] = ENC2(acc[1][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[1][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[1][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[1][1].zw);
+            uOutput.data[base] = ENC2(acc[1][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[1][1].zw);
         }
       }
     }
@@ -2722,14 +2773,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[2][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[2][0].zw);
+            uOutput.data[base] = ENC2(acc[2][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[2][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[2][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[2][1].zw);
+            uOutput.data[base] = ENC2(acc[2][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[2][1].zw);
         }
       }
     }
@@ -2738,14 +2789,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[3][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[3][0].zw);
+            uOutput.data[base] = ENC2(acc[3][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[3][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[3][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[3][1].zw);
+            uOutput.data[base] = ENC2(acc[3][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[3][1].zw);
         }
       }
     }
@@ -2754,14 +2805,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[4][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[4][0].zw);
+            uOutput.data[base] = ENC2(acc[4][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[4][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[4][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[4][1].zw);
+            uOutput.data[base] = ENC2(acc[4][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[4][1].zw);
         }
       }
     }
@@ -2770,14 +2821,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[5][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[5][0].zw);
+            uOutput.data[base] = ENC2(acc[5][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[5][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[5][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[5][1].zw);
+            uOutput.data[base] = ENC2(acc[5][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[5][1].zw);
         }
       }
     }
@@ -2786,14 +2837,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[6][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[6][0].zw);
+            uOutput.data[base] = ENC2(acc[6][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[6][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[6][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[6][1].zw);
+            uOutput.data[base] = ENC2(acc[6][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[6][1].zw);
         }
       }
     }
@@ -2802,14 +2853,14 @@ void matmul16_tiled128() {
         int gcol0 = col0 + 0 + tx * 4;
         if (gcol0 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol0) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[7][0].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[7][0].zw);
+            uOutput.data[base] = ENC2(acc[7][0].xy);
+            uOutput.data[base + 1] = ENC2(acc[7][0].zw);
         }
         int gcol1 = col0 + 64 + tx * 4;
         if (gcol1 + 3 < uPC.N) {
             int base = ((b * uPC.M + grow) * uPC.N + gcol1) >> 1;
-            uOutput.data[base] = packHalf2x16(acc[7][1].xy);
-            uOutput.data[base + 1] = packHalf2x16(acc[7][1].zw);
+            uOutput.data[base] = ENC2(acc[7][1].xy);
+            uOutput.data[base + 1] = ENC2(acc[7][1].zw);
         }
       }
     }
@@ -2937,7 +2988,7 @@ vec4 down_act_w(int b, int j, int c) {
 // tail loop uniform whatever the row start's parity.
 float down_act_xi(int a_off, int k) {
     int idx = a_off + k;
-    vec2 v = unpackHalf2x16(uInputA.data[idx >> 1]);
+    vec2 v = unpackA2(uInputA.data[idx >> 1]);
     return (idx & 1) != 0 ? v.y : v.x;
 }
 
@@ -2977,13 +3028,13 @@ void matmul16_ksplit_down_act() {
                 // GEMV's memory-level-parallelism rule). x pairs (k, k+1)
                 // into one word because a_off is even on this path.
                 for (; k + 7 < kx; k += 8) {
-                    vec2 x0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                    vec2 x0 = unpackA2(uInputA.data[(a_off + k) >> 1]);
                     vec2 x1 =
-                        unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
+                        unpackA2(uInputA.data[(a_off + k + 2) >> 1]);
                     vec2 x2 =
-                        unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
+                        unpackA2(uInputA.data[(a_off + k + 4) >> 1]);
                     vec2 x3 =
-                        unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+                        unpackA2(uInputA.data[(a_off + k + 6) >> 1]);
                     vec4 xs = vec4(x0.x, x0.y, x1.x, x1.y);
                     vec4 xt = vec4(x2.x, x2.y, x3.x, x3.y);
                     gr += xs.x * down_act_gj(bb, j, k, kg) +
@@ -3077,8 +3128,8 @@ void matmul16_ksplit_fold_down_act() {
         a3 += uintBitsToFloat(uScratch.data[w + 3]);
     }
     int out_i = row * uPC.N + c0;
-    uOutput.data[out_i >> 1] = packHalf2x16(vec2(a0, a1));
-    uOutput.data[(out_i + 2) >> 1] = packHalf2x16(vec2(a2, a3));
+    uOutput.data[out_i >> 1] = ENC2(vec2(a0, a1));
+    uOutput.data[(out_i + 2) >> 1] = ENC2(vec2(a2, a3));
 }
 
 #endif
@@ -3174,7 +3225,7 @@ void matmul32() {
         float a = uintBitsToFloat(uInputA.data[a_base + i * uPC.K + k]);
         // A bf16 weight under an fp32 activation: two values per word, like
         // the fp16 build's B, so this one scalar path reads it by half-word.
-        float b = uPC.bf16 != 0
+        float b = (uPC.bf16 & 1) != 0
                       ? bf16_to_float(uInputB.data[b_idx >> 1] >>
                                       ((b_idx & 1) * 16))
                       : uintBitsToFloat(uInputB.data[b_idx]);

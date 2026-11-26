@@ -70,10 +70,10 @@ void main() {
     int e1 = 2 * gid + 1;
     float v0 = float(BUF_LOAD(uInput.data, split_elem(e0)));
     if (e1 >= out_total) {
-        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, 0.0));
     } else {
         float v1 = float(BUF_LOAD(uInput.data, split_elem(e1)));
-        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, v1));
     }
 #else
     if (gid >= out_total) return;

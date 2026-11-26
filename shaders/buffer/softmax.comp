@@ -6,6 +6,7 @@
 #endif
 
 #include "../common/subgroup_reduce.comp"
+#include "../common/bf16.comp"
 
 // Softmax SSBO op over an arbitrary axis. One workgroup reduces one
 // non-axis slice along the full axis_size. Workgroup reduce: shared-memory
@@ -82,8 +83,24 @@ shared float s_max[256];
 shared float s_sum[256];
 
 #ifdef FP16
+// Both 16-bit float formats share the two-per-word packing, so -DBF16 swaps
+// only the decode/encode step; every index above stays valid (common/bf16.comp).
+vec2 dec2(uint w) {
+#ifdef BF16
+    return unpackBF16x2(w);
+#else
+    return unpackHalf2x16(w);
+#endif
+}
+uint enc2(vec2 v) {
+#ifdef BF16
+    return packBF16x2(v);
+#else
+    return packHalf2x16(v);
+#endif
+}
 float load_elem(int idx) {
-    return unpackHalf2x16(uInput.data[idx >> 1])[idx & 1];
+    return dec2(uInput.data[idx >> 1])[idx & 1];
 }
 #else
 float load_elem(int idx) { return uintBitsToFloat(uInput.data[idx]); }
@@ -103,7 +120,7 @@ void pack_pass() {
     float v1 = (e1 < uSoft.outer_size)
         ? uintBitsToFloat(uScratch.data[e1])
         : 0.0f;
-    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    uOutput.data[gid] = enc2(vec2(v0, v1));
 }
 #endif
 
@@ -119,7 +136,7 @@ void row_pass(uint wg, uint lid) {
     int base = int(wg) * nw;
     float localMax = -1e30f;
     for (int w = int(lid); w < nw; w += int(gl_WorkGroupSize.x)) {
-        vec2 v = unpackHalf2x16(uInput.data[base + w]);
+        vec2 v = dec2(uInput.data[base + w]);
         localMax = max(localMax, max(v.x, v.y));
     }
 #ifdef SUBGROUP
@@ -135,7 +152,7 @@ void row_pass(uint wg, uint lid) {
     float globalMax = s_max[0];
     float localSum = 0.0f;
     for (int w = int(lid); w < nw; w += int(gl_WorkGroupSize.x)) {
-        vec2 v = unpackHalf2x16(uInput.data[base + w]);
+        vec2 v = dec2(uInput.data[base + w]);
         localSum += exp(v.x - globalMax) + exp(v.y - globalMax);
     }
 #ifdef SUBGROUP
@@ -150,9 +167,9 @@ void row_pass(uint wg, uint lid) {
 #endif
     float globalSum = s_sum[0];
     for (int w = int(lid); w < nw; w += int(gl_WorkGroupSize.x)) {
-        vec2 v = unpackHalf2x16(uInput.data[base + w]);
+        vec2 v = dec2(uInput.data[base + w]);
         vec2 r = vec2(exp(v.x - globalMax), exp(v.y - globalMax)) / globalSum;
-        uOutput.data[base + w] = packHalf2x16(r);
+        uOutput.data[base + w] = enc2(r);
     }
 }
 #endif

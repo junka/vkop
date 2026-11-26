@@ -115,7 +115,11 @@ void throw_unsupported_elem(ElemKind kind, const char *op, const char *what) {
 }
 
 void require_float_elem(ElemKind kind, const char *op, const char *what) {
-    if (kind != ElemKind::kFloat32 && kind != ElemKind::kFloat16) {
+    // bf16 is a float a kernel can compute on: same 16-bit storage and 32-bit
+    // arithmetic as fp16, with fp32's exponent (shaders/common/bf16.comp does
+    // the decode). The gate exists to keep a QUANTIZED payload out of a kernel
+    // that would read its bytes as floats, and that argument does not apply.
+    if (!is_float_elem(kind)) {
         throw_unsupported_elem(kind, op, what);
     }
 }

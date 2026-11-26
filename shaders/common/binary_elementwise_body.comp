@@ -22,6 +22,29 @@
 #ifdef BINARY_HAS_ACTIVATION
 #include "activation.comp"
 #endif
+#include "bf16.comp"
+
+// Every binary op (Add/Sub/Mul/Div/Pow/Min/Max/Mod) decodes through here, so
+// this is the one place a 16-bit float's layout is chosen. Both formats share
+// the two-per-word packing and 32-bit arithmetic; only the two-to-float step
+// differs (common/bf16.comp). The A and B slots are decoded INDEPENDENTLY --
+// an fp32 operand beside a bf16 one is how a Cast-crossing chain binds them.
+#ifdef FP16
+vec2 bdec2(uint w) {
+#ifdef BF16
+    return unpackBF16x2(w);
+#else
+    return unpackHalf2x16(w);
+#endif
+}
+uint benc2(vec2 v) {
+#ifdef BF16
+    return packBF16x2(v);
+#else
+    return packHalf2x16(v);
+#endif
+}
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -109,14 +132,14 @@ layout(push_constant) uniform PC_uPC {
 float load_elem(int linear, IArr8 out_d, IArr8 in0_d) {
     if (uPC.broadcast == 0) {
 #ifdef FP16
-        return unpackHalf2x16(B_INA(linear >> 1))[linear & 1];
+        return bdec2(B_INA(linear >> 1))[linear & 1];
 #else
         return uintBitsToFloat(B_INA(linear));
 #endif
     }
     int ia = broadcast_index(linear, out_d, in0_d, uPC.rank);
 #ifdef FP16
-    return unpackHalf2x16(B_INA(ia >> 1))[ia & 1];
+    return bdec2(B_INA(ia >> 1))[ia & 1];
 #else
     return uintBitsToFloat(B_INA(ia));
 #endif
@@ -127,7 +150,7 @@ float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
                  ? linear
                  : broadcast_index(linear, out_d, in1_d, uPC.rank);
 #ifdef FP16
-    return unpackHalf2x16(B_INB(ib >> 1))[ib & 1];
+    return bdec2(B_INB(ib >> 1))[ib & 1];
 #else
     return uintBitsToFloat(B_INB(ib));
 #endif
@@ -154,12 +177,12 @@ int aff_index(int lin, int d, int m) {
 #ifdef FP16
 vec2 load_pair(bool isA, int a0, int a1) {
     if (a1 == a0 + 1 && (a0 & 1) == 0) {
-        return unpackHalf2x16(isA ? B_INA(a0 >> 1) : B_INB(a0 >> 1));
+        return bdec2(isA ? B_INA(a0 >> 1) : B_INB(a0 >> 1));
     }
-    float v0 = unpackHalf2x16(isA ? B_INA(a0 >> 1) : B_INB(a0 >> 1))[a0 & 1];
+    float v0 = bdec2(isA ? B_INA(a0 >> 1) : B_INB(a0 >> 1))[a0 & 1];
     float v1 = (a1 == a0)
                    ? v0
-                   : unpackHalf2x16(isA ? B_INA(a1 >> 1) : B_INB(a1 >> 1))[a1 & 1];
+                   : bdec2(isA ? B_INA(a1 >> 1) : B_INB(a1 >> 1))[a1 & 1];
     return vec2(v0, v1);
 }
 #endif
@@ -176,9 +199,9 @@ void main_affine(IArr8 out_d) {
     vec2 b = load_pair(false, aff_index(i0, dB, mB), aff_index(i1, dB, mB));
     vec2 out_pair = vec2(BIN_APPLY(a.x, b.x), BIN_APPLY(a.y, b.y));
     if (2 * gid + 1 >= uPC.total) {
-        out_pair[1] = unpackHalf2x16(B_OUT(gid))[1];  // keep the high half
+        out_pair[1] = bdec2(B_OUT(gid))[1];  // keep the high half
     }
-    B_OUT(gid) = packHalf2x16(out_pair);
+    B_OUT(gid) = benc2(out_pair);
 #else
     if (gid >= uPC.total) return;
     float a = uintBitsToFloat(B_INA(aff_index(gid, dA, mA)));
@@ -219,9 +242,9 @@ void main() {
         out_pair[1] = BIN_APPLY(load_elem(i1, out_d, in0_d),
                                 load_elem_b(i1, out_d, in1_d));
     } else {
-        out_pair[1] = unpackHalf2x16(B_OUT(gid))[1];  // keep the high half
+        out_pair[1] = bdec2(B_OUT(gid))[1];  // keep the high half
     }
-    B_OUT(gid) = packHalf2x16(out_pair);
+    B_OUT(gid) = benc2(out_pair);
 #else
     if (gid >= uPC.total) return;
     B_OUT(gid) = floatBitsToUint(BIN_APPLY(load_elem(gid, out_d, in0_d),

@@ -247,6 +247,18 @@ void upload_float(const std::shared_ptr<Runtime> &rt,
     }
     if (probe->dtype() == typeid(float)) {
         upload<float>(rt, pool, name, host, dims);
+    } else if (probe->elem_kind() == vkop::core::ElemKind::kBFloat16) {
+        // bf16 rides the same uint16_t container as fp16, so `dtype()` alone
+        // cannot tell them apart -- and f32_to_f16 on a bf16-declared input
+        // hands the graph fp16 bytes under a bf16 label. The graph then reads
+        // them with bf16's decode and every activation is garbage (measured:
+        // Add nodes in a bf16 artifact receiving mixed 14/2 elem kinds).
+        std::vector<uint16_t> bits(host.size());
+        for (size_t i = 0; i < host.size(); ++i) {
+            bits[i] = static_cast<uint16_t>(
+                vkop::core::float_to_bf16(host[i]));
+        }
+        upload<uint16_t>(rt, pool, name, bits, dims);
     } else {
         upload<uint16_t>(rt, pool, name, f32_to_f16(host), dims);
     }

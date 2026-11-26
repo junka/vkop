@@ -1,5 +1,6 @@
 #version 450 core
 #include "../common/subgroup_reduce.comp"
+#include "../common/bf16.comp"
 
 // Fused Attention (SSBO/fp16+fp32), tiled / online-softmax form. One workgroup
 // per query row (b, h, s): grid = (B*H*S, 1, 1). Computes
@@ -302,9 +303,23 @@ float cache_elem(int e) {
 // Element-loaded float: fp16 reads packed half2 (2 elements/word), fp32 one
 // element per word.
 #ifdef FP16
+vec2 dec2(uint w) {
+#ifdef BF16
+    return unpackBF16x2(w);
+#else
+    return unpackHalf2x16(w);
+#endif
+}
+uint enc2(vec2 v) {
+#ifdef BF16
+    return packBF16x2(v);
+#else
+    return packHalf2x16(v);
+#endif
+}
 #define LOADF(buf, e)                                                          \
-    ((((e) & 1) != 0) ? unpackHalf2x16((buf).data[(e) >> 1]).y                 \
-                      : unpackHalf2x16((buf).data[(e) >> 1]).x)
+    ((((e) & 1) != 0) ? dec2((buf).data[(e) >> 1]).y                           \
+                      : dec2((buf).data[(e) >> 1]).x)
 #else
 #define LOADF(buf, e) uintBitsToFloat((buf).data[(e)])
 #endif
@@ -330,17 +345,17 @@ shared float sAcc[4][MAX_HD];
         const int nw = D >> 1;                                                  \
         int w = 0;                                                              \
         for (; w + 4 <= nw; w += 4) {                                           \
-            vec2 v0 = unpackHalf2x16((BUF).data[wo + w]);                       \
-            vec2 v1 = unpackHalf2x16((BUF).data[wo + w + 1]);                   \
-            vec2 v2 = unpackHalf2x16((BUF).data[wo + w + 2]);                   \
-            vec2 v3 = unpackHalf2x16((BUF).data[wo + w + 3]);                   \
+            vec2 v0 = dec2((BUF).data[wo + w]);                       \
+            vec2 v1 = dec2((BUF).data[wo + w + 1]);                   \
+            vec2 v2 = dec2((BUF).data[wo + w + 2]);                   \
+            vec2 v3 = dec2((BUF).data[wo + w + 3]);                   \
             a0 += sQ[2 * w] * v0.x + sQ[2 * w + 1] * v0.y;                      \
             a1 += sQ[2 * w + 2] * v1.x + sQ[2 * w + 3] * v1.y;                  \
             a2 += sQ[2 * w + 4] * v2.x + sQ[2 * w + 5] * v2.y;                  \
             a3 += sQ[2 * w + 6] * v3.x + sQ[2 * w + 7] * v3.y;                  \
         }                                                                       \
         for (; w < nw; ++w) {                                                   \
-            vec2 v = unpackHalf2x16((BUF).data[wo + w]);                        \
+            vec2 v = dec2((BUF).data[wo + w]);                        \
             a0 += sQ[2 * w] * v.x + sQ[2 * w + 1] * v.y;                        \
         }                                                                       \
         (DOT) = (a0 + a1) + (a2 + a3);                                          \
@@ -369,7 +384,7 @@ shared float sAcc[4][MAX_HD];
 #ifdef FP16
 #define ACC_PAIR(BUF, ROWOFF, D0, P, A0, A1)                                    \
     do {                                                                        \
-        vec2 v_ = unpackHalf2x16((BUF).data[((ROWOFF) >> 1) + ((D0) >> 1)]);    \
+        vec2 v_ = dec2((BUF).data[((ROWOFF) >> 1) + ((D0) >> 1)]);    \
         (A0) += (P) * v_.x;                                                     \
         (A1) += (P) * v_.y;                                                     \
     } while (false)
@@ -553,6 +568,10 @@ void copy_cache_f8(int cwg) {
         // internal error"), and it takes the whole attention pipeline down with
         // it. Scalars compile clean on the same path.
         float a0, a1, b0, b1;
+        // This is the fp8 KV-cache requantise path: K/V here are the incoming
+        // fp16 cache rows, unconditionally -- an fp8 cache does not exist in a
+        // bf16 artifact, so this decode stays `unpackHalf2x16` rather than
+        // following the graph's activation width.
         if (c == 0) {
             a0 = unpackHalf2x16(uK.data[krow]).x;
             a1 = unpackHalf2x16(uK.data[krow]).y;
@@ -607,7 +626,7 @@ void combine_partials(int row) {
         float inv = 1.0 / (L + 1e-30);
         int y_off = q_base + d0;
 #ifdef FP16
-        uOutput.data[y_off >> 1] = packHalf2x16(vec2(a0 * inv, a1 * inv));
+        uOutput.data[y_off >> 1] = enc2(vec2(a0 * inv, a1 * inv));
 #else
         uOutput.data[y_off] = floatBitsToUint(a0 * inv);
         uOutput.data[y_off + 1] = floatBitsToUint(a1 * inv);
@@ -856,7 +875,7 @@ void attend() {
         float inv = 1.0 / (l + 1e-30);
         int y_off = q_base + d0;
 #ifdef FP16
-        uOutput.data[y_off >> 1] = packHalf2x16(vec2(o0 * inv, o1 * inv));
+        uOutput.data[y_off >> 1] = enc2(vec2(o0 * inv, o1 * inv));
 #else
         uOutput.data[y_off] = floatBitsToUint(o0 * inv);
         uOutput.data[y_off + 1] = floatBitsToUint(o1 * inv);

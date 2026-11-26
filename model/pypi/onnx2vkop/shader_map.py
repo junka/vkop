@@ -724,6 +724,17 @@ def shader_keys_for_model(
             for cell in cells:
                 if plan[cell]:
                     keys.add(plan[cell])
+            if emit_fp16 and plan[col + "_fp16"]:
+                # The bf16 build of a dual shader: same source, -DFP16 -DBF16,
+                # one entry per DUAL_FP16_SHADERS member (see the loop in
+                # CMakeLists.txt). It ships whenever the fp16 one does, because
+                # the artifact's activation width is a converter decision the
+                # runtime reads off the tensors -- a bf16 graph that embedded
+                # only the fp16 keys would fail at pipeline creation with no
+                # SPIR-V to fall back on.
+                bf16 = plan[col + "_fp16"].replace("_fp16", "_bf16")
+                if bf16 != plan[col + "_fp16"]:
+                    keys.add(bf16)
         for v in plan["variants"]:
             # Variants carry their backend's prefix (enforced by
             # test_shader_map_agrees), so a pinned backend takes only its own

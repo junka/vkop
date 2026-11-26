@@ -1763,7 +1763,16 @@ class MatMulBuffer : public BufferFactory {
         para_.weight_int8 = weight_byte ? 1 : 0;
         para_.fp8 = weight_fp8 ? 1 : 0;
         para_.fp8_e5m2 = bkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
-        para_.bf16 = weight_bf16 ? 1 : 0;
+        // A BITFIELD, because the push constant is exactly 128 bytes and bf16
+        // is the last int: bit 0 = B is bf16, bit 1 = the ACTIVATION is.
+        // They are independent -- a quantized weight (int4/fp8) beside a bf16
+        // activation sets only bit 1, and reading that as "B is fp16, A is
+        // fp16" is what fed bf16 bits through unpackHalf2x16 (measured: a
+        // MatMul emitting 1056 NaN from an all-1/8 softmax).
+        const bool act_bf16 =
+            a_index < static_cast<int>(inputs.size()) && inputs[a_index] &&
+            inputs[a_index]->elem_kind() == core::ElemKind::kBFloat16;
+        para_.bf16 = (weight_bf16 ? 1 : 0) | (act_bf16 ? 2 : 0);
         para_.w8_quad = (w8_quad && !ksplit && !tiled) ? 1 : 0;
         // main() tests uPC.ksplit before uPC.tile, so raising both flags makes
         // the host's tile dispatch (y = UP_DIV(m,64)) run the split-K GEMV,

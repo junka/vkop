@@ -319,7 +319,13 @@ void require_float_elem(ElemKind kind, const char *op, const char *what);
 // A kernel handed a bf16 tensor it cannot decode should fail closed, so the
 // answer that keeps it out of the generic path is false.
 constexpr bool is_float_elem(ElemKind kind) {
-    return kind == ElemKind::kFloat32 || kind == ElemKind::kFloat16;
+    // bf16 belongs here now: with the _bf16 module of every dual shader built
+    // (shaders/common/bf16.comp), an op reads bf16 with the same 16-bit
+    // storage and 32-bit arithmetic as fp16 -- only the decode differs. The
+    // merge kept it out while that coverage did not exist, because a generic
+    // float kernel would have read bf16 bits as fp16.
+    return kind == ElemKind::kFloat32 || kind == ElemKind::kFloat16 ||
+           kind == ElemKind::kBFloat16;
 }
 
 // Guard for the word-granular buffer data-movement kernels (Slice, Concat,

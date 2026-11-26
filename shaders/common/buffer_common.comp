@@ -32,9 +32,21 @@
 #define DTYPE   float16_t
 #define DTYPE2  f16vec2
 #define DTYPE4  f16vec4
+// FLOAT is the type the ACTIVATION epilogue computes and returns in, and bf16
+// must keep it 32-bit: bf16 has no shader arithmetic type, so every kernel runs
+// it through fp32 registers and narrows only at the store. Making FLOAT
+// float16_t under -DBF16 would route the epilogue's intermediate through
+// fp16's 65504 ceiling -- the exact overflow bf16 exists to avoid, and measured
+// as 117 NaN in an Add whose own operands were +-19.
+#ifdef BF16
+#define FLOAT   float
+#define FLOAT2  vec2
+#define FLOAT4  vec4
+#else
 #define FLOAT   float16_t
 #define FLOAT2  f16vec2
 #define FLOAT4  f16vec4
+#endif
 #else
 #define DTYPE   float
 #define DTYPE2  vec2
@@ -44,62 +56,57 @@
 #define FLOAT4  vec4
 #endif
 
-// ---- bfloat16 as a drop-in replacement for fp16 storage ------------------
+// ---- bfloat16 storage ----------------------------------------------------
 //
-// A bf16 build is the FP16 build with a different 16-bit float in the same
+// A bf16 build IS the FP16 build with a different 16-bit float in the same
 // two-per-word slots: same packing, same strides, same dispatch geometry, same
-// arithmetic -- 16-bit storage and 32-bit compute, exactly like fp16. Only the
-// bit layout differs, so this shadows the two built-ins the whole shader tree
-// already calls rather than teaching 371 call sites a second format.
+// 32-bit arithmetic. Only the bit layout differs. The decode/encode lives in
+// common/bf16.comp (the host mirrors it in core::DType.hpp), and each shader's
+// own unpack wrapper picks it under -DBF16 -- a global #define over the
+// built-ins does NOT work here, because the kernels that matter (matmul,
+// attention, rmsnorm, ...) decode through their own helpers rather than
+// through BUF_LOAD. Measured: -DBF16 with only a global shadow compiled to
+// byte-identical SPIR-V for 16 of the dual shaders.
 //
-// Why it is worth the second format: fp16's five exponent bits cap it at
-// 65504, and MiniMax-H3 overflows that. Its hidden states reach ~4200 and a
-// 14336-wide FFN accumulation crosses the ceiling on a handful of elements,
-// which then poison the whole graph (measured: `MatMul_5969 out ne=860160
-// inf=4` at seq=160, and NaN in the output while the fp32 artifact on the same
-// weights and shape is finite). bf16 spends the mantissa instead of the
-// exponent -- 8 exponent bits, fp32's range, ~3 decimal digits of precision --
-// which is what the checkpoint itself uses (626 of its 638 tensors are bf16).
-//
-// Rounding: round-to-nearest-even on the 16 dropped mantissa bits. Truncation
-// would be one instruction cheaper and biased, and the converter's own bf16
-// path (converter._bf16_bytes_to_fp32) is used only in the widening direction,
-// so this is the only place a rounding choice is made.
-//
-// Inf/NaN survive the round trip: 0x7F80/0x7FC0 in and out, because the
-// exponent field is copied verbatim and only the mantissa is rounded.
+// The bf16 decode is pulled in only under -DBF16, so an fp16 or fp32 build of
+// these headers is byte-for-byte what it was before bf16 existed. (An
+// unconditional include here reordered the reference-block declarations of
+// shaders that emit their own `DataBuf` before including this header --
+// measured as "no such field in structure 'uTrans'" on every -DBDA build.)
 #ifdef BF16
-uint bf16_bits(float v) {
-    uint u = floatBitsToUint(v);
-    // NaN must stay NaN rather than round its mantissa into the exponent.
-    if ((u & 0x7F800000u) == 0x7F800000u) return u >> 16;
-    uint lsb = (u >> 16) & 1u;
-    return (u + 0x7FFFu + lsb) >> 16;
-}
-float bf16_to_float(uint h) { return uintBitsToFloat(h << 16); }
-vec2 unpackBf16x2(uint w) {
-    return vec2(bf16_to_float(w & 0xFFFFu), bf16_to_float(w >> 16));
-}
-uint packBf16x2(vec2 v) {
-    return (bf16_bits(v.x) & 0xFFFFu) | (bf16_bits(v.y) << 16);
-}
-#define unpackHalf2x16(w) unpackBf16x2(w)
-#define packHalf2x16(v)   packBf16x2(v)
+#include "bf16.comp"
 #endif
-
 
 // 8-int struct used for dims/coords in push constants and local helpers.
 struct IArr8 { int v[8]; };
 
 #ifdef FP16
-// fp16: element idx is lane (idx&1) of the half2 in word (idx>>1).
-#define BUF_LOAD(data, idx) (unpackHalf2x16((data)[(idx) >> 1])[(idx) & 1])
+// 16-bit: element idx is lane (idx&1) of the word (idx>>1). -DBF16 swaps only
+// the two-to-float step, so the word arithmetic below is shared.
+#ifdef BF16
+// Pack two floats into the graph's 16-bit word. The counterpart to BUF_LOAD,
+// exported so a shader that re-packs (Split, Transpose, ...) does not switch
+// formats halfway.
+#define BUF_PACK2(v) packBF16x2(v)
+#define BUF_LOAD(data, idx) \
+    (unpackBF16x2((data)[(idx) >> 1])[(idx) & 1])
+#define BUF_STORE(data, idx, v) do { \
+        uint _w = (idx) >> 1; \
+        vec2 _p = unpackBF16x2((data)[_w]); \
+        _p[(idx) & 1] = float(v); \
+        (data)[_w] = packBF16x2(_p); \
+    } while (false)
+#else
+#define BUF_PACK2(v) packHalf2x16(v)
+#define BUF_LOAD(data, idx) \
+    (unpackHalf2x16((data)[(idx) >> 1])[(idx) & 1])
 #define BUF_STORE(data, idx, v) do { \
         uint _w = (idx) >> 1; \
         vec2 _p = unpackHalf2x16((data)[_w]); \
         _p[(idx) & 1] = float(v); \
         (data)[_w] = packHalf2x16(_p); \
     } while (false)
+#endif
 #else
 #define BUF_LOAD(data, idx)  uintBitsToFloat((data)[(idx)])
 #define BUF_STORE(data, idx, v) (data)[(idx)] = floatBitsToUint(float(v))

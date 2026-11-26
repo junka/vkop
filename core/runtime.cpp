@@ -408,15 +408,20 @@ void dump_node_tensors(
             const auto &d = g->data();
             double s = 0.0;
             float mn = 1e30f, mx = -1e30f;
+            // bf16 shares the uint16_t container, so the decode has to follow
+            // elem_kind -- an fp16 read of bf16 bits reports plausible garbage
+            // and sent two debugging rounds after defects that were not there.
+            const bool bf = t->elem_kind() == core::ElemKind::kBFloat16;
             for (auto raw : d) {
-                const float v = core::ITensor::fp16_to_fp32(raw);
+                const float v = bf ? core::bf16_to_float(raw)
+                                   : core::ITensor::fp16_to_fp32(raw);
                 s += v;
                 mn = std::min(mn, v);
                 mx = std::max(mx, v);
             }
-            std::printf("[node] %-34s fp16 n=%zu min=%.5g max=%.5g mean=%.5g\n",
-                        node_name.c_str(), d.size(), mn, mx,
-                        d.empty() ? 0.0 : s / d.size());
+            std::printf("[node] %-34s %s n=%zu min=%.5g max=%.5g mean=%.5g\n",
+                        node_name.c_str(), bf ? "bf16" : "fp16", d.size(), mn,
+                        mx, d.empty() ? 0.0 : s / d.size());
         } else if (t->dtype() == typeid(float)) {
             auto g = core::as_tensor<float>(t);
             if (!g) continue;
@@ -808,7 +813,12 @@ void Runtime::LoadModel() {
                 t = typed;
                 break;
             }
-            case ElemKind::kFloat16: {
+            // bf16 takes the fp16 path exactly: same two-per-word uint16_t
+            // storage, same leaf semantics. The KIND is what tells the op
+            // which bit layout to unpack (shaders/common/bf16.comp), so
+            // nothing here depends on the difference.
+            case ElemKind::kFloat16:
+            case ElemKind::kBFloat16: {
                 auto typed = std::make_shared<Tensor<uint16_t>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
@@ -1610,13 +1620,43 @@ void Runtime::LoadModel() {
                                         : nullptr;
                 if (added && added->elem_kind() == ElemKind::kBFloat16 &&
                     !bf16_consumer_ok(type, node_inputs.size() - 1)) {
-                    throw std::runtime_error(
-                        "vkop: no bf16 kernel for " + n.op_type + " (node '" +
-                        n.name + "', input " +
-                        std::to_string(node_inputs.size() - 1) + " '" +
-                        in_shape.name +
-                        "' is bfloat16; only MatMul/Gemm input 1 and Gather "
-                        "input 0 read bf16)");
+                    // A bf16 ACTIVATION (not one of the whitelisted weight
+                    // slots above) is legal exactly when this op has a _bf16
+                    // module in the archive -- the kernel that would run then
+                    // decodes bf16 for every operand it binds. Asking the
+                    // archive rather than a hand-kept op list is what keeps
+                    // this gate honest as _bf16 coverage grows: a shader
+                    // without one still fails here, before a pipeline is
+                    // built, and names the node.
+                    const std::string bf16_key = [&] {
+                        std::string k = shader_key_for(
+                            type, backend_buffer_, 1, /*bf16=*/true);
+                        return k;
+                    }();
+                    // A host-only op (Shape / Squeeze / Unsqueeze) has no
+                    // shader at all -- it runs on the CPU and moves bytes
+                    // without interpreting them, so bf16 needs no kernel for
+                    // it. Distinguishing that from "an op whose bf16 build is
+                    // missing" is why the key is computed rather than a
+                    // hand-kept op list: an empty key means host-only, a
+                    // non-empty one that the archive lacks means a real gap.
+                    const bool host_only = bf16_key.empty();
+                    const bool have_bf16 =
+                        host_only ||
+                        (shader_archive_ &&
+                         shader_archive_->lookup(bf16_key).first != nullptr);
+                    if (!have_bf16) {
+                        throw std::runtime_error(
+                            "vkop: no bf16 kernel for " + n.op_type +
+                            " (node '" + n.name + "', input " +
+                            std::to_string(node_inputs.size() - 1) + " '" +
+                            in_shape.name +
+                            "' is bfloat16, and this op has no " + bf16_key +
+                            " module (archive=" +
+                            (shader_archive_ ? "loaded" : "MISSING") +
+                            "); only MatMul/Gemm input 1 and Gather "
+                            "input 0 decode bf16 as a WEIGHT)");
+                    }
                 }
             }
 
@@ -1711,11 +1751,24 @@ void Runtime::LoadModel() {
                             dtype_marker = "_f16_";
                         } else if (odt == "float32") {
                             dtype_marker = "_f32_";
+                        } else if (odt == "bfloat16") {
+                            // The chain TERMINAL is bf16 while an operand
+                            // earlier in the chain may be fp32 (fusing across
+                            // a Cast is what this op is for). Without this arm
+                            // the declaration fell through to _f32_ and every
+                            // downstream consumer of the terminal went fp32 --
+                            // measured as a whole attention block running fp32
+                            // inside a bf16 graph, which then met a bf16 Add
+                            // and produced garbage.
+                            dtype_marker = "_bf16_";
                         } else if (!node_inputs.empty() &&
                                    node_inputs[0] != nullptr &&
                                    node_inputs[0]->dtype() ==
                                        typeid(uint16_t)) {
-                            dtype_marker = "_f16_";
+                            dtype_marker = node_inputs[0]->elem_kind() ==
+                                                   core::ElemKind::kBFloat16
+                                               ? "_bf16_"
+                                               : "_f16_";
                         } else {
                             dtype_marker = "_f32_";
                         }
@@ -1766,10 +1819,16 @@ void Runtime::LoadModel() {
                         // uint16_t container, which would make it fp16 even
                         // in an fp32 graph. No recorded dtype: precision_.
                         const auto &odt = out_shape.dtype;
-                        dtype_marker = odt == "float32"   ? "_f32_"
-                                       : odt == "float16" ? "_f16_"
-                                       : precision_ == 1  ? "_f16_"
-                                                          : "_f32_";
+                        // bf16 ACTIVATION: the file declares the output
+                        // bf16, so the tensor must carry that KIND and the
+                        // op must resolve to its _bf16 module. Without this
+                        // arm every such op got _f16_ while its bytes were
+                        // bf16 (measured: Add in0 kind 14 beside in1 kind 2).
+                        dtype_marker = odt == "float32"    ? "_f32_"
+                                       : odt == "float16"  ? "_f16_"
+                                       : odt == "bfloat16" ? "_bf16_"
+                                       : precision_ == 1   ? "_f16_"
+                                                           : "_f32_";
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(int64_t)) {
@@ -1852,6 +1911,16 @@ void Runtime::LoadModel() {
                             // buffer (which would make copyToCPU deref null).
                             auto t = std::make_shared<Tensor<int64_t>>(
                                 alloc_dims, false);
+                            t->set_ref_cnt(consumers[out_shape.name]);
+                            tensor_map[out_shape.name] = t;
+                            node_outputs.push_back(t);
+                        } else if (dtype_marker == "_bf16_") {
+                            // Same uint16_t container as _f16_; the KIND is
+                            // what every consumer decodes by and what
+                            // op_shader_fp16 reads to pick the _bf16 module.
+                            auto t = std::make_shared<Tensor<uint16_t>>(
+                                alloc_dims, true);
+                            t->set_elem_kind(core::ElemKind::kBFloat16);
                             t->set_ref_cnt(consumers[out_shape.name]);
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);
@@ -2962,6 +3031,14 @@ double Runtime::Run() {
                                               (is_fp16 ? 2 : 4));
                     if (ne <= 0)
                         continue;
+                    // bf16 shares fp16's uint16_t container, so the storage
+                    // type alone cannot pick the decode -- elem_kind has to.
+                    // Reading bf16 bits with unpackHalf2x16 turned every
+                    // ordinary value into a spurious NaN (0x7C2A is a fine
+                    // bf16 and an fp16 NaN), which sent two debugging rounds
+                    // after a defect that was in this scanner, not the graph.
+                    const bool is_bf16 =
+                        t->elem_kind() == core::ElemKind::kBFloat16;
                     int nan_cnt = 0, inf_cnt = 0;
                     if (is_fp16) {
                         auto tg = as_tensor<uint16_t>(t);
@@ -2969,7 +3046,9 @@ double Runtime::Run() {
                         const uint16_t *p = reinterpret_cast<const uint16_t *>(
                             tg->data().data());
                         for (int i = 0; i < ne; ++i) {
-                            float v = ITensor::fp16_to_fp32(p[i]);
+                            const float v =
+                                is_bf16 ? core::bf16_to_float(p[i])
+                                        : ITensor::fp16_to_fp32(p[i]);
                             if (std::isnan(v))
                                 nan_cnt++;
                             else if (std::isinf(v))
@@ -3016,6 +3095,8 @@ double Runtime::Run() {
                                 std::printf("  in[%zu] ne=0\n", ii);
                                 continue;
                             }
+                            const bool ibf16 =
+                                it->elem_kind() == core::ElemKind::kBFloat16;
                             int inan = 0, iinf = 0;
                             float imn = 1e30f, imx = -1e30f;
                             if (ifp16) {
@@ -3025,7 +3106,9 @@ double Runtime::Run() {
                                     reinterpret_cast<const uint16_t *>(
                                         tg->data().data());
                                 for (int i = 0; i < ine; ++i) {
-                                    float v = ITensor::fp16_to_fp32(p[i]);
+                                    const float v =
+                                        ibf16 ? core::bf16_to_float(p[i])
+                                              : ITensor::fp16_to_fp32(p[i]);
                                     if (std::isnan(v))
                                         inan++;
                                     else if (std::isinf(v))
@@ -3087,45 +3170,52 @@ double Runtime::Run() {
                         // Dump up to 16 output-NaN indices paired with the
                         // corresponding input[0] and input[1] values, so we
                         // can see exactly which (a,b) pairs go NaN.
-                        if (oi == 0 && !ins.empty() && ins[0] &&
-                            ins[0]->dtype() == typeid(uint16_t)) {
-                            auto a_tg = as_tensor<uint16_t>(ins[0]);
-                            a_tg->copyToCPU(m_cmdpool_);
-                            const uint16_t *ap =
-                                reinterpret_cast<const uint16_t *>(
-                                    a_tg->data().data());
-                            int ane = ins[0]->size() / 2;
-                            const uint16_t *bp = nullptr;
-                            int bne = 0;
-                            if (ins.size() > 1 && ins[1] &&
-                                ins[1]->dtype() == typeid(uint16_t)) {
-                                auto b_tg = as_tensor<uint16_t>(ins[1]);
-                                b_tg->copyToCPU(m_cmdpool_);
-                                bp = reinterpret_cast<const uint16_t *>(
-                                    b_tg->data().data());
-                                bne = ins[1]->size() / 2;
-                            }
-                            auto out_tg = as_tensor<uint16_t>(t);
-                            out_tg->copyToCPU(m_cmdpool_);
-                            const uint16_t *op =
-                                reinterpret_cast<const uint16_t *>(
-                                    out_tg->data().data());
+                        //
+                        // Every operand is read through `read_elem`, which
+                        // dispatches on the tensor's OWN dtype and elem_kind.
+                        // Add/Sub/Mul process mixed fp32 and bf16, and the
+                        // earlier version understood only two uint16 inputs --
+                        // a fp32 operand printed as a `nan` placeholder and
+                        // sent debugging rounds after defects that were in this
+                        // probe.
+                        if (oi == 0 && !ins.empty()) {
+                            auto read_elem = [&](const ITensor *tt,
+                                                 int i) -> float {
+                                const float nan_v =
+                                    std::numeric_limits<float>::quiet_NaN();
+                                if (!tt || i < 0) return nan_v;
+                                if (tt->dtype() == typeid(float)) {
+                                    auto *g = const_cast<core::Tensor<float> *>(
+                                        dynamic_cast<const core::Tensor<float> *>(tt));
+                                    if (!g) return nan_v;
+                                    if (g->gpu_resource()) g->copyToCPU(m_cmdpool_);
+                                    return g->data()[static_cast<size_t>(i)];
+                                }
+                                if (tt->dtype() != typeid(uint16_t))
+                                    return nan_v;
+                                const auto *g =
+                                    dynamic_cast<const core::Tensor<uint16_t> *>(tt);
+                                if (!g) return nan_v;
+                                const uint16_t bits =
+                                    g->data()[static_cast<size_t>(i)];
+                                return tt->elem_kind() ==
+                                               core::ElemKind::kBFloat16
+                                           ? core::bf16_to_float(bits)
+                                           : ITensor::fp16_to_fp32(bits);
+                            };
                             int shown = 0;
                             std::printf("  nanidx (i: a -> out):");
                             for (int i = 0; i < ne && shown < 16; ++i) {
-                                float ov = ITensor::fp16_to_fp32(op[i]);
-                                if (!std::isnan(ov) && !std::isinf(ov))
-                                    continue;
-                                const float nan_val =
-                                    std::numeric_limits<float>::quiet_NaN();
-                                float av = (i < ane)
-                                               ? ITensor::fp16_to_fp32(ap[i])
-                                               : nan_val;
-                                float bv = (bp && i < bne)
-                                               ? ITensor::fp16_to_fp32(bp[i])
-                                               : nan_val;
-                                std::printf(" [%d: a=%.5g b=%.5g o=%04x]", i,
-                                            av, bv, op[i]);
+                                const float ov = read_elem(t.get(), i);
+                                if (!std::isnan(ov) && !std::isinf(ov)) continue;
+                                const float av = read_elem(ins[0].get(), i);
+                                const float bv =
+                                    ins.size() > 1
+                                        ? read_elem(ins[1].get(), i)
+                                        : std::numeric_limits<float>::
+                                              quiet_NaN();
+                                std::printf(" [%d: a=%.6g b=%.6g o=%.6g]", i,
+                                            av, bv, ov);
                                 shown++;
                             }
                             std::printf("\n");
@@ -4437,7 +4527,19 @@ double Runtime::Run() {
                 // next level begins (batch_levels defaults to 0), so waiting is
                 // enough there; in graph mode the flush+submit above is what
                 // puts the segment on the queue first.
+                static const bool settle_trace =
+                    std::getenv("VKOP_PAGED_SETTLE_TRACE") != nullptr;
+                static size_t settle_n = 0;
+                auto st0 = std::chrono::steady_clock::now();
                 dev->wait_all_done();
+                if (settle_trace) {
+                    auto st1 = std::chrono::steady_clock::now();
+                    std::fprintf(stderr,
+                                 "[settle] #%zu lvl=%zu %.1f ms\n", settle_n++,
+                                 level_idx,
+                                 std::chrono::duration<double, std::milli>(st1 - st0)
+                                     .count());
+                }
             }
             level_hook_(level_idx);
         }
@@ -5706,4 +5808,4 @@ void Runtime::TraceNode(const std::string &name) {
 }
 
 } // namespace core
-} // namespace vkop
+} // namespace vko // namespace vkop
