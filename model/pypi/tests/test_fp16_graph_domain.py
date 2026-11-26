@@ -454,3 +454,42 @@ def test_a_lone_pow_gets_no_cast():
     apply(m)
     assert not [n for n in m.nodes.values() if n.op_type == "Cast"]
     assert dtype_of(m, "xsq") == F16, dtype_of(m, "xsq")
+
+
+def test_a_sinusoidal_phase_stays_fp32_up_to_the_next_cast():
+    """DiT timestep embedding: t * 1000 * freq is a phase in the thousands,
+    where fp16 spacing is ~1 rad. The FusedElemwise that computes it reads its
+    operands at independent widths, so nothing else would hold it wide; the
+    whole cone (graph input and freq table included) and the Sin/Cos must stay
+    FP32, and the domain resumes after the export's Cast(to=fp16)."""
+    fe = node("FusedElemwise", "fe", ["t", "k", "freq"], ["phase"])
+    cos = node("Cos", "cos", ["phase"], ["c"])
+    sin = node("Sin", "sin", ["phase"], ["s"])
+    cat = node("Concat", "cat", ["c", "s"], ["emb"], axis=-1)
+    down = node("Cast", "down", ["emb"], [ref("emb16", F16)], to=F16)
+    mm = node("MatMul", "mm", [ref("emb16", F16), "W"], ["h"])
+    m = build([fe, cos, sin, cat, down, mm], inputs=["t"], outputs=["h"],
+              initializers={"k": numpy.array(1000.0, numpy.float32),
+                            "freq": numpy.ones((1, 8), numpy.float32),
+                            "W": numpy.ones((16, 4), numpy.float32)})
+    plan = GraphFp16.plan(m)
+    for name in ("t", "k", "freq", "phase", "c", "s", "emb"):
+        assert name in plan["forced"], name
+    assert "h" in plan["domain"] and "W" in plan["domain"]
+    assert not plan["conflicts"]
+
+
+def test_a_sin_on_a_long_activation_chain_is_not_a_phase():
+    """A cone deeper than _PHASE_CONE_MAX is a Sin activation on a hidden
+    state, not an embedding phase: holding it wide would drag the network to
+    FP32, so the rule leaves it alone."""
+    from onnx2vkop.fp16_graph import _PHASE_CONE_MAX
+    nodes, prev = [], "x"
+    for i in range(_PHASE_CONE_MAX + 2):
+        nodes.append(node("Add", f"a{i}", [prev, "b"], [f"y{i}"]))
+        prev = f"y{i}"
+    nodes.append(node("Sin", "sin", [prev], ["out"]))
+    m = build(nodes, inputs=["x"], outputs=["out"],
+              initializers={"b": numpy.ones((1,), numpy.float32)})
+    plan = GraphFp16.plan(m)
+    assert "x" in plan["domain"] and "out" in plan["domain"]

@@ -510,9 +510,13 @@ def report_nodes(node_map, dumps, refs, args):
             if got is None:
                 rows.append((seq, node, tensor, None, how))
                 continue
-            rows.append((seq, node, tensor,
-                         compare(ref, got, args.rtol, args.atol, args.cos_min,
-                                 args.bad_frac_max), how))
+            # numpy on Accelerate raises spurious FP warnings from float64
+            # matmul on large-magnitude rows (a -65504 mask); the metrics
+            # themselves are finite and checked by compare().
+            with np.errstate(all="ignore"):
+                m = compare(ref, got, args.rtol, args.atol, args.cos_min,
+                            args.bad_frac_max)
+            rows.append((seq, node, tensor, m, how))
     rows.sort(key=lambda r: r[0])
     print(f"\nper-node outputs ({len(rows)} dumped tensors matched to ORT)")
     print(f"{'seq':>6} {'tensor':<48} {'dt':<8} {'maxabs':>9} {'relL2':>9} "

@@ -107,6 +107,12 @@ _MIXED_WIDTH_OPS = {"FusedElemwise"}
 # Matching the export's Pow -> ReduceMean -> Add -> Sqrt found zero chains.
 _VARIANCE_CHAIN = ("Pow", "Reduce", "FusedElemwise")
 
+# What a Sin/Cos phase is computed from (see GraphFp16._hold_phase_chains).
+_PHASE_OPS = {"FusedElemwise", "Mul", "Add", "Sub", "Div", "Neg", "Unsqueeze",
+              "Squeeze", "Reshape", "Expand", "Concat", "Transpose", "MatMul",
+              "Gather", "Slice", "Cast", "Where"}
+_PHASE_CONE_MAX = 32
+
 # Largest finite half. Past this a value rounds to Inf, and the fp16 kernels
 # have no saturation path -- the reference exporter does the same and calls it
 # a lossy conversion.
@@ -283,6 +289,8 @@ class GraphFp16:
                     else f"{node.op_type}: no dual FP16 buffer build")
                 force(group, blockers[node.name])
 
+        GraphFp16._hold_phase_chains(dag_model, candidates, force, blockers)
+
         # Ops whose operands are independent widths: a forced input says
         # nothing about the others, so it must not propagate.
         #   FusedElemwise  -- exists to straddle a Cast; the shader reads each
@@ -329,6 +337,65 @@ class GraphFp16:
         return {"decls": decls, "domain": domain, "forced": forced,
                 "reasons": reasons, "blockers": blockers,
                 "conflicts": GraphFp16._audit(dag_model, decls, domain)}
+
+    @staticmethod
+    def _hold_phase_chains(dag_model, candidates, force, blockers) -> int:
+        """Keep the phase a Sin/Cos reads -- and everything it is computed
+        from -- in FP32.
+
+        A sinusoidal embedding's phase is `t * 1000 * freq` (DiT timestep) or
+        `position * inv_freq` (RoPE): magnitudes in the hundreds to thousands,
+        where fp16's spacing is 0.25..1 rad, so the cos/sin of an fp16 phase is
+        mostly rounding. Measured on the tiny Qwen-Image DiT decode with
+        `vkop_vs_ort.py --node-dump`: /Cos at cos 0.9996 with 20% of elements
+        outside the band, carried through the whole timestep MLP.
+
+        Nothing else holds it wide. The export's own `Cast(timestep, to=fp32)`
+        is folded away as redundant once the input is fp32, and the phase is
+        usually one FusedElemwise, whose operands are independent widths, so no
+        forced tensor upstream or downstream reaches its inputs. So the
+        backward cone of each Sin/Cos input is forced here, through the
+        elementwise/view/MatMul ops a phase is built from, stopping at a Cast
+        (its output is forced, nothing behind it), a graph input or an
+        initializer. The propagation below then carries the Sin/Cos node itself
+        to the next Cast; the exports put a Cast(to=fp16) one or two nodes after
+        it. A cone that grows past _PHASE_CONE_MAX nodes is not a phase
+        computation (a Sin activation on a hidden state) and is left alone.
+        """
+        producer_of = {}
+        for node in dag_model.nodes.values():
+            for out in node.outputs:
+                producer_of[out.get("name")] = node
+        held = 0
+        for node in dag_model.nodes.values():
+            if node.op_type not in ("Sin", "Cos") or not node.inputs:
+                continue
+            cone, seen_nodes = set(), set()
+            stack = [node.inputs[0].get("name")]
+            ok = True
+            while stack:
+                name = stack.pop()
+                if name in cone or name not in candidates:
+                    continue
+                cone.add(name)
+                src = producer_of.get(name)
+                if src is None or src.name in seen_nodes:
+                    continue
+                seen_nodes.add(src.name)
+                if len(seen_nodes) > _PHASE_CONE_MAX or \
+                        src.op_type not in _PHASE_OPS:
+                    ok = False
+                    break
+                if src.op_type == "Cast":
+                    continue
+                stack.extend(i.get("name") for i in src.inputs)
+            if not ok or not cone:
+                continue
+            force(cone, f"phase of {node.op_type} '{node.name}': fp16 cannot "
+                        "hold t*freq")
+            blockers.setdefault(node.name, f"{node.op_type}: phase held in FP32")
+            held += 1
+        return held
 
     @staticmethod
     def _widen_variance_chains(dag_model, candidates, forced, reasons,
