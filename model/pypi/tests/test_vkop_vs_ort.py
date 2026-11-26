@@ -669,3 +669,26 @@ def test_main_reports_a_missing_vkopbin_as_exit_two(tmp_path, monkeypatch,
                                       str(tmp_path / "gone.vkopbin")])
     assert loop.main() == 2
     assert "not found" in capsys.readouterr().err
+
+
+def test_a_declared_output_the_run_never_saved_fails(tmp_path, bench, models,
+                                                     monkeypatch, capsys):
+    """vkop-bench reports a failed write on stderr only; an output the
+    .vkopbin declares and the manifest lacks must not vanish from the report
+    (it did for every name containing '/', the path separator)."""
+    make_input_dir(tmp_path)
+    monkeypatch.setattr(FakeView, "outputs",
+                        lambda self: [spec("y"), spec("/layer/Mul_output_0")])
+    assert loop.run(loop_args(tmp_path, bench, models)) == 1
+    out = capsys.readouterr().out
+    assert "/layer/Mul_output_0" in out and "NOT SAVED" in out
+
+
+def test_read_output_finds_a_slashed_name_under_its_file_name(tmp_path):
+    arr = np.arange(4, dtype=np.float32).reshape(1, 4)
+    out = tmp_path / "out"
+    out.mkdir()
+    arr.tofile(out / "_layer_Mul_output_0.bin")
+    row = {"name": "/layer/Mul_output_0", "bytes_as": "float32",
+           "dims": [1, 4], "nbytes": arr.nbytes}
+    assert np.array_equal(loop.read_output(out, row), arr)

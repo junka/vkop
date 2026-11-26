@@ -96,6 +96,9 @@ BYTES_AS = {
     "int64": np.dtype(np.int64),
     "int8": np.dtype(np.int8),
     "uint8": np.dtype(np.uint8),
+    # A bool input is an int8_t tensor in the runtime; vkop-bench fills it
+    # byte for byte from a 1-byte numpy bool array.
+    "bool": np.dtype(np.bool_),
 }
 # onnxruntime's spelling of an element type, for feeding the reference.
 ORT_TYPE = {
@@ -147,7 +150,8 @@ def read_output(outdir: Path, row):
     both would otherwise decode into a wrong-shaped array that then shows up
     as a numerical difference.
     """
-    bin_path = outdir / (row["name"] + ".bin")
+    # vkop-bench writes '/' in an output name as '_' (a path separator).
+    bin_path = outdir / (row["name"].replace("/", "_") + ".bin")
     if not bin_path.is_file():
         raise LoopError(f"{bin_path} is in the manifest but not on disk")
     raw = bin_path.read_bytes()
@@ -710,6 +714,16 @@ def run(args):
         if len(rows) > len(shown):
             print(f"... {len(rows) - len(shown)} more output(s) not shown "
                   f"(--limit {args.limit})")
+        # An output the .vkopbin declares but the run never wrote is a FAIL,
+        # not an absence: vkop-bench reports a failed write only on stderr,
+        # and this loop iterates the manifest, so it used to vanish silently.
+        saved = {r["name"] for r in rows}
+        unsaved = [o["name"] for o in view.outputs() if o["name"] not in saved]
+        for name in unsaved:
+            print(f"{name:<30} ! NOT SAVED: declared by the .vkopbin, absent "
+                  "from vkop-bench's manifest (rerun with -v for its stderr)")
+        failed += len(unsaved)
+        shown = shown + [None] * len(unsaved)
         print(f"\nRESULT: {len(shown) - failed}/{len(shown)} shown output(s) "
               f"pass" + ("" if not failed else f", {failed} FAIL"))
         if node_map is not None:

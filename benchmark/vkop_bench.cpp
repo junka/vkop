@@ -550,7 +550,13 @@ void save_outputs(const std::shared_ptr<Runtime> &rt,
             continue;
         }
         const auto &dt = t->dtype();
-        std::string path = dir + "/" + name + ".bin";
+        // An output name may contain '/' (an exporter's "/layer/Mul_output_0"
+        // kept as a graph output); used as-is it names a directory that does
+        // not exist and the write fails. The file takes '/' -> '_'; the
+        // manifest keeps the real name (tools/vkop_vs_ort.py maps it back).
+        std::string fname = name;
+        std::replace(fname.begin(), fname.end(), '/', '_');
+        std::string path = dir + "/" + fname + ".bin";
         std::ofstream f(path, std::ios::binary);
         if (!f) {
             std::fprintf(stderr, "save: cannot write %s\n", path.c_str());
