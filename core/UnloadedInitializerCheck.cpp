@@ -105,6 +105,11 @@ int main(int argc, char **argv) {
     }
     const std::string path_a = argv[1], path_b = argv[2];
     const std::string wname = argc >= 4 ? argv[3] : "w";
+    // Sections 1-4 drive the model by feeding an input called "x", which is a
+    // fixture assumption; a real LLM artifact has no such input. Section 5
+    // (does a shared arena free device memory?) needs no input at all, so a
+    // real model can be measured for arena size with this switch.
+    const bool arena_only = std::getenv("UIC_ARENA_ONLY") != nullptr;
 
     Logger::getInstance().setLevel(LOG_WARNING);
     const auto &phy = VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -116,7 +121,7 @@ int main(int argc, char **argv) {
     auto pool = std::make_shared<VulkanCommandPool>(dev);
 
     // ---- 1. the default path is untouched ----
-    {
+    if (!arena_only) {
         auto rt = std::make_shared<Runtime>(pool, path_a, 0);
         rt->set_backend_buffer(true);
         rt->LoadModel();
@@ -141,7 +146,7 @@ int main(int argc, char **argv) {
     // ---- 2. a skipped weight keeps its buffer but not its bytes ----
     std::shared_ptr<Runtime> rt;
     std::shared_ptr<vkop::core::ITensor> wt;
-    {
+    if (!arena_only) {
         rt = std::make_shared<Runtime>(pool, path_a, 0);
         rt->set_backend_buffer(true);
         // Not shared: the chain reads every weight in the same round, so each
@@ -182,6 +187,7 @@ int main(int argc, char **argv) {
     }
 
     // ---- 3. running before the page-in uses garbage; after, it is exact ----
+    if (!arena_only) {
     fill_input(rt, pool);
     // Ground truth for A with its own weight resident.
     auto gt_a = [&] {
@@ -223,8 +229,10 @@ int main(int argc, char **argv) {
     Check(diff(after, gt_a) != 0, "the page-in took effect (output moved)");
     std::printf("[uic] skip+page: vs B -> %d mismatch(es); vs A -> %d\n",
                 diff(after, gt_b), diff(after, gt_a));
+    } // !arena_only
 
     // ---- 4. fail-closed paths ----
+    if (!arena_only) {
     {
         auto r = std::make_shared<Runtime>(pool, path_a, 0);
         r->set_backend_buffer(true);
@@ -242,6 +250,7 @@ int main(int argc, char **argv) {
         Check(r->unloaded_initializers().empty(),
               "nothing was skipped for an unknown name");
     }
+    } // !arena_only
 
     // ---- 5. does a SHARED arena actually free device memory? ----
     // Asserted on the arena's own size, which is deterministic, rather than on
@@ -251,12 +260,24 @@ int main(int argc, char **argv) {
     {
         vkop::load::VkModel mc(path_a);
         std::vector<std::string> names;
-        size_t largest = 0, sum = 0;
+        size_t largest = 0, sum = 0, refused = 0, refused_bytes = 0;
         for (const auto &kv : mc.initializers) {
+            // Same eligibility rule the runtime enforces: an int64/int32
+            // constant is read on the host, so it cannot be paged. Declaring it
+            // here would make LoadModel throw by design, not measure the arena.
+            if (kv.second.dtype == "int64" || kv.second.dtype == "int32") {
+                ++refused;
+                refused_bytes += kv.second.size;
+                continue;
+            }
             names.push_back(kv.first);
             largest = std::max<size_t>(largest, kv.second.size);
             sum += kv.second.size;
         }
+        if (refused)
+            std::printf("[uic] %zu host-read constant(s) (%.2f MiB) are not "
+                        "pageable and stay out of the arena\n",
+                        refused, refused_bytes / 1048576.0);
         if (names.size() >= 2) {
             auto arena_of = [&](bool share) {
                 auto r = std::make_shared<Runtime>(pool, path_a, 0);
@@ -269,7 +290,15 @@ int main(int argc, char **argv) {
                 return r->paged_arena() ? r->paged_arena()->getSize() : 0;
             };
             const size_t shared = arena_of(true);
-            const size_t per_weight = arena_of(false);
+            // The per-weight arm sizes the arena to the payload sum, which is
+            // the very thing a card too small for the model cannot allocate.
+            // Skipping it does not weaken the claim: the saving is
+            // `sum - shared`, and `sum` is already known from the file.
+            size_t per_weight = 0;
+            if (!std::getenv("UIC_NO_PER_WEIGHT_ARM"))
+                per_weight = arena_of(false);
+            else
+                per_weight = sum;
             std::printf("[uic] %zu weights: shared arena %.2f MiB, "
                         "per-weight arena %.2f MiB (payload sum %.2f MiB)\n",
                         names.size(), shared / 1048576.0,
@@ -278,6 +307,13 @@ int main(int argc, char **argv) {
             Check(shared < per_weight,
                   "a shared slot costs one largest weight, not their sum");
             Check(shared >= largest, "a shared slot still fits the largest");
+            if (per_weight)
+                std::printf("[uic] saving %.2f GiB (%.1f%% of the per-weight "
+                            "arena); the shared arena is %.2f%% of the payload "
+                            "sum\n",
+                            (per_weight - shared) / 1073741824.0,
+                            100.0 * (per_weight - shared) / per_weight,
+                            sum ? 100.0 * shared / sum : 0.0);
         }
     }
 

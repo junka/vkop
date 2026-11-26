@@ -4384,18 +4384,61 @@ double Runtime::Run() {
         // --- weight-paging seam ---
         //
         // Runs BEFORE this level records anything, so a pager can move the
-        // band this level reads into its resident buffer. No flush is needed
-        // ahead of it: the copy is a separate submit, and a band is read by
-        // exactly one level (measured 312/313 weights on llm.vkopbin), so the
-        // still-unsubmitted segment for earlier levels cannot read the band
-        // being written. The copy therefore may execute before that segment;
-        // ordering that matters -- copy before THIS level's dispatches -- holds
-        // because this level's recording has not started.
+        // band this level reads into its resident buffer.
         //
-        // A hook that lied about that property (a band shared by two levels)
-        // would produce a stale read rather than an error, which is why the
-        // band derivation refuses to declare a shared weight.
+        // ORDERING. The copy a pager issues is submitted on its own queue and
+        // waited on immediately, so it lands the moment this hook returns. What
+        // it lands INTO decides whether that is safe:
+        //
+        //  * distinct slots (one weight, one address): no flush is needed. A
+        //    band is read by exactly one level (measured 312/313 weights on
+        //    llm.vkopbin), so a copy into THIS band's bytes cannot disturb an
+        //    earlier level's still-unsubmitted dispatches; those read other
+        //    addresses. Only "copy precedes THIS level's dispatches" has to
+        //    hold, and this level has not begun recording.
+        //
+        //  * a shared slot (every paged weight aliased onto one arena offset,
+        //    which is what makes paging actually save VRAM): the argument above
+        //    does NOT hold, because "this band's bytes" IS the address every
+        //    earlier paged level reads. A copy landing now can execute before
+        //    those levels' dispatches, and they then read this band.
+        //    Measured (core/ArenaSeamPagingCheck.cpp, a 6-layer chain whose
+        //    output depends on every layer): with the default graph-submit mode
+        //    the shared arena diverged from a normal load in 2048/2048 elements,
+        //    deterministically, while one-slot-per-weight stayed bit-exact; the
+        //    per-level submit path was correct in both. So the hazard is exactly
+        //    "an earlier level's segment is still unsubmitted when a later level
+        //    overwrites the slot".
+        //
+        // The fix is therefore conditional: when the runtime owns paged weights
+        // that share a slot, settle everything recorded so far before running
+        // the hook, so no earlier level's dispatches can still be pending. A
+        // pager with distinct slots pays nothing (its caller's copies were
+        // already ordered correctly), and so does a Runtime told nothing.
         if (level_hook_) {
+            // VKOP_PAGED_NO_SETTLE=1 restores the pre-fix behaviour, so the
+            // hazard stays reproducible on demand (core/ArenaSeamPagingCheck.cpp
+            // fails 2048/2048 with it set and passes without it).
+            static const bool no_settle =
+                std::getenv("VKOP_PAGED_NO_SETTLE") != nullptr;
+            if (paged_shared_slot_ && !no_settle) {
+                // Everything recorded for earlier levels must have EXECUTED
+                // before the hook can overwrite the slot they read. Submitting
+                // is not enough: the copy the pager issues is its own submit
+                // and the queue may still be executing the segment that reads
+                // the slot. So close+submit the open segment, flush whatever is
+                // batched, and wait for the device.
+                if (graph_mode) {
+                    if (graph_seg) graph_submit();
+                    flush_seg_batch();
+                    if (sec_cmd) commit_primaries();
+                }
+                // The per-op path has already flushed each level by the time the
+                // next level begins (batch_levels defaults to 0), so waiting is
+                // enough there; in graph mode the flush+submit above is what
+                // puts the segment on the queue first.
+                dev->wait_all_done();
+            }
             level_hook_(level_idx);
         }
         // --- Host-side reshape_view pre-pass ---

@@ -118,6 +118,12 @@ class Runtime {
     // The shared arena and each paged weight's slot offset inside it.
     std::shared_ptr<VulkanBuffer> paged_arena_;
     std::unordered_map<std::string, size_t> paged_offsets_;
+    // True when the plan aliased every paged weight onto ONE slot. This is what
+    // makes paging save VRAM (23.87 GiB of 27B weights fit in a 1.19 GiB arena
+    // on b3), but it also means a page-in for level N overwrites the bytes
+    // level N-1 read -- so the level seam must settle the device before running
+    // the hook. Set from the plan; false keeps the seam's zero-cost path.
+    bool paged_shared_slot_ = false;
 
     // Per-level "contains a synchronous readback" flag, learned on round 0
     // (via the queue submit counter advancing during onExecute) and reused to
@@ -556,6 +562,7 @@ class Runtime {
     // Must be called before LoadModel(). The plan type is PagedArenaPlan,
     // declared above Runtime.
     void set_paged_initializers(PagedArenaPlan plan) {
+        paged_shared_slot_ = plan.share_slots;
         paged_plan_ = std::move(plan);
         unloaded_inits_.clear();
         unloaded_inits_.reserve(paged_plan_.names.size() * 2);
