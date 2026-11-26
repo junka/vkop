@@ -329,11 +329,10 @@ def test_a_view_chain_over_a_float32_weight_hydrates(tmp_path, monkeypatch):
 
 def test_deferral_is_refused_when_a_payload_would_be_rewritten(monkeypatch):
     monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
-    # nf4/nvfp4 and AWQ cannot be built from a streamed band: nvfp4 has a
+    # nvfp4 and AWQ cannot be built from a streamed band: nvfp4 has a
     # per-TENSOR factor (a genuinely global reduction) and AWQ is a real-valued
-    # rescale of the whole weight. nf4's scale is local like int4's but its
-    # codebook encode has not been validated on this path, so it stays refused.
-    for rewritten in ("nf4", "nvfp4", "awq"):
+    # rescale of the whole weight. (nf4 streams now: test_streamed_4bit.)
+    for rewritten in ("nvfp4", "awq"):
         assert ws.deferral_refusal(rewritten, False, False) is not None, rewritten
     assert ws.deferral_refusal("fp16", True, False) is not None
     assert ws.deferral_refusal("fp16", False, True) is not None
@@ -356,12 +355,12 @@ def test_a_byte_format_may_stream_and_quantize_on_the_way_out(monkeypatch):
     a 27B model convertible in 62 GB of RAM at all.
     """
     monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
-    for value_free in ("int8", "fp8e4m3", "fp8e5m2", "int4"):
+    for value_free in ("int8", "fp8e4m3", "fp8e5m2", "int4", "nf4"):
         assert ws.deferral_refusal(value_free, False, False) is None
         assert ws.exports_weight_values(value_free, False, False) is False
     assert ws.exports_weight_values("int8", True, False) is True
     assert ws.exports_weight_values("int8", False, True) is True
-    for needs_values in ("nf4", "nvfp4", "awq", "fp16", None):
+    for needs_values in ("nvfp4", "awq", "fp16", None):
         assert ws.exports_weight_values(needs_values, False, False) is True
 
 

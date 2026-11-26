@@ -39,6 +39,14 @@ from onnx import TensorProto, numpy_helper
 # than a few hundred MiB at a time.
 ROW_BLOCK = 2048
 
+# ...and values per read pass, because a row count alone does not bound a band:
+# 2048 rows of GLM-Edge's 59264-column lm_head is the WHOLE 121M-value matrix,
+# i.e. 485 MiB of fp32 plus as much again for np.abs in the scale sweep -- the
+# 1.7 GiB that set a streamed -q nf4 conversion's peak. The default band is the
+# smaller of the two, kept even (the transposed 4-bit writer packs column
+# pairs and needs every band to start on an even column).
+BAND_VALUES = 1 << 22
+
 
 def _np_dtype_of(dtype):
     """The numpy dtype that decodes this source file's element type.
@@ -89,14 +97,19 @@ class WeightReader:
         self.is_bf16 = src == TensorProto.BFLOAT16
         self.dtype = _np_dtype_of(src)
 
-    def bands(self, block=ROW_BLOCK):
+    def bands(self, block=None):
         """Yield (row_offset, float32 [rows, N]) for the whole weight.
 
         The source is the file the entry points at; `length` is its extent in
         source bytes, which is `numel * itemsize(src_dtype)`. A short read is
         a hard error for the same reason it is in write_payload: the entry
         already promised those bytes.
+
+        `block` is rows per band; the default is ROW_BLOCK rows or
+        BAND_VALUES values, whichever is fewer (and even).
         """
+        if block is None:
+            block = default_block(self.n)
         path = (self._path_for(self.entry) if self._path_for is not None
                 else self.entry["location"])
         if not os.path.isabs(path):
@@ -123,6 +136,12 @@ class WeightReader:
                         yield offset, band.astype(np.float32)
                 offset += rows
                 remaining -= rows * row_bytes
+
+
+def default_block(n):
+    """Rows per band for an n-column source: see BAND_VALUES."""
+    rows = min(ROW_BLOCK, BAND_VALUES // max(1, int(n)))
+    return max(2, rows & ~1)
 
 
 def _amax(reader, transposed: bool):
@@ -182,6 +201,12 @@ def scale_for(fmt, reader, transposed: bool = False, group: int = 0):
     if fmt == "int4":
         amax = grouped_amax(reader, group, transposed)
         return np.where(amax == 0, 1.0, amax / 7.0).astype(np.float32)
+    if fmt == "nf4":
+        # nf4 decodes as codebook[q] * scale with the codebook spanning
+        # [-1, 1], so the scale IS the group absmax (no /7) -- `_quantize_w3`'s
+        # unsigned branch, same zero guard.
+        amax = grouped_amax(reader, group, transposed)
+        return np.where(amax == 0, 1.0, amax).astype(np.float32)
     amax = _amax(reader, transposed)
     if fmt == "int8":
         return np.where(amax == 0, 1.0, amax / 127.0).astype(np.float32)
@@ -258,38 +283,154 @@ def grouped_amax(reader, group: int, transposed: bool = False):
     return amax
 
 
-def code_nibble(fmt, reader, scale, group: int, transposed: bool = False):
-    """A function (row_offset, band) -> int8 codes in [-8, 7], band-shaped.
+# The grouped 4-bit formats: one fp32 scale per (group of K, output column),
+# two codes per byte. int4 is a signed nibble (scale = absmax / 7), nf4 an index
+# into Quantizer._NF4_CODEBOOK (scale = absmax). Both stream the same way; only
+# the per-element encode differs.
+FOUR_BIT_FORMATS = ("int4", "nf4")
 
-    `scale` is the table `scale_for` produced: `[n_groups, N]` for int4. The
-    grouping is applied by indexing it with the K index's group, so a band that
-    starts mid-group still divides every row by the scale of the group that row
+
+def _encode_4bit(fmt):
+    """(normalized fp32 values) -> int8 codes, the in-memory quantizer's rule."""
+    if fmt == "int4":
+        return lambda x: np.clip(np.round(x), -8, 7).astype(np.int8)
+    from .optimizer import Quantizer
+    return Quantizer._nf4_encode
+
+
+def code_nibble(fmt, reader, scale, group: int, transposed: bool = False):
+    """A function (row_offset, band) -> int8 codes, band-shaped.
+
+    int4 codes are in [-8, 7]; nf4 codes are codebook indices in [0, 15].
+
+    `scale` is the table `scale_for` produced: `[n_groups, N]`. The grouping is
+    applied by indexing it with the K index's group, so a band that starts
+    mid-group still divides every row by the scale of the group that row
     belongs to.
 
     The division is the in-memory quantizer's, element for element:
     `Quantizer._quantize_w3` divides the [n_groups, group, N] operand by a
     [n_groups, 1, N] table, which for a row inside group g is exactly
-    `band[row] / scale[g]`. Same operands, same fp32 rounding, so the codes are
-    bit-identical -- the packed bytes only ever differ in how they are laid
+    `band[row] / scale[g]`. Same operands, same fp32 rounding, and the same
+    encoder after it (nf4 calls `Quantizer._nf4_encode` itself), so the codes
+    are bit-identical -- the packed bytes only ever differ in how they are laid
     down, never in what they say.
     """
-    if fmt != "int4":
+    if fmt not in FOUR_BIT_FORMATS:
         raise ValueError(f"code_nibble is the 4-bit encoder; got {fmt!r}")
     scale = np.asarray(scale, dtype=np.float32)
+    encode = _encode_4bit(fmt)
 
     if transposed:
         def codes(offset, band):
             rows = band.shape[0]
             # [rows, n_groups] -> [rows, K], one scale per K value of the row.
             s = np.repeat(scale[:, offset:offset + rows].T, group, axis=1)
-            return np.clip(np.round(band / s), -8, 7).astype(np.int8)
+            return encode(band / s)
         return codes
 
     def codes(offset, band):
         rows = band.shape[0]
         idx = np.arange(offset, offset + rows) // group
-        return np.clip(np.round(band / scale[idx]), -8, 7).astype(np.int8)
+        return encode(band / scale[idx])
     return codes
+
+
+def dequantize_4bit(fmt, codes, scale):
+    """What the kernel reads back for `codes` under a broadcastable `scale`.
+
+    `Quantizer._dequantize_w3`'s arithmetic (int4: code * scale; nf4:
+    codebook[code] * scale), on whatever layout the caller holds.
+    """
+    from .optimizer import Quantizer
+    return Quantizer._dequantize_w3(codes, scale, fmt)
+
+
+def audit_4bit(fmt, reader, scale, group: int, transposed: bool = False):
+    """The numeric-audit RoundTrip of a streamed 4-bit weight, one band at a time.
+
+    The in-memory pass reports every weight it encodes (`_report_qerror`: the
+    "Quantized '<name>'" lines and the audit row); a streamed weight is encoded
+    by the writer, after the audit has been printed, so without this it would
+    silently drop out of both. This sweeps the source once more -- one band in
+    RAM -- encodes it with the very codes the writer will emit, decodes it the
+    way the kernel does and folds the pair into a RoundTrip.
+
+    The sweep is bounded by AUDIT_VALUES values per band (~4 MiB of fp32,
+    ~40 MiB of float64 temporaries in RoundTrip.add) rather than by
+    numeric_audit's own 8M-value chunk: at that size the float64 working set
+    of the audit, not the weight, was the conversion's peak (+0.8 GiB on
+    GLM-Edge). The cost is the summation order -- the in-memory pass sums its
+    8M-value slices, this sums smaller ones -- so the float64 totals agree to
+    rounding (relative ~1e-16), far below the printed digits; the maxima and
+    the counts are order-independent and identical.
+
+    Returns (RoundTrip, dead_slices) -- dead_slices is `_report_qerror`'s
+    count of zero entries in the scale table.
+    """
+    from . import numeric_audit
+
+    scale = np.asarray(scale, dtype=np.float32)
+    stats = numeric_audit.RoundTrip(fmt)
+    codes = code_nibble(fmt, reader, scale, group, transposed)
+    block = max(2, (AUDIT_VALUES // max(1, reader.n)) & ~1)
+    for offset, band in reader.bands(block=block):
+        rows = band.shape[0]
+        if transposed:
+            # [rows, n_groups] -> [rows, K], one scale per K value of the row.
+            s = np.repeat(scale[:, offset:offset + rows].T, group, axis=1)
+        else:
+            s = scale[np.arange(offset, offset + rows) // group]
+        stats.add(band, dequantize_4bit(fmt, codes(offset, band), s))
+    return stats, int(np.count_nonzero(scale == 0))
+
+
+# Values per band of the audit sweep (see audit_4bit).
+AUDIT_VALUES = 1 << 20
+
+
+class InterleavedReader:
+    """The SwiGLU gate/up fold's [K, 2N] weight, read from its two sources.
+
+    `FusionOptimizer.fold_swiglu_gate_up` replaces Wg and Wu ([K, N] each) with
+    one [K, 2N] weight whose columns interleave four at a time (g0..g3 u0..u3
+    g4 ..). A quantizing deferred entry for that weight keeps both sources
+    (`entry["interleave"]`), and this reader yields bands of the interleaved
+    matrix -- the same float32 values, in the same places, the in-memory fold
+    builds with np.concatenate -- so the encoder, the writer and the audit see
+    the fused weight without either source ever being whole in RAM.
+    """
+
+    def __init__(self, entry, name, path_for=None):
+        spec = entry["interleave"]
+        self.name = name
+        self.g = WeightReader(spec["g"], name + " (gate)", path_for=path_for)
+        self.u = WeightReader(spec["u"], name + " (up)", path_for=path_for)
+        if (self.g.k, self.g.n) != (self.u.k, self.u.n) or self.g.n % 4:
+            raise ValueError(
+                f"'{name}': gate {self.g.k}x{self.g.n} and up "
+                f"{self.u.k}x{self.u.n} cannot interleave four columns at a time")
+        self.k, self.n = self.g.k, 2 * self.g.n
+
+    def bands(self, block=None):
+        half = self.g.n
+        if block is None:
+            block = default_block(self.n)
+        for (og, bg), (ou, bu) in zip(self.g.bands(block), self.u.bands(block)):
+            if og != ou or bg.shape != bu.shape:
+                raise ValueError(
+                    f"'{self.name}': gate and up bands disagree at row {og}/{ou}")
+            rows = bg.shape[0]
+            yield og, np.concatenate(
+                [bg.reshape(rows, half // 4, 4), bu.reshape(rows, half // 4, 4)],
+                axis=2).reshape(rows, 2 * half)
+
+
+def reader_for(entry, name, path_for=None):
+    """The band reader for a deferred entry: plain, or the SwiGLU interleave."""
+    if entry.get("interleave") is not None:
+        return InterleavedReader(entry, name, path_for=path_for)
+    return WeightReader(entry, name, path_for=path_for)
 
 
 def code_byte(fmt, reader, scale, transposed: bool = False):

@@ -79,10 +79,26 @@ _PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2, TensorProto.BFLOAT16: 2,
 # band-at-a-time sweep accumulates exactly the same table (quant_payload's
 # _grouped_amax). Only the grouping boundary matters, and a band that starts
 # mid-group is handled by slicing on `offset % group_size` rather than assuming
-# the two line up. nf4 is NOT here: its scale has the same local property but its
-# payload is a per-element codebook search this module has not been validated
-# against, and nvfp4 adds a per-TENSOR factor (a true whole-matrix reduction).
-_VALUE_FREE_FORMATS = ("int8", "fp8e4m3", "fp8e5m2", "int4")
+# the two line up. nf4 is here for the same reason: its scale is the same
+# grouped absmax (without the /7) and its code is a per-element nearest-codebook
+# lookup, the shared `Quantizer._nf4_encode`, so a band encodes exactly as the
+# in-memory pass would (pinned byte-for-byte by test_streamed_4bit). nvfp4 is
+# not: it adds a per-TENSOR factor that every block scale is divided by, so the
+# block table can only be built after a whole-matrix reduction.
+_VALUE_FREE_FORMATS = ("int8", "fp8e4m3", "fp8e5m2", "int4", "nf4")
+
+# Values per band for the [K, N] 4-bit writer (see _write_int4).
+_BAND_VALUES = 1 << 22
+
+# Rows per band for the writers that re-lay an [N, K] source as [K, N]. Each
+# band costs one positioned write per k, so these keep the historical
+# ROW_BLOCK bands rather than the value-bounded default (quant_payload
+# .default_block), which would multiply the write count on a wide K.
+_TRANSPOSED_BAND_ROWS = 2048
+
+# The grouped 4-bit members of that set: packed two codes per byte, a
+# [K/group, N] scale table, and the [K, N]-only layout gate (_int4_layout_ok).
+_FOUR_BIT_FORMATS = ("int4", "nf4")
 
 # The payload element type each of those produces. The deferred row
 # records it, which is what lets the extent checks and the writer treat
@@ -93,6 +109,10 @@ _PAYLOAD_DTYPES = {
     "fp8e4m3": TensorProto.FLOAT8E4M3FN,
     "fp8e5m2": TensorProto.FLOAT8E5M2,
     "int4": TensorProto.INT4,
+    # ONNX has no NF4 element type: the nibble's storage is UINT4 and its
+    # meaning rides the initializer's `vkop_dtype` metadata, which the
+    # quantizer stamps on the deferred tensor (Quantizer._stream_4bit_rows).
+    "nf4": TensorProto.UINT4,
 }
 
 
@@ -166,7 +186,7 @@ def deferral_refusal(quant: Optional[str], unify: bool,
                      rgba: bool) -> Optional[str]:
     """Why deferral must not run, or None when it may.
 
-    A value-free format (int8, fp8, int4) is allowed: it derives its scale from
+    A value-free format (int8, fp8, int4, nf4) is allowed: it derives its scale from
     the weight's magnitudes and overwrites the values, so the bytes can be
     quantized on the way into the trailer (`quant_payload`) instead of being
     inflated into an array first. Their scales are LOCAL to a slice of the
@@ -174,11 +194,12 @@ def deferral_refusal(quant: Optional[str], unify: bool,
     per-(K group, output column) absmax for int4 -- so a band-at-a-time sweep
     computes exactly the table the in-memory quantizer would.
 
-    AWQ and nf4/nvfp4 still refuse. AWQ is a real-valued rescale of the whole
+    nf4 streams like int4: the same grouped absmax (unscaled) and a
+    per-element codebook lookup shared with the in-memory pass.
+
+    AWQ and nvfp4 still refuse. AWQ is a real-valued rescale of the whole
     weight (`W * s` needs every element before any of it can be written), and
-    nvfp4's per-tensor factor is a genuinely global reduction. nf4's scale is
-    local but its codebook encode has not been validated on the streaming path,
-    so it stays conservative rather than shipping unverified nibbles.
+    nvfp4's per-tensor factor is a genuinely global reduction.
     """
     if not _env_flag(_ENV_ENABLE, True):
         return f"{_ENV_ENABLE}=0"
@@ -479,7 +500,8 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 # produces, and on the 27B it is 48.9 GiB of the 49.3 GiB.
                 and (_only_weight_consumers(consumers.get(init.name))
                      or _reachable_as_weight(uses, init.name)))
-            if keep_in_file_gates and quantizes and quant == "int4":
+            if (keep_in_file_gates and quantizes
+                    and quant in _FOUR_BIT_FORMATS):
                 # A 4-bit payload has a layout the graph has to agree with
                 # before it can be deferred at all: the nibble kernels unpack
                 # only a [K, N] payload with N % 8, and this pass -- not the
@@ -516,7 +538,7 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 # this is the only point that still has the graph: by the time
                 # the scale is computed the Transpose may have been folded away.
                 entry["transposed"] = is_transposed_weight(uses, init.name)
-                if quant == "int4":
+                if quant in _FOUR_BIT_FORMATS:
                     # The group length, recorded because the scale table's row
                     # count is derived from it (n_groups = K / group) and a
                     # reader has only the payload's dims to go on.
@@ -1187,7 +1209,7 @@ def _write_quantized(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
     """
     from . import quant_payload
 
-    if entry.get("quant") == "int4":
+    if entry.get("quant") in _FOUR_BIT_FORMATS:
         return _write_int4(entry, out_f, dag_model, base_dir)
 
     if entry.get("transpose_payload"):
@@ -1238,7 +1260,11 @@ def _pack_nibbles(codes) -> np.ndarray:
 
 def _write_int4(entry: dict, out_f, dag_model=None,
                 base_dir: str = "") -> int:
-    """Stream an int4 entry's source, write packed nibbles (two per byte).
+    """Stream a 4-bit (int4 / nf4) entry's source, write packed nibbles.
+
+    Two codes per byte, the even element low. The format only changes the
+    per-element encode (quant_payload.code_nibble); everything about layout
+    below is shared.
 
     Two layouts, one payload:
 
@@ -1260,20 +1286,21 @@ def _write_int4(entry: dict, out_f, dag_model=None,
     """
     from . import quant_payload
 
-    reader = quant_payload.WeightReader(
+    fmt = entry["quant"]
+    reader = quant_payload.reader_for(
         entry, entry["name"],
         path_for=lambda e: source_read_path(e, out_f, base_dir))
     transposed = bool(entry.get("transposed"))
     group = int(entry.get("group") or 0)
     if group <= 0:
         raise DeferredWeightError(
-            f"deferred weight '{entry['name']}' is int4 but its row records no "
+            f"deferred weight '{entry['name']}' is {fmt} but its row records no "
             f"group size; the scale table's row length cannot be derived")
     scale = (scale_values_for(entry, dag_model) if dag_model is not None
              else entry.get("scale_values"))
     if scale is None:
-        scale = quant_payload.scale_for("int4", reader, transposed, group)
-    codes = quant_payload.code_nibble("int4", reader, scale, group, transposed)
+        scale = quant_payload.scale_for(fmt, reader, transposed, group)
+    codes = quant_payload.code_nibble(fmt, reader, scale, group, transposed)
 
     if entry.get("transpose_payload"):
         return _write_int4_transposed(entry, out_f, reader, codes)
@@ -1291,10 +1318,15 @@ def _write_int4(entry: dict, out_f, dag_model=None,
             f"source but no pass re-laid it as [K, N]; a 4-bit payload is only "
             f"readable in that orientation, so encoding the stored order would "
             f"ship silently transposed weights. Reconvert with "
-            f"{_ENV_ENABLE}=0, or exclude this weight from -q int4.")
+            f"{_ENV_ENABLE}=0, or exclude this weight from -q {fmt}.")
 
+    # A [K, N] band is consecutive payload rows, so its size only bounds memory:
+    # ~4M values (16 MiB of fp32 plus the encoder's temporaries) instead of
+    # ROW_BLOCK whole rows, which for a 59264-column lm_head was 485 MiB of
+    # fp32 band and as much again in temporaries.
+    block = max(1, _BAND_VALUES // max(1, reader.n))
     written = 0
-    for offset, band in reader.bands():
+    for offset, band in reader.bands(block=block):
         packed = _pack_nibbles(codes(offset, band))
         out_f.write(packed.tobytes())
         written += packed.nbytes
@@ -1326,7 +1358,7 @@ def _write_int4_transposed(entry: dict, out_f, reader, codes) -> int:
     base = out_f.tell()
     pwrite = _pwrite_for(out_f)
     done = 0
-    for offset, band in reader.bands():
+    for offset, band in reader.bands(block=_TRANSPOSED_BAND_ROWS):
         rows = band.shape[0]
         if offset % 2:
             raise DeferredWeightError(
@@ -1401,7 +1433,7 @@ def _write_quantized_transposed(entry: dict, out_f, base_dir: str,
     pwrite = _pwrite_for(out_f)
     left = dst_n                       # output columns still to be written
     done = 0
-    for offset, band in reader.bands():
+    for offset, band in reader.bands(block=_TRANSPOSED_BAND_ROWS):
         rows = band.shape[0]
         q = codes(offset, band)
         if q.shape != (rows, src_k):

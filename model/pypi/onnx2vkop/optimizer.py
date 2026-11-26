@@ -6216,8 +6216,43 @@ class FusionOptimizer:
     # [K, 2*N] with Wg and Wu interleaved four columns at a time
     # (g0..g3 u0..u3 g4..), so a kernel lane that owns eight consecutive
     # columns holds a gate quartet and its up quartet and can apply the
-    # activation in its own epilogue (ops/Matmul.hpp, swiglu). fp16 weights
-    # only: a quantized pair keeps the unfused graph.
+    # activation in its own epilogue (ops/Matmul.hpp, swiglu). fp16 weights,
+    # plus one quantized form: a pair streamed under -q int4/nf4, which the
+    # in-memory path would fold as fp16 and then encode as one 4-bit [K, 2N]
+    # weight (the nibble epilogue carries the swiglu arm). The streamed pair
+    # already carries its finalize-appended scales, [x, W, W_scale]; it folds
+    # to [x, Wgu, Wgu_scale] with the two tables interleaved like the columns.
+    # Any other quantized pair keeps the unfused graph.
+    @staticmethod
+    def _streamed_4bit_pair(dag_model, gate, up):
+        """(eg, eu) when gate/up are a foldable streamed 4-bit pair, else None.
+
+        Both B operands deferred under the same grouped 4-bit format and group,
+        both [K, N] sources (no Transpose behind them -- the fold needs the
+        stored rows to BE the K axis), and each MatMul's third input is that
+        weight's own scale table: exactly the [x, W, W_scale] quant_payload
+        .finalize builds and nothing else."""
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
+        if len(gate.inputs) != 3 or len(up.inputs) != 3:
+            return None
+        eg = deferred.get(gate.inputs[1]["name"])
+        eu = deferred.get(up.inputs[1]["name"])
+        if eg is None or eu is None:
+            return None
+        for e, node in ((eg, gate), (eu, up)):
+            if (e.get("quant") not in ("int4", "nf4") or e.get("transposed")
+                    or e.get("transpose_payload") or e.get("interleave")
+                    or e.get("lane_major") or not e.get("scale")
+                    or node.inputs[2]["name"] != e["scale"]
+                    or e["scale"] not in dag_model.initializers):
+                return None
+        if (eg["quant"] != eu["quant"]
+                or int(eg.get("group") or 0) != int(eu.get("group") or 0)
+                or int(eg.get("group") or 0) <= 0
+                or eg.get("src_dtype") != eu.get("src_dtype")):
+            return None
+        return eg, eu
+
     @staticmethod
     def match_swiglu_gate_up(dag_model):
         producer = {}
@@ -6260,7 +6295,7 @@ class FusionOptimizer:
                         and q.op_type == "MatMul"):
                     m1, up = p, q
                     break
-            if m1 is None or len(m1.inputs) != 2 or len(up.inputs) != 2:
+            if m1 is None or len(m1.inputs) != 2 or len(up.inputs) not in (2, 3):
                 continue
             gate = sig = None
             for a, b in ((m1.inputs[0], m1.inputs[1]),
@@ -6272,17 +6307,24 @@ class FusionOptimizer:
                             and p.inputs[0]["name"] == a["name"]):
                         gate, sig = cand, p
                         break
-            if gate is None or len(gate.inputs) != 2 or gate is up:
+            if gate is None or gate is up or len(gate.inputs) not in (2, 3):
                 continue
+            quant_pair = None
+            if len(gate.inputs) == 3 or len(up.inputs) == 3:
+                quant_pair = FusionOptimizer._streamed_4bit_pair(
+                    dag_model, gate, up)
+                if quant_pair is None:
+                    continue
             if gate.attributes.get("transB", 0) or up.attributes.get("transB", 0):
                 continue
             if any(k != "transB" for k in list(gate.attributes) + list(up.attributes)):
                 continue
-            x, wg = gate.inputs
-            xu, wu = up.inputs
+            x, wg = gate.inputs[:2]
+            xu, wu = up.inputs[:2]
             if x["name"] != xu["name"] or wg["name"] == wu["name"]:
                 continue
-            if not (_plain_fp16(wg["name"]) and _plain_fp16(wu["name"])):
+            if quant_pair is None and not (_plain_fp16(wg["name"])
+                                           and _plain_fp16(wu["name"])):
                 continue
             if (wg["name"] in deferred) != (wu["name"] in deferred):
                 continue
@@ -6292,6 +6334,19 @@ class FusionOptimizer:
             k_dim, n_dim = int(tg.dims[0]), int(tg.dims[1])
             if n_dim % 4 != 0:
                 continue
+            if quant_pair is not None:
+                # Each scale table is [K/group, N] for its own weight; the
+                # interleave needs the two to line up row for row.
+                sg = inits[quant_pair[0]["scale"]]
+                su = inits[quant_pair[1]["scale"]]
+                if list(sg.dims) != list(su.dims) or len(sg.dims) != 2 \
+                        or int(sg.dims[1]) != n_dim:
+                    continue
+                # Each scale must be read by its MatMul alone: the fold
+                # replaces both tables with the interleaved one.
+                if (len(consumers.get(quant_pair[0]["scale"], [])) != 1
+                        or len(consumers.get(quant_pair[1]["scale"], [])) != 1):
+                    continue
             if any(_single(t) is None for t in (up.outputs[0]["name"],
                                                sig.outputs[0]["name"],
                                                m1.outputs[0]["name"])):
@@ -6306,7 +6361,8 @@ class FusionOptimizer:
                 continue
             matches.append({"gate": gate, "up": up, "sigmoid": sig, "m1": m1,
                             "m2": m2, "x": x, "wg": wg["name"],
-                            "wu": wu["name"], "k": k_dim, "n": n_dim})
+                            "wu": wu["name"], "k": k_dim, "n": n_dim,
+                            "quant": quant_pair is not None})
         return matches
 
     @staticmethod
@@ -6334,6 +6390,33 @@ class FusionOptimizer:
             entry["consumers"] = 1
             entry["interleave"] = {"g": dict(eg), "u": dict(eu),
                                    "k": k_dim, "n": n_dim}
+            if match.get("quant"):
+                # The fused weight is encoded as ONE [K, 2N] 4-bit payload,
+                # exactly as the in-memory pass encodes the fp16 fold: the
+                # writer reads the interleaved bands
+                # (quant_payload.InterleavedReader). A group's absmax runs
+                # along K, so the interleaved matrix's table is the two
+                # tables' columns interleaved the same way -- the same fp32
+                # values the in-memory quantizer computes, in the same order.
+                scale_name = name + "_scale"
+                sg = numpy_helper.to_array(inits[eg["scale"]])
+                su = numpy_helper.to_array(inits[eu["scale"]])
+                groups = sg.shape[0]
+                sgu = np.concatenate(
+                    [sg.reshape(groups, n_dim // 4, 4),
+                     su.reshape(groups, n_dim // 4, 4)], axis=2)
+                scale_init = numpy_helper.from_array(
+                    np.ascontiguousarray(
+                        sgu.reshape(groups, 2 * n_dim), dtype=np.float32),
+                    scale_name)
+                scale_init.data_type = TensorProto.FLOAT
+                del inits[eg["scale"]]
+                del inits[eu["scale"]]
+                inits[scale_name] = scale_init
+                entry["scale"] = scale_name
+                entry.pop("scale_values", None)
+                quant_scale = {"name": scale_name,
+                               "shape": [groups, 2 * n_dim]}
             deferred[name] = entry
             deferred.pop(wg, None)
             deferred.pop(wu, None)
@@ -6347,11 +6430,14 @@ class FusionOptimizer:
         inits[name] = t
         del inits[wg]
         del inits[wu]
+        inputs = [match["x"], {"name": name}]
+        if match.get("quant"):
+            inputs.append(quant_scale)
         fused = Node(
             op_type="MatMul",
             name=match["gate"].name + "_swiglu",
             attributes={"swiglu": [1]},
-            inputs=[match["x"], {"name": name}],
+            inputs=inputs,
             outputs=match["m2"].outputs[:],
         )
         for key in ("gate", "up", "sigmoid", "m1", "m2"):
@@ -9414,32 +9500,127 @@ class Quantizer:
 
         scale_keepdims = np.where(amax == 0, 1.0, amax)
         normalized = w3.astype(np.float32) / scale_keepdims
-        # NF4 nearest-codebook lookup. The codebook is a sorted 16-point
-        # grid, so np.searchsorted finds each value's insertion index in
-        # O(log 16) with no broadcast temp — the naive
-        #   np.abs(normalized[..., None] - CODEBOOK[None,None,None,:])
-        #   .argmin(-1)
-        # materializes a [n_groups, group_size, N, 16] fp32 array (~8.7GB
-        # for the 151936x896 lm_head) and OOMs the converter. This path
-        # uses O(1) extra memory and is bit-identical to it.
-        codebook = Quantizer._NF4_CODEBOOK  # ascending, length 16
-        # Clip into [codebook[0], codebook[-1]] so searchsorted is
-        # stable. NaN (a degenerate group that is all-zero except a
-        # NaN, which shouldn't happen for real weights but guard it)
-        # maps to index 0, matching what the broadcast argmin path did.
-        clipped = np.clip(np.nan_to_num(normalized, nan=codebook[0]),
-                          codebook[0], codebook[-1])
-        hi = np.searchsorted(codebook, clipped, side="left")
-        # hi is in [1, 16]; the nearest code is either hi-1 or hi (clipped
-        # to [0, 15]). Compare the two candidates.
-        lo = hi - 1
-        hi = np.minimum(hi, 15)
-        d_lo = np.abs(clipped - codebook[lo])
-        d_hi = np.abs(clipped - codebook[hi])
-        # Tie-break toward the smaller index (matches argmin, which picks
-        # the first minimum): when d_lo <= d_hi take lo.
-        codes = np.where(d_lo <= d_hi, lo, hi).astype(np.int8)
+        codes = Quantizer._nf4_encode(normalized)
         return codes, scale_keepdims.astype(out_dtype)
+
+    # The 15 float32 decision points between neighbouring NF4 codes, built once
+    # by _nf4_thresholds.
+    _NF4_THRESHOLDS = None
+
+    @staticmethod
+    def _nf4_thresholds():
+        """The exact fp32 boundaries of the nearest-NF4-code rule.
+
+        The rule the payload is defined by is "nearest codebook entry, the
+        lower index on a tie", evaluated in float32:
+
+            d_lo = |x - c[j]|,  d_hi = |x - c[j+1]|,  pick j iff d_lo <= d_hi
+
+        for x in (c[j], c[j+1]]. Both distances are monotone in x (fp32
+        subtraction rounds monotonically), so on each interval the rule flips
+        exactly once. T[j] is the LARGEST float32 for which it still picks j,
+        found by bisection over the ordered fp32 bit patterns -- so it is the
+        rule itself, rounding included, not the real midpoint (c[j]+c[j+1])/2,
+        which can sit one ulp off it and move a code.
+
+        With T in hand the code of x is just "how many T[j] are below x", which
+        needs no gather and no int64 index array (see _nf4_encode).
+        """
+        if Quantizer._NF4_THRESHOLDS is not None:
+            return Quantizer._NF4_THRESHOLDS
+        cb = Quantizer._NF4_CODEBOOK
+
+        def key(v):      # fp32 -> integer, order-preserving (-0.0 == +0.0)
+            b = int(np.float32(v).view(np.int32))
+            return b if b >= 0 else -(b & 0x7FFFFFFF)
+
+        def value(k):    # inverse of key
+            if k >= 0:
+                return np.uint32(k).view(np.float32)
+            return np.uint32((-k) | 0x80000000).view(np.float32)
+
+        def picks_lo(x, lo, hi):
+            return np.abs(x - lo) <= np.abs(x - hi)
+
+        out = []
+        for j in range(len(cb) - 1):
+            lo, hi = cb[j], cb[j + 1]
+            a, b = key(lo), key(hi)   # picks_lo(a) holds, picks_lo(b) does not
+            while b - a > 1:
+                m = (a + b) // 2
+                if picks_lo(value(m), lo, hi):
+                    a = m
+                else:
+                    b = m
+            out.append(value(a))
+        Quantizer._NF4_THRESHOLDS = np.array(out, dtype=np.float32)
+        return Quantizer._NF4_THRESHOLDS
+
+    @staticmethod
+    def _nf4_encode(normalized, chunk: int = 1 << 18):
+        """Nearest-NF4-code index (int8, 0..15) of every value, same shape.
+
+        Bit-identical to the reference rule -- clip to [-1, 1], NaN -> code 0,
+        nearest codebook entry with ties to the lower index -- but computed as
+        the count of exact fp32 decision points below each value
+        (_nf4_thresholds): 15 compare-and-add passes into a uint8, over a
+        chunk at a time. That is ~4x faster than the searchsorted +
+        two gathers + where it replaces, allocates no int64 index array (8
+        bytes per weight), and needs no special cases: NaN compares false
+        against every threshold (code 0), +inf true against all (15), -inf
+        false against all (0), and anything past +-1 lands on the end codes
+        exactly as the clip did.
+
+        The shared encoder for every NF4 producer -- the -q nf4 pass, AWQ and
+        the streamed payload writer (quant_payload.code_nibble) -- so the
+        three cannot drift apart.
+        """
+        x = np.ascontiguousarray(normalized, dtype=np.float32)
+        flat = x.reshape(-1)
+        out = np.zeros(flat.shape, dtype=np.uint8)
+        thresholds = Quantizer._nf4_thresholds()
+
+        def encode(s, e):
+            xs = flat[s:e]
+            o = out[s:e]
+            t = np.empty(xs.size, dtype=bool)
+            for th in thresholds:
+                np.greater(xs, th, out=t)
+                o += t
+
+        spans = [(s, min(s + chunk, flat.size))
+                 for s in range(0, flat.size, chunk)]
+        pool = Quantizer._nf4_pool() if len(spans) > 2 else None
+        if pool is None:
+            for s, e in spans:
+                encode(s, e)
+        else:
+            # Every chunk writes its own slice of `out`, and numpy releases
+            # the GIL inside each ufunc, so the chunks run in parallel with a
+            # result that cannot depend on the scheduling: ~5x on 8 threads
+            # (measured 6.8 -> 1.3 ns per value on an M5 Max).
+            list(pool.map(lambda span: encode(*span), spans))
+        return out.reshape(x.shape).view(np.int8)
+
+    _NF4_POOL = None
+
+    @staticmethod
+    def _nf4_pool():
+        """The worker pool _nf4_encode fans its chunks out to (None: serial).
+
+        At most 8 threads -- past that the chunk passes are memory-bound and
+        measured no faster. VKOP_CONVERT_THREADS overrides; 1 keeps it
+        serial."""
+        if Quantizer._NF4_POOL is None:
+            raw = os.environ.get("VKOP_CONVERT_THREADS", "").strip()
+            n = int(raw) if raw.isdigit() else min(8, os.cpu_count() or 1)
+            if n <= 1:
+                Quantizer._NF4_POOL = False
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                Quantizer._NF4_POOL = ThreadPoolExecutor(
+                    n, thread_name_prefix="nf4")
+        return Quantizer._NF4_POOL or None
 
     @staticmethod
     def _dequantize_w3(codes, scale_keepdims, fmt: str):
@@ -9475,6 +9656,18 @@ class Quantizer:
                 codes[g0:g1], scale_keepdims[g0:g1], fmt)
             stats.add(w3[g0:g1], part)
             del part
+        Quantizer._print_qerror(
+            name, stats, fmt, k, n, n_groups, group_size,
+            int(np.count_nonzero(scale_keepdims == 0)), via)
+
+    @staticmethod
+    def _print_qerror(name, stats, fmt, k, n, n_groups, group_size,
+                      dead_slices, via=""):
+        """The per-weight 4-bit report and its audit row, from a RoundTrip.
+
+        Shared by the in-memory pass (_report_qerror) and the streamed one
+        (_stream_4bit_rows), so a weight reports the same lines whichever path
+        encoded it."""
         print(f"Quantized '{name}':")
         print(f"  Shape: [{k}, {n}], groups: {n_groups} x {group_size}")
         print(f"  Scale shape: [{n_groups}, {n}]")
@@ -9482,9 +9675,90 @@ class Quantizer:
         print(f"  Mean Rel Error: {stats.mean_rel:.2%}, "
               f"Max Rel Error: {stats.max_rel:.2%}")
         numeric_audit.record(name, fmt, stats,
-                             dead_slices=int(np.count_nonzero(
-                                 scale_keepdims == 0)), via=via)
+                             dead_slices=int(dead_slices), via=via)
 
+    @staticmethod
+    def _stream_4bit_rows(dag_model, name, entry, consumers, fmt, group_size):
+        """Finish a streamed 4-bit weight on the DAG side.
+
+        weight_stream writes its nibbles and quant_payload.finalize already put
+        its scale table in the graph, so what is left is what the in-memory
+        pass would have done to the graph around them:
+
+          * nf4's meaning: ONNX has no NF4 type, so the payload is UINT4 storage
+            and the `vkop_dtype` metadata names it, exactly as
+            _pack_4bit_weight stamps an in-memory payload. Without it the side
+            table says "uint4" and the loader has no such weight kernel.
+          * the per-weight report and audit row (_print_qerror), from one more
+            band-at-a-time sweep of the source (quant_payload.audit_4bit) --
+            skipped under VKOP_NUMERIC_AUDIT=off, the one mode that does not
+            want the numbers, since it costs a read of the weight.
+          * the scale's position: the in-memory pass appends `{name}_scale` to
+            the initializer list as it encodes each weight, and the writer lays
+            the blob out in that order. Moving the streamed scale to the end
+            here, in the same weight order, gives both paths the same blob
+            layout -- the same file, not just the same payloads.
+        """
+        from . import quant_payload, weight_stream
+
+        init = dag_model.initializers[name]
+        if fmt == "nf4":
+            if not any(kv.key == "vkop_dtype" for kv in init.metadata_props):
+                init.metadata_props.add(key="vkop_dtype", value="nf4")
+
+        scale_name = entry.get("scale")
+        if (numeric_audit.numeric_audit_mode() != "off"
+                and entry.get("location") and scale_name
+                and scale_name in dag_model.initializers):
+            reader = quant_payload.reader_for(
+                entry, name,
+                path_for=lambda e: weight_stream.source_read_path(
+                    e, None, e.get("base_dir") or ""))
+            transposed = bool(entry.get("transposed"))
+            group = int(entry.get("group") or group_size)
+            scale = weight_stream.scale_values_for(entry, dag_model)
+            stats, dead = quant_payload.audit_4bit(
+                fmt, reader, scale, group, transposed)
+            k, n = (int(d) for d in entry["dims"])
+            if transposed and not entry.get("transpose_payload"):
+                n, k = k, n
+            Quantizer._print_qerror(
+                name, stats, fmt, k, n, k // group, group, dead,
+                via=numeric_audit.consumer_tag(consumers))
+
+        if scale_name and scale_name in dag_model.initializers:
+            dag_model.initializers[scale_name] = (
+                dag_model.initializers.pop(scale_name))
+
+        # The consumer's input references, as the in-memory pass leaves them.
+        # There the weight was a float initializer when the graph was parsed,
+        # so its reference carries that float type (FLOAT16 once the FP16
+        # domain pass has run over it), and the scale is appended afterwards
+        # with no declared type. A streamed weight was already its payload
+        # type (UINT4/INT4) at parse time, which the parser has no name for
+        # (dtype 0), while its scale was a parsed FLOAT initializer that the
+        # domain pass then re-declared FLOAT16 -- a declaration the fp32
+        # table does not have. Both are normalized to the in-memory form.
+        src_float = entry.get("src_dtype", onnx.TensorProto.FLOAT)
+        for node in consumers:
+            scale_dt = None
+            for inp in node.inputs:
+                if scale_name and inp.get("name") == scale_name:
+                    scale_dt = inp.pop("dtype", None)
+            for inp in node.inputs:
+                if inp.get("name") == name and inp.get("dtype", None) == 0:
+                    if src_float in (onnx.TensorProto.FLOAT16,
+                                     onnx.TensorProto.BFLOAT16):
+                        inp["dtype"] = onnx.TensorProto.FLOAT16
+                    elif scale_dt == onnx.TensorProto.FLOAT16:
+                        # fp32 source, and the domain pass flipped this node.
+                        inp["dtype"] = onnx.TensorProto.FLOAT16
+                    else:
+                        inp["dtype"] = onnx.TensorProto.FLOAT
+        src = entry.get("src_dtype", entry.get("data_type"))
+        print(f"Converted {onnx.TensorProto.DataType.Name(src)} tensor "
+              f"'{name}' to {fmt} with group scale '{scale_name}' (streamed: "
+              f"encoded on the way into the trailer)")
 
 
     @staticmethod
@@ -9733,9 +10007,14 @@ class Quantizer:
         # Counting them here is what makes the summary line honest: a fully
         # streamed `-q int4` conversion used to report "Converted 0 tensors",
         # which reads as "nothing was quantized" when in fact every weight was.
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
         streamed_count = sum(
-            1 for e in (getattr(dag_model, "deferred_weights", {}) or {}).values()
-            if e.get("quant") == fmt)
+            1 for e in deferred.values() if e.get("quant") == fmt)
+        # The scale tables quant_payload.finalize put in the graph for those.
+        # The in-memory pass appends its tables after the snapshot below and
+        # never visits them; these are already there, and are not weights.
+        streamed_scales = {e.get("scale") for e in deferred.values()
+                           if e.get("quant") == fmt and e.get("scale")}
 
         initializer_consumers = defaultdict(list)
         for node in dag_model.nodes.values():
@@ -9743,16 +10022,24 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if name in streamed_scales:
+                continue
             if Quantizer._is_excluded(name, exclude):
                 skipped_count += 1
                 continue
-            if name in getattr(dag_model, "deferred_weights", {}):
+            if name in deferred:
                 # Left in its source file: the nibbles and the scale table are
                 # built by weight_stream on the way into the trailer, and this
                 # pass could not produce them anyway -- the tensor has no
                 # bytes. Deferral is only granted to a weight this gate would
                 # have accepted (weight_stream._int4_layout_ok), so skipping is
-                # the same set of weights, reached from the other side.
+                # the same set of weights, reached from the other side. What
+                # the in-memory branch below does to the GRAPH around the
+                # payload (dtype name, report, scale position) still happens.
+                if deferred[name].get("quant") == fmt:
+                    Quantizer._stream_4bit_rows(
+                        dag_model, name, deferred[name],
+                        initializer_consumers.get(name, []), fmt, group_size)
                 continue
             initializer = dag_model.initializers[name]
             consumers = initializer_consumers.get(name, [])
@@ -10602,7 +10889,14 @@ class KnWeightLayout:
                 # A quantizing entry's payload type is the format's, not the
                 # tensor's -- the tensor still spells the float it came from.
                 dtype = entry.get("data_type", dtype)
-            if not KnWeightLayout.is_byte_value_type(dtype):
+            # A streamed nf4 weight is UINT4 storage with int4's layout
+            # contract (the nibble kernel reads only [K, N]), so its [N, K]
+            # source needs this flip for the same reason. Only the DEFERRED one:
+            # an in-memory nf4 payload is already packed [K, N] by the
+            # quantizer (and a UINT4 that is not nf4 is not ours to move).
+            streamed_nf4 = (entry is not None and entry.get("quant") == "nf4"
+                            and dtype == onnx.TensorProto.UINT4)
+            if not (KnWeightLayout.is_byte_value_type(dtype) or streamed_nf4):
                 continue
             readers = uses.get(name, [])
             if not readers:

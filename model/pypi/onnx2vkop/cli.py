@@ -576,13 +576,13 @@ def _force_payloads_for_exclusion(args) -> None:
     """Make --stream-weights and the exclusion flags agree, or refuse.
 
     A weight left in its ONNX data file under a value-free format (int8, fp8,
-    int4) is quantized on the way into the trailer (weight_stream/quant_payload),
+    int4, nf4) is quantized on the way into the trailer (weight_stream/quant_payload),
     and that code has no notion of a node exclusion -- it would produce the
     quantized weight this run is asking not to produce, and report a clean
     conversion doing it. The payloads have to be in memory for the exclusion to
     have anything to skip.
 
-    Only the value-free formats reach that path: nvfp4, nf4 and AWQ still refuse
+    Only the value-free formats reach that path: nvfp4 and AWQ still refuse
     deferral, so for those this changes nothing. It is still the memory of the
     whole model, so the switch is announced rather than silent, and an explicit
     --stream-weights on is an error rather than a contradiction the run resolves
