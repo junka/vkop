@@ -37,7 +37,14 @@ def _model(tmp, kind):
     rng = np.random.RandomState(3)
 
     def w(*s):
-        return (rng.randn(*s) * 0.05).astype(np.float16)
+        a = (rng.randn(*s) * 0.05).astype(np.float16)
+        if kind == "same_amax":
+            # Every weight's absmax is exactly 1.0, so every nvfp4 per-tensor
+            # global is the same fp32 value: identical initializers that
+            # onnxoptimizer's eliminate_duplicate_initializer would merge into
+            # one name unless the converter pins them.
+            a[0, 0] = 1.0
+        return a
 
     inits = [numpy_helper.from_array(w(K, K), "Wq")]
     nodes = [helper.make_node("MatMul", ["X", "Wq"], ["q"])]
@@ -153,7 +160,8 @@ def _report(log):
     return re.findall(r"Quantized '[^']+':\n(?:  .*\n){4}", log)
 
 
-@pytest.mark.parametrize("kind", ["plain", "swiglu", "tied", "transposed"])
+@pytest.mark.parametrize("kind", ["plain", "swiglu", "tied", "transposed",
+                                  "same_amax"])
 @pytest.mark.parametrize("quant", ["int4", "nf4", "nvfp4"])
 def test_streamed_file_is_byte_identical(quant, kind):
     with tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +172,13 @@ def test_streamed_file_is_byte_identical(quant, kind):
         assert streamed and int(streamed.group(1)) >= 3, (
             "the streamed arm did not stream; the comparison would be vacuous")
         assert "weights not streamed" not in got_log
+        # A tensor type onnxoptimizer cannot parse (an fp8 scale table put in
+        # the proto by finalize) makes it skip every structural pass. On this
+        # small graph that changes nothing, so the byte comparison below would
+        # not notice; on GLM-Edge it left 784 unfolded shape nodes behind.
+        assert "onnxoptimizer skipped" not in got_log, (
+            f"{quant}/{kind}: onnxoptimizer did not run on the streamed arm")
+        assert "onnxoptimizer skipped" not in ref_log
         if kind == "tied":
             # The hydrated table E (and the Et the folder builds from it) sits
             # among streamed weights. The two arms lay the blob out in a

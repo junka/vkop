@@ -656,8 +656,15 @@ def finalize(model, deferred, verbose=True) -> int:
                     bool(entry.get("transposed")), name)
                 del _deq
                 n_blocks, n_cols = codes_t.shape
+                # Stored as UINT8 for now -- the same bytes -- because this
+                # proto still goes through onnxoptimizer, which has no fp8
+                # type: one FLOAT8E4M3FN initializer made it skip its whole
+                # structural pass set ("no supported data type: 17"), and
+                # GLM-Edge came out with 784 unfolded Shape/Gather/Div/Concat
+                # nodes and twice the decode time. Quantizer._stream_4bit_rows
+                # gives the table its real type on the DAG, after the passes.
                 graph.initializer.append(helper.make_tensor(
-                    scale_name, TensorProto.FLOAT8E4M3FN, [n_blocks, n_cols],
+                    scale_name, TensorProto.UINT8, [n_blocks, n_cols],
                     codes_t.reshape(-1).tobytes(), raw=True))
                 graph.initializer.append(numpy_helper.from_array(
                     np.array([global_scale], dtype=np.float32), global_name))

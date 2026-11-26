@@ -604,8 +604,15 @@ class ModelConverter:
             restore_paging_slots(model, base_dir, deferred_weights, moe_slots)
         PreQuantizedWeights.strip_fp4_operand_casts(model)
         print("Optimizing ONNX model...")
+        # The scale initializers quant_payload.finalize added for streamed
+        # weights are found again by name (the entry records it), so no pass may
+        # merge one into an identical twin: an nvfp4 global is a single fp32
+        # value, and equal ones across weights are common.
+        quant_scales = {n for e in (deferred_weights or {}).values()
+                        for n in (e.get("scale"), e.get("scale_global")) if n}
         model = self.optimizer.optimize_model(model, batch_size,
-                                              keep_alive=moe_slots)
+                                              keep_alive=moe_slots,
+                                              pinned=quant_scales)
 
         # Do NOT onnx.save here — llm.onnx weights exceed protobuf's 2GB
         # single-file limit. The DAG converter reads model.graph directly

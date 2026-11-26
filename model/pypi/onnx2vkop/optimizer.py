@@ -414,8 +414,17 @@ _VIEW_MIN_INIT_BYTES = 3 * (1 << 30) // 2
 _MAX_VIEW_ROUNDS = _env_int("VKOP_MAX_VIEW_ROUNDS", 3)
 
 
-def _demote_large_initializers(model):
+def _demote_large_initializers(model, pinned=(), by_size=True):
     """Move initializers carrying >= _VIEW_DEMOTE_CAP raw bytes out of the graph.
+
+    `by_size=False` demotes only `pinned`. `pinned` names inline
+    initializers demoted whatever their size: tensors
+    whose identity matters to a later stage, which `eliminate_duplicate_
+    initializer` must not merge into a lookalike. The quantizer's scale tables
+    for streamed weights are the case: weight_stream finds each by NAME, and an
+    nvfp4 per-tensor global is one fp32 value -- two weights with the same fp16
+    absmax get the same one, the pass kept one name, and the writer then found
+    no initializer for the other.
 
     Returns [(name, data_type, dims)] plus the list of graph inputs we had to
     synthesize, so _reattach_initializers can put everything back exactly.
@@ -436,7 +445,8 @@ def _demote_large_initializers(model):
             # Typed-field storage (float_data / int64_data): not byte-copyable,
             # so it is never demoted, whatever its size.
             continue
-        if _init_byte_len(init) >= _VIEW_DEMOTE_CAP:
+        if (init.name in pinned
+                or (by_size and _init_byte_len(init) >= _VIEW_DEMOTE_CAP)):
             demoted.append((init.name, init.data_type, tuple(init.dims)))
             big.append(idx)
     for idx in reversed(big):
@@ -813,8 +823,12 @@ class ONNXOptimizer:
     """Class for optimizing ONNX models."""
 
     @staticmethod
-    def optimize_model(onnx_model, batch_size: int = 1, keep_alive=()):
+    def optimize_model(onnx_model, batch_size: int = 1, keep_alive=(),
+                       pinned=()):
         """Optimize the ONNX model using ONNX's built-in optimizer.
+
+        `pinned`: inline initializers kept out of the passes (demoted to inputs
+        and restored verbatim), see _demote_large_initializers.
 
         先跑 onnxoptimizer 的结构化 pass，再做常量折叠：
           优先用内置 ConstantFolder（纯 numpy，无外部依赖，与 onnxsim 等价地
@@ -883,8 +897,11 @@ class ONNXOptimizer:
             print(f"[optimize] external-payload view: {len(ext_demoted)} "
                   f"initializer(s) whose bytes are still in the data file "
                   f"demoted to inputs for the passes")
-        if total_init_bytes >= _VIEW_MIN_INIT_BYTES:
-            demoted, added_inputs = _demote_large_initializers(onnx_model)
+        pinned = {name for name in pinned}
+        by_size = total_init_bytes >= _VIEW_MIN_INIT_BYTES
+        if by_size or pinned:
+            demoted, added_inputs = _demote_large_initializers(
+                onnx_model, pinned, by_size=by_size)
             print(f"[optimize] value-free view for onnxoptimizer: "
                   f"{len(demoted)} initializer(s) demoted to inputs "
                   f"({total_init_bytes >> 20} MiB of weights)")
@@ -9831,6 +9848,13 @@ class Quantizer:
                 init.metadata_props.add(key="vkop_dtype", value="nf4")
 
         scale_name = entry.get("scale")
+        if fmt == "nvfp4" and scale_name in dag_model.initializers:
+            # finalize stored the e4m3 block-scale bytes as UINT8 so that
+            # onnxoptimizer (no fp8 type) would still run its passes over the
+            # proto; past them now, the table takes the type the kernel reads.
+            s_init = dag_model.initializers[scale_name]
+            if s_init.data_type == TensorProto.UINT8:
+                s_init.data_type = TensorProto.FLOAT8E4M3FN
         # nvfp4 carries a second scale level, the per-tensor fp32 factor, as
         # its own initializer and its own (fourth) consumer input.
         global_name = entry.get("scale_global") if fmt == "nvfp4" else None
