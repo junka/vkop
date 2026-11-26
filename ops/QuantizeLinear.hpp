@@ -18,7 +18,8 @@ namespace quant {
 //
 //   fmt        which byte format the quantized side holds:
 //                0 = fp8 E4M3, 1 = fp8 E5M2, 2 = int8, 3 = uint8,
-//                4 = int4 (packed, 2 values/byte), 5 = nf4 (packed)
+//                4 = int4 (packed, 2 values/byte), 5 = nf4 (packed),
+//                6 = uint4 (packed), 7 = float4e2m1 (packed E2M1 nibble)
 //   mode       0 = quantize (float -> bytes), 1 = dequantize (bytes -> float)
 //   total      element count (== byte count on the quantized side == element
 //              count on the float side) — the LOGICAL value count, not the
@@ -27,8 +28,8 @@ namespace quant {
 //   zp         per-tensor zero_point as a plain int (read from inputs[2]).
 //              fp8 has no zero_point (zp stays 0); int8/uint8 are asymmetric in
 //              general (ORT dynamic quantize emits a non-zero uint8 zp). The
-//              4-bit formats are symmetric (int4/nf4 grids are zero-centred),
-//              so zp stays 0 for them too.
+//              4-bit formats are symmetric (int4/nf4/float4e2m1 grids are
+//              zero-centred), so zp stays 0 for them too.
 //   out_fp32   dequant only: 0 = fp16 output, 1 = fp32 output. The float side
 //              of quantize follows inputs[0]'s dtype the same way.
 //   in_fp32    quant only: 0 = fp16 input,  1 = fp32 input.
@@ -37,7 +38,8 @@ struct alignas(16) QuantPC {
     int total;    // element count (logical values)
     float scale;  // per-tensor fp32 scale
     int zp;       // per-tensor zero_point (int)
-    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8, 4=int4, 5=nf4
+    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8, 4=int4, 5=nf4,
+                  // 6=uint4, 7=float4e2m1
     int out_fp32; // dequant: output fp32?
     int in_fp32;  // quant: input fp32?
     int _pad;
@@ -160,6 +162,14 @@ class QuantizeLinear : public BufferFactory {
         // encoders round to [0, 15] instead of clamping to [-8, 7].
         case core::ElemKind::kUint4:
             fmt = 6;
+            break;
+        // ONNX FLOAT4E2M1 (opset 23 Q/DQ): the same packed nibble, read as an
+        // E2M1 code (x = e2m1(q) * scale, +-6 finite, saturating). Only the
+        // per-tensor scale form -- the per-axis/blocked scale NVFP4 exports
+        // carry is refused below like every other per-axis scale; a weight
+        // chain of that shape is folded into MatMul by the converter instead.
+        case core::ElemKind::kFloat4E2M1:
+            fmt = 7;
             break;
         default:
             throw std::runtime_error(

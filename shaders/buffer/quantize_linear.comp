@@ -26,6 +26,10 @@
 //   3 = uint8    (unsigned;        x = (q - zp) * scale)
 //   4 = int4     (two's complement nibble; x = q * scale, symmetric)
 //   5 = nf4      (4-bit codebook; x = codebook[q] * scale)
+//   6 = uint4    (unsigned nibble; x = q * scale, q in [0, 15])
+//   7 = float4e2m1 (E2M1 nibble: sign|2 exp|1 mant; x = e2m1(q) * scale,
+//                 +-6 finite, saturating; ONNX FLOAT4E2M1 with a per-tensor
+//                 scale -- NVFP4's two-level block scale is MatMul's, not this)
 //
 // `mode` selects direction: 0 = quantize (float->byte), 1 = dequant (byte->
 // float). `scale` and `zp` are per-tensor scalars (per-axis is a later phase).
@@ -33,7 +37,7 @@
 // The float side is fp16 (in_fp32=0) or fp32 (in_fp32=1 / out_fp32=1).
 //
 // Word packing: the byte side packs 4 values per uint word for the byte formats
-// (0..3) and 8 for the 4-bit formats (4..5, two values per byte). The float side
+// (0..3) and 8 for the 4-bit formats (4..7, two values per byte). The float side
 // packs 2 values per uint word (fp16) or 1 (fp32). One thread per BYTE-WORD; the
 // thread reads/writes the corresponding float word(s):
 //   - byte formats: 4 values = 2 fp16 words / 4 fp32 words.
@@ -60,7 +64,8 @@ layout(push_constant) uniform PC {
     int total;    // element count
     float scale;  // per-tensor fp32 scale
     int zp;       // per-tensor zero_point (int); 0 for fp8
-    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8
+    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8, 4=int4, 5=nf4,
+                  // 6=uint4, 7=float4e2m1
     int out_fp32; // dequant: 1 = fp32 output
     int in_fp32;  // quant:   1 = fp32 input
     int _pad;
@@ -193,8 +198,44 @@ uint nf4_encode(float x) {
     return best;
 }
 
+// ---- float4e2m1 (fmt 7) ---------------------------------------------------
+// E2M1: sign in bit 3, then 2 exponent bits and 1 mantissa bit (bias 1). The
+// eight magnitudes are 0, 0.5 (the lone subnormal), 1, 1.5, 2, 3, 4, 6; there
+// is no Inf or NaN code. Same table as matmul.comp's e2m1_val, so a Q/DQ pair
+// and an NVFP4 MatMul agree on every nibble.
+float e2m1_code(uint q) {
+    const float mag[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = mag[q & 7u];
+    return (q & 8u) != 0u ? -v : v;
+}
+
+// x (already divided by the scale) -> nearest E2M1 code, ties to the even code
+// (the one whose mantissa bit is 0) -- IEEE round-half-even on this grid, which
+// is what ml_dtypes' float4_e2m1fn and the converter's Quantizer._e2m1_encode
+// do: 0.25 -> 0, 0.75 -> 1.0, 1.25 -> 1.0, 1.75 -> 2.0, 2.5 -> 2.0,
+// 3.5 -> 4.0, 5.0 -> 4.0. The boundaries are the midpoints between grid
+// values, inclusive on the side of the even code. Past 6 it saturates (ONNX's
+// default saturate=1; the format has no Inf to land on), and NaN fails every
+// compare and lands there too. The sign is the float's own sign bit, so -0.1
+// encodes as -0 (0x8), as the converter's encoder does.
+uint e2m1_encode(float x) {
+    uint sign = (floatBitsToUint(x) >> 31u) << 3u;
+    float a = abs(x);
+    uint m;
+    if (a <= 0.25) m = 0u;
+    else if (a < 0.75) m = 1u;
+    else if (a <= 1.25) m = 2u;
+    else if (a < 1.75) m = 3u;
+    else if (a <= 2.5) m = 4u;
+    else if (a < 3.5) m = 5u;
+    else if (a <= 5.0) m = 6u;
+    else m = 7u;
+    return sign | m;
+}
+
 // One 4-bit code -> float (value only; the caller applies the scale).
 float nibble_decode(uint q) {
+    if (uPC.fmt == 7) return e2m1_code(q & 15u);
     if (uPC.fmt == 5) return nf4_code(int(q & 15u));
     // uint4: the nibble is already the unsigned value in [0, 15] -- no sign
     // extension, so the grid runs from 0 to 15 * scale with a zero point of 0.
@@ -208,6 +249,7 @@ float nibble_decode(uint q) {
 // scale and rounds to [-8, 7]; uint4 the same but to [0, 15]; nf4 picks the
 // nearest codebook entry of x/scale.
 uint nibble_encode(float x) {
+    if (uPC.fmt == 7) return e2m1_encode(x / uPC.scale);
     if (uPC.fmt == 5) return nf4_encode(x / uPC.scale);
     float q = roundEven(x / uPC.scale);
     if (uPC.fmt == 6) {
@@ -270,7 +312,7 @@ void store_float_at(int i, float x) {
 }
 
 void main() {
-    // Byte formats (0..3) pack 4 values per word; the 4-bit formats (4,5) pack 8.
+    // Byte formats (0..3) pack 4 values per word; the 4-bit formats (4..7) pack 8.
     const int group = (uPC.fmt >= 4) ? 8 : 4;
     const int shift = (uPC.fmt >= 4) ? 4 : 8;
 

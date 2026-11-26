@@ -605,6 +605,95 @@ TEST(QuantizeLinearTest, Uint4PackedRoundTrip) {
     }
 }
 
+// float4e2m1 (ONNX FLOAT4E2M1, per-tensor scale): the E2M1 nibble -- sign in
+// bit 3, magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6. The reference picks the nearest
+// magnitude by an explicit sweep and breaks a tie toward the EVEN code (mantissa
+// bit 0), i.e. round-half-even on this grid; it is written independently of the
+// shader's threshold chain on purpose. The inputs hit every midpoint (0.25,
+// 0.75, ..., 5.0 after the scale), saturation past 6, and -0. Scale 0.5 so the
+// divide is exercised; n = 21 is odd so the tail nibble stays 0.
+TEST(QuantizeLinearTest, Float4E2M1PackedRoundTrip) {
+    const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float scale = 0.5f;
+    // In units of scale: 0.25 0.75 1.25 1.75 2.5 3.5 5.0 (ties), 7 and 100
+    // (saturate), then ordinary values and their negatives.
+    std::vector<float> xs = {0.125f, 0.375f, 0.625f, 0.875f, 1.25f, 1.75f,
+                             2.5f,   3.5f,   50.0f,  0.0f,   -0.05f, 0.3f,
+                             -0.6f,  1.1f,   -1.6f,  2.2f,   -2.9f,  -3.0f,
+                             -0.375f, -2.5f, 0.74f};
+    auto vals = torch::tensor(xs).to(torch::kFloat16);
+    int n = static_cast<int>(vals.numel());
+    ASSERT_EQ(n % 2, 1);
+
+    auto tin = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    tin->fillToCPU(ql_fp16_bits(vals));
+
+    auto tq = ql_packed(n, vkop::core::ElemKind::kFloat4E2M1);
+    run_quant(tin, tq, scale);
+
+    auto xf = vals.to(torch::kFloat32);
+    std::vector<int> codes(n);
+    for (int i = 0; i < n; ++i) {
+        const float x = xf[i].item<float>() / scale;
+        const float a = std::fabs(x);
+        int best = 0;
+        float bd = std::fabs(a - mag[0]);
+        for (int q = 1; q < 8; ++q) {
+            const float d = std::fabs(a - mag[q]);
+            if (d < bd || (d == bd && (q & 1) == 0)) {
+                bd = d;
+                best = q;
+            }
+        }
+        codes[i] = best | (std::signbit(x) ? 8 : 0);
+    }
+    // Spot-check the reference's tie rule itself, so a wrong reference cannot
+    // silently agree with a wrong shader.
+    EXPECT_EQ(codes[0], 0);  // 0.25 -> 0
+    EXPECT_EQ(codes[1], 2);  // 0.75 -> 1.0
+    EXPECT_EQ(codes[2], 2);  // 1.25 -> 1.0
+    EXPECT_EQ(codes[3], 4);  // 1.75 -> 2.0
+    EXPECT_EQ(codes[4], 4);  // 2.5  -> 2.0
+    EXPECT_EQ(codes[5], 6);  // 3.5  -> 4.0
+    EXPECT_EQ(codes[6], 6);  // 5.0  -> 4.0
+    EXPECT_EQ(codes[7], 7);  // 7    -> 6 (saturate)
+    EXPECT_EQ(codes[8], 7);  // 100  -> 6 (saturate)
+    EXPECT_EQ(codes[10], 8); // -0.1 -> -0
+
+    const auto want = ql_pack_nibbles(codes, n);
+    ASSERT_EQ(tq->num_elements(), (n + 1) / 2)
+        << "packed payload should be ceil(n/2) bytes";
+    for (int i = 0; i < (n + 1) / 2; ++i) {
+        EXPECT_EQ(static_cast<uint8_t>((*tq)[i]),
+                  static_cast<uint8_t>(want[i]))
+            << "float4e2m1 packed byte mismatch at " << i;
+    }
+
+    // Dequantize: e2m1(q) * scale, in fp16 and in fp32.
+    std::vector<float> dec(n);
+    for (int i = 0; i < n; ++i) {
+        const float v = mag[codes[i] & 7] * scale;
+        dec[i] = (codes[i] & 8) ? -v : v;
+    }
+    auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n}, true);
+    run_quant(tq, tout, scale);
+    auto ref = torch::tensor(dec).to(torch::kFloat16);
+    const auto *ref_p =
+        reinterpret_cast<const uint16_t *>(ref.data_ptr<at::Half>());
+    for (int i = 0; i < n; ++i) {
+        EXPECT_EQ((*tout)[i], ref_p[i])
+            << "float4e2m1 dequant mismatch at " << i
+            << " (orig=" << xs[i] << ")";
+    }
+
+    auto tout32 = std::make_shared<Tensor<float>>(std::vector<int>{n}, true);
+    run_quant(tq, tout32, scale);
+    for (int i = 0; i < n; ++i) {
+        EXPECT_EQ((*tout32)[i], dec[i])
+            << "float4e2m1 fp32 dequant mismatch at " << i;
+    }
+}
+
 // An odd logical count (17 above, 5 here) leaves the last byte's high nibble
 // unused: the shader must emit 0 there and must not read past the float side.
 TEST(QuantizeLinearTest, Int4OddTotal) {
