@@ -547,6 +547,19 @@ class GraphFp16:
         return out
 
     @staticmethod
+    def mixed_width_conflicts(dag_model) -> List[str]:
+        """The _audit verdict for the graph AS DECLARED (an empty domain).
+
+        Under -q fp32 the domain pass does not run, so nothing would reconcile
+        a node that already mixes FP16 and FP32 operands in the export -- e.g.
+        ModelOpt's NVFP4 exporter casts a GEMM's activation to fp16 while the
+        GEMM's output stays FLOAT. The runtime builds one shader per node from
+        its data input, so such a node converts fine and computes garbage (the
+        ModelOpt case: all-NaN output). Same exemptions as _audit: Cast,
+        the mixed-width-by-design ops and the linear-attention state slots."""
+        return GraphFp16._audit(dag_model, GraphFp16._decls(dag_model), set())
+
+    @staticmethod
     def apply(dag_model, target_backend: str = "buffer",
               verbose: bool = True, skip_weights=None) -> dict:
         """Declare and store the FP16 domain; returns what it did.

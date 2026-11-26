@@ -321,6 +321,43 @@ class DAGBasedModel:
             if name and name not in produced
         ]
 
+    def dangling_outputs(self) -> List[str]:
+        """Graph outputs that nothing produces: no node output, graph input or
+        initializer carries the name.
+
+        The output-side twin of dangling_inputs. A pass that deletes the node
+        producing a graph output (re-pointing node inputs but not the graph
+        output) leaves the output reachable from nothing, so the liveness prune
+        seeds from an empty set and removes the WHOLE graph -- the artifact is
+        written with zero nodes and the conversion still exits 0."""
+        produced = {inp["name"] for inp in self.inputs}
+        produced |= set(self.initializers)
+        for node in self.nodes.values():
+            for out in node.outputs:
+                produced.add(out["name"])
+        return [o["name"] for o in self.outputs
+                if o.get("name") and o["name"] not in produced]
+
+    def check_graph_not_hollow(self):
+        """Fail when the runtime graph lost its outputs or every node.
+
+        Called at the write point, after the final prune: a 0-node artifact or
+        an output with no producer is never what a conversion meant to ship,
+        and the runtime would load it and return empty/zero outputs."""
+        dangling = self.dangling_outputs()
+        if dangling:
+            raise RuntimeError(
+                f"onnx2vkop: {len(dangling)} graph output(s) have no producer "
+                f"after the optimizer passes: {dangling[:5]}. A pass deleted "
+                f"the node that wrote them without handing the name to its "
+                f"replacement; refusing to write an artifact whose outputs "
+                f"the runtime cannot fill.")
+        if not self.nodes:
+            raise RuntimeError(
+                "onnx2vkop: the converted graph has no nodes left "
+                f"(outputs {[o.get('name') for o in self.outputs][:5]}); "
+                "refusing to write an empty artifact.")
+
     def find_concurrent_nodes(self) -> List[List[str]]:
         """Find nodes that can be executed in parallel."""
         levels = []
@@ -638,6 +675,10 @@ class DAGBasedModel:
             print(f"[integrity] {len(stranded)} dangling input(s), runtime reads "
                   f"zeros for them: "
                   + ", ".join(f"{n} <- {i}" for n, i in stranded[:5]))
+
+        # And the output side: a graph output nobody produces, or a graph the
+        # prune emptied because of one, fails here instead of shipping.
+        self.check_graph_not_hollow()
 
         # Same place to hold the streaming contract to account: a weight whose
         # bytes were left in the source file must still be the tensor we

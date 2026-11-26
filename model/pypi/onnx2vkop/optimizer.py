@@ -2042,6 +2042,41 @@ class FusionOptimizer:
         return producer, consumers
 
     @staticmethod
+    def _bypass_value(dag_model, old: str, new: str) -> bool:
+        """Make every reader of `old` read `new`, the same value under another
+        name, so the node producing `old` can be deleted.
+
+        A graph OUTPUT is not a reader the input loop can re-point: its name is
+        the artifact's I/O contract, and a deleted producer would leave it
+        dangling -- the liveness prune then finds nothing reaching an output
+        and removes the whole graph, and the conversion "succeeds" with zero
+        nodes. So when `old` is a graph output the rename goes the other way:
+        `new`'s producer takes over the name `old` (the graph output entry, and
+        with it the declared dtype, stays as it was). That is only possible
+        when `new` is a plain node output; a graph input, an initializer or a
+        second graph output cannot be renamed, and the caller must keep its
+        node (returns False, nothing changed)."""
+        graph_outputs = {o.get("name") for o in getattr(dag_model, "outputs", [])}
+        if old not in graph_outputs:
+            for other in dag_model.nodes.values():
+                for inp in other.inputs:
+                    if inp.get("name") == old:
+                        inp["name"] = new
+            return True
+        if (new in graph_outputs or new in dag_model.initializers
+                or any(i.get("name") == new
+                       for i in getattr(dag_model, "inputs", []))):
+            return False
+        if not any(o.get("name") == new for n in dag_model.nodes.values()
+                   for o in n.outputs):
+            return False
+        for other in dag_model.nodes.values():
+            for entry in list(other.inputs) + list(other.outputs):
+                if entry.get("name") == new:
+                    entry["name"] = old
+        return True
+
+    @staticmethod
     def match_identity(dag_model):
         matches = []
         for node in dag_model.nodes.values():
@@ -2055,12 +2090,8 @@ class FusionOptimizer:
         input_name = node.inputs[0]["name"]
         output_name = node.outputs[0]["name"]
 
-        for other_node in dag_model.nodes.values():
-            if other_node.name == node.name:
-                continue
-            for inp in other_node.inputs:
-                if inp["name"] == output_name:
-                    inp["name"] = input_name
+        if not FusionOptimizer._bypass_value(dag_model, output_name, input_name):
+            return False
 
         del dag_model.nodes[node.name]
         return True
@@ -2202,10 +2233,12 @@ class FusionOptimizer:
             output_name = node.outputs[0]["name"]
 
             # 将后续节点的输入从output_name重定向到input_name
-            for other_node in dag_model.nodes.values():
-                for inp in other_node.inputs:
-                    if inp["name"] == output_name:
-                        inp["name"] = input_name
+            # A Cast that produces a graph output hands that name to its
+            # source instead, or stays when the source cannot be renamed
+            # (_bypass_value).
+            if not FusionOptimizer._bypass_value(dag_model, output_name,
+                                                 input_name):
+                return False
 
             # 删除此冗余节点
             to_remove_initializers = []
@@ -2228,10 +2261,9 @@ class FusionOptimizer:
             final_output_name = second_node.outputs[0]["name"]
 
             # 将使用最终输出的节点重定向到初始输入
-            for other_node in dag_model.nodes.values():
-                for inp in other_node.inputs:
-                    if inp["name"] == final_output_name:
-                        inp["name"] = initial_input_name
+            if not FusionOptimizer._bypass_value(
+                    dag_model, final_output_name, initial_input_name):
+                return False
 
             # 删除两个冗余的Cast节点
             del dag_model.nodes[first_node.name]
@@ -2288,10 +2320,8 @@ class FusionOptimizer:
         c1, c2 = match["cast1"], match["cast2"]
         src = c1.inputs[0]["name"]   # 原 dtype A
         dst = c2.outputs[0]["name"]  # 末尾 dtype A
-        for n in dag_model.nodes.values():
-            for inp in n.inputs:
-                if inp["name"] == dst:
-                    inp["name"] = src
+        if not FusionOptimizer._bypass_value(dag_model, dst, src):
+            return False
         if c1.name in dag_model.nodes:
             del dag_model.nodes[c1.name]
         if c2.name in dag_model.nodes:
@@ -2552,12 +2582,8 @@ class FusionOptimizer:
         input_name = node.inputs[0]["name"]
         output_name = node.outputs[0]["name"]
 
-        for other_node in dag_model.nodes.values():
-            if other_node.name == node.name:
-                continue
-            for inp in other_node.inputs:
-                if inp["name"] == output_name:
-                    inp["name"] = input_name
+        if not FusionOptimizer._bypass_value(dag_model, output_name, input_name):
+            return False
 
         del dag_model.nodes[node.name]
         return True
@@ -2581,12 +2607,8 @@ class FusionOptimizer:
         input_name = node.inputs[0]["name"]
         output_name = node.outputs[0]["name"]
 
-        for other_node in dag_model.nodes.values():
-            if other_node.name == node.name:
-                continue
-            for inp in other_node.inputs:
-                if inp["name"] == output_name:
-                    inp["name"] = input_name
+        if not FusionOptimizer._bypass_value(dag_model, output_name, input_name):
+            return False
 
         del dag_model.nodes[node.name]
         return True
@@ -2610,12 +2632,8 @@ class FusionOptimizer:
         input_name = node.inputs[0]["name"]
         output_name = node.outputs[0]["name"]
 
-        for other_node in dag_model.nodes.values():
-            if other_node.name == node.name:
-                continue
-            for inp in other_node.inputs:
-                if inp["name"] == output_name:
-                    inp["name"] = input_name
+        if not FusionOptimizer._bypass_value(dag_model, output_name, input_name):
+            return False
 
         to_remove_initializers = []
         for inp in node.inputs[1:]:
@@ -11205,11 +11223,26 @@ class PreQuantizedWeights:
 
         payload = dag_model.initializers.get(x_name)
         if payload is None:
+            src = (producers or {}).get(x_name)
+            if src is None:
+                origin = "it is a graph input"
+            else:
+                origin = f"it is produced by {src.op_type} '{src.name}'"
+            hint = ""
+            if src is not None and src.op_type.endswith("FP4DynamicQuantize"):
+                # trt::TRT_FP4DynamicQuantize: ModelOpt's NVFP4 activation
+                # quantizer (NVFP4_DEFAULT_CFG, i.e. W4A4). A TensorRT plugin
+                # with no ONNX definition and no vkop kernel.
+                hint = (" That is TensorRT's dynamic NVFP4 ACTIVATION quantizer "
+                        "(W4A4, e.g. ModelOpt's NVFP4_DEFAULT_CFG); vkop imports "
+                        "NVFP4 weights only, so re-export weight-only "
+                        "(W4A16_NVFP4_CFG) or without input quantizers.")
             raise ValueError(
                 f"DequantizeLinear '{node.name}': '{x_name}' is a graph value with "
-                f"no QuantizeLinear producing it. A QDQ pair on an activation is "
-                f"left for ops/QuantizeLinear.hpp to run; a bare value has no "
-                f"quantized bytes behind it, so there is nothing to import."
+                f"no QuantizeLinear producing it ({origin}). A QDQ pair on an "
+                f"activation is left for ops/QuantizeLinear.hpp to run; a bare "
+                f"value has no quantized bytes behind it, so there is nothing to "
+                f"import.{hint}"
             )
         # NVFP4's scale is normally a graph VALUE (the first DQ of the chain),
         # so it is dispatched before the constant-scale requirement below.
@@ -11436,6 +11469,83 @@ class PreQuantizedWeights:
                     f"a graph output, and the NVFP4 import deletes the node.")
             found[dq1.name] = dq1
         return found
+
+    @staticmethod
+    def strip_fp4_operand_casts(model) -> int:
+        """Undo the ACTIVATION half of ModelOpt's fp4-GEMM operand casts, on
+        the proto, before any fusion can swallow the Cast.
+
+        NVFP4QuantExporter.post_process (`_cast_input_dtypes`, ModelOpt 0.48)
+        puts a Cast(to=FLOAT16) on input 0 AND input 1 of every Gemm/MatMul
+        whose weight it rewrote into the two-DQ chain -- TensorRT's fp4 GEMM
+        runs in half -- also in an fp32 model, where the node's output and a
+        Gemm bias stay FLOAT. The weight-side Cast is a view _nvfp4_readers
+        absorbs. The activation-side one makes the consumer take an FP16 A and
+        produce a FLOAT output; under -q fp32 (no FP16-domain pass) that
+        artifact converts and then produces all-NaN output (measured on a real
+        ModelOpt export), and under the default domain it is a no-op Cast
+        dispatch. Only a Cast whose source is a FLOAT tensor and whose consumer
+        reads an E2M1 DequantizeLinear (through Cast/Transpose views) as input
+        1, and whose own output is declared FLOAT (or, undeclared, whose Gemm
+        bias is FLOAT), is bypassed; the Cast node itself goes when nothing
+        else reads it. A source of unknown width is left alone: under -q fp32
+        the converter's mixed-width check then refuses the node rather than
+        shipping it (GraphFp16.mixed_width_conflicts).
+        Returns the number of operands re-pointed."""
+        g = model.graph
+        inits = {i.name: i for i in g.initializer}
+        prod = {o: n for n in g.node for o in n.output}
+        elem = {v.name: v.type.tensor_type.elem_type
+                for v in list(g.input) + list(g.value_info) + list(g.output)}
+        for i in g.initializer:
+            elem.setdefault(i.name, i.data_type)
+
+        def fp4_weight(name):
+            n = prod.get(name)
+            while n is not None and n.op_type in ("Cast", "Transpose"):
+                n = prod.get(n.input[0])
+            if n is None or n.op_type != "DequantizeLinear":
+                return False
+            w = inits.get(n.input[0])
+            return w is not None and w.data_type == TensorProto.FLOAT4E2M1
+
+        changed, casts = 0, set()
+        for node in g.node:
+            if node.op_type not in ("Gemm", "MatMul") or len(node.input) < 2:
+                continue
+            if not fp4_weight(node.input[1]):
+                continue
+            c = prod.get(node.input[0])
+            if c is None or c.op_type != "Cast":
+                continue
+            to = next((a.i for a in c.attribute if a.name == "to"), None)
+            if to != TensorProto.FLOAT16 or elem.get(c.input[0]) != TensorProto.FLOAT:
+                continue
+            # Only where the GEMM itself is declared FLOAT (an fp32 model): a
+            # half-typed GEMM inside fp32 I/O is a coherent fp16 island and its
+            # Cast is a real domain boundary, not an exporter artifact.
+            # An export without value_info leaves the output undeclared until
+            # shape inference (which runs later, in optimize_model); a Gemm's
+            # FLOAT bias -- which ModelOpt leaves alone -- says the same thing.
+            out_elem = elem.get(node.output[0])
+            if not out_elem and node.op_type == "Gemm" and len(node.input) > 2:
+                out_elem = elem.get(node.input[2])
+            if out_elem != TensorProto.FLOAT:
+                continue
+            node.input[0] = c.input[0]
+            casts.add(c.output[0]); changed += 1
+        if changed:
+            read = {i for n in g.node for i in n.input} | {o.name for o in g.output}
+            dead = [n for n in g.node if n.op_type == "Cast" and n.output[0] in casts
+                    and n.output[0] not in read]
+            for n in dead:
+                g.node.remove(n)
+            gone = {n.output[0] for n in dead}
+            for vi in [v for v in g.value_info if v.name in gone]:
+                g.value_info.remove(vi)
+            print(f"[nvfp4] bypassed {changed} fp16 activation Cast(s) the "
+                  f"exporter put in front of fp4 GEMMs ({len(dead)} removed)")
+        return changed
 
     @staticmethod
     def _nvfp4_readers(dag_model, node, consumers):

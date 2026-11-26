@@ -478,6 +478,7 @@ class ModelConverter:
         if moe_slots:
             moe_sources = weight_stream.slot_sources(model, base_dir, moe_slots)
             restore_paging_slots(model, base_dir, deferred_weights, moe_slots)
+        PreQuantizedWeights.strip_fp4_operand_casts(model)
         print("Optimizing ONNX model...")
         model = self.optimizer.optimize_model(model, batch_size,
                                               keep_alive=moe_slots)
@@ -1205,6 +1206,27 @@ class ModelConverter:
             fp16_summary = GraphFp16.apply(
                 dag_model, getattr(args, "target_backend", "buffer"),
                 skip_weights=skip)
+        elif (args.quant == "fp32"
+              and getattr(args, "target_backend", "buffer") == "buffer"):
+            # -q fp32 keeps the export's widths, so a node the export already
+            # declares with FP16 and FP32 operands side by side reaches the
+            # runtime as-is -- and runs one shader picked from its data input
+            # over both. Measured on a ModelOpt NVFP4 export (Cast(to=fp16) on
+            # the GEMM activation, FLOAT output): converted, then all-NaN.
+            # The image backend builds everything fp16 and ignores the
+            # declarations, so only the buffer backend is checked.
+            conflicts = GraphFp16.mixed_width_conflicts(dag_model)
+            if conflicts:
+                for line in conflicts[:10]:
+                    print(f"[fp32-widths]   {line}", file=sys.stderr)
+                raise RuntimeError(
+                    f"onnx2vkop: -q fp32 keeps the export's widths, and "
+                    f"{len(conflicts)} node(s) declare FP16 and FP32 operands "
+                    f"in one op, which the runtime cannot execute (one shader "
+                    f"per node, picked from the data input's dtype). First: "
+                    f"{conflicts[0]}. Convert without -q fp32 (the FP16 domain "
+                    f"pass reconciles the widths) or fix the export's dtype "
+                    f"coherence.")
 
         if args.quant == "fp16":
             if excluded_weights:
