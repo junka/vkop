@@ -223,7 +223,6 @@ class WeightPager {
             }
         }
 
-        size_t bands = 0;
         for (const auto &kv : readers) {
             if (kv.second.size() != 1) continue; // shared: keep resident
             const auto &init = model.initializers.at(kv.first);
@@ -239,7 +238,6 @@ class WeightPager {
             s.size = init.size;
             s.group = "level:" + std::to_string(kv.second.front());
             add(std::move(s));
-            ++bands;
         }
         // Report bands, which is how a schedule walks them, not weights.
         return groups().size();
