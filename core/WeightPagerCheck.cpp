@@ -13,10 +13,12 @@
 // question with an independent answer (model_b loaded fresh).
 //
 // Build (against a libvkop from the same source revision):
-//   g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS \
-//       -I<src> -I<src>/model -I<src>/model/SYSTEM -I<src>/model/generated \
-//       -xc++ core/WeightPagerCheck.cpp -o wpcheck \
-//       <build>/libvkop.a <build>/model/libvload.a -ldl -lpthread
+//   cmake: the `WeightPagerCheck` target (see CMakeLists.txt).
+//   manual: g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS
+//           -I<src> -I<src>/model -I<src>/model/SYSTEM
+//           -I<src>/model/generated -xc++ core/WeightPagerCheck.cpp
+//           -o WeightPagerCheck <build>/libvkop.a
+//           <build>/model/libvload.a -ldl -lpthread
 //
 //   ./wpcheck <model_a.vkopbin> <model_b.vkopbin> [weight_name]
 

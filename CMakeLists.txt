@@ -186,6 +186,11 @@ include_directories(${CMAKE_SOURCE_DIR})
 
 # Source files
 file(GLOB_RECURSE SRC_FILES vulkan/*.cpp ops/*.cpp core/*.cpp)
+# core/*Check.cpp are standalone verification programs: each defines main() and
+# is built as its own executable below. Excluded from the library because a
+# main() has no business in libvkop -- the GLOB above pulled them in and only a
+# -Werror build noticed (their usage comments end lines with a backslash).
+list(FILTER SRC_FILES EXCLUDE REGEX "/core/[^/]*Check\\.cpp$")
 file(GLOB_RECURSE ALL_SOURCE_FILES vulkan/*.cpp vulkan/*.hpp ops/*.cpp core/*.cpp ops/*.hpp core/*.hpp)
 
 if(DEFINED GLSLC_EXECUTABLE)
@@ -1374,6 +1379,16 @@ endif()
 # Manual diagnostics rather than ctest tests, so they are listed separately
 # from the suite above (see tools/probes/CMakeLists.txt).
 add_subdirectory(tools/probes)
+
+# Layer-paging verification programs. Each takes .vkopbin paths on argv and
+# exits non-zero on a numerical disagreement; they are manual proofs, not ctest
+# cases, because each needs a GPU plus fixtures generated on the machine (see
+# the build recipe in each file's header).
+foreach(check ArenaSeamPagingCheck WeightPagerCheck WeightPagerModelCheck
+              LevelHookPagingCheck UnloadedInitializerCheck)
+    add_executable(${check} core/${check}.cpp)
+    target_link_libraries(${check} PRIVATE vkop vload)
+endforeach()
 
 # LLM conversational driver (Qwen3-VL, buffer backend). Text in → text out.
 # Links vkop + vload (graph runtime + model loader) and the standalone Qwen

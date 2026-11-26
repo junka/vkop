@@ -12,9 +12,12 @@
 // independently of the copy machinery that WeightPagerCheck.cpp exercises.
 //
 // Build:
-//   g++ -std=gnu++17 -O1 -I<src> -I<src>/model -I<src>/model/SYSTEM \
-//       -I<src>/model/generated -xc++ core/WeightPagerModelCheck.cpp -o wpm \
-//       <build>/libvkop.a <build>/model/libvload.a -ldl -lpthread
+//   cmake: the `WeightPagerModelCheck` target (see CMakeLists.txt).
+//   manual: g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS
+//           -I<src> -I<src>/model -I<src>/model/SYSTEM
+//           -I<src>/model/generated -xc++ core/WeightPagerModelCheck.cpp
+//           -o WeightPagerModelCheck <build>/libvkop.a
+//           <build>/model/libvload.a -ldl -lpthread
 //
 //   ./wpm <moe_paged_slots.vkopbin> [<moe_slots_absent.vkopbin>]
 

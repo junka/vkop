@@ -283,6 +283,17 @@ class WeightPager {
             throw std::runtime_error(
                 "WeightPager::attach_to needs a command pool");
         }
+        // Adopt `rt` as the runtime this pager drives. The declaration half
+        // (add_bands_from_graph etc.) needs no runtime, so a driver usually
+        // builds the pager with a null one and supplies the real Runtime only
+        // here -- but resolve_() dereferences rt_ on every page-in, so attaching
+        // without rebinding segfaults on the FIRST band (measured: llm_serve's
+        // --page-weights path died inside resolve_ on level 1's page-in).
+        if (!rt) {
+            throw std::runtime_error(
+                "WeightPager::attach_to given a null Runtime");
+        }
+        rt_ = rt;
         for (const auto &g : groups()) {
             if (g.rfind("level:", 0) != 0) {
                 throw std::runtime_error(
@@ -308,6 +319,56 @@ class WeightPager {
             auto st = page_in_group(g);
             if (on_page) on_page(st);
         });
+    }
+
+    // Every declared weight's name, in declaration order. Exactly the set a
+    // driver hands to Runtime::set_paged_initializers, so the plan and the
+    // pager cannot disagree about which weights the arena is responsible for.
+    std::vector<std::string> names() const {
+        std::vector<std::string> out;
+        out.reserve(order_.size());
+        for (const auto &kv : order_) out.push_back(kv.first);
+        return out;
+    }
+
+    // band_bytes() under the name a caller would look for: per-band totals, so
+    // a driver can pick which bands stay resident. Largest first is the rule
+    // that matters on a real artifact -- a 27B lm_head band is 1212.5 MiB
+    // against 170 MiB for a per-layer band, so keeping the head resident shrinks
+    // the shared arena 7x on its own.
+    std::vector<std::pair<std::string, size_t>> group_bytes() const {
+        return band_bytes();
+    }
+
+    // Drop a band from the paging plan. A driver that keeps a band resident
+    // calls this so it is neither page-in'd nor passed to
+    // set_paged_initializers, which is what leaves its own buffer uploaded.
+    void drop_group(const std::string &group) {
+        order_.erase(std::remove_if(order_.begin(), order_.end(),
+                                    [&](const auto &kv) {
+                                        return kv.second.group == group;
+                                    }),
+                     order_.end());
+        for (auto it = by_name_.begin(); it != by_name_.end();) {
+            if (it->second.group == group)
+                it = by_name_.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    // weight name -> band name, for PagedArenaPlan::slot_of.
+    //
+    // A band is paged in by one call and read by one level, so its members are
+    // live together and must get DISJOINT arena offsets; separate bands can
+    // reuse the same region. Without this map the plan sees a flat list and
+    // gives every weight the same offset -- see the corruption note in
+    // Runtime's arena layout: a k/q/v band then keeps only v_proj's bytes.
+    std::unordered_map<std::string, std::string> slot_groups() const {
+        std::unordered_map<std::string, std::string> out;
+        out.reserve(order_.size());
+        for (const auto &kv : order_) out.emplace(kv.first, kv.second.group);
+        return out;
     }
 
     // Distinct band names, in declaration order.
@@ -474,6 +535,13 @@ class WeightPager {
             // of restoring access 0 (the trap ops/Operator.cpp:287 records for
             // the BDA address table: a fresh table's access is 0, and a
             // restored 0 leaves the write with no visibility edge).
+            //
+            // Destination offset stays 0 on purpose: `buf` is the weight's
+            // sub-range of the paged arena, and VulkanBuffer forwards a copy
+            // on a parented buffer to the parent with `offset + range_offset_`
+            // added. That forwarding is what routes each band member to its own
+            // slot -- see the group layout in Runtime::LoadModel. Passing the
+            // offset explicitly here would apply it twice.
             buf->readBarrier(cmd.get(), n, 0);
             buf->copyStageBufferToBuffer(cmd.get(), stage.getBuffer(),
                                          copies[i].dst_off, n, 0);

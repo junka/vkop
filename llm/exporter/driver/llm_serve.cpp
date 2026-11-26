@@ -78,8 +78,10 @@
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
+#include "core/WeightPager.hpp"
 #include "tokenizer.hpp"
 #include "kv_cache.hpp"
+#include "model/load.hpp"
 #include "llm_common.hpp"
 
 using vkop::VulkanInstance;
@@ -386,9 +388,10 @@ class InferenceServer {
                     const std::string &kv_warm = "",
                     float repetition_penalty = 1.0f, uint64_t seed = 0,
                     int sample_topk = kDefaultSampleTopK,
-                    int context_length = 0, double kv_budget_mb = 0)
+                    int context_length = 0, double kv_budget_mb = 0,
+                    std::string page_policy = "")
         : max_kv_(max_kv), prefill_chunk_(std::max(1, prefill_chunk)),
-          model_path_(model) {
+          model_path_(model), page_policy_(std::move(page_policy)) {
         sampler_ = Sampler(seed);
         seed_ = seed;
         defaults_.repetition_penalty = repetition_penalty;
@@ -406,9 +409,112 @@ class InferenceServer {
         tok_.load(tok_path);
         rt_ = std::make_shared<Runtime>(cmdpool_, model, /*precision=*/1);
         rt_->set_backend_buffer(true);
+        // ---- layer paging, decided before LoadModel ----
+        //
+        // The plan must reach the Runtime BEFORE LoadModel decides what to
+        // upload. WeightPager's declaration half reads only the artifact file
+        // (no runtime, no GPU), so the bands are derivable here even though the
+        // tensors do not exist yet.
+        //
+        // What paging buys, measured on b3: the 27B int8 artifact's 23.87 GiB of
+        // pageable weights fit a 1.19 GiB shared arena. What it costs: every
+        // page-in is a host read plus a PCIe copy (23 GB/s measured), and the
+        // seam has to settle the device before each one. That is why the bands
+        // worth keeping resident are picked LARGEST FIRST: the lm_head band is
+        // 1212.5 MiB against 170 MiB for a per-layer band, so keeping the head
+        // resident takes 7x less budget out of the arena than anything else.
+        if (!page_policy_.empty()) {
+            std::shared_ptr<Runtime> no_rt;
+            // A real pool even for the declaration-only phase: this same object
+            // is the one attached to the seam later, and attach_to refuses a
+            // pager it cannot submit through.
+            auto pager = std::make_unique<vkop::core::WeightPager>(no_rt, cmdpool_);
+            vkop::load::VkModel artifact(model);
+            const size_t nbands = pager->add_bands_from_graph(artifact, model);
+            (void)nbands;
+            auto bands = pager->group_bytes();
+            std::sort(bands.begin(), bands.end(),
+                      [](const auto &a, const auto &b) {
+                          return a.second > b.second;
+                      });
+            // `--page-weights float:<MiB>` keeps the biggest bands resident
+            // until their total reaches that budget; the rest are paged.
+            // `all` pages everything pageable, `none` disables paging.
+            size_t budget = 0;
+            bool do_paging = true;
+            if (page_policy_.rfind("float:", 0) == 0) {
+                budget = static_cast<size_t>(
+                    std::atof(page_policy_.c_str() + 6) * 1048576.0);
+            } else if (page_policy_ == "all") {
+                budget = 0;
+            } else {
+                do_paging = false;
+            }
+            if (do_paging) {
+                size_t kept = 0, kept_n = 0;
+                for (const auto &b : bands) {
+                    if (kept + b.second <= budget) {
+                        kept += b.second;
+                        ++kept_n;
+                        pager->drop_group(b.first);
+                        continue;
+                    }
+                    break;
+                }
+                if (pager->size() == 0) {
+                    std::printf("[serve] paging: every band fits the %.1f MiB "
+                                "budget, nothing to page\n", budget / 1048576.0);
+                    pager.reset();
+                } else {
+                    vkop::core::PagedArenaPlan plan;
+                    plan.names = pager->names();
+                    // Bands reuse one region; the weights INSIDE a band do not.
+                    // A band is paged in by a single call and every one of its
+                    // weights is read by the same level, so flattening them to
+                    // one offset silently kept only the last weight of each
+                    // band -- measured as a 3-way k/q/v band serving v_proj's
+                    // bytes to k and q, which answered "The main and most
+                    // famous capital of France" and turned to noise once enough
+                    // multi-weight bands were paged.
+                    plan.share_slots = true;
+                    plan.slot_of = pager->slot_groups();
+                    rt_->set_paged_initializers(std::move(plan));
+                    std::printf("[serve] paging: %zu band(s) paged (%zu weight(s)), "
+                                "%zu largest band(s) (%.1f MiB) kept resident\n",
+                                pager->groups().size(), pager->size(), kept_n,
+                                kept / 1048576.0);
+                    pager_ = std::move(pager);
+                }
+                std::fflush(stdout);
+            }
+        }
         std::printf("[serve] === LoadModel ===\n");
         rt_->LoadModel();
         std::printf("[serve] === LoadModel done ===\n");
+        // The seam needs the runtime, so attach after LoadModel: the pager
+        // resolves each weight's buffer on every page-in rather than caching it.
+        if (pager_) {
+            // The callback must not capture anything by reference: attach_to
+            // stores it in the runtime's level hook, so it outlives this block
+            // and runs once per level inside Run(). Capturing local counters
+            // here is a dangling write on every level -- measured as a SIGSEGV
+            // after the last level, and, under a different stack layout, as a
+            // corrupted `prefill L=...`.
+            pager_->attach_to(rt_, [this](const vkop::core::PageStats &st) {
+                ++page_calls_;
+                page_bytes_ += st.bytes;
+                page_host_ms_ += st.host_ms;
+                page_device_ms_ += st.device_ms;
+                if (std::getenv("VKOP_SERVE_VERBOSE"))
+                    std::printf("[serve] page-in %zu B (host %.1f + dev %.1f ms)\n",
+                                st.bytes, st.host_ms, st.device_ms);
+            });
+            std::printf("[serve] paging attached: %zu band(s), arena %.1f MiB\n",
+                        pager_->groups().size(),
+                        rt_->paged_arena() ? rt_->paged_arena()->getSize() / 1048576.0
+                                           : 0.0);
+            std::fflush(stdout);
+        }
         topk_k_ = vkop::llm::register_gpu_topk(rt_, "serve", sample_topk);
         arch_ = vkop::llm::infer_arch(rt_, "serve");
         if (kv_kind != "auto") {
@@ -1320,6 +1426,16 @@ class InferenceServer {
         std::printf("[serve] prefill L=%d (reuse %d, %d chunk(s)) %.0fms "
                     "total, last chunk %.0fms -> %d\n",
                     L, P, n_chunks, prefill_ms, last_run_ms, next_id);
+        if (pager_) {
+            // Paging cost is the other half of the trade: the arena freed the
+            // VRAM, and this is what it charged per prefill.
+            std::printf("[serve] paging: %zu page-in(s), %.1f MiB moved "
+                        "(host %.0f ms + device %.0f ms)\n",
+                        page_calls_, page_bytes_ / 1048576.0, page_host_ms_,
+                        page_device_ms_);
+            page_calls_ = page_bytes_ = 0;
+            page_host_ms_ = page_device_ms_ = 0.0;
+        }
         std::fflush(stdout);
 
         // ---- decode ----
@@ -1483,6 +1599,16 @@ class InferenceServer {
     std::shared_ptr<VulkanDevice> dev_;
     std::shared_ptr<vkop::VulkanCommandPool> cmdpool_;
     std::shared_ptr<Runtime> rt_;
+    // Layer paging (--page-weights). Declared AFTER rt_ on purpose: the pager
+    // dereferences the runtime on every page-in, so it must be destroyed first.
+    std::unique_ptr<vkop::core::WeightPager> pager_;
+    // "", "none", "all" or "float:<MiB>" -- see the plan in the constructor.
+    std::string page_policy_;
+    // Page-in accounting, written from the level hook (so members, not locals).
+    size_t page_calls_ = 0;
+    size_t page_bytes_ = 0;
+    double page_host_ms_ = 0.0;
+    double page_device_ms_ = 0.0;
     Tokenizer tok_;
     ModelArch arch_;
     std::vector<uint16_t> embed_table_;
@@ -1533,8 +1659,18 @@ const char *kUsage =
     "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
     "[--max-kv N|auto] [--context-length N] [--kv-budget-mb MB] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}] "
     "[--prefill-chunk N] [--kv-warm FILE] [--kv-dump FILE] "
+    "[--page-weights {all|float:MiB|none}] "
     "[--repetition-penalty F] [--seed N] [--sample-topk K] "
-    "[--rpc-in FD] [--rpc-out FD]\n";
+    "[--rpc-in FD] [--rpc-out FD]\n"
+    "\n"
+    "  --page-weights  stream the single-consuming-level weights from the\n"
+    "                  artifact through one shared VRAM arena instead of\n"
+    "                  keeping them all resident (needs the disk read to be\n"
+    "                  fast: every token re-reads every paged band).\n"
+    "                  all        page every pageable weight (smallest VRAM)\n"
+    "                  float:MiB  keep the largest bands resident up to this\n"
+    "                             budget, page the rest\n"
+    "                  none       off (default: every weight resident)\n";
 
 }  // namespace
 
@@ -1555,6 +1691,8 @@ int main(int argc, char **argv) {
     int rpc_in = 3, rpc_out = 4;
     std::string kv_kind = "auto";
     std::string kv_warm, kv_dump;
+    // "" = paging off (the historical behaviour, every weight resident).
+    std::string page_policy;
     float repetition_penalty = 1.0f;
     uint64_t seed = 0;
     for (int i = 4; i < argc; ++i) {
@@ -1572,6 +1710,7 @@ int main(int argc, char **argv) {
         else if (a == "--kv-budget-mb" && i + 1 < argc)
             kv_budget_mb = std::atof(argv[++i]);
         else if (a == "--kv-kind" && i + 1 < argc) kv_kind = argv[++i];
+        else if (a == "--page-weights" && i + 1 < argc) page_policy = argv[++i];
         else if (a == "--prefill-chunk" && i + 1 < argc) prefill_chunk = std::atoi(argv[++i]);
         else if (a == "--kv-warm" && i + 1 < argc) kv_warm = argv[++i];
         else if (a == "--kv-dump" && i + 1 < argc) kv_dump = argv[++i];
@@ -1609,7 +1748,7 @@ int main(int argc, char **argv) {
                                                 max_kv, kv_kind, prefill_chunk,
                                                 kv_warm, repetition_penalty, seed,
                                                 sample_topk, context_length,
-                                                kv_budget_mb);
+                                                kv_budget_mb, page_policy);
         srv->set_kv_dump_path(kv_dump);
     } catch (const std::exception &e) {
         emit(rpc_out, std::string("FATAL ") + b64_encode(e.what()));

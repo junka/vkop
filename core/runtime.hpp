@@ -45,10 +45,26 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
 // contract and the fail-closed rules.
 struct PagedArenaPlan {
     std::vector<std::string> names;
-    // Reuse one slot round-robin in `names` order instead of giving each weight
-    // its own. Only correct when no two of these weights are read in the same
-    // round -- which is the single-consuming-level property bands rest on.
+    // Reuse one slot instead of giving each weight its own. Only correct when
+    // no two weights that are LIVE AT THE SAME TIME alias the same bytes.
+    //
+    // "At the same time" is the part that has a trap in it: it means within one
+    // page-in, not within one round. A band is paged in by ONE page_in_group
+    // call and every weight in it is read by the level that opens that band, so
+    // two weights of the same band are live together and must NOT overlap. Use
+    // `slot_of` to say which weights may share; with a flat share_slots the
+    // whole plan is one slot, which is only correct for a plan whose weights
+    // are paged one at a time.
     bool share_slots = false;
+    // Optional: weight name -> slot group. A group's members are laid out end
+    // to end inside one region, because they are live at the same time (one
+    // band, paged in by one call). Separate groups reuse that same region.
+    //
+    // Empty means "one group for the whole plan", which is what a plan paged one
+    // weight at a time wants and is exactly the historical behaviour. A plan
+    // whose weights are paged in BANDS must fill this in (WeightPager's
+    // slot_groups()) or the band members will overwrite each other.
+    std::unordered_map<std::string, std::string> slot_of;
     // Arena bytes. 0 = size it from the plan (largest slot when sharing, the
     // sum when not).
     size_t arena_bytes = 0;
@@ -558,7 +574,6 @@ class Runtime {
     //   * what was skipped is reported, so a driver can assert the set it asked
     //     for is the set that took effect.
     //
-    // Must be called before LoadModel().
     // Must be called before LoadModel(). The plan type is PagedArenaPlan,
     // declared above Runtime.
     void set_paged_initializers(PagedArenaPlan plan) {

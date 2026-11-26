@@ -12,10 +12,12 @@
 //     still upload instead of short-circuiting on a stale flag.
 //
 // Build:
-//   g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS \
-//       -I<src> -I<src>/model -I<src>/model/SYSTEM -I<src>/model/generated \
-//       -xc++ core/UnloadedInitializerCheck.cpp -o uic \
-//       <build>/libvkop.a <build>/model/libvload.a -ldl -lpthread
+//   cmake: the `UnloadedInitializerCheck` target (see CMakeLists.txt).
+//   manual: g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS
+//           -I<src> -I<src>/model -I<src>/model/SYSTEM
+//           -I<src>/model/generated -xc++ core/UnloadedInitializerCheck.cpp
+//           -o UnloadedInitializerCheck <build>/libvkop.a
+//           <build>/model/libvload.a -ldl -lpthread
 //
 //   ./uic <model_a.vkopbin> <model_b.vkopbin> [weight_name]
 
@@ -279,24 +281,36 @@ int main(int argc, char **argv) {
                         "pageable and stay out of the arena\n",
                         refused, refused_bytes / 1048576.0);
         if (names.size() >= 2) {
-            auto arena_of = [&](bool share) {
+            // Group the weights the way a real paging plan does -- by the level
+            // that reads each one -- so "shared" costs one TYPICAL band, not one
+            // weight. A flat plan puts every weight in one group and therefore
+            // lays them out end to end (they are all live at once as far as the
+            // runtime can tell), which is the sum and measures nothing.
+            std::shared_ptr<Runtime> no_rt;
+            vkop::core::WeightPager layout(no_rt, nullptr);
+            const size_t nbands =
+                layout.add_bands_from_graph(mc, path_a, /*min_bytes=*/0);
+            std::printf("[uic] banding: %zu band(s) over %zu weight(s)\n",
+                        nbands, layout.size());
+            auto banded = [&](bool share) {
                 auto r = std::make_shared<Runtime>(pool, path_a, 0);
                 r->set_backend_buffer(true);
                 vkop::core::PagedArenaPlan p;
                 p.names = names;
                 p.share_slots = share;
+                if (share && layout.size() > 0) p.slot_of = layout.slot_groups();
                 r->set_paged_initializers(std::move(p));
                 r->LoadModel();
                 return r->paged_arena() ? r->paged_arena()->getSize() : 0;
             };
-            const size_t shared = arena_of(true);
+            const size_t shared = banded(true);
             // The per-weight arm sizes the arena to the payload sum, which is
             // the very thing a card too small for the model cannot allocate.
             // Skipping it does not weaken the claim: the saving is
             // `sum - shared`, and `sum` is already known from the file.
             size_t per_weight = 0;
             if (!std::getenv("UIC_NO_PER_WEIGHT_ARM"))
-                per_weight = arena_of(false);
+                per_weight = banded(false);
             else
                 per_weight = sum;
             std::printf("[uic] %zu weights: shared arena %.2f MiB, "
@@ -305,7 +319,7 @@ int main(int argc, char **argv) {
                         per_weight / 1048576.0, sum / 1048576.0);
             Check(shared > 0 && per_weight > 0, "both plans allocate an arena");
             Check(shared < per_weight,
-                  "a shared slot costs one largest weight, not their sum");
+                  "a shared slot costs one band, not the sum of every weight");
             Check(shared >= largest, "a shared slot still fits the largest");
             if (per_weight)
                 std::printf("[uic] saving %.2f GiB (%.1f%% of the per-weight "

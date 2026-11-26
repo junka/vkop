@@ -24,10 +24,12 @@
 // compute garbage.
 //
 // Build:
-//   g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS \
-//       -I<src> -I<src>/model -I<src>/model/SYSTEM -I<src>/model/generated \
-//       -xc++ core/ArenaSeamPagingCheck.cpp -o asp \
-//       <build>/libvkop.a <build>/model/libvload.a -ldl -lpthread
+//   cmake: the `ArenaSeamPagingCheck` target (see CMakeLists.txt).
+//   manual: g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS
+//           -I<src> -I<src>/model -I<src>/model/SYSTEM
+//           -I<src>/model/generated -xc++ core/ArenaSeamPagingCheck.cpp
+//           -o ArenaSeamPagingCheck <build>/libvkop.a
+//           <build>/model/libvload.a -ldl -lpthread
 //
 //   ./asp <chain_a.vkopbin> <chain_b.vkopbin>
 

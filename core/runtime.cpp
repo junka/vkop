@@ -1191,19 +1191,62 @@ void Runtime::LoadModel() {
             largest = std::max(largest, sz);
             sum += sz;
         }
+        // Which weights may alias each other. A slot group is the unit that is
+        // live all at once, so its members get DISJOINT offsets inside one
+        // region sized to their sum; separate groups reuse that same region.
+        //
+        // Two layouts share this one code path:
+        //   * not sharing: every weight gets its own address, which is the same
+        //     as "one group, laid out end to end" -- the historical per-weight
+        //     layout, so a caller that never asked for sharing is unaffected;
+        //   * sharing: groups reuse one region, and a group's members are
+        //     packed inside it.
+        //
+        // The flat share_slots case (no slot_of) makes the whole plan one
+        // group -- right for a plan paged one weight at a time, and wrong for a
+        // band, which is paged in one call and whose members are read together.
+        // That mistake is not theoretical: with one flat slot every weight of a
+        // band was copied to offset 0 and the last one won, so a k/q/v band left
+        // only v_proj's bytes in VRAM. The model still answered, slightly wrong
+        // ("The main and most famous capital of France"), which is the worst
+        // kind of wrong; page more bands and it degraded to noise.
+        std::string flat = paged_plan_.share_slots ? "\x01all" : "";
+        auto group_of = [&](const std::string &name) -> std::string {
+            if (!paged_plan_.share_slots) return flat; // one run, all distinct
+            if (!paged_plan_.slot_of.empty()) {
+                auto it = paged_plan_.slot_of.find(name);
+                if (it != paged_plan_.slot_of.end()) return it->second;
+            }
+            return flat;
+        };
+        // group -> (bytes laid out end to end, name -> offset within the group)
+        std::unordered_map<std::string, size_t> group_cursor;
+        std::unordered_map<std::string, size_t> group_bytes;
+        std::unordered_map<std::string, size_t> offset_in_group;
+        size_t region = 0; // bytes of the largest group: what one region holds
+        for (const auto &[name, sz] : slots) {
+            const std::string g = group_of(name);
+            size_t &cur = group_cursor[g];
+            offset_in_group[name] = cur;
+            cur += sz;
+            group_bytes[g] = cur;
+            region = std::max(region, cur);
+        }
         if (!slots.empty()) {
-            // share_slots: one slot, reused. Otherwise: every weight its own,
-            // so no two can alias by accident.
+            // A shared plan needs one region big enough for the LARGEST group
+            // (every group reuses the same region). A split plan needs the sum.
+            const size_t shared_need = region;
             const size_t arena_bytes = paged_plan_.arena_bytes != 0
                                            ? paged_plan_.arena_bytes
-                                           : (paged_plan_.share_slots ? largest
+                                           : (paged_plan_.share_slots ? shared_need
                                                                       : sum);
-            if (paged_plan_.share_slots && largest > arena_bytes) {
+            if (paged_plan_.share_slots && shared_need > arena_bytes) {
                 throw std::runtime_error(
                     "vkop: paged arena is " + std::to_string(arena_bytes) +
-                    " bytes but the largest paged weight needs " +
-                    std::to_string(largest) +
-                    "; a shared slot must hold any one of them");
+                    " bytes but the largest slot group needs " +
+                    std::to_string(shared_need) +
+                    "; a shared region must hold every weight that is live at "
+                    "the same time");
             }
             if (!paged_plan_.share_slots && sum > arena_bytes) {
                 throw std::runtime_error(
@@ -1218,16 +1261,21 @@ void Runtime::LoadModel() {
                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            size_t cursor = 0;
+            // Every group starts at 0 and lays its members out end to end;
+            // groups reuse each other's region, which is what makes a shared
+            // plan cost one region instead of the sum.
             for (const auto &[name, sz] : slots) {
-                // A shared slot always lands at 0; the pager writes whichever
-                // weight is being brought in to that same offset.
-                paged_offsets_[name] = paged_plan_.share_slots ? 0 : cursor;
-                if (!paged_plan_.share_slots) cursor += sz;
+                (void)sz;
+                paged_offsets_[name] = offset_in_group[name];
             }
+            const std::string how =
+                paged_plan_.share_slots
+                    ? "shared over " + std::to_string(group_bytes.size()) +
+                          " group(s)"
+                    : std::string("per-weight");
             printf("Paged arena: %.2f MiB, %zu weight(s), %s slots\n",
                    static_cast<double>(arena_bytes) / (1 << 20), slots.size(),
-                   paged_plan_.share_slots ? "shared" : "per-weight");
+                   how.c_str());
         }
     }
 
@@ -4522,24 +4570,22 @@ double Runtime::Run() {
                     if (graph_seg) graph_submit();
                     flush_seg_batch();
                     if (sec_cmd) commit_primaries();
+                } else {
+                    // Per-op path with batching on (VKOP_BATCH_LEVELS>0):
+                    // earlier levels' submit infos may still be sitting in
+                    // batched_sis, never handed to the queue, so waiting for the
+                    // device would not constrain them at all. Close the batch
+                    // first. With the default batch_levels==0 this is a no-op
+                    // (every level already flushed when it ended), so it costs
+                    // nothing in the configuration that does not need it.
+                    flush_batched(batched_sis, single_queue ? 1 : vkop::kInflight);
+                    levels_since_flush = 0;
                 }
-                // The per-op path has already flushed each level by the time the
-                // next level begins (batch_levels defaults to 0), so waiting is
-                // enough there; in graph mode the flush+submit above is what
-                // puts the segment on the queue first.
-                static const bool settle_trace =
-                    std::getenv("VKOP_PAGED_SETTLE_TRACE") != nullptr;
-                static size_t settle_n = 0;
-                auto st0 = std::chrono::steady_clock::now();
+                // Both branches have now put everything recorded so far on the
+                // queue, so the wait below is what actually guarantees the
+                // earlier levels EXECUTED before the hook overwrites the slot
+                // they read.
                 dev->wait_all_done();
-                if (settle_trace) {
-                    auto st1 = std::chrono::steady_clock::now();
-                    std::fprintf(stderr,
-                                 "[settle] #%zu lvl=%zu %.1f ms\n", settle_n++,
-                                 level_idx,
-                                 std::chrono::duration<double, std::milli>(st1 - st0)
-                                     .count());
-                }
             }
             level_hook_(level_idx);
         }

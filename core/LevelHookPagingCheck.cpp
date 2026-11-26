@@ -14,10 +14,12 @@
 // weight and the hook fires once per pageable level.
 //
 // Build:
-//   g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS \
-//       -I<src> -I<src>/model -I<src>/model/SYSTEM -I<src>/model/generated \
-//       -xc++ core/LevelHookPagingCheck.cpp -o lhp \
-//       <build>/libvkop.a <build>/model/libvload.a -ldl -lpthread
+//   cmake: the `LevelHookPagingCheck` target (see CMakeLists.txt).
+//   manual: g++ -std=gnu++17 -O2 -mf16c -DVK_ENABLE_BETA_EXTENSIONS
+//           -I<src> -I<src>/model -I<src>/model/SYSTEM
+//           -I<src>/model/generated -xc++ core/LevelHookPagingCheck.cpp
+//           -o LevelHookPagingCheck <build>/libvkop.a
+//           <build>/model/libvload.a -ldl -lpthread
 //
 //   ./lhp <chain_a.vkopbin> <chain_b.vkopbin>
 
