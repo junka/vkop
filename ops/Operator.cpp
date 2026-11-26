@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "core/Bf16Gate.hpp"
 #include "core/ShaderArchive.hpp"
 #include "core/ShaderKeys.hpp"
 #include "vulkan/VulkanBuffer.hpp"
@@ -54,7 +55,11 @@ static bool bda_shaders_enabled() {
 
 void Operator::resolve_primary_spv() {
     resolve_fp16_layout();
-    std::string key = core::shader_key_for(type_, uses_buffer_backend(), fp16_);
+    // fp16_ == 2 is a bf16 ACTIVATION build (op_shader_fp16): the module is
+    // <key>_bf16, never the fp16 one -- asking for "_fp16" here ran the fp16
+    // decode over bf16 words for every op built outside Runtime.
+    std::string key = core::shader_key_for(type_, uses_buffer_backend(),
+                                           fp16_ != 0 ? 1 : 0, fp16_ == 2);
     // The three qwen3_5 ops ship a second fp16 layout (packed half2 words).
     // Only those keys exist as <key>_fp16_packed, so the suffix is harmless for
     // every other op -- it would miss and fall back. The test is on the SUFFIX:
@@ -140,6 +145,12 @@ void Operator::try_build_bda_pipeline(VkPipelineCache cache) {
     // switch.
     if (!bda_shaders_enabled() || bda_pipeline_ || !supports_bda_variant() ||
         !m_dev_ || !m_dev_->is_support_buffer_device_address()) {
+        return;
+    }
+    // No -DBDA -DBF16 module exists: the key below would name the fp16 BDA
+    // build, which decodes bf16 words as fp16. A bf16 op keeps its
+    // descriptor pipeline (the _bf16 module).
+    if (fp16_ == 2) {
         return;
     }
     // Packed fp16 kernels load uint words. Descriptor offsets (the only way a
@@ -420,6 +431,23 @@ bool Operator::submit_bda_table_module(
 void Operator::onExecute(
     const std::vector<std::shared_ptr<core::ITensor>> &inputs,
     const std::vector<std::shared_ptr<core::ITensor>> &outputs, int id) {
+    // bf16 activations reach only the kernels that were verified to decode
+    // them (core/Bf16Gate.hpp). Runtime::LoadModel runs the same check per
+    // node; this one covers an op driven directly (tests, example drivers)
+    // and a tensor whose kind changed after load.
+    {
+        const std::string op_name = convert_optype_to_string(type_);
+        if (core::check_bf16_activation(type_, op_name, name_, inputs, outputs,
+                                        uses_buffer_backend()) &&
+            fp16_ != 2 && type_ != OpType::SHAPE &&
+            type_ != OpType::SQUEEZE && type_ != OpType::UNSQUEEZE) {
+            throw std::runtime_error(
+                "vkop: " + op_name + " '" + (name_.empty() ? op_name : name_) +
+                "' was handed bfloat16 activations but was built for " +
+                (fp16_ == 1 ? "fp16" : "fp32") +
+                " (create it with fp16 = 2 to get the _bf16 module)");
+        }
+    }
     if (!m_cmd_ && !graph_cmd_) {
         m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_cmdpool_, id);
     }

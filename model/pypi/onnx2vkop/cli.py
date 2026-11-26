@@ -688,7 +688,7 @@ def main():
             str(input_path), args.batch, quant=args.quant,
             unify=args.unify, rgba=args.rgba,
             group_size=getattr(args, "group_size", 0),
-            keep_bf16=args.keep_bf16)
+            keep_bf16=args.keep_bf16, act=args.act)
 
         # Create a simple args object for apply_optimizations
         class Args:

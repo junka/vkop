@@ -408,7 +408,7 @@ class AttentionBuffer : public BufferFactory {
         const int head_dim = dim(q_shape, q_shape.size() - 1);
         const bool flash = flash_route(
             batch, heads, seq, head_dim,
-            inputs[0]->dtype() == typeid(uint16_t), /*cache_fp8=*/false);
+            fp16_q(inputs[0]), /*cache_fp8=*/false);
         return publish_dyn(kv_len, /*kv_past=*/0, /*ring_head=*/0,
                            flash ? batch * heads * flash_row_tiles(seq)
                                  : batch * heads * seq);
@@ -724,7 +724,7 @@ class AttentionBuffer : public BufferFactory {
         // instead of one per query row (see flash_route for what it serves).
         const bool use_flash =
             flash_route(batch, heads, seq, head_dim,
-                        inputs[0]->dtype() == typeid(uint16_t), cache_fp8);
+                        fp16_q(inputs[0]), cache_fp8);
         int grid = use_flash ? batch * heads * flash_row_tiles(seq)
                              : batch * heads * seq;
         flash_cache_last_ = use_flash && has_cache;
@@ -732,7 +732,7 @@ class AttentionBuffer : public BufferFactory {
         const int rows = batch * heads * seq;
         const bool use_split =
             !use_flash && split_route(rows, head_dim, has_cache,
-                                      inputs[0]->dtype() == typeid(uint16_t));
+                                      fp16_q(inputs[0]));
         split_last_ = use_split;
         const int splits = use_split ? kv_splits_for(rows, kv_len) : 0;
         if (use_split) {
@@ -943,6 +943,15 @@ class AttentionBuffer : public BufferFactory {
         } else {
             submit(&pc, grid, 1, 1);
         }
+    }
+
+    // Whether Q is true fp16 -- the only width the flash and split-KV routes
+    // have a module for. Their keys are the `_fp16` builds by name
+    // (flash_pipeline / split_pipeline), so a bf16 Q (same uint16_t container)
+    // must stay on the row kernel, whose _bf16 build decodes through dec2.
+    static bool fp16_q(const std::shared_ptr<core::ITensor> &q) {
+        return q->dtype() == typeid(uint16_t) &&
+               q->elem_kind() != core::ElemKind::kBFloat16;
     }
 
     // ---- tiled many-row route (shaders/buffer/attention_flash.comp) ----

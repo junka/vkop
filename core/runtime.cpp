@@ -15,6 +15,7 @@
 #include <thread>
 #include <unordered_set>
 
+#include "core/Bf16Gate.hpp"
 #include "core/DType.hpp"
 #include "core/ShaderKeys.hpp"
 #include "core/runtime.hpp"
@@ -34,34 +35,16 @@ std::atomic<int> ops::Operator::instance_count_{0};
 std::atomic<long> ops::Operator::replay_total_hits_{0};
 namespace core {
 
-// v1 bfloat16 WEIGHT scope: which (op, input slot) pairs have a bf16 read. A bf16
-// tensor is a constant weight, and only three kernels decode it: the buffer
-// MatMul's and Gemm's B (input 1, see para_.bf16 / gemm.comp fp16b == 2) and
-// Gather's table (input 0, gather.comp -DBF16_TABLE). Every other op treats a
-// uint16_t container as fp16, so handing it a bf16 tensor is a silent wrong
-// answer; LoadModel refuses the graph instead.
-bool bf16_consumer_ok(ops::OpType type, size_t input_index) {
-    switch (type) {
-    case ops::OpType::MATMUL:
-    case ops::OpType::GEMM:
-        return input_index == 1;
-    case ops::OpType::GATHER:
-        return input_index == 0;
-    default:
-        return false;
-    }
-}
-
 // The half-width family a tensor's storage stands for: 1 for fp16, 2 for bf16,
 // 0 for anything else. Both occupy uint16_t storage, so `dtype()` alone cannot
 // tell them apart -- elem_kind() is the discriminator, and it is what the
 // loader sets from the file's dtype string.
 //
-// This is the ACTIVATION-side query and is orthogonal to bf16_consumer_ok
-// above, which whitelists the weight slots that decode bf16 bytes. A graph may
-// carry bf16 activations (--act bf16) whose every half-width op has
-// a _bf16 build; LoadModel's consumer check is what still refuses a bf16
-// WEIGHT reaching a kernel that would read it as fp16.
+// This is the ACTIVATION-side query and is orthogonal to core::bf16_weight_slot
+// (core/Bf16Gate.hpp), which whitelists the weight slots that decode bf16
+// bytes. A graph may carry bf16 activations (--act bf16) only through the ops
+// core::bf16_activation_op allows; LoadModel's check_bf16_activation refuses
+// every other bf16 edge by name.
 int half_width_kind(const ITensor *t) {
     if (t == nullptr || t->dtype() != typeid(uint16_t)) {
         return 0;
@@ -1009,6 +992,24 @@ void Runtime::LoadModel() {
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
+        } else if (okind == ElemKind::kBFloat16) {
+            // A bf16 graph output (--act bf16). Same container as
+            // fp16, so without this branch it fell to precision_ and was born
+            // kFloat16: the producer then resolved its _fp16 module (or, with
+            // a bf16 input, mixed the two) and the caller decoded bf16 bytes
+            // as fp16. The kind is the whole contract.
+            if (!backend_buffer_) {
+                throw std::runtime_error(
+                    "vkop: graph output " + o.name +
+                    " is bfloat16, which only the buffer backend produces");
+            }
+            auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
+            t->set_elem_kind(ElemKind::kBFloat16);
+            t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
         } else if (precision_ == 1) {
             auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
             t->set_ref_cnt_forever();
@@ -1514,7 +1515,7 @@ void Runtime::LoadModel() {
             // Raw little-endian bf16 bits on fp16's uint16_t container. The
             // elem_kind is the only thing that says "bf16": every reader keys
             // on it (MatMul/Gemm B, Gather's table) and LoadModel refuses any
-            // other consumer (bf16_consumer_ok). The image backend has no bf16
+            // other consumer (core/Bf16Gate.hpp). The image backend has no bf16
             // read at all, so a bf16 weight there must not become an image.
             if (!backend_buffer_) {
                 throw std::runtime_error(
@@ -1659,52 +1660,6 @@ void Runtime::LoadModel() {
                     printf("we should not reach here %s\n",
                            in_shape.name.c_str());
                     assert(false);
-                }
-                // Every branch above pushes exactly one entry (or asserts), so
-                // this input's slot is node_inputs.size() - 1 when the two
-                // lists agree.
-                const auto *added = node_inputs.size() == node_input_shapes.size()
-                                        ? node_inputs.back().get()
-                                        : nullptr;
-                if (added && added->elem_kind() == ElemKind::kBFloat16 &&
-                    !bf16_consumer_ok(type, node_inputs.size() - 1)) {
-                    // A bf16 ACTIVATION (not one of the whitelisted weight
-                    // slots above) is legal exactly when this op has a _bf16
-                    // module in the archive -- the kernel that would run then
-                    // decodes bf16 for every operand it binds. Asking the
-                    // archive rather than a hand-kept op list is what keeps
-                    // this gate honest as _bf16 coverage grows: a shader
-                    // without one still fails here, before a pipeline is
-                    // built, and names the node.
-                    const std::string bf16_key = [&] {
-                        std::string k = shader_key_for(
-                            type, backend_buffer_, 1, /*bf16=*/true);
-                        return k;
-                    }();
-                    // A host-only op (Shape / Squeeze / Unsqueeze) has no
-                    // shader at all -- it runs on the CPU and moves bytes
-                    // without interpreting them, so bf16 needs no kernel for
-                    // it. Distinguishing that from "an op whose bf16 build is
-                    // missing" is why the key is computed rather than a
-                    // hand-kept op list: an empty key means host-only, a
-                    // non-empty one that the archive lacks means a real gap.
-                    const bool host_only = bf16_key.empty();
-                    const bool have_bf16 =
-                        host_only ||
-                        (shader_archive_ &&
-                         shader_archive_->lookup(bf16_key).first != nullptr);
-                    if (!have_bf16) {
-                        throw std::runtime_error(
-                            "vkop: no bf16 kernel for " + n.op_type +
-                            " (node '" + n.name + "', input " +
-                            std::to_string(node_inputs.size() - 1) + " '" +
-                            in_shape.name +
-                            "' is bfloat16, and this op has no " + bf16_key +
-                            " module (archive=" +
-                            (shader_archive_ ? "loaded" : "MISSING") +
-                            "); only MatMul/Gemm input 1 and Gather "
-                            "input 0 decode bf16 as a WEIGHT)");
-                    }
                 }
             }
 
@@ -2045,6 +2000,16 @@ void Runtime::LoadModel() {
                     }
                 }
             }
+            // bf16 ACTIVATIONS reach only the kernels verified to decode them
+            // (core/Bf16Gate.hpp). Asking the archive whether a _bf16 key
+            // exists -- the gate this replaces -- admitted every dual shader,
+            // most of whose _bf16 builds still decode fp16, and every op
+            // without one (its bf16 key falls back to the plain fp32 module).
+            // Checked here, after the outputs exist, because a bf16 OUTPUT
+            // (Gather of a bf16 table declared bf16, a bf16 Cast) is just as
+            // wrong as a bf16 input.
+            core::check_bf16_activation(type, n.op_type, n.name, node_inputs,
+                                        node_outputs, backend_buffer_);
             // An input name can be listed twice on one node (Pow(x,2), x-x),
             // and the ref count then drops to zero on the first decrement —
             // without this, the loop would push the same object into the pool
@@ -2063,7 +2028,13 @@ void Runtime::LoadModel() {
                     if (t->dtype() == typeid(int64_t)) {
                         key += "i64_";
                     } else if (t->dtype() == typeid(uint16_t)) {
-                        key += "f16_";
+                        // bf16 and fp16 share the container but not the
+                        // pool: a recycled tensor keeps its elem_kind, so a
+                        // bf16 buffer handed to an _f16_ output would be read
+                        // as bf16 by its consumers (and vice versa).
+                        key += t->elem_kind() == ElemKind::kBFloat16
+                                   ? "bf16_"
+                                   : "f16_";
                     } else if (t->dtype() == typeid(float)) {
                         key += "f32_";
                     } else if (t->dtype() == typeid(int)) {

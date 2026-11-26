@@ -397,8 +397,15 @@ def _bf16_bytes_to_fp32(raw: bytes) -> bytes:
 _downcast_stats = {"widened": 0}
 
 
-def _downcast_bfloat16(model) -> int:
+def _downcast_bfloat16(model, act: str = "fp16") -> int:
     """Rewrite every bfloat16 tensor in the model to float16, in place.
+
+    Under `act == "bf16"` the target is float32 instead, for every tensor: the
+    bf16 domain pass (fp16_graph.py) re-declares what it owns as bfloat16 from
+    FLOAT, and bf16 -> fp32 -> bf16 is exact. Normalizing to float16 there
+    left a bf16 checkpoint's weights and I/O as FLOAT16, which the domain pass
+    never rewrites (it only downgrades FLOAT) -- i.e. a mixed fp16/bf16 graph
+    from a plain `--act bf16` conversion.
 
     Covers the three places a dtype is spelled: an initializer's payload, a
     ValueInfoProto's element type (graph input/output/value_info), and a node
@@ -423,10 +430,11 @@ def _downcast_bfloat16(model) -> int:
     forced_fp32 |= {node.input[2] for node in model.graph.node
                     if node.op_type == "MatMulBnb4" and len(node.input) > 2}
     widened = 0
+    to_fp32 = act == "bf16"
     for init in model.graph.initializer:
         if init.data_type != _BFLOAT16:
             continue
-        if init.name in forced_fp32:
+        if to_fp32 or init.name in forced_fp32:
             init.raw_data = _bf16_bytes_to_fp32(init.raw_data)
             init.data_type = _FLOAT32
             widened += 1
@@ -438,14 +446,18 @@ def _downcast_bfloat16(model) -> int:
     for vi in (list(model.graph.input) + list(model.graph.output)
                + list(model.graph.value_info)):
         if vi.type.tensor_type.elem_type == _BFLOAT16:
-            vi.type.tensor_type.elem_type = _FLOAT16
+            vi.type.tensor_type.elem_type = _FLOAT32 if to_fp32 else _FLOAT16
             count += 1
     for node in model.graph.node:
         for attr in node.attribute:
             if (attr.type == onnx.AttributeProto.TENSOR
                     and attr.t.data_type == _BFLOAT16):
-                attr.t.raw_data = _bf16_bytes_to_fp16(attr.t.raw_data)
-                attr.t.data_type = _FLOAT16
+                if to_fp32:
+                    attr.t.raw_data = _bf16_bytes_to_fp32(attr.t.raw_data)
+                    attr.t.data_type = _FLOAT32
+                else:
+                    attr.t.raw_data = _bf16_bytes_to_fp16(attr.t.raw_data)
+                    attr.t.data_type = _FLOAT16
                 count += 1
     return count
 
@@ -463,7 +475,8 @@ class ModelConverter:
                          quant: str = None, unify: bool = False,
                          rgba: bool = False,
                          group_size: int = 0,
-                         keep_bf16: bool = False) -> DAGBasedModel:
+                         keep_bf16: bool = False,
+                         act: str = "fp16") -> DAGBasedModel:
         """Parse and convert ONNX model to DAG format.
 
         `group_size` is the 4-bit K group (`-q int4`'s knob). It is needed
@@ -550,9 +563,13 @@ class ModelConverter:
             if bf16_sources:
                 print(f"[bf16] {len(bf16_sources)} bf16 weight source(s) "
                       f"stashed for the bf16 weight slots")
-        bf16_count = _downcast_bfloat16(model)
+        # `act` (--act) picks the normalization target: under --act bf16 a
+        # bf16 source goes to float32, which the bf16 domain pass turns back
+        # into bf16 exactly (see _downcast_bfloat16).
+        bf16_count = _downcast_bfloat16(model, act)
         if bf16_count or _downcast_stats["widened"]:
-            print(f"[bf16] {bf16_count} bfloat16 tensor(s) -> float16, "
+            target = "float32" if act == "bf16" else "float16"
+            print(f"[bf16] {bf16_count} bfloat16 tensor(s) -> {target}, "
                   f"{_downcast_stats['widened']} -> float32 (fp32 consumers)")
 
         # Slots have to be declared in expert order *before* the passes run, and
@@ -1317,7 +1334,12 @@ class ModelConverter:
             fp16_summary = GraphFp16.apply(
                 dag_model, _declared_widths_backend(args),
                 skip_weights=skip,
-                half=act)
+                half=act,
+                # Under --act bf16 a MatMul whose B a byte/4-bit quantizer
+                # will replace has no bf16-activation kernel (the runtime
+                # refuses a quantized operand beside bf16), so the domain
+                # pass keeps it FP32. -q bf16's own weights are bf16 and fine.
+                quantized=skip if args.quant != "bf16" else set())
         elif (act == "fp32"
               and _declared_widths_backend(args) == "buffer"):
             # --act fp32 keeps the export's widths, so a node the export already
@@ -1450,6 +1472,22 @@ class ModelConverter:
                 dag_model, keep=True, quantize=args.quant == "bf16",
                 exclude=excluded_weights, only=bf16_only)
 
+        if act == "bf16" and _declared_widths_backend(args) == "buffer":
+            # A graph that declares bf16 activations and float16 tensors has
+            # no way to run: the runtime has no fp16<->bf16 conversion and
+            # refuses a node binding both. Weight passes run after the domain
+            # pass (-q fp16's selective weight pass writes float16), and an
+            # fp16 export already declares FLOAT16 activations that the
+            # domain pass does not touch, so the check is made here, on the
+            # finished graph, rather than left for LoadModel to find.
+            mixed = GraphFp16.mixed_half_kinds(dag_model)
+            if mixed:
+                raise RuntimeError(
+                    "onnx2vkop: --act bf16 refused: the converted graph mixes "
+                    "fp16 and bf16 (" + mixed[0] + "). vkop has no kernel "
+                    "that converts between them and refuses a node that "
+                    "binds both. Use --act fp16, or a weight format other "
+                    "than -q fp16, or start from an fp32/bf16 export.")
         numeric_audit.finish()
 
         # The folded-weight ABI, checked once for every format.

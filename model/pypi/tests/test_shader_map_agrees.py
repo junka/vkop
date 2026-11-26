@@ -293,10 +293,15 @@ def test_every_coop_module_key_is_declared():
 # the op -> key decision; these tests pin it to the two that came before.
 def _legacy_key_selection(op_types, backend, emit_fp16=True):
     """The formula shader_keys_for_model used before the plan existed:
-    this backend's primary keys + this backend's secondary pipelines."""
+    this backend's primary keys + this backend's secondary pipelines -- plus,
+    since the bf16 activation builds, the `_bf16` twin of every BUFFER dual
+    shader (same source, -DFP16 -DBF16; the image backend has no bf16)."""
     keys = set()
     for op in set(op_types):
-        keys.update(shader_map._primary_keys(op, backend, emit_fp16))
+        primary = shader_map._primary_keys(op, backend, emit_fp16)
+        keys.update(primary)
+        if backend == "buffer" and emit_fp16 and len(primary) > 1:
+            keys.add(primary[1].replace("_fp16", "_bf16"))
         keys.update(shader_map._SECONDARY.get((op, backend), ()))
     return keys
 

@@ -52,6 +52,27 @@ def test_activation_dtype_reads_legacy_args():
     assert activation_dtype(a) == "fp32"
 
 
+def tiny_bf16_capable_model(path):
+    """tiny_fp32_model's shape with Add(bias) for the Relu: MatMul (even N)
+    and Add are both on the bf16 activation allow-list."""
+    import numpy as np
+    import onnx
+    from onnx import TensorProto as T, helper as h, numpy_helper as nh
+    rng = np.random.default_rng(0)
+    w = nh.from_array(rng.standard_normal((64, 64)).astype(np.float32), "w")
+    b = nh.from_array(rng.standard_normal((64,)).astype(np.float32), "b")
+    g = h.make_graph(
+        [h.make_node("MatMul", ["x", "w"], ["y"]),
+         h.make_node("Add", ["y", "b"], ["z"])],
+        "g",
+        [h.make_tensor_value_info("x", T.FLOAT, [4, 64])],
+        [h.make_tensor_value_info("z", T.FLOAT, [4, 64])],
+        [w, b])
+    m = h.make_model(g, opset_imports=[h.make_opsetid("", 17)])
+    m.ir_version = 8
+    onnx.save(m, path)
+
+
 def run(src, out, *extra):
     p = subprocess.run(
         [sys.executable, "-m", "onnx2vkop.cli", "-i", src, "-o", out, *extra],
@@ -71,7 +92,14 @@ def run(src, out, *extra):
         "int8", "int8-act-fp32"])
 def test_cli_axes(tmp_path, flags, io_dt, w_dt):
     src, out = str(tmp_path / "m.onnx"), str(tmp_path / "m.vkopbin")
-    tiny_fp32_model(src)
+    if "bf16" in flags:
+        # tiny_fp32_model ends in a Relu, which has no bf16 activation kernel
+        # (core/Bf16Gate.hpp), so under bf16 the domain pass rightly keeps
+        # that graph FP32. The flag is what is under test here, so give it
+        # a graph whose ops all run bf16.
+        tiny_bf16_capable_model(src)
+    else:
+        tiny_fp32_model(src)
     rc, log = run(src, out, *flags)
     assert rc == 0, log[-2000:]
     io, inits = dtypes_of(out)

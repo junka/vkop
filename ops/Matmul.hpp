@@ -834,13 +834,41 @@ class MatMulBuffer : public BufferFactory {
         const bool a_int8 = a_int8_raw && a_index == 0;
         const bool a_int8_candidate =
             a_int8 && core::matmul_knobs().dp4a_enabled && weight_int8;
-        if (!a_int8_candidate) {
+        // A bf16 ACTIVATION (--act bf16). Operator::onExecute has
+        // already held every float operand of this node to bf16 (so B is a
+        // bf16 weight or activation, the output is bf16, and nothing is
+        // quantized); what is left here is keeping it on the routes whose
+        // _bf16 build decodes A through the bf16 path -- see
+        // core::MatmulFeatures::act_bf16.
+        const bool act_bf16 =
+            inputs[a_index]->elem_kind() == core::ElemKind::kBFloat16;
+        if (!a_int8_candidate && !act_bf16) {
             core::require_float_elem(inputs[a_index]->elem_kind(), "MatMul",
                                      "input 0");
         }
         if (!weight_byte && !weight_4bit && !weight_bf16) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
+        }
+        if (act_bf16) {
+            // Each of these is a separate module or epilogue with no bf16
+            // read: the SwiGLU down fold (matmul_down_act.comp), the gate/up
+            // fold's pack pass (matmul_swiglu_pack.comp), and the attention
+            // QK^T epilogue's mask/bias read. attn_softmax deletes the
+            // Softmax node in the converter and relies on a route that only
+            // takes an fp16 B, so with bf16 there would be no softmax at all.
+            const char *why = down_act_      ? "down_act SwiGLU fold"
+                              : swiglu_      ? "swiglu gate/up fold"
+                              : epi_bias_    ? "QK^T epi_bias mask/bias epilogue"
+                              : attn_softmax_ ? "fused attn_softmax"
+                                             : nullptr;
+            if (why != nullptr) {
+                throw std::runtime_error(
+                    "vkop: no bf16 activation kernel for MatMul '" +
+                    get_name() + "' (" + why +
+                    "); reconvert with --act fp16 or without the "
+                    "fold");
+            }
         }
         if (weight_bf16) {
             // v1 scope: bf16 is a constant weight. The SwiGLU down fold reads
@@ -854,7 +882,10 @@ class MatMulBuffer : public BufferFactory {
                     "fuse_swiglu_down_proj or with fp16 weights");
             }
         }
-        core::require_float_elem(outputs[0]->elem_kind(), "MatMul", "output");
+        if (!act_bf16) {
+            core::require_float_elem(outputs[0]->elem_kind(), "MatMul",
+                                     "output");
+        }
         const std::string weight_label = weight_int8    ? "int8"
                                          : weight_fp8   ? "fp8"
                                          : weight_nvfp4 ? "nvfp4"
@@ -1351,6 +1382,7 @@ class MatMulBuffer : public BufferFactory {
         // self-packing coop module cannot, so coop_n_ok() steers away from it.
         sel_feat.swiglu = swiglu_;
         sel_feat.bf16_wide = weight_bf16 && bf16_wide_;
+        sel_feat.act_bf16 = act_bf16;
 
         // Modules set_runtime_device() already built are facts. The ones built
         // on first use (WIDE GEMV, 512-lane split-K, tile-split-K, the down
@@ -1551,6 +1583,18 @@ class MatMulBuffer : public BufferFactory {
                 std::to_string(down_k_out) +
                 "); any other route would compute x . Wd and drop gate/up. "
                 "Reconvert without fuse_swiglu_down_proj.");
+        }
+
+        // bf16 activations: only the routes the selector keeps for act_bf16
+        // dispatch this op's own (_bf16) module with A read through the bf16
+        // decode. Anything else -- odd N lands on reduce_pack, whose pack pass
+        // (buffer_matmul_pack) writes fp16 -- has no bf16 kernel.
+        if (act_bf16 && !core::matmul_route_takes_bf16_act(plan.route)) {
+            throw std::runtime_error(
+                "vkop: no bf16 activation kernel for MatMul '" + get_name() +
+                "' at m=" + std::to_string(m) + " n=" + std::to_string(n) +
+                " k=" + std::to_string(k) + " (the only route left is '" +
+                plan.tag + "', which has no bf16 read/write)");
         }
 
         // The dispatch below reads the plan through these aliases so the
@@ -1791,10 +1835,8 @@ class MatMulBuffer : public BufferFactory {
         // They are independent -- a quantized weight (int4/fp8) beside a bf16
         // activation sets only bit 1, and reading that as "B is fp16, A is
         // fp16" is what fed bf16 bits through unpackHalf2x16 (measured: a
-        // MatMul emitting 1056 NaN from an all-1/8 softmax).
-        const bool act_bf16 =
-            a_index < static_cast<int>(inputs.size()) && inputs[a_index] &&
-            inputs[a_index]->elem_kind() == core::ElemKind::kBFloat16;
+        // MatMul emitting 1056 NaN from an all-1/8 softmax). act_bf16 is the
+        // flag computed with the operand checks above.
         para_.bf16 = (weight_bf16 ? 1 : 0) | (act_bf16 ? 2 : 0);
         para_.w8_quad = (w8_quad && !ksplit && !tiled) ? 1 : 0;
         // main() tests uPC.ksplit before uPC.tile, so raising both flags makes
@@ -2782,9 +2824,12 @@ class MatMulBuffer : public BufferFactory {
                 const char *e = std::getenv("VKOP_TILE128");
                 return e == nullptr || std::atoi(e) != 0;
             }();
+            // A bf16 activation stays on the 64x64 SIMT tile: the coop8 GEMM
+            // and the 128x128 tile below stage A as fp16 (no bf16 decode).
+            const bool act_bf16_tile = (para_.bf16 & 2) != 0;
             // Apple: the same plain fp16 shape on 8x8x8 simdgroup matrices
             // (64x64 workgroup tile, 16-deep K step).
-            if (coop8_eligible(m, n, k)) {
+            if (!act_bf16_tile && coop8_eligible(m, n, k)) {
                 if (VulkanPipeline *c8 = coop8_pipeline()) {
                     set_route(swiglu_coop8_ ? "coop8_swiglu" : "coop8", batch,
                               m, n, k, rep);
@@ -2808,7 +2853,7 @@ class MatMulBuffer : public BufferFactory {
                                    : (n >= 3072) ? 192
                                    : (n >= 2048) ? 256
                                                  : (1 << 30);
-            if (t128_on && fp16_ != 0 && para_.transB == 0 &&
+            if (t128_on && !act_bf16_tile && fp16_ != 0 && para_.transB == 0 &&
                 para_.weight_int8 == 0 && para_.w4 == 0 &&
                 para_.epi_bias == 0 && n % 8 == 0 && k % 16 == 0 &&
                 n >= 128 && m >= t128_min_m) {

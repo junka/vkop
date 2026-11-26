@@ -148,6 +148,9 @@ def test_auto_backend_embeds_both_sides(tmp_path):
     master, _ = fake_master(tmp_path, [
         "buffer_add", "buffer_add_fp16", "image_add", "image_add_fp16",
         "buffer_add_bda", "buffer_add_bda_fp16",
+        # The bf16 build of each buffer dual shader (-DFP16 -DBF16), shipped
+        # beside the fp16 one; the image backend has none.
+        "buffer_add_bf16", "buffer_mul_bf16",
         # Add's int64 twin, resolved by name from BufferBinaryFactory's
         # int64 path (shaderInt64 builds).
         "buffer_add_int64", "buffer_add_int64_bda",
@@ -168,8 +171,10 @@ def test_auto_backend_embeds_both_sides(tmp_path):
     subset, missing, count = build_shader_subset(m, master, backend="auto")
     assert "buffer_add" in subset and "image_add" in subset
     # 20 base keys + Add's and Mul's int64 twins (2 each: descriptor + BDA)
-    # + Gather's two bf16-table builds.
-    assert count == 26
+    # + Gather's two bf16-table builds + Add's and Mul's buffer bf16 builds.
+    assert count == 28
+    assert not any(k.startswith("image_") and k.endswith("_bf16")
+                   for k in subset)
     # Gather has no image variant: shader_map emits the phantom "image_gather"
     # (meaning "fall back to buffer_gather"), which must not be reported as a
     # missing shader -- the spelling the runtime would actually ask for is

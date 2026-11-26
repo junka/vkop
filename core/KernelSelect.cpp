@@ -1341,12 +1341,46 @@ const MatmulKnobs &matmul_knobs() {
     return knobs;
 }
 
+bool matmul_route_takes_bf16_act(MatmulRoute route) {
+    switch (route) {
+    case MatmulRoute::kKsplit:
+    case MatmulRoute::kKsplitWide:
+    case MatmulRoute::kFusedFp16:
+    case MatmulRoute::kTiled: // the 64x64 SIMT tile; the op skips coop8/128
+        return true;
+    default:
+        return false;
+    }
+}
+
 MatmulPlan select_matmul(const DeviceTraits &traits, const MatmulShape &shape,
                          const MatmulFeatures &features,
                          const MatmulAvailability &availability,
                          const MatmulKnobs &knobs) {
     const DeviceProfile &profile = device_profile_for(traits);
     Ctx c = make_ctx(traits, profile, shape, features, availability, knobs);
+    if (features.act_bf16) {
+        // No smart coopmat pass and no rule outside the bf16 set: the first
+        // kept rule that applies wins, exactly as it would in the full walk.
+        for (const MatmulRule &rule : kMatmulRules) {
+            if (!matmul_route_takes_bf16_act(rule.route)) {
+                continue;
+            }
+            const bool a = rule.applies(c);
+            if (knobs.trace) {
+                std::fprintf(stderr, "[ksel] bf16 rule %s -> %d\n", rule.tag,
+                             a);
+            }
+            if (a) {
+                return apply_rule(c, rule);
+            }
+        }
+        // Nothing bf16-capable fits (odd N, ...): fall through to the full
+        // table so the op can name the route it would have needed.
+        MatmulFeatures plain = features;
+        plain.act_bf16 = false;
+        return select_matmul(traits, shape, plain, availability, knobs);
+    }
     if (knobs.trace) {
         std::fprintf(stderr, "[ksel] m=%d n=%d k=%d fp16=%d weight_fp16=%d coop_split=%d force_coop=%d coopmat_av=%d\n",
                      shape.m, shape.n, shape.k, features.fp16,

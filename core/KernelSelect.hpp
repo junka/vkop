@@ -288,7 +288,23 @@ struct MatmulFeatures {
     // and column-parallel routes decode bf16 straight to fp32 and take it.
     // Ignored for every other weight kind.
     bool bf16_wide = false;
+    // A is a bf16 ACTIVATION (--act bf16): the op runs its _bf16
+    // module, and only some of its routes read A through the bf16 decode.
+    // Selection keeps to those (matmul_route_takes_bf16_act): the split-K
+    // GEMV and its WIDE form, the even-N fused kernel and the 64x64 SIMT tile.
+    // Excluded: every cooperative-matrix route (KHR and the Apple coop8 GEMM
+    // the op reaches through kTiled -- it stages A as fp16), the 128x128 tile,
+    // tile-split-K and the 512-lane split-K (the host binds their `_fp16`
+    // secondary modules), the down_act/attn_softmax folds and reduce_pack
+    // (its pack pass writes fp16). When none of the kept routes fits the
+    // shape, the plan is whatever the full table picks, and the op refuses
+    // it by name.
+    bool act_bf16 = false;
 };
+
+// The routes a bf16 activation may take (see MatmulFeatures::act_bf16). The
+// op checks the selected plan against this before dispatching.
+bool matmul_route_takes_bf16_act(MatmulRoute route);
 
 // What the op actually managed to build. A route whose module is missing (driver
 // refusal, archive without the key) must fall through, so availability is an

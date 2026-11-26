@@ -106,8 +106,9 @@ class RMSNormBuffer : public BufferFactory {
         }
         // Same packed-half2 contract as LayerNorm (rmsnorm.comp states it only
         // in a comment): an odd slice starts mid-word, so its last half would
-        // share a word with the neighbouring slice.
-        if (fp16_ == 1 && (inner_size % 2) != 0) {
+        // share a word with the neighbouring slice. bf16 (fp16_ == 2) packs
+        // two per word too, so it is held to the same contract.
+        if (fp16_ != 0 && (inner_size % 2) != 0) {
             throw std::runtime_error(
                 "RMSNorm fp16: odd inner_size straddles packed half2 words");
         }

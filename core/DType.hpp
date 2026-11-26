@@ -88,7 +88,7 @@ enum class ElemKind : uint8_t {
     // bf16.comp): the B input of the buffer MatMul and Gemm kernels, and the
     // table of Gather (an embedding). Activations stay fp16/fp32, so every
     // other op still refuses a bf16 tensor -- the runtime checks every node
-    // input at LoadModel (see bf16_consumer_ok in core/runtime.cpp) and the
+    // input at LoadModel (see core/Bf16Gate.hpp) and the
     // three readers check their own operands at execute.
     kBFloat16,
 };
@@ -319,13 +319,15 @@ void require_float_elem(ElemKind kind, const char *op, const char *what);
 // A kernel handed a bf16 tensor it cannot decode should fail closed, so the
 // answer that keeps it out of the generic path is false.
 constexpr bool is_float_elem(ElemKind kind) {
-    // bf16 belongs here now: with the _bf16 module of every dual shader built
-    // (shaders/common/bf16.comp), an op reads bf16 with the same 16-bit
-    // storage and 32-bit arithmetic as fp16 -- only the decode differs. The
-    // merge kept it out while that coverage did not exist, because a generic
-    // float kernel would have read bf16 bits as fp16.
-    return kind == ElemKind::kFloat32 || kind == ElemKind::kFloat16 ||
-           kind == ElemKind::kBFloat16;
+    // fp32/fp16 only. ffe69d9 widened this to bf16 on the argument that every
+    // dual shader now has a _bf16 build; that reopened every path this
+    // predicate guards (the SwiGLU gate/up check, the QuantizeLinear side
+    // test, the Gemm/Conv/ConvTranspose weight guards) to a bf16 tensor none of
+    // them decodes, and most of those _bf16 builds turned out not to decode
+    // bf16 either. A bf16 ACTIVATION is admitted per op instead, by
+    // core/Bf16Gate.hpp's allow-list, which names the kernels and routes that
+    // were actually verified.
+    return kind == ElemKind::kFloat32 || kind == ElemKind::kFloat16;
 }
 
 // Guard for the word-granular buffer data-movement kernels (Slice, Concat,

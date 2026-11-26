@@ -91,6 +91,7 @@ set(TEST_SOURCES
     BackendCoverageTest.cpp
     ConvWeightLayoutTest.cpp
     ConvTransposeTest.cpp
+    Bf16ActivationTest.cpp
 )
 
 # Test sources are compiled one TU per file. That used to be a bad deal: every
@@ -598,6 +599,34 @@ target_sources(all_tests PRIVATE ${CONV_WL_VKOPBIN} ${CONV_WL_VKOPBIN_FALLBACK})
 target_compile_definitions(all_tests PRIVATE
     CONV_WEIGHT_LAYOUT_DATA="${CONV_WL_DIR}")
 add_dependencies(all_tests shader_archive)
+
+# Bf16ActivationTest fixtures: one-node graphs carrying bf16 activations, built
+# on the DAG and written with the real writer (not through the converter, which
+# keeps these shapes out of the bf16 domain), so LoadModel's gate is what is
+# tested. PYTHONPATH pins the converter of THIS source tree: the build venv may
+# have another checkout's onnx2vkop installed.
+set(BF16_GATE_DIR ${CMAKE_CURRENT_BINARY_DIR}/model)
+set(BF16_GATE_FIXTURES
+    ${BF16_GATE_DIR}/bf16_gate_add.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_relu.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_cast.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_gather.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_mixed.vkopbin)
+add_custom_command(
+    OUTPUT ${BF16_GATE_FIXTURES}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${BF16_GATE_DIR}
+    COMMAND ${CMAKE_COMMAND} -E env
+            PYTHONPATH=${CMAKE_SOURCE_DIR}/model/pypi
+            ${Python3_EXECUTABLE} -X utf8
+            ${CMAKE_CURRENT_SOURCE_DIR}/make_bf16_gate_fixture.py
+            ${BF16_GATE_DIR} ${VKOP_SHADER_ARCHIVE_FILE}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/make_bf16_gate_fixture.py
+            ${ONNX2VKOP_PY} ${VKOP_SHADER_ARCHIVE_FILE}
+    COMMENT "Writing the bf16 activation-gate fixtures"
+    VERBATIM
+)
+target_sources(all_tests PRIVATE ${BF16_GATE_FIXTURES})
+target_compile_definitions(all_tests PRIVATE BF16_GATE_DATA="${BF16_GATE_DIR}")
 
 # Runtime's per-op shader dtype decision (core::op_shader_fp16). Plain main: it
 # reads dtype() only, so it needs neither a Vulkan device nor a converted

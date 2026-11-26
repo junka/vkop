@@ -724,7 +724,10 @@ def shader_keys_for_model(
             for cell in cells:
                 if plan[cell]:
                     keys.add(plan[cell])
-            if emit_fp16 and plan[col + "_fp16"]:
+            # Buffer only: the image backend has no bf16 path at all (the
+            # runtime refuses a bf16 tensor there), so no image_*_bf16 key is
+            # ever asked for.
+            if emit_fp16 and col == "buffer" and plan[col + "_fp16"]:
                 # The bf16 build of a dual shader: same source, -DFP16 -DBF16,
                 # one entry per DUAL_FP16_SHADERS member (see the loop in
                 # CMakeLists.txt). It ships whenever the fp16 one does, because

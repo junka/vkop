@@ -71,7 +71,29 @@ _FLOAT16 = onnx.TensorProto.FLOAT16
 # crosses the ceiling).
 _BFLOAT16 = onnx.TensorProto.BFLOAT16
 _DOUBLE = onnx.TensorProto.DOUBLE
-_FLOAT_FAMILY = (_FLOAT, _FLOAT16, _DOUBLE)
+# BFLOAT16 is a float like the others: leaving it out made a bf16 declaration
+# invisible to _decls/_audit, so an fp16 tensor beside a bf16 one (or a bf16
+# one beside an FP32 one) was never reported.
+_FLOAT_FAMILY = (_FLOAT, _FLOAT16, _BFLOAT16, _DOUBLE)
+_INT32 = onnx.TensorProto.INT32
+_INT64 = onnx.TensorProto.INT64
+
+# The ops whose `_bf16` build decodes AND encodes bf16 end to end -- the
+# converter mirror of core/Bf16Gate.hpp's bf16_activation_op, which the
+# runtime enforces at LoadModel. Under --act bf16 only these (plus the
+# host-only byte movers in shader_map.HOST_ONLY_OPS) may enter the domain;
+# every other op holds its tensors FP32. Everything else in the archive with a
+# `_bf16` key (unary ops, Transpose, Expand, Resize, Reduce, RotaryEmbedding,
+# FusedElemwise, Cast, Gather's output, Conv, ...) still decodes fp16 somewhere.
+BF16_ACT_OPS = frozenset({
+    "Add", "Sub", "Mul", "Div", "Pow", "Min", "Max", "Mod",
+    "Split", "LayerNormalization", "LayerNorm", "RMSNorm", "Softmax",
+    "MatMul", "Attention",
+})
+
+# MatMul attributes whose kernel (a fold module or the QK^T epilogue) has no
+# bf16 read. The runtime refuses a bf16 A on any of them.
+_BF16_MATMUL_FOLDS = ("down_act", "swiglu", "epi_bias", "attn_softmax")
 
 # The qwen3_5 linear-attention ops take mixed widths by design: their DATA
 # tensors follow the artifact's dtype while their recurrent state is fp32
@@ -147,7 +169,7 @@ class GraphFp16:
         can still be rewritten into something coherent.
     """
         decls: Dict[str, dict] = {}
-        rank = {_FLOAT: 3, _DOUBLE: 2, _FLOAT16: 1}
+        rank = {_FLOAT: 4, _DOUBLE: 3, _BFLOAT16: 2, _FLOAT16: 1}
 
         def note(name, elem, slot=None):
             d = decls.get(name)
@@ -195,7 +217,7 @@ class GraphFp16:
         return decls
 
     @staticmethod
-    def plan(dag_model, half: str = "fp16") -> dict:
+    def plan(dag_model, half: str = "fp16", quantized=None) -> dict:
         """{domain, forced, reasons, blockers, conflicts} for this DAG.
 
         Computes, writes nothing. `blockers` maps a node name to why it cannot
@@ -266,7 +288,11 @@ class GraphFp16:
 
         def classify(op):
             if op == "Cast":
-                return "boundary"
+                # Under bf16 a Cast cannot be the boundary: the runtime has no
+                # Cast to or from bf16 (cast.comp converts fp32<->fp16 only),
+                # so both of its sides stay FP32 and the bf16 island is bounded
+                # by allow-listed ops alone.
+                return "blocked" if half == "bf16" else "boundary"
             if op in shader_map.HOST_ONLY_OPS:
                 # No shader at all: a host-side copy whose output dtype is its
                 # input's by construction. It can live in either domain.
@@ -275,11 +301,53 @@ class GraphFp16:
                 return "blocked"
             if not shader_map.fp16_dtype_driven(op):
                 return "blocked"
+            if half == "bf16" and op not in BF16_ACT_OPS:
+                return "blocked"
             return "domain"
+
+        quantized = set(quantized or ())
+
+        def bf16_node_blocker(node):
+            """Why an allow-listed op still cannot run this NODE in bf16."""
+            if node.op_type == "MatMul":
+                for a in _BF16_MATMUL_FOLDS:
+                    v = node.attributes.get(a)
+                    if v not in (None, 0, "0", [0], []):
+                        return f"MatMul {a}: no bf16 kernel for the fold"
+                if len(node.inputs) > 1 and \
+                        node.inputs[1].get("name") in quantized:
+                    return ("MatMul: a quantized weight has no bf16-"
+                            "activation kernel")
+                shape = node.outputs[0].get("shape") if node.outputs else None
+                if isinstance(shape, list) and shape and \
+                        isinstance(shape[-1], int) and shape[-1] > 0 and \
+                        shape[-1] % 2 == 1:
+                    return "MatMul: odd N has no bf16 route (reduce_pack)"
+            for entry in list(node.inputs) + list(node.outputs):
+                d = decls.get(entry.get("name"))
+                if d is None or d["float"] or d["elem"] in (0, _INT32,
+                                                            _INT64):
+                    continue
+                return (f"{node.op_type}: operand '{entry.get('name')}' is "
+                        f"elem type {d['elem']}, which no bf16 kernel binds "
+                        "beside bf16")
+            return None
 
         for node in dag_model.nodes.values():
             kind = classify(node.op_type)
             group = group_of[node.name]
+            if kind == "blocked" and half == "bf16" and group:
+                blockers[node.name] = (
+                    f"{node.op_type}: no bf16 activation kernel "
+                    "(core/Bf16Gate.hpp)")
+                force(group, blockers[node.name])
+                continue
+            if kind == "domain" and half == "bf16" and group:
+                why = bf16_node_blocker(node)
+                if why is not None:
+                    blockers[node.name] = why
+                    force(group, why)
+                    continue
             if kind == "boundary":
                 # Only the OUTPUT side of a Cast is decided by the attribute.
                 # Forcing its input too would drag the whole graph back to
@@ -359,7 +427,7 @@ class GraphFp16:
         domain = candidates - forced
         return {"decls": decls, "domain": domain, "forced": forced,
                 "reasons": reasons, "blockers": blockers,
-                "conflicts": GraphFp16._audit(dag_model, decls, domain)}
+                "conflicts": GraphFp16._audit(dag_model, decls, domain, half)}
 
     @staticmethod
     def _hold_phase_chains(dag_model, candidates, force, blockers) -> int:
@@ -524,7 +592,8 @@ class GraphFp16:
         return widened
 
     @staticmethod
-    def _audit(dag_model, decls: Dict[str, dict], domain: Set[str]) -> List[str]:
+    def _audit(dag_model, decls: Dict[str, dict], domain: Set[str],
+               half: str = "fp16") -> List[str]:
         """Nodes that would end up with a mixed operand set, described.
 
         The rewrite only downgrades FLOAT, so a tensor the file already
@@ -551,6 +620,7 @@ class GraphFp16:
                     if i < len(node.outputs):
                         exempt.add(node.outputs[i].get("name"))
             wide, narrow = [], []
+            halves16, halvesbf = [], []
             for entry in list(node.inputs) + list(node.outputs):
                 name = entry.get("name")
                 if name in exempt or (name or "").startswith(
@@ -559,7 +629,15 @@ class GraphFp16:
                 d = decls.get(entry.get("name"))
                 if d is None or not d["float"]:
                     continue
-                if d["elem"] == _FLOAT16 or entry["name"] in domain:
+                # A domain member is about to be declared at `half`.
+                kind = (_BFLOAT16 if half == "bf16" else _FLOAT16) \
+                    if entry["name"] in domain else d["elem"]
+                if kind == _FLOAT16:
+                    halves16.append(entry["name"])
+                elif kind == _BFLOAT16:
+                    halvesbf.append(entry["name"])
+                if d["elem"] in (_FLOAT16, _BFLOAT16) or \
+                        entry["name"] in domain:
                     narrow.append(entry["name"])
                 elif slots is not None:
                     # A linear-attention op's DATA slots have no usable
@@ -576,7 +654,38 @@ class GraphFp16:
                 out.append(f"{node.op_type} {node.name}: FP32 "
                            f"{sorted(set(wide))[:3]} beside FP16 "
                            f"{sorted(set(narrow))[:3]}")
+            elif halves16 and halvesbf:
+                out.append(f"{node.op_type} {node.name}: FP16 "
+                           f"{sorted(set(halves16))[:3]} beside BF16 "
+                           f"{sorted(set(halvesbf))[:3]}")
         return out
+
+    @staticmethod
+    def mixed_half_kinds(dag_model) -> List[str]:
+        """Tensors that make this graph a fp16/bf16 MIX, or [] if it is not.
+
+        The runtime has no kernel that converts between the two (Cast does
+        fp32<->fp16 only) and refuses a node binding both, so a graph that
+        declares bf16 activations AND float16 tensors anywhere has no way to
+        run. Weights in a bf16 weight slot (MatMul/Gemm B, Gather table) are
+        exempt: there bf16 is the weight's own storage, read beside fp16 or
+        fp32 activations by design (--keep-bf16 / -q bf16).
+        """
+        weight_slots = {"MatMul": (1,), "Gemm": (1,), "Gather": (0,)}
+        exempt = set()
+        for node in dag_model.nodes.values():
+            for i in weight_slots.get(node.op_type, ()):
+                if i < len(node.inputs):
+                    nm = node.inputs[i].get("name")
+                    if nm in dag_model.initializers:
+                        exempt.add(nm)
+        decls = GraphFp16._decls(dag_model)
+        f16 = sorted(n for n, d in decls.items() if d["elem"] == _FLOAT16)
+        bf = sorted(n for n, d in decls.items()
+                    if d["elem"] == _BFLOAT16 and n not in exempt)
+        if f16 and bf:
+            return [f"float16 {f16[:3]} beside bfloat16 {bf[:3]}"]
+        return []
 
     @staticmethod
     def mixed_width_conflicts(dag_model) -> List[str]:
@@ -594,7 +703,7 @@ class GraphFp16:
     @staticmethod
     def apply(dag_model, target_backend: str = "buffer",
               verbose: bool = True, skip_weights=None,
-              half: str = "fp16") -> dict:
+              half: str = "fp16", quantized=None) -> dict:
         """Declare and store the FP16 domain; returns what it did.
 
         `skip_weights` names initializers whose BYTES must not be rewritten
@@ -626,7 +735,7 @@ class GraphFp16:
                       "is nothing to declare here.")
             return summary
 
-        plan = GraphFp16.plan(dag_model, half)
+        plan = GraphFp16.plan(dag_model, half, quantized=quantized)
         (summary["domain"], summary["forced"], summary["blockers"],
          summary["conflicts"]) = (plan["domain"], plan["forced"],
                                   plan["blockers"], plan["conflicts"])
