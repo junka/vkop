@@ -4241,6 +4241,23 @@ double Runtime::Run() {
     for (size_t level_idx = 0; level_idx < n_levels;
          level_idx++) {
         graph_cur_level = level_idx;
+        // --- weight-paging seam ---
+        //
+        // Runs BEFORE this level records anything, so a pager can move the
+        // band this level reads into its resident buffer. No flush is needed
+        // ahead of it: the copy is a separate submit, and a band is read by
+        // exactly one level (measured 312/313 weights on llm.vkopbin), so the
+        // still-unsubmitted segment for earlier levels cannot read the band
+        // being written. The copy therefore may execute before that segment;
+        // ordering that matters -- copy before THIS level's dispatches -- holds
+        // because this level's recording has not started.
+        //
+        // A hook that lied about that property (a band shared by two levels)
+        // would produce a stale read rather than an error, which is why the
+        // band derivation refuses to declare a shared weight.
+        if (level_hook_) {
+            level_hook_(level_idx);
+        }
         // --- Host-side reshape_view pre-pass ---
         // This block used to sit deep inside the per-op loop, and the
         // segment-replay hit path skipped it entirely — which broke decode:

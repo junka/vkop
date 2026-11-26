@@ -2,6 +2,7 @@
 #ifndef CORE_RUNTIME_HPP_
 #define CORE_RUNTIME_HPP_
 
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -88,6 +89,10 @@ class Runtime {
     std::vector<std::string> dump_matches_;
 
     std::vector<std::vector<size_t>> level_node_indices_;
+
+    // Optional per-level seam (set_level_hook). Empty for every driver that
+    // does not page, in which case the level loop pays one branch.
+    std::function<void(size_t)> level_hook_;
 
     // Per-level "contains a synchronous readback" flag, learned on round 0
     // (via the queue submit counter advancing during onExecute) and reused to
@@ -539,6 +544,41 @@ class Runtime {
     // Diagnostic only: lets a driver/tests assert the declaration took effect
     // instead of trusting that the shapes were what the policy expected.
     int last_run_skipped_nodes() const { return last_run_skipped_nodes_; }
+
+    // ---- per-level hook: the seam a weight pager attaches to ----
+    //
+    // Called at the top of each level, BEFORE that level records anything, with
+    // the level index. A pager uses it to move the band this level reads into
+    // its resident buffer so the level finds it there.
+    //
+    // Why a hook and not a pager inside Runtime: the copy has to be its own
+    // submit (it is a transfer, and a replayed segment skips re-recording but
+    // not the memory it reads -- see tools/probes/weight_paging_probe.cpp,
+    // which measured that arrangement exact).
+    //
+    // Runtime does NOT flush before calling it, and does not need to: a band is
+    // read by exactly one level (measured 312/313 weights on llm.vkopbin), so
+    // the still-unsubmitted segment for earlier levels cannot read the band
+    // being written, and the copy may execute before that segment. What must
+    // hold is only that the copy precedes THIS level's dispatches, which it
+    // does because this level has not started recording. A caller that paged a
+    // band shared by two levels would get a stale read, not an error, which is
+    // why the band derivation refuses to declare a shared weight.
+    //
+    // Measured: with a hook installed the seam is exact on a 6-level chain,
+    // including under warm segment replay. A driver that does not page pays one
+    // null check per level. The hook must not call back into Run(), and must
+    // leave the GPU idle when it returns (a synchronous submit+wait), which is
+    // what WeightPager::page_in_* does.
+    void set_level_hook(std::function<void(size_t)> hook) {
+        level_hook_ = std::move(hook);
+    }
+    // Whether a level hook is installed (so a driver can skip the per-level
+    // branch entirely by choosing a different path).
+    bool has_level_hook() const { return static_cast<bool>(level_hook_); }
+    // Number of concurrent levels this graph executes. A pager derives its
+    // bands from the same level numbers (WeightPager::add_bands_from_graph).
+    size_t level_count() const { return level_node_indices_.size(); }
 };
 
 } // namespace core
