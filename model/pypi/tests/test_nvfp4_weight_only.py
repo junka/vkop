@@ -12,7 +12,8 @@ answer is a wrong one:
 
   * MatMul only — Gemm/Conv have no nibble kernel;
   * a plain 2-D B operand with transB == 0 — [N, K] would put a column's nibbles
-    along K instead of across it;
+    along K instead of across it, so a transB=1 weight is re-laid as [K, N]
+    first (the same flip int4/nf4 use) and only then gated;
   * N % 8 == 0 — a packed row must start on a 32-bit word;
   * K % 16 == 0 — a block is 16 rows, and the format fixes that, not the caller;
   * a block scale that stays inside e4m3's finite range.
@@ -366,8 +367,11 @@ def test_gates_preserve_the_float_weight():
         ("A-side weight",
          build("W", numpy.random.randn(16, 16).astype(numpy.float32),
                [("MatMul", "mm", {"transB": 0}, ["W", "x"])])),
-        ("transB=1 stores [N, K]",
-         build("W", numpy.random.randn(16, 16).astype(numpy.float32),
+        ("transB=1 [N, K] whose flipped N=4 is not a multiple of 8",
+         build("W", numpy.random.randn(4, 16).astype(numpy.float32),
+               [("MatMul", "mm", {"transB": 1}, ["x", "W"])])),
+        ("transB=1 [N, K] whose K=24 is not a whole number of blocks",
+         build("W", numpy.random.randn(8, 24).astype(numpy.float32),
                [("MatMul", "mm", {"transB": 1}, ["x", "W"])])),
         ("N=5 is not a multiple of 8",
          build("W", numpy.random.randn(16, 5).astype(numpy.float32),
@@ -404,6 +408,44 @@ def quantize_4bit(w, group_size, fmt):
     with contextlib.redirect_stdout(io.StringIO()):
         Quantizer.quantize_to_4bit_weight_only(m, group_size, fmt)
     return m
+
+
+def test_a_transpose_fed_weight_is_re_laid_and_encoded():
+    """A [N, K] weight under transB=1 becomes the [K, N] payload of its transpose.
+
+    The state fold_transpose_into_matmul leaves an export with Transpose folding
+    off in: every linear's weight is the checkpoint's [N, K] with transB=1. Before
+    the flip all of them failed the transB gate and stayed float, so `-q nvfp4`
+    on such a graph quantized nothing and said so only in a "Preserving" line.
+    The reference is the plain [K, N] encode of the same matrix: a block is one
+    column's run of 16 K values in either layout, and the global factor is a
+    whole-tensor amax, so the three tensors must match byte for byte.
+    """
+    n, k = 16, 32
+    numpy.random.seed(12)
+    w_nk = numpy.random.randn(n, k).astype(numpy.float32)
+    m = build("W", w_nk, [("MatMul", "mm", {"transB": 1}, ["x", "W"])])
+    quantize(m)
+    assert "transB" not in m.nodes["mm"].attributes, "transB must be cleared"
+    w_kn = numpy.ascontiguousarray(w_nk.T)
+    check_payload(m, w_kn)
+
+    ref = matmul_case(w_kn)
+    for t in ("W", "W_scale", "W_scale_global"):
+        assert m.initializers[t].raw_data == ref.initializers[t].raw_data or \
+            numpy.array_equal(numpy_helper.to_array(m.initializers[t]),
+                              numpy_helper.to_array(ref.initializers[t])), \
+            f"{t} differs from the [K, N] encode"
+
+    # --exclude-* keeps the layout too: an excluded weight is neither flipped
+    # nor encoded.
+    m = build("W", w_nk, [("MatMul", "mm", {"transB": 1}, ["x", "W"])])
+    with contextlib.redirect_stdout(io.StringIO()):
+        Quantizer.quantize_to_nvfp4_weight_only(m, BLOCK, None, {"W"})
+    assert m.initializers["W"].data_type == TensorProto.FLOAT
+    assert list(m.initializers["W"].dims) == [n, k]
+    assert m.nodes["mm"].attributes.get("transB") == 1
+    print("  PASS (transB=1 [N, K] weight re-laid as [K, N] and encoded)")
 
 
 def test_a_fine_group_at_half_a_byte_per_value():

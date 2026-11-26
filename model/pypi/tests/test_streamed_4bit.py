@@ -51,6 +51,19 @@ def _model(tmp, kind):
         inits += [numpy_helper.from_array(w(K, N), "Wg"),
                   numpy_helper.from_array(w(K, N), "Wu"),
                   numpy_helper.from_array(w(N, K), "Wd")]
+    elif kind == "transposed":
+        # The checkpoint layout an exporter with Transpose folding off emits:
+        # each linear's weight stored [N, K] and read through a Transpose. The
+        # streamed arm re-lays it in the writer (KnWeightLayout's
+        # transpose_payload), the in-memory arm before encoding
+        # (_flip_transposed_4bit_weights); both must land on the same bytes.
+        nodes += [helper.make_node("Transpose", ["Wup"], ["Wup_t"], perm=[1, 0]),
+                  helper.make_node("MatMul", ["q", "Wup_t"], ["h"]),
+                  helper.make_node("Relu", ["h"], ["r"]),
+                  helper.make_node("Transpose", ["Wd"], ["Wd_t"], perm=[1, 0]),
+                  helper.make_node("MatMul", ["r", "Wd_t"], ["d"])]
+        inits += [numpy_helper.from_array(w(N, K), "Wup"),
+                  numpy_helper.from_array(w(K, N), "Wd")]
     else:
         nodes += [helper.make_node("MatMul", ["q", "Wup"], ["h"]),
                   helper.make_node("Relu", ["h"], ["r"]),
@@ -140,8 +153,8 @@ def _report(log):
     return re.findall(r"Quantized '[^']+':\n(?:  .*\n){4}", log)
 
 
-@pytest.mark.parametrize("kind", ["plain", "swiglu", "tied"])
-@pytest.mark.parametrize("quant", ["int4", "nf4"])
+@pytest.mark.parametrize("kind", ["plain", "swiglu", "tied", "transposed"])
+@pytest.mark.parametrize("quant", ["int4", "nf4", "nvfp4"])
 def test_streamed_file_is_byte_identical(quant, kind):
     with tempfile.TemporaryDirectory() as tmp:
         mp = _model(tmp, kind)
@@ -163,6 +176,25 @@ def test_streamed_file_is_byte_identical(quant, kind):
             assert _by_name(got) == _by_name(ref), (
                 f"{quant}/tied: a payload or row differs between the arms")
             assert _nodes(got, tmp) == _nodes(ref, tmp)
+        elif kind == "transposed":
+            # The in-memory arm constant-folds Transpose(W) into a NEW
+            # initializer named after the Transpose's output (`Wup_t`); the
+            # streamed arm keeps the source name, because the bytes never
+            # enter the process to be folded. Node numbering shifts with it.
+            # Everything the runtime reads must still agree once the names are
+            # mapped: payload bytes, dtypes, dims, and what each node computes.
+            def _ren(text):
+                return text.replace("Wup_t", "Wup").replace("Wd_t", "Wd")
+            assert {_ren(k): v for k, v in _by_name(ref).items()} == \
+                _by_name(got), f"{quant}/transposed: a payload differs"
+
+            def _computes(nodes):
+                return sorted(
+                    _ren(repr((n["op_type"], n["inputs"], n["outputs"],
+                               n.get("attributes"))))
+                    for n in nodes)
+            assert _computes(_nodes(got, tmp)) == _computes(_nodes(ref, tmp))
+            ref_log, got_log = _ren(ref_log), _ren(got_log)
         else:
             assert got == ref, (
                 f"{quant}/{kind}: streamed .vkopbin differs from the in-memory "
@@ -176,6 +208,13 @@ def test_streamed_file_is_byte_identical(quant, kind):
                 "the streamed gate/up pair was not folded")
         if quant == "nf4":
             assert b"nf4" in got
+        if quant == "nvfp4":
+            assert b"float4e2m1fn" in got
+            assert "streamed and encoded on the way into the trailer" in got_log
+            # Every eligible weight is encoded on both arms: nothing left
+            # float behind a refused gate.
+            assert "Preserving 'W" not in got_log
+            assert "Preserving 'W" not in ref_log
 
 
 def _nf4_reference(normalized):

@@ -15,10 +15,11 @@ OWN `group_size` rows and nothing else, so a band-at-a-time sweep can accumulate
 `amax[n_groups, N]` exactly (`_grouped_amax`). The band boundary and the group
 boundary need not coincide; the reduceat slice below is computed from
 `offset % group_size` rather than assumed. That is what makes `-q int4`
-convertible on a machine that cannot hold the model, and it is the only 4-bit
-format here: nf4's codebook lookup is per-element but its *scale* is the group
-absmax, so it would stream too -- it is refused for a different reason (the
-nibble grid it writes is not what this module was validated against).
+convertible on a machine that cannot hold the model. nf4 streams the same way
+(its codebook lookup is per-element, its scale the group absmax), and so does
+nvfp4: its per-tensor factor is the max of the 16-value block absmax table the
+same sweep builds (`nvfp4_tables`), and it stores two scale initializers
+instead of one.
 
 It runs on the **onnx proto**, right after `weight_stream.prepare`, because no
 DAGBasedModel exists at that point. Adding the scale here (rather than later)
@@ -33,7 +34,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
-from onnx import TensorProto, numpy_helper
+from onnx import TensorProto, helper, numpy_helper
 
 # Rows per read pass. Bounded so a 151936-row weight never materializes more
 # than a few hundred MiB at a time.
@@ -207,6 +208,12 @@ def scale_for(fmt, reader, transposed: bool = False, group: int = 0):
         # unsigned branch, same zero guard.
         amax = grouped_amax(reader, group, transposed)
         return np.where(amax == 0, 1.0, amax).astype(np.float32)
+    if fmt == "nvfp4":
+        # The fp32 factor per block the kernel applies (e4m3 block scale *
+        # global), not what the graph stores -- finalize stores the two levels
+        # (nvfp4_tables). This is the writer's fallback when no graph is at
+        # hand, and it is the same number either way.
+        return nvfp4_tables(reader, transposed, reader.name)[2]
     amax = _amax(reader, transposed)
     if fmt == "int8":
         return np.where(amax == 0, 1.0, amax / 127.0).astype(np.float32)
@@ -283,11 +290,33 @@ def grouped_amax(reader, group: int, transposed: bool = False):
     return amax
 
 
-# The grouped 4-bit formats: one fp32 scale per (group of K, output column),
-# two codes per byte. int4 is a signed nibble (scale = absmax / 7), nf4 an index
-# into Quantizer._NF4_CODEBOOK (scale = absmax). Both stream the same way; only
-# the per-element encode differs.
-FOUR_BIT_FORMATS = ("int4", "nf4")
+def nvfp4_tables(reader, transposed: bool = False, name="<weight>"):
+    """NVFP4's two scale levels from one band-at-a-time sweep.
+
+    The per-tensor factor looks like it needs the whole matrix -- it is
+    amax_tensor / (448 * 6) and every block scale is divided by it -- but
+    amax_tensor is just the max of the per-block absmax table, and that table is
+    `grouped_amax` with a 16-value group: each block's absmax is over its own 16
+    values of K. So the same single sweep int4 does yields both levels, and the
+    table is reduced to them by the in-memory pass's own arithmetic
+    (`Quantizer._nvfp4_scales`), which is what keeps the bytes identical.
+
+    Returns (scale_codes uint8 [K/16, N], global_scale np.float32,
+    dequant_scale float32 [K/16, N], dead).
+    """
+    from .optimizer import Quantizer
+
+    amax = grouped_amax(reader, Quantizer._NVFP4_BLOCK, transposed)
+    return Quantizer._nvfp4_scales(amax, name)
+
+
+# The grouped 4-bit formats: one scale per (group of K, output column), two
+# codes per byte. int4 is a signed nibble (scale = absmax / 7), nf4 an index
+# into Quantizer._NF4_CODEBOOK (scale = absmax), nvfp4 an E2M1 code against a
+# 16-value block's e4m3 scale times one fp32 factor per tensor (the writer and
+# the encoder see the product, an fp32 [K/16, N] table like the other two).
+# All three stream the same way; only the per-element encode differs.
+FOUR_BIT_FORMATS = ("int4", "nf4", "nvfp4")
 
 
 def _encode_4bit(fmt):
@@ -301,7 +330,8 @@ def _encode_4bit(fmt):
 def code_nibble(fmt, reader, scale, group: int, transposed: bool = False):
     """A function (row_offset, band) -> int8 codes, band-shaped.
 
-    int4 codes are in [-8, 7]; nf4 codes are codebook indices in [0, 15].
+    int4 codes are in [-8, 7]; nf4 codes are codebook indices in [0, 15];
+    nvfp4 codes are E2M1 nibbles (sign in bit 3), already uint8.
 
     `scale` is the table `scale_for` produced: `[n_groups, N]`. The grouping is
     applied by indexing it with the K index's group, so a band that starts
@@ -319,6 +349,24 @@ def code_nibble(fmt, reader, scale, group: int, transposed: bool = False):
     if fmt not in FOUR_BIT_FORMATS:
         raise ValueError(f"code_nibble is the 4-bit encoder; got {fmt!r}")
     scale = np.asarray(scale, dtype=np.float32)
+    if fmt == "nvfp4":
+        # The in-memory pass's encode (Quantizer._nvfp4_encode): divide by the
+        # block's dequant factor (a zero factor divides as 1), clip to +-6,
+        # round to E2M1. Same elementwise fp32 division, same bytes.
+        from .optimizer import Quantizer
+
+        if transposed:
+            def codes(offset, band):
+                rows = band.shape[0]
+                s = np.repeat(scale[:, offset:offset + rows].T, group, axis=1)
+                return Quantizer._nvfp4_encode(band, s)
+            return codes
+
+        def codes(offset, band):
+            rows = band.shape[0]
+            idx = np.arange(offset, offset + rows) // group
+            return Quantizer._nvfp4_encode(band, scale[idx])
+        return codes
     encode = _encode_4bit(fmt)
 
     if transposed:
@@ -343,6 +391,8 @@ def dequantize_4bit(fmt, codes, scale):
     codebook[code] * scale), on whatever layout the caller holds.
     """
     from .optimizer import Quantizer
+    if fmt == "nvfp4":
+        return Quantizer._e2m1_decode(codes) * np.asarray(scale, np.float32)
     return Quantizer._dequantize_w3(codes, scale, fmt)
 
 
@@ -586,9 +636,40 @@ def finalize(model, deferred, verbose=True) -> int:
             # Record what is there so the missing check below does not mistake
             # "already done" for "could not".
             entry["scale"] = carrier.input[slot]
+            if entry["quant"] == "nvfp4":
+                if len(carrier.input) <= slot + 1:
+                    raise ValueError(
+                        f"'{name}' is nvfp4 but its consumer carries a block "
+                        f"scale and no global scale; the kernel needs both")
+                entry["scale_global"] = carrier.input[slot + 1]
             appended[name] = carrier.input[slot]
             continue
         scale_name = entry.get("scale") or f"{name}_scale"
+        if entry["quant"] == "nvfp4":
+            # Two levels, two initializers, two inputs: [A, W, s_e4m3, g], the
+            # list ops/Matmul.hpp requires for a float4e2m1 weight and the
+            # in-memory pass builds. Named as that pass names them.
+            global_name = entry.get("scale_global") or f"{name}_scale_global"
+            if scale_name not in existing:
+                codes_t, global_scale, _deq, dead = nvfp4_tables(
+                    WeightReader(entry, name),
+                    bool(entry.get("transposed")), name)
+                del _deq
+                n_blocks, n_cols = codes_t.shape
+                graph.initializer.append(helper.make_tensor(
+                    scale_name, TensorProto.FLOAT8E4M3FN, [n_blocks, n_cols],
+                    codes_t.reshape(-1).tobytes(), raw=True))
+                graph.initializer.append(numpy_helper.from_array(
+                    np.array([global_scale], dtype=np.float32), global_name))
+                existing.update((scale_name, global_name))
+                entry["nvfp4_dead"] = int(dead)
+                del codes_t
+            entry["scale"] = scale_name
+            entry["scale_global"] = global_name
+            carrier.input.append(scale_name)
+            carrier.input.append(global_name)
+            appended[name] = scale_name
+            continue
         if scale_name not in existing:
             reader = WeightReader(entry, name)
             scale = scale_for(entry["quant"], reader,

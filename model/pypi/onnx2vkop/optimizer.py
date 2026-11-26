@@ -6276,20 +6276,30 @@ class FusionOptimizer:
         both [K, N] sources (no Transpose behind them -- the fold needs the
         stored rows to BE the K axis), and each MatMul's third input is that
         weight's own scale table: exactly the [x, W, W_scale] quant_payload
-        .finalize builds and nothing else."""
+        .finalize builds and nothing else -- or, for nvfp4, the four-input
+        [x, W, W_scale, W_scale_global] it builds for that format."""
         deferred = getattr(dag_model, "deferred_weights", {}) or {}
-        if len(gate.inputs) != 3 or len(up.inputs) != 3:
-            return None
-        eg = deferred.get(gate.inputs[1]["name"])
-        eu = deferred.get(up.inputs[1]["name"])
+        eg = deferred.get(gate.inputs[1]["name"]) if len(gate.inputs) > 1 \
+            else None
+        eu = deferred.get(up.inputs[1]["name"]) if len(up.inputs) > 1 \
+            else None
         if eg is None or eu is None:
             return None
+        want = 4 if eg.get("quant") == "nvfp4" else 3
+        if len(gate.inputs) != want or len(up.inputs) != want:
+            return None
         for e, node in ((eg, gate), (eu, up)):
-            if (e.get("quant") not in ("int4", "nf4") or e.get("transposed")
+            if (e.get("quant") not in ("int4", "nf4", "nvfp4")
+                    or e.get("transposed")
                     or e.get("transpose_payload") or e.get("interleave")
                     or e.get("lane_major") or not e.get("scale")
                     or node.inputs[2]["name"] != e["scale"]
                     or e["scale"] not in dag_model.initializers):
+                return None
+            if e["quant"] == "nvfp4" and (
+                    not e.get("scale_global")
+                    or node.inputs[3]["name"] != e["scale_global"]
+                    or e["scale_global"] not in dag_model.initializers):
                 return None
         if (eg["quant"] != eu["quant"]
                 or int(eg.get("group") or 0) != int(eu.get("group") or 0)
@@ -6340,7 +6350,8 @@ class FusionOptimizer:
                         and q.op_type == "MatMul"):
                     m1, up = p, q
                     break
-            if m1 is None or len(m1.inputs) != 2 or len(up.inputs) not in (2, 3):
+            if (m1 is None or len(m1.inputs) != 2
+                    or len(up.inputs) not in (2, 3, 4)):
                 continue
             gate = sig = None
             for a, b in ((m1.inputs[0], m1.inputs[1]),
@@ -6352,10 +6363,10 @@ class FusionOptimizer:
                             and p.inputs[0]["name"] == a["name"]):
                         gate, sig = cand, p
                         break
-            if gate is None or gate is up or len(gate.inputs) not in (2, 3):
+            if gate is None or gate is up or len(gate.inputs) not in (2, 3, 4):
                 continue
             quant_pair = None
-            if len(gate.inputs) == 3 or len(up.inputs) == 3:
+            if len(gate.inputs) >= 3 or len(up.inputs) >= 3:
                 quant_pair = FusionOptimizer._streamed_4bit_pair(
                     dag_model, gate, up)
                 if quant_pair is None:
@@ -6391,6 +6402,9 @@ class FusionOptimizer:
                 # replaces both tables with the interleaved one.
                 if (len(consumers.get(quant_pair[0]["scale"], [])) != 1
                         or len(consumers.get(quant_pair[1]["scale"], [])) != 1):
+                    continue
+                if any(len(consumers.get(e["scale_global"], [])) != 1
+                       for e in quant_pair if e.get("quant") == "nvfp4"):
                     continue
             if any(_single(t) is None for t in (up.outputs[0]["name"],
                                                sig.outputs[0]["name"],
@@ -6435,7 +6449,44 @@ class FusionOptimizer:
             entry["consumers"] = 1
             entry["interleave"] = {"g": dict(eg), "u": dict(eu),
                                    "k": k_dim, "n": n_dim}
-            if match.get("quant"):
+            if match.get("quant") and eg.get("quant") == "nvfp4":
+                # One [K, 2N] nvfp4 payload, like the in-memory pass encodes
+                # the fp16 fold -- but its scales cannot be interleaved from
+                # the two weights' own: the in-memory encode takes ONE global
+                # factor over gate and up together, and every e4m3 block byte
+                # is relative to it. So the two levels are re-derived from the
+                # interleaved matrix itself: one more band-at-a-time sweep of
+                # the two sources (InterleavedReader), the same grouped absmax
+                # and the same Quantizer._nvfp4_scales -- byte for byte what
+                # the in-memory pass computes.
+                from . import quant_payload, weight_stream as _ws
+                scale_name = name + "_scale"
+                global_name = name + "_scale_global"
+                reader = quant_payload.reader_for(
+                    entry, name,
+                    path_for=lambda e: _ws.source_read_path(
+                        e, None, e.get("base_dir") or ""))
+                codes_t, global_scale, _deq, dead = quant_payload.nvfp4_tables(
+                    reader, False, name)
+                del _deq
+                groups = codes_t.shape[0]
+                for old in (eg["scale"], eu["scale"],
+                            eg["scale_global"], eu["scale_global"]):
+                    del inits[old]
+                inits[scale_name] = helper.make_tensor(
+                    scale_name, TensorProto.FLOAT8E4M3FN,
+                    [groups, 2 * n_dim], codes_t.reshape(-1).tobytes(),
+                    raw=True)
+                inits[global_name] = numpy_helper.from_array(
+                    np.array([global_scale], dtype=np.float32), global_name)
+                entry["scale"] = scale_name
+                entry["scale_global"] = global_name
+                entry["nvfp4_dead"] = int(dead)
+                entry.pop("scale_values", None)
+                quant_scale = {"name": scale_name,
+                               "shape": [groups, 2 * n_dim]}
+                quant_global = {"name": global_name, "shape": [1]}
+            elif match.get("quant"):
                 # The fused weight is encoded as ONE [K, 2N] 4-bit payload,
                 # exactly as the in-memory pass encodes the fp16 fold: the
                 # writer reads the interleaved bands
@@ -6480,6 +6531,9 @@ class FusionOptimizer:
             FusionOptimizer._input_entry(match["up"], wu), init=t)]
         if match.get("quant"):
             inputs.append(quant_scale)
+            if deferred is not None and \
+                    deferred.get(name, {}).get("quant") == "nvfp4":
+                inputs.append(quant_global)
         fused = Node(
             op_type="MatMul",
             name=match["gate"].name + "_swiglu",
@@ -9777,6 +9831,9 @@ class Quantizer:
                 init.metadata_props.add(key="vkop_dtype", value="nf4")
 
         scale_name = entry.get("scale")
+        # nvfp4 carries a second scale level, the per-tensor fp32 factor, as
+        # its own initializer and its own (fourth) consumer input.
+        global_name = entry.get("scale_global") if fmt == "nvfp4" else None
         if (numeric_audit.numeric_audit_mode() != "off"
                 and entry.get("location") and scale_name
                 and scale_name in dag_model.initializers):
@@ -9792,13 +9849,24 @@ class Quantizer:
             k, n = (int(d) for d in entry["dims"])
             if transposed and not entry.get("transpose_payload"):
                 n, k = k, n
-            Quantizer._print_qerror(
-                name, stats, fmt, k, n, k // group, group, dead,
-                via=numeric_audit.consumer_tag(consumers))
+            if fmt == "nvfp4":
+                # `dead` from the table would count zero scales, including
+                # all-zero blocks; the in-memory report counts only blocks that
+                # held values, which finalize knew and recorded.
+                Quantizer._print_nvfp4_qerror(
+                    name, stats, k, n,
+                    weight_stream.nvfp4_global_for(entry, dag_model),
+                    int(entry.get("nvfp4_dead") or 0),
+                    via=numeric_audit.consumer_tag(consumers))
+            else:
+                Quantizer._print_qerror(
+                    name, stats, fmt, k, n, k // group, group, dead,
+                    via=numeric_audit.consumer_tag(consumers))
 
-        if scale_name and scale_name in dag_model.initializers:
-            dag_model.initializers[scale_name] = (
-                dag_model.initializers.pop(scale_name))
+        for moved in (scale_name, global_name):
+            if moved and moved in dag_model.initializers:
+                dag_model.initializers[moved] = (
+                    dag_model.initializers.pop(moved))
 
         # The consumer's input references, as the in-memory pass leaves them.
         # There the weight was a float initializer when the graph was parsed,
@@ -9815,6 +9883,8 @@ class Quantizer:
             for inp in node.inputs:
                 if scale_name and inp.get("name") == scale_name:
                     scale_dt = inp.pop("dtype", None)
+                elif global_name and inp.get("name") == global_name:
+                    inp.pop("dtype", None)
             for inp in node.inputs:
                 if inp.get("name") == name and inp.get("dtype", None) == 0:
                     if src_float in (onnx.TensorProto.FLOAT16,
@@ -9826,8 +9896,10 @@ class Quantizer:
                     else:
                         inp["dtype"] = onnx.TensorProto.FLOAT
         src = entry.get("src_dtype", entry.get("data_type"))
+        what = (f"block scale '{scale_name}' and global scale '{global_name}'"
+                if fmt == "nvfp4" else f"group scale '{scale_name}'")
         print(f"Converted {onnx.TensorProto.DataType.Name(src)} tensor "
-              f"'{name}' to {fmt} with group scale '{scale_name}' (streamed: "
+              f"'{name}' to {fmt} with {what} (streamed: "
               f"encoded on the way into the trailer)")
 
 
@@ -9996,6 +10068,10 @@ class Quantizer:
                 # it) and is part of the same payload ABI -- also fp32.
                 out.add(name)
                 out.add(name + "_scale")
+                # nvfp4's per-tensor factor: ops/Matmul.hpp refuses a global
+                # scale that is not fp32, and the domain pass would halve it.
+                if deferred[name].get("scale_global"):
+                    out.add(deferred[name]["scale_global"])
                 continue
             try:
                 gate = Quantizer._match_weight_only(
@@ -10447,6 +10523,96 @@ class Quantizer:
         mag = Quantizer._E2M1_GRID[m]
         return np.where(np.asarray(nibbles, dtype=np.uint8) & 0x08, -mag, mag)
 
+    # NVFP4's arithmetic, split into the pieces a streamed weight needs one at a
+    # time. The in-memory pass (quantize_to_nvfp4_weight_only) and the streamed
+    # one (quant_payload.finalize -> weight_stream._write_int4) both call these,
+    # so the two produce the same bytes by construction rather than by keeping
+    # two copies of the formulas in step.
+    #
+    # What makes NVFP4 streamable at all: its per-tensor factor is
+    # amax_tensor / (448 * 6), and amax_tensor is just the max of the per-block
+    # absmax table -- the same [K/16, N] table int4's grouped_amax already
+    # accumulates one band at a time. So one sweep gives both scale levels; no
+    # second whole-matrix pass is needed.
+
+    @staticmethod
+    def _nvfp4_scales(amax_b, name="<weight>"):
+        """The two scale levels from a [n_blocks, N] block-absmax table.
+
+        Returns (scale_codes uint8 [n_blocks, N], global_scale np.float32,
+        dequant_scale float32 [n_blocks, N], dead) where `dequant_scale` is what
+        the kernel multiplies a code by (e4m3 block scale * global) and `dead`
+        counts blocks whose scale rounded to zero while holding nonzero values.
+        """
+        max_f4 = Quantizer._E2M1_MAX
+        values_lut, first_bad = Quantizer._fp8_lut(4, 3, 448.0)
+        amax_b = np.asarray(amax_b, dtype=np.float32)
+        amax_t = float(np.max(amax_b)) if amax_b.size else 0.0
+        global_scale = np.float32(
+            amax_t / (448.0 * max_f4) if amax_t > 0 else 1.0
+        )
+        # <= 448 by construction: amax_b <= amax_t, and global divides
+        # amax_t by 448 * 6. Clip anyway, so a bug shows up as an error
+        # rather than as an Inf/NaN scale byte.
+        s_real = amax_b / (max_f4 * float(global_scale))
+        scale_codes = Quantizer._fp8_encode(
+            np.clip(s_real, -448.0, 448.0), 4, 3
+        )
+        bad_scale = int(np.count_nonzero((scale_codes & 0x7F) >= first_bad))
+        if bad_scale:
+            raise ValueError(
+                f"nvfp4: block scale of '{name}' encoded {bad_scale} byte(s) "
+                f"at or past 0x{first_bad:x}, which is fp8 Inf or NaN"
+            )
+        # A block whose scale rounds to zero decodes to 0 for every value in
+        # it -- the format's own behavior, counted out loud because it is the
+        # one thing that can silently flatten a span of weights.
+        s = values_lut[scale_codes & 0x7F]
+        dead = int(np.count_nonzero((s == 0) & (amax_b > 0)))
+        dequant_scale = Quantizer._nvfp4_dequant_table(scale_codes,
+                                                       global_scale)
+        return scale_codes, global_scale, dequant_scale, dead
+
+    @staticmethod
+    def _nvfp4_dequant_table(scale_codes, global_scale):
+        """e4m3 block-scale bytes x the fp32 global -> the fp32 factor per block
+        the kernel applies (`scale4`: e4m3_val(byte) * uGlobal)."""
+        values_lut, _ = Quantizer._fp8_lut(4, 3, 448.0)
+        s = values_lut[np.asarray(scale_codes, dtype=np.uint8) & 0x7F]
+        return (s * float(global_scale)).astype(np.float32)
+
+    @staticmethod
+    def _nvfp4_encode(values, dequant_scale):
+        """Values -> E2M1 codes against a broadcastable per-value dequant scale.
+
+        A zero scale is divided as 1 only to keep the division finite; the
+        kernel multiplies such a block by 0 and flattens it regardless."""
+        max_f4 = Quantizer._E2M1_MAX
+        divide_by = np.where(dequant_scale == 0, np.float32(1.0),
+                             dequant_scale)
+        return Quantizer._e2m1_encode(
+            np.clip(values / divide_by, -max_f4, max_f4))
+
+    @staticmethod
+    def _print_nvfp4_qerror(name, stats, k, n, global_scale, dead, via=""):
+        """The per-weight nvfp4 report and audit row, from a RoundTrip.
+
+        Shared by the in-memory pass and the streamed one
+        (_stream_4bit_rows), so a weight reports the same lines whichever path
+        encoded it."""
+        n_blocks = k // Quantizer._NVFP4_BLOCK
+        print(f"Quantized '{name}':")
+        print(f"  Shape: [{k}, {n}], blocks: {n_blocks} x "
+              f"{Quantizer._NVFP4_BLOCK}")
+        print(f"  Global scale: {float(global_scale):.6e} fp32, "
+              f"block scale table [{n_blocks}, {n}] fp8e4m3")
+        print(f"  Blocks whose scale rounded to 0 with nonzero values: {dead}")
+        print(f"  MSE: {stats.mse:.6e}, MAE: {stats.mae:.6e}")
+        print(f"  Mean Rel Error: {stats.mean_rel:.2%}, "
+              f"Max Rel Error: {stats.max_rel:.2%}")
+        numeric_audit.record(name, "nvfp4", stats, dead_slices=int(dead),
+                             via=via)
+
     # ------------------------------------------------------------------
     # AWQ: a real-valued weight transform, so it pairs with every low-bit
     # format. The transform (W·diag(s), 1/s folded upstream) is
@@ -10564,6 +10730,16 @@ class Quantizer:
         the 4-bit ones -- MatMul only, plain 2-D B operand, transB == 0, N % 8 --
         plus the block length, which this format fixes at 16.
 
+        A weight behind a Transpose (the checkpoint's [N, K] with transB=1) is
+        re-laid as [K, N] first, by the same `_flip_transposed_4bit_weights`
+        int4/nf4 use. Flip-then-encode gives the codes encode-then-flip would:
+        a 16-value block is one output column's run of K in either layout, and
+        the per-tensor amax does not care about the layout at all. Without the
+        flip every such weight -- every linear of an export with Transpose
+        folding off -- failed the transB gate and silently stayed float. The
+        AWQ call (`only` set) is left as it was, matching the int4/nf4
+        `_quantize_selected` path.
+
         `exclude` is the --exclude-* weight set, honoured as in the other byte
         passes: the name keeps its dtype and no scale input is appended.
         """
@@ -10573,13 +10749,30 @@ class Quantizer:
                 f"group_size={group_size}"
             )
         block = Quantizer._NVFP4_BLOCK
-        max_f4 = Quantizer._E2M1_MAX
-        values_lut, first_bad = Quantizer._fp8_lut(4, 3, 448.0)
         print("Applying weight-only nvfp4 quantization "
               f"(block={block}, e4m3 block scale)...")
 
+        if only is None:
+            flipped = Quantizer._flip_transposed_4bit_weights(
+                dag_model, block, exclude)
+            if flipped:
+                print(f"[nvfp4] {flipped} weight(s) behind a Transpose re-laid "
+                      f"as [K, N] with transB=0 before encoding")
+
         converted_count = 0
         skipped_count = 0
+        # Weights weight_stream encodes on the way into the trailer (see
+        # quantize_to_4bit_weight_only for the same bookkeeping): counted here,
+        # their two scale initializers are not weights, and the loop below
+        # only finishes the graph around them.
+        deferred = getattr(dag_model, "deferred_weights", {}) or {}
+        streamed_count = sum(
+            1 for e in deferred.values() if e.get("quant") == "nvfp4")
+        streamed_scales = set()
+        for e in deferred.values():
+            if e.get("quant") == "nvfp4":
+                streamed_scales.update(
+                    x for x in (e.get("scale"), e.get("scale_global")) if x)
 
         initializer_consumers = defaultdict(list)
         for node in dag_model.nodes.values():
@@ -10587,10 +10780,18 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if name in streamed_scales:
+                continue
             if Quantizer._is_excluded(name, exclude):
                 skipped_count += 1
                 continue
             if only is not None and name not in only:
+                continue
+            if name in deferred:
+                if deferred[name].get("quant") == "nvfp4":
+                    Quantizer._stream_4bit_rows(
+                        dag_model, name, deferred[name],
+                        initializer_consumers.get(name, []), "nvfp4", block)
                 continue
             initializer = dag_model.initializers[name]
             consumers = initializer_consumers.get(name, [])
@@ -10608,60 +10809,32 @@ class Quantizer:
             arr = numpy_helper.to_array(initializer).astype(np.float32)
             n_blocks = k // block
             w3 = arr.reshape(n_blocks, block, n)
+            del arr
 
-            amax_t = float(np.max(np.abs(arr)))
-            global_scale = np.float32(
-                amax_t / (448.0 * max_f4) if amax_t > 0 else 1.0
-            )
             amax_b = np.max(np.abs(w3), axis=1)  # [n_blocks, n]
-            # <= 448 by construction: amax_b <= amax_t, and global divides
-            # amax_t by 448 * 6. Clip anyway, so a bug shows up as an error
-            # rather than as an Inf/NaN scale byte.
-            s_real = amax_b / (max_f4 * float(global_scale))
-            scale_codes = Quantizer._fp8_encode(
-                np.clip(s_real, -448.0, 448.0), 4, 3
-            )
-            bad_scale = int(np.count_nonzero((scale_codes & 0x7F) >= first_bad))
-            if bad_scale:
-                raise ValueError(
-                    f"nvfp4: block scale of '{name}' encoded {bad_scale} byte(s) "
-                    f"at or past 0x{first_bad:x}, which is fp8 Inf or NaN"
-                )
-            # What the kernel multiplies by. A block whose scale rounds to zero
-            # decodes to 0 for every value in it -- the format's own behavior, and
-            # counted out loud here because it is the one thing that can silently
-            # flatten a span of weights.
-            s = values_lut[scale_codes & 0x7F]
-            dead = int(np.count_nonzero((s == 0) & (amax_b > 0)))
-            dequant_scale = (s * float(global_scale)).astype(np.float32)
-            # divide_by only keeps the encoding division finite for a block whose
-            # scale rounded to zero; the error report multiplies by the real
-            # scale, which is what the kernel does and flattens such a block to 0.
-            divide_by = np.where(dequant_scale == 0, np.float32(1.0),
-                                 dequant_scale)[:, None, :]
-            scaled = w3 / divide_by
-            codes = Quantizer._e2m1_encode(np.clip(scaled, -max_f4, max_f4))
-            dequantized = Quantizer._e2m1_decode(codes) * dequant_scale[:, None, :]
+            scale_codes, global_scale, dequant_scale, dead = \
+                Quantizer._nvfp4_scales(amax_b, name)
+            del amax_b
+            codes = Quantizer._nvfp4_encode(w3, dequant_scale[:, None, :])
 
-            diff = dequantized - w3
-            rel_error = np.abs(diff) / (np.abs(w3) + 1e-8)
-            print(f"Quantized '{name}':")
-            print(f"  Shape: [{k}, {n}], blocks: {n_blocks} x {block}")
-            print(f"  Global scale: {float(global_scale):.6e} fp32, "
-                  f"block scale table [{n_blocks}, {n}] fp8e4m3")
-            print(f"  Blocks whose scale rounded to 0 with nonzero values: {dead}")
-            print(f"  MSE: {np.mean(diff**2):.6e}, MAE: {np.mean(np.abs(diff)):.6e}")
-            print(
-                f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
-                f"Max Rel Error: {np.max(rel_error):.2%}"
-            )
-            numeric_audit.record_roundtrip(name, "nvfp4", w3, dequantized,
-                                           dead_slices=int(dead),
-                                           via=numeric_audit.consumer_tag(
-                                               consumers))
+            # The report, a slice of blocks at a time (see _report_qerror):
+            # the same RoundTrip the streamed audit accumulates, so both paths
+            # print the same numbers.
+            stats = numeric_audit.RoundTrip("nvfp4")
+            step = max(1, numeric_audit._CHUNK_ELEMS // max(1, block * n))
+            for g0 in range(0, n_blocks, step):
+                g1 = min(g0 + step, n_blocks)
+                stats.add(w3[g0:g1],
+                          Quantizer._e2m1_decode(codes[g0:g1])
+                          * dequant_scale[g0:g1, None, :])
+            Quantizer._print_nvfp4_qerror(
+                name, stats, k, n, global_scale, dead,
+                via=numeric_audit.consumer_tag(consumers))
+            del w3, dequant_scale
 
             nib = codes.reshape(-1)
             packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
+            del codes, nib
             payload = helper.make_tensor(
                 name,
                 TensorProto.FLOAT4E2M1,
@@ -10698,7 +10871,13 @@ class Quantizer:
             )
             converted_count += 1
 
-        print(f"Converted {converted_count} tensors to nvfp4 weight-only")
+        total = converted_count + streamed_count
+        if streamed_count:
+            print(f"Converted {total} tensors to nvfp4 weight-only "
+                  f"({converted_count} in memory, {streamed_count} streamed "
+                  f"and encoded on the way into the trailer)")
+        else:
+            print(f"Converted {total} tensors to nvfp4 weight-only")
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
@@ -10964,8 +11143,13 @@ class KnWeightLayout:
             # source needs this flip for the same reason. Only the DEFERRED one:
             # an in-memory nf4 payload is already packed [K, N] by the
             # quantizer (and a UINT4 that is not nf4 is not ours to move).
-            streamed_nf4 = (entry is not None and entry.get("quant") == "nf4"
-                            and dtype == onnx.TensorProto.UINT4)
+            # A streamed nvfp4 weight (FLOAT4E2M1 storage, same nibble layout
+            # and [K, N]-only contract) needs it for the same reason.
+            streamed_nf4 = entry is not None and (
+                (entry.get("quant") == "nf4"
+                 and dtype == onnx.TensorProto.UINT4)
+                or (entry.get("quant") == "nvfp4"
+                    and dtype == onnx.TensorProto.FLOAT4E2M1))
             if not (KnWeightLayout.is_byte_value_type(dtype) or streamed_nf4):
                 continue
             readers = uses.get(name, [])

@@ -606,8 +606,8 @@ def _force_payloads_for_exclusion(args) -> None:
     conversion doing it. The payloads have to be in memory for the exclusion to
     have anything to skip.
 
-    Only the value-free formats reach that path: nvfp4 and AWQ still refuse
-    deferral, so for those this changes nothing. It is still the memory of the
+    Only the value-free formats (nvfp4 among them) reach that path: AWQ still
+    refuses deferral, so for it this changes nothing. It is still the memory of the
     whole model, so the switch is announced rather than silent, and an explicit
     --stream-weights on is an error rather than a contradiction the run resolves
     on its own.

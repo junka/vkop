@@ -83,9 +83,12 @@ _PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2, TensorProto.BFLOAT16: 2,
 # grouped absmax (without the /7) and its code is a per-element nearest-codebook
 # lookup, the shared `Quantizer._nf4_encode`, so a band encodes exactly as the
 # in-memory pass would (pinned byte-for-byte by test_streamed_4bit). nvfp4 is
-# not: it adds a per-TENSOR factor that every block scale is divided by, so the
-# block table can only be built after a whole-matrix reduction.
-_VALUE_FREE_FORMATS = ("int8", "fp8e4m3", "fp8e5m2", "int4", "nf4")
+# here too, although its per-TENSOR factor (every block scale is divided by it)
+# reads like a whole-matrix reduction: that factor is amax_tensor / (448 * 6),
+# and amax_tensor is the max of the [K/16, N] block-absmax table the same
+# grouped sweep builds -- so one pass still yields both levels
+# (quant_payload.nvfp4_tables).
+_VALUE_FREE_FORMATS = ("int8", "fp8e4m3", "fp8e5m2", "int4", "nf4", "nvfp4")
 
 # Values per band for the [K, N] 4-bit writer (see _write_int4).
 _BAND_VALUES = 1 << 22
@@ -98,7 +101,9 @@ _TRANSPOSED_BAND_ROWS = 2048
 
 # The grouped 4-bit members of that set: packed two codes per byte, a
 # [K/group, N] scale table, and the [K, N]-only layout gate (_int4_layout_ok).
-_FOUR_BIT_FORMATS = ("int4", "nf4")
+# nvfp4's group is fixed at 16 by the format, whatever --group-size says.
+_FOUR_BIT_FORMATS = ("int4", "nf4", "nvfp4")
+_NVFP4_BLOCK = 16
 
 # The payload element type each of those produces. The deferred row
 # records it, which is what lets the extent checks and the writer treat
@@ -113,6 +118,8 @@ _PAYLOAD_DTYPES = {
     # meaning rides the initializer's `vkop_dtype` metadata, which the
     # quantizer stamps on the deferred tensor (Quantizer._stream_4bit_rows).
     "nf4": TensorProto.UINT4,
+    # NVFP4's E2M1 nibble; its two scale levels are separate initializers.
+    "nvfp4": TensorProto.FLOAT4E2M1,
 }
 
 
@@ -197,9 +204,11 @@ def deferral_refusal(quant: Optional[str], unify: bool,
     nf4 streams like int4: the same grouped absmax (unscaled) and a
     per-element codebook lookup shared with the in-memory pass.
 
-    AWQ and nvfp4 still refuse. AWQ is a real-valued rescale of the whole
-    weight (`W * s` needs every element before any of it can be written), and
-    nvfp4's per-tensor factor is a genuinely global reduction.
+    nvfp4 streams too: its per-tensor factor is the max of the same grouped
+    (16-value) absmax table, so the one sweep yields both scale levels.
+
+    AWQ still refuses: it is a real-valued rescale of the whole weight
+    (`W * s` needs every element before any of it can be written).
     """
     if not _env_flag(_ENV_ENABLE, True):
         return f"{_ENV_ENABLE}=0"
@@ -353,7 +362,8 @@ def _stream_entry(tensor, base_dir, location, offset, length,
     return entry
 
 
-def _int4_layout_ok(init, uses: Dict[str, list], group_size: int) -> bool:
+def _int4_layout_ok(init, uses: Dict[str, list], group_size: int,
+                    matmul_only: bool = False) -> bool:
     """Can this weight's bytes become a packed 4-bit payload as they stream?
 
     The same gates `Quantizer._match_weight_only` applies to an in-memory
@@ -386,6 +396,12 @@ def _int4_layout_ok(init, uses: Dict[str, list], group_size: int) -> bool:
         return False
     node, operand = chain[-1]
     if node.op_type not in ("MatMul", "Gemm") or operand != 1:
+        return False
+    if matmul_only and node.op_type != "MatMul":
+        # nvfp4 appends TWO inputs ([A, W, s, g]); lower_gemm_to_matmul keys
+        # "has a bias" off the input count for a quantized weight, so a
+        # four-input Gemm would lose its global scale to a bias Add. A Gemm's
+        # weight is hydrated instead and quantized in memory after lowering.
         return False
     transposed = is_transposed_weight(uses, init.name)
     n, k = (dims[0], dims[1]) if transposed else (dims[1], dims[0])
@@ -511,7 +527,10 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 # here is only what the ROW records: the group size (the scale
                 # table's row length, which the kernel reads back as K /
                 # n_groups) and the stored layout the source reader seeks by.
-                keep_in_file_gates = _int4_layout_ok(init, uses, group_size)
+                keep_in_file_gates = _int4_layout_ok(
+                    init, uses,
+                    _NVFP4_BLOCK if quant == "nvfp4" else group_size,
+                    matmul_only=quant == "nvfp4")
         if keep_in_file_gates:
             entry = _stream_entry(
                 init, base_dir, location, offset, length,
@@ -542,7 +561,8 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                     # The group length, recorded because the scale table's row
                     # count is derived from it (n_groups = K / group) and a
                     # reader has only the payload's dims to go on.
-                    entry["group"] = int(group_size)
+                    entry["group"] = int(_NVFP4_BLOCK if quant == "nvfp4"
+                                         else group_size)
             deferred[init.name] = entry
 
     # A declared slot the gates above turned down anyway -- a name the graph
@@ -1177,6 +1197,8 @@ def scale_values_for(entry: dict, dag_model):
     cached = entry.get("scale_values")
     if cached is not None:
         return np.asarray(cached, dtype=np.float32)
+    if entry.get("quant") == "nvfp4":
+        return _nvfp4_scale_values(entry, dag_model)
     name = entry.get("scale")
     if not name:
         raise DeferredWeightError(
@@ -1190,6 +1212,46 @@ def scale_values_for(entry: dict, dag_model):
     from onnx import numpy_helper
     return np.ascontiguousarray(
         np.asarray(numpy_helper.to_array(init), dtype=np.float32))
+
+
+def _scale_init(entry: dict, dag_model, key: str):
+    name = entry.get(key)
+    if not name:
+        raise DeferredWeightError(
+            f"deferred weight '{entry['name']}' is quantized but carries no "
+            f"{key} initializer name; quant_payload.finalize did not run")
+    init = dag_model.initializers.get(name)
+    if init is None:
+        raise DeferredWeightError(
+            f"deferred weight '{entry['name']}': {key} initializer '{name}' is "
+            f"not in the model, so the payload cannot be decoded")
+    return init
+
+
+def nvfp4_global_for(entry: dict, dag_model) -> np.float32:
+    """The per-tensor fp32 factor of a streamed nvfp4 weight, from the graph."""
+    init = _scale_init(entry, dag_model, "scale_global")
+    from onnx import numpy_helper
+    return np.float32(np.asarray(numpy_helper.to_array(init),
+                                 dtype=np.float32).reshape(-1)[0])
+
+
+def _nvfp4_scale_values(entry: dict, dag_model):
+    """The fp32 [K/16, N] factor table a streamed nvfp4 weight decodes with.
+
+    finalize stored the two levels the kernel reads (e4m3 bytes and the fp32
+    global); the encoder wants their product, which is rebuilt here with the
+    in-memory pass's own arithmetic (Quantizer._nvfp4_dequant_table). The e4m3
+    table is read from raw_data rather than through numpy_helper, which needs
+    ml_dtypes for fp8 and the converter does not depend on it.
+    """
+    from .optimizer import Quantizer
+
+    block = _scale_init(entry, dag_model, "scale")
+    codes = np.frombuffer(block.raw_data, dtype=np.uint8).reshape(
+        [int(d) for d in block.dims])
+    return Quantizer._nvfp4_dequant_table(
+        codes, nvfp4_global_for(entry, dag_model))
 
 
 def _write_quantized(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
