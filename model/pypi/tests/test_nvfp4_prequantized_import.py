@@ -556,6 +556,10 @@ def convert(src, out, *extra):
          "--target-backend", "buffer", "--external-blob-mb", "0", *extra],
         capture_output=True, text=True, cwd=PYPI)
     assert p.returncode == 0, p.stdout[-1500:] + p.stderr[-1500:]
+    # The e2m1/e4m3 initializers are types onnxoptimizer cannot hold; they
+    # used to make it skip every structural pass on an imported checkpoint.
+    assert "onnxoptimizer skipped" not in p.stdout + p.stderr, (
+        "onnxoptimizer did not run on the imported NVFP4 model")
     return out
 
 

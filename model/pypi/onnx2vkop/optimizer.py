@@ -414,6 +414,15 @@ _VIEW_MIN_INIT_BYTES = 3 * (1 << 30) // 2
 _MAX_VIEW_ROUNDS = _env_int("VKOP_MAX_VIEW_ROUNDS", 3)
 
 
+# Initializer element types onnxoptimizer's IR has no case for (measured on
+# onnxoptimizer with onnx 1.19: each raises "no supported data type: N" as an
+# initializer, and each is accepted as a graph input).
+_ONNXOPT_UNSUPPORTED_INIT_TYPES = frozenset((
+    TensorProto.FLOAT8E4M3FN, TensorProto.FLOAT8E4M3FNUZ,
+    TensorProto.FLOAT8E5M2, TensorProto.FLOAT8E5M2FNUZ,
+    TensorProto.UINT4, TensorProto.INT4, TensorProto.FLOAT4E2M1))
+
+
 def _demote_large_initializers(model, pinned=(), by_size=True):
     """Move initializers carrying >= _VIEW_DEMOTE_CAP raw bytes out of the graph.
 
@@ -898,6 +907,21 @@ class ONNXOptimizer:
                   f"initializer(s) whose bytes are still in the data file "
                   f"demoted to inputs for the passes")
         pinned = {name for name in pinned}
+        # onnxoptimizer refuses a whole model that holds one initializer of a
+        # type it has no case for ("no supported data type: 23"), and the
+        # caller then runs NONE of its structural passes: an imported NVFP4 /
+        # int4 / fp8 checkpoint, or a streamed nvfp4 scale table, came out with
+        # every Shape/Gather/Concat chain unfolded (GLM-Edge: 1804 ops instead
+        # of 1020, decode 15.6 -> 8.1 ms/token once fixed). The same tensors
+        # are accepted as graph INPUTS, so they sit the passes out that way,
+        # with their real type, and come back verbatim.
+        unsupported = {init.name for init in onnx_model.graph.initializer
+                       if init.data_type in _ONNXOPT_UNSUPPORTED_INIT_TYPES}
+        if unsupported:
+            print(f"[optimize] {len(unsupported)} initializer(s) of a type "
+                  f"onnxoptimizer cannot hold (fp8/int4/uint4/fp4) kept out "
+                  f"of the passes")
+        pinned |= unsupported
         by_size = total_init_bytes >= _VIEW_MIN_INIT_BYTES
         if by_size or pinned:
             demoted, added_inputs = _demote_large_initializers(
@@ -9848,13 +9872,6 @@ class Quantizer:
                 init.metadata_props.add(key="vkop_dtype", value="nf4")
 
         scale_name = entry.get("scale")
-        if fmt == "nvfp4" and scale_name in dag_model.initializers:
-            # finalize stored the e4m3 block-scale bytes as UINT8 so that
-            # onnxoptimizer (no fp8 type) would still run its passes over the
-            # proto; past them now, the table takes the type the kernel reads.
-            s_init = dag_model.initializers[scale_name]
-            if s_init.data_type == TensorProto.UINT8:
-                s_init.data_type = TensorProto.FLOAT8E4M3FN
         # nvfp4 carries a second scale level, the per-tensor fp32 factor, as
         # its own initializer and its own (fourth) consumer input.
         global_name = entry.get("scale_global") if fmt == "nvfp4" else None
