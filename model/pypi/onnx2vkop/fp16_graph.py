@@ -298,7 +298,15 @@ class GraphFp16:
                     else f"{node.op_type}: no dual FP16 buffer build")
                 force(group, blockers[node.name])
 
-        GraphFp16._hold_phase_chains(dag_model, candidates, force, blockers)
+        # A Sin/Cos PHASE (t*freq) does not fit fp16 -- it grows with the
+        # position and saturates at 65504, after which the rotation is wrong.
+        # bf16 has fp32's exponent range, so the same argument does not apply
+        # and holding the cone wide would drag the whole attention block (and,
+        # through the propagation, most of the graph) back to FP32: measured on
+        # the VAE, where this single rule left 1835 of 2417 tensors at FP32.
+        if half != "bf16":
+            GraphFp16._hold_phase_chains(dag_model, candidates, force,
+                                         blockers)
 
         # Ops whose operands are independent widths: a forced input says
         # nothing about the others, so it must not propagate.
@@ -340,8 +348,14 @@ class GraphFp16:
                 force(group_of[node_name], blockers[node_name])
 
         domain = candidates - forced
-        GraphFp16._widen_variance_chains(dag_model, candidates, forced,
-                                         reasons, blockers, half)
+        # Same argument as the rope phase above: x**2 overflows fp16's 65504
+        # and needs the chain held wide. bf16's exponent range holds it with no
+        # special handling -- 890**2 = 7.9e5 is an ordinary bf16 -- so leaving
+        # this rule on under bf16 costs a Cast per norm AND, through the
+        # propagation, drags each block's consumers back to FP32.
+        if half != "bf16":
+            GraphFp16._widen_variance_chains(dag_model, candidates, forced,
+                                             reasons, blockers, half)
         domain = candidates - forced
         return {"decls": decls, "domain": domain, "forced": forced,
                 "reasons": reasons, "blockers": blockers,
@@ -400,6 +414,8 @@ class GraphFp16:
                 stack.extend(i.get("name") for i in src.inputs)
             if not ok or not cone:
                 continue
+            # (Not reached under --half-precision bf16: the caller skips this
+            # rule there, because bf16's 8 exponent bits hold any phase.)
             force(cone, f"phase of {node.op_type} '{node.name}': fp16 cannot "
                         "hold t*freq")
             blockers.setdefault(node.name, f"{node.op_type}: phase held in FP32")
@@ -604,7 +620,7 @@ class GraphFp16:
         if target_backend != "buffer":
             summary["skipped_backend"] = True
             if verbose:
-                print(f"[fp16-domain] {target_backend} backend: this pass only "
+                print(f"[half-domain:{half}] {target_backend} backend: this pass only "
                       "rewrites declarations, and the image backend ignores "
                       "them (it builds every graph input as fp16), so there "
                       "is nothing to declare here.")
@@ -617,18 +633,18 @@ class GraphFp16:
         if plan["conflicts"]:
             summary["refused"] = True
             if verbose:
-                print(f"[fp16-domain] REFUSED: {len(plan['conflicts'])} node(s) "
+                print(f"[half-domain:{half}] REFUSED: {len(plan['conflicts'])} node(s) "
                       "would mix FP32 and FP16 operands, which the runtime "
                       "cannot execute -- it picks one shader per node from its "
                       "data input. A boundary between the two domains needs a "
                       "Cast node, and this graph does not have one:")
                 for line in plan["conflicts"][:10]:
-                    print(f"[fp16-domain]   {line}")
+                    print(f"[half-domain:{half}]   {line}")
             return summary
 
         if verbose:
             for node_name, why in sorted(plan["blockers"].items()):
-                print(f"[fp16-domain] stays FP32: {node_name}: {why}")
+                print(f"[half-domain:{half}] stays FP32: {node_name}: {why}")
 
         # The half-width target: fp16 by default, bf16 when the caller asked
         # for the wider exponent (see _BFLOAT16). Everything downstream --
@@ -664,7 +680,7 @@ class GraphFp16:
                 # No bytes in the DAG to rewrite; weight_stream lays the
                 # payload down and records its dtype at trailer time.
                 if verbose:
-                    print(f"[fp16-domain] '{name}' is streamed; its payload "
+                    print(f"[half-domain:{half}] '{name}' is streamed; its payload "
                           "dtype is decided at write time")
                 continue
             arr = numpy_helper.to_array(init)
@@ -704,12 +720,16 @@ class GraphFp16:
                                            halves.astype(np.float32))
 
         if verbose:
-            print(f"[fp16-domain] {len(plan['domain'])} tensor(s) in the FP16 "
-                  f"domain, {len(plan['forced'])} stay FP32, "
+            # The tag says the DOMAIN pass, not the width: under
+            # --half-precision bf16 the tensors are BFLOAT16 and a "FP16
+            # domain" line reads as if the flag had been ignored (it did
+            # exactly that in a debugging session). Report the actual target.
+            print(f"[half-domain:{half}] {len(plan['domain'])} tensor(s) half, "
+                  f"{len(plan['forced'])} stay FP32, "
                   f"{summary['converted']} weight(s) downcast "
                   f"({summary['bytes_before']} -> {summary['bytes_after']} bytes)")
             if summary["out_of_range"]:
-                print(f"[fp16-domain] WARNING: {len(summary['out_of_range'])} "
+                print(f"[half-domain:{half}] WARNING: {len(summary['out_of_range'])} "
                       "tensor(s) hold a magnitude past FP16's 65504 and become "
                       "Inf: " + ", ".join(
                           f"{n} (max {v:.6g})"

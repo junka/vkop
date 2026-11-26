@@ -54,6 +54,18 @@ layout(set = 0, binding = 1) readonly buffer Input {
 #define U_OUTPUT(gid) uOutput.data[gid]
 #endif
 
+// Both 16-bit float formats share the two-per-word packing, so -DBF16 swaps
+// only the two-to-float step (common/bf16.comp); every index is unchanged.
+#ifdef FP16
+#ifdef BF16
+#define UDEC2(w) unpackBF16x2(w)
+#define UENC2(v) packBF16x2(v)
+#else
+#define UDEC2(w) unpackHalf2x16(w)
+#define UENC2(v) packHalf2x16(v)
+#endif
+#endif
+
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
 #ifdef FP16
@@ -64,7 +76,7 @@ void main() {
     if (2 * gid + 1 < uPC.total) {
         p.y = apply(p.y);
     }
-    U_OUTPUT(gid) = packHalf2x16(p);
+    U_OUTPUT(gid) = UENC2(p);
 #else
     if (gid >= uPC.total) return;
     U_OUTPUT(gid) = floatBitsToUint(apply(uintBitsToFloat(U_INPUT(gid))));
