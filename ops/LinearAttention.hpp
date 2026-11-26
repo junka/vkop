@@ -185,7 +185,17 @@ class LinearAttentionBuffer : public BufferFactory {
                     ")");
             }
             if (so->num_elements() != heads * dk * dv) {
-                so->resize(s_shape);
+                // Take state_in's shape when it is the state (it is: same
+                // element count), so a graph declaring [1, H, Dk, Dv] gets
+                // that back rather than the kernel's rank-3 view -- the
+                // output's dims were a dynamic placeholder until now.
+                // Measured: recurrent_state_out came back [16,128,128]
+                // against the export's [1,16,128,128].
+                if (st_in->num_elements() == heads * dk * dv) {
+                    so->resize(st_in->getShape());
+                } else {
+                    so->resize(s_shape);
+                }
             }
             state_out_buf = bind_ssbo<float>(outputs[1], /*is_output=*/true);
         } else {
