@@ -114,6 +114,23 @@ def resolve_logits_last_row(metadata_props, env_value):
     return wanted
 
 
+
+def _declared_widths_backend(args) -> str:
+    """The backend whose dtype rules the width passes (FP16/bf16 domain, the
+    fp16 weight pass, the -q fp32 mixed-width check) should follow.
+
+    "auto" ships both backends' shaders and lets the runtime pick, so it must
+    get the buffer backend's declarations: the buffer backend creates every
+    tensor with the dtype the file declares, while the image backend ignores
+    declarations (it builds every graph input fp16), so declaring for buffer
+    costs the image side nothing. Treating "auto" as "not buffer" silently
+    skipped the whole half-domain pass for a default conversion -- fp32
+    activations, fp16 or bf16 alike.
+    """
+    backend = getattr(args, "target_backend", "buffer") or "buffer"
+    return "image" if backend == "image" else "buffer"
+
+
 class UnsupportedOpError(RuntimeError):
     """A graph contains an op_type the runtime cannot execute.
 
@@ -1204,11 +1221,11 @@ class ModelConverter:
                     group_size=getattr(args, "group_size", 64),
                     exclude=excluded_weights)
             fp16_summary = GraphFp16.apply(
-                dag_model, getattr(args, "target_backend", "buffer"),
+                dag_model, _declared_widths_backend(args),
                 skip_weights=skip,
                 half=getattr(args, "half_precision", "fp16"))
         elif (args.quant == "fp32"
-              and getattr(args, "target_backend", "buffer") == "buffer"):
+              and _declared_widths_backend(args) == "buffer"):
             # -q fp32 keeps the export's widths, so a node the export already
             # declares with FP16 and FP32 operands side by side reaches the
             # runtime as-is -- and runs one shader picked from its data input
@@ -1273,7 +1290,7 @@ class ModelConverter:
             # with the dtype the file declares, so only there can a "this op
             # runs fp32" verdict be read off the graph.
             self.quantizer.quantize_to_fp16_selective(
-                dag_model, getattr(args, "target_backend", "buffer")
+                dag_model, _declared_widths_backend(args)
             )
         elif args.quant == "int8":
             self.quantizer.quantize_to_int8_weight_only(
