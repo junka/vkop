@@ -39,6 +39,21 @@ namespace core {
 int op_shader_fp16(ops::OpType type, const ITensor *data_input,
                    const ITensor *output, int precision);
 
+// Which initializers LoadModel routes into one shared arena instead of giving
+// each its own device buffer. Defined out of line (before Runtime) because a
+// Runtime member holds one by value; see set_paged_initializers for the
+// contract and the fail-closed rules.
+struct PagedArenaPlan {
+    std::vector<std::string> names;
+    // Reuse one slot round-robin in `names` order instead of giving each weight
+    // its own. Only correct when no two of these weights are read in the same
+    // round -- which is the single-consuming-level property bands rest on.
+    bool share_slots = false;
+    // Arena bytes. 0 = size it from the plan (largest slot when sharing, the
+    // sum when not).
+    size_t arena_bytes = 0;
+};
+
 class Runtime {
   public:
     // Longest live PREFIX of `levels`, given which nodes must run.
@@ -93,6 +108,16 @@ class Runtime {
     // Optional per-level seam (set_level_hook). Empty for every driver that
     // does not page, in which case the level loop pays one branch.
     std::function<void(size_t)> level_hook_;
+
+    // Initializers routed to a shared arena (set_paged_initializers). An empty
+    // plan keeps LoadModel's historical "upload everything" behaviour.
+    PagedArenaPlan paged_plan_;
+    std::unordered_map<std::string, char> unloaded_inits_;
+    // What the skip actually applied to, for the driver to assert against.
+    std::vector<std::string> unloaded_taken_;
+    // The shared arena and each paged weight's slot offset inside it.
+    std::shared_ptr<VulkanBuffer> paged_arena_;
+    std::unordered_map<std::string, size_t> paged_offsets_;
 
     // Per-level "contains a synchronous readback" flag, learned on round 0
     // (via the queue submit counter advancing during onExecute) and reused to
@@ -494,6 +519,66 @@ class Runtime {
         backend_buffer_explicit_ = true;
     }
     bool get_backend_buffer() const { return backend_buffer_; }
+
+    // Initializers LoadModel must NOT allocate or fill -- they are paged.
+    //
+    // Skipping only the upload saves no memory: the buffer is still allocated at
+    // full size (measured: a skipped 170 MiB weight still cost its 170 MiB).
+    // What actually saves device memory is pointing every paged weight into a
+    // SHARED ARENA, so N weights that are never live at the same time cost one
+    // arena instead of the sum of their sizes. LoadModel therefore:
+    //
+    //   1. allocates ONE device-local arena big enough for the largest paged
+    //      weight (or the sum, if the caller wants them all resident);
+    //   2. binds each paged weight's tensor to a sub-range of it
+    //      (alias_storage_buffer_range, so the op still sees a normal SSBO of
+    //      the right size at the right offset);
+    //   3. does not upload their bytes -- a pager writes them
+    //      (WeightPager::page_in_*).
+    //
+    // Compatibility is the point of a per-name list with an empty default: a
+    // Runtime that is never told anything uploads every initializer exactly as
+    // before.
+    //
+    // Fail-closed, because an unfilled weight is a silent-wrong-answer hazard:
+    //   * only float/quantized buffer-backed weights may be paged; int64/int32
+    //     host-authoritative constants, the unified (-u) region and
+    //     image-backed weights are refused;
+    //   * each weight gets its OWN arena slot unless `share_slots` is set, so
+    //     the default cannot alias two live weights by accident. With
+    //     `share_slots`, slots are reused in declaration order -- the caller
+    //     asserts that the weights are never live at the same time, which is
+    //     the single-consuming-level property bands rest on;
+    //   * what was skipped is reported, so a driver can assert the set it asked
+    //     for is the set that took effect.
+    //
+    // Must be called before LoadModel().
+    // Must be called before LoadModel(). The plan type is PagedArenaPlan,
+    // declared above Runtime.
+    void set_paged_initializers(PagedArenaPlan plan) {
+        paged_plan_ = std::move(plan);
+        unloaded_inits_.clear();
+        unloaded_inits_.reserve(paged_plan_.names.size() * 2);
+        for (const auto &n : paged_plan_.names) unloaded_inits_.emplace(n, 1);
+    }
+    bool is_unloaded_initializer(const std::string &name) const {
+        return unloaded_inits_.count(name) != 0;
+    }
+    // Names LoadModel actually routed to the arena, in load order. Empty unless
+    // a paged plan named something that reached the buffer path.
+    const std::vector<std::string> &unloaded_initializers() const {
+        return unloaded_taken_;
+    }
+    // The shared arena the paged weights were bound into, or null when nothing
+    // was paged. A driver hands this to WeightPager so the two agree on which
+    // bytes are which weight.
+    std::shared_ptr<VulkanBuffer> paged_arena() const { return paged_arena_; }
+    // Byte offset of a paged weight inside the arena (0 when not paged). The
+    // pager needs it: a weight's bytes go to its slot, not to offset 0.
+    size_t paged_arena_offset(const std::string &name) const {
+        auto it = paged_offsets_.find(name);
+        return it == paged_offsets_.end() ? 0 : it->second;
+    }
 
     // Turn on per-op GPU timestamp profiling programmatically. Same path
     // VKOP_SUBMIT_PROF=1 takes; setting the flag here before the first

@@ -20,6 +20,7 @@
 #include "core/runtime.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/DescriptorWriteProf.hpp"
 #include "vulkan/PipelineCreateProf.hpp"
 #include "vulkan/Renderdoc.hpp"
@@ -497,6 +498,9 @@ Runtime::kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
 }
 
 void Runtime::LoadModel() {
+    // Reset what the previous load took: a Runtime may load twice (a model
+    // swap), and a stale list would make the skip set look bigger than it is.
+    unloaded_taken_.clear();
     // Comma-separated: one dump pass per name, so a whole chain can be
     // captured in a single run instead of one 45 s round each.
     if (const char *dm = std::getenv("VKOP_DUMP_NODE")) {
@@ -1035,6 +1039,29 @@ void Runtime::LoadModel() {
         }
 
         if (backend_buffer_) {
+            // A paged weight (set_paged_initializers): bind it into the shared
+            // arena instead of allocating a private buffer, and never upload
+            // its bytes. The sub-range keeps a normal SSBO of exactly the size
+            // the op expects, at the offset the arena assigned, so the op is
+            // unchanged -- only which bytes back it, and who fills them.
+            //
+            // Deliberately NOT marked on-GPU: a pager writes the bytes and
+            // nothing should believe they are already there.
+            if (is_unloaded_initializer(init.name) && paged_arena_) {
+                const size_t off = paged_arena_offset(init.name);
+                // size() is the payload in BYTES: for a packed 4-bit weight the
+                // constructor already reduced it from the logical element count
+                // via set_payload_bytes, so this is the arena span to bind --
+                // not prod(dims) * sizeof(T).
+                const VkDeviceSize len =
+                    static_cast<VkDeviceSize>(tensor->size());
+                tensor->alias_storage_buffer_range(paged_arena_, off, len,
+                                                   nullptr);
+                unloaded_taken_.push_back(init.name);
+                tensor_map[init.name] = tensor;
+                initializers_[init.name] = tensor;
+                return;
+            }
             // SSBO backend: every initializer is a storage buffer regardless of
             // rank (row-major compact, no NCHW->RGBA image packing). This is
             // the path the LLM (buffer-only ops) uses.
@@ -1124,7 +1151,101 @@ void Runtime::LoadModel() {
     std::optional<ITensor::InitializerUploadScope> init_upload_scope;
     init_upload_scope.emplace();
 
+    // ---- shared arena for paged weights ----
+    //
+    // One device-local buffer that every paged weight binds a sub-range of, so
+    // N weights that are never live at once cost one arena rather than the sum
+    // of their sizes. Slot assignment happens here (before the upload loop) so
+    // handle_floating_point_tensor only has to look the offset up.
+    //
+    // Alignment: minStorageBufferOffsetAlignment is the device's floor for a
+    // non-zero SSBO offset (the same limit the Slice/Split zero-copy views
+    // respect). A slot that ignored it would bind at an illegal offset and the
+    // descriptor would fail validation rather than compute -- loud, but only at
+    // the first dispatch, so it is enforced here instead.
+    if (!paged_plan_.names.empty()) {
+        const VkDeviceSize align =
+            std::max<VkDeviceSize>(1, dev->minStorageBufferOffsetAlignment());
+        auto align_up = [align](size_t v) {
+            return (v + align - 1) / align * align;
+        };
+        // Size each weight's slot from the file's own byte count, which is
+        // authoritative (a packed 4-bit payload holds several values per byte).
+        std::vector<std::pair<std::string, size_t>> slots;
+        size_t largest = 0, sum = 0;
+        for (const auto &name : paged_plan_.names) {
+            auto it = model.initializers.find(name);
+            if (it == model.initializers.end()) continue; // not an initializer
+            const size_t sz = align_up(it->second.size);
+            slots.emplace_back(name, sz);
+            largest = std::max(largest, sz);
+            sum += sz;
+        }
+        if (!slots.empty()) {
+            // share_slots: one slot, reused. Otherwise: every weight its own,
+            // so no two can alias by accident.
+            const size_t arena_bytes = paged_plan_.arena_bytes != 0
+                                           ? paged_plan_.arena_bytes
+                                           : (paged_plan_.share_slots ? largest
+                                                                      : sum);
+            if (paged_plan_.share_slots && largest > arena_bytes) {
+                throw std::runtime_error(
+                    "vkop: paged arena is " + std::to_string(arena_bytes) +
+                    " bytes but the largest paged weight needs " +
+                    std::to_string(largest) +
+                    "; a shared slot must hold any one of them");
+            }
+            if (!paged_plan_.share_slots && sum > arena_bytes) {
+                throw std::runtime_error(
+                    "vkop: paged arena is " + std::to_string(arena_bytes) +
+                    " bytes but the per-weight slots need " +
+                    std::to_string(sum));
+            }
+            auto &dev_mut = const_cast<std::shared_ptr<VulkanDevice> &>(dev);
+            paged_arena_ = std::make_shared<VulkanBuffer>(
+                dev_mut, arena_bytes,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            size_t cursor = 0;
+            for (const auto &[name, sz] : slots) {
+                // A shared slot always lands at 0; the pager writes whichever
+                // weight is being brought in to that same offset.
+                paged_offsets_[name] = paged_plan_.share_slots ? 0 : cursor;
+                if (!paged_plan_.share_slots) cursor += sz;
+            }
+            printf("Paged arena: %.2f MiB, %zu weight(s), %s slots\n",
+                   static_cast<double>(arena_bytes) / (1 << 20), slots.size(),
+                   paged_plan_.share_slots ? "shared" : "per-weight");
+        }
+    }
+
     if (model.unified && !model.unified_meta.empty()) {
+        // A unified model sub-allocates every member out of ONE region streamed
+        // in a single copy, so a member cannot be left unfilled -- skipping one
+        // would mean uploading the region with a hole. Refuse rather than
+        // silently upload everything: the caller asked to save VRAM, and a
+        // paged plan over a -u artifact is a plan the artifact cannot support.
+        if (!unloaded_inits_.empty()) {
+            const char *np = model.unified_names.data();
+            size_t noff = 0;
+            for (const auto &meta : model.unified_meta) {
+                const size_t len = meta.name_len();
+                if (noff + len > model.unified_names.size()) break; // the
+                // main loop below reports this corruption with a better message
+                const std::string nm(np + noff, len);
+                noff += len;
+                if (unloaded_inits_.count(nm) != 0) {
+                    throw std::runtime_error(
+                        "vkop: initializer " + nm +
+                        " was declared unloaded, but this is a unified (-u) "
+                        "model: its members share one region and cannot be "
+                        "skipped individually; reconvert without -u to page "
+                        "them");
+                }
+            }
+        }
         // Unified-tensor sub-allocation: one shared GPU uniform buffer holds
         // the whole unified region of the blob; each tensor is a BufferView at
         // meta.offset() into it. (Replaces the legacy unified_metadata /
@@ -1268,6 +1389,25 @@ void Runtime::LoadModel() {
             init.dtype, ("initializer " + init.name).c_str());
         check_initializer_payload(init, kind, offset,
                                   model.initializer_memory_size);
+        // Names that reach a path which cannot be left unfilled are refused
+        // here rather than silently uploaded (which would waste the VRAM the
+        // caller was trying to save) or silently skipped (which would leave a
+        // half-initialized graph). The float/quantized buffer paths handle the
+        // skip themselves; these are the three that cannot.
+        if (is_unloaded_initializer(init.name) &&
+            (kind == ElemKind::kInt64 || kind == ElemKind::kInt32)) {
+            throw std::runtime_error(
+                "vkop: initializer " + init.name +
+                " is a " + elem_name(kind) +
+                " constant, which set_unloaded_initializers cannot skip: it is "
+                "read on the host, not paged");
+        }
+        if (is_unloaded_initializer(init.name) && !backend_buffer_) {
+            throw std::runtime_error(
+                "vkop: initializer " + init.name +
+                " was declared unloaded, but this model does not use the "
+                "buffer backend; image-backed weights cannot be paged");
+        }
         if (kind == ElemKind::kInt64) {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
             t->set_elem_kind(kind);
