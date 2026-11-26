@@ -197,6 +197,30 @@ def activation_dtype(args) -> str:
         return "fp32"
     return getattr(args, "half_precision", None) or "fp16"
 
+
+def _fusions_the_target_cannot_run(args) -> dict:
+    """Fusion passes whose output this conversion's artifact could not run,
+    as {pass name: reason}.
+
+    The SwiGLU folds (fuse_swiglu_gate_up -> MatMul swiglu=1,
+    fuse_swiglu_down_proj -> down_act) only have half-activation kernels on
+    the buffer backend: ops/Matmul.hpp throws "swiglu needs fp16" for an fp32
+    activation, and the fold kernels read their weights as halves. Under
+    --act fp32 (which -q fp32 implies) or for the image backend, folding
+    would either ship an artifact that throws at load or -- with an fp32
+    export's weights -- be refused by Quantizer._validate_folded_weights.
+    The unfolded gate/up/SiLU/Mul/down chain runs everywhere, so drop the
+    folds instead.
+    """
+    if activation_dtype(args) == "fp32":
+        why = ("--act fp32 keeps fp32 activations and the SwiGLU fold kernels "
+               "only run on fp16/bf16 activations")
+    elif _declared_widths_backend(args) == "image":
+        why = "the image backend has no SwiGLU fold kernels"
+    else:
+        return {}
+    return {"fuse_swiglu_gate_up": why, "fuse_swiglu_down_proj": why}
+
 class UnsupportedOpError(RuntimeError):
     """A graph contains an op_type the runtime cannot execute.
 
@@ -1197,7 +1221,8 @@ class ModelConverter:
             getattr(args, "exclude_downstream_of", None),
         )
 
-        self.fusion_optimizer.optimize(dag_model)
+        self.fusion_optimizer.optimize(
+            dag_model, skip=_fusions_the_target_cannot_run(args))
 
         # The Conv weight-image layout is a converter decision now, so assert it
         # here rather than reading it back off the runtime's guess.

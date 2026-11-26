@@ -1288,8 +1288,14 @@ class ConvWeightLayoutPass(OptimizationPass):
 
 
 class MultiRoundOptimizer:
-    def __init__(self, max_rounds: int = None):
+    def __init__(self, max_rounds: int = None, skip: dict = None):
         self.passes: List[OptimizationPass] = []
+        # name -> reason: passes the converter drops because the artifact it
+        # is building cannot run their output (e.g. the SwiGLU folds under
+        # --act fp32, see ModelConverter._fusions_the_target_cannot_run).
+        # Unlike VKOP_NO_FUSIONS this is not an ablation: it is decided from
+        # the conversion's own settings, and each skip says why.
+        self.skip = dict(skip or {})
         # Every name this optimizer was asked to register, including the ones
         # VKOP_NO_FUSIONS dropped. warn_unknown_disabled needs the full set: a
         # disabled pass is absent from self.passes, so judging the ablation
@@ -1309,6 +1315,11 @@ class MultiRoundOptimizer:
         # is model-dependent (a rope fusion that removes 200 nodes on an LLM is
         # dead weight on a CNN), so ablation is done by env rather than by
         # editing this list -- see tools/ablate.py.
+        if (pass_instance.name in self.skip
+                and pass_instance.name not in ALWAYS_ON_FUSIONS):
+            print(f"[fusions] {pass_instance.name} skipped: "
+                  f"{self.skip[pass_instance.name]}")
+            return
         if pass_instance.name in _disabled_passes("VKOP_NO_FUSIONS"):
             if pass_instance.name in ALWAYS_ON_FUSIONS:
                 print(f"[ablate] {pass_instance.name} is always on (fused "
@@ -1415,8 +1426,9 @@ class FusionOptimizer:
     }
 
     @staticmethod
-    def create_default_optimizer(max_rounds: int = None) -> MultiRoundOptimizer:
-        optimizer = MultiRoundOptimizer(max_rounds=max_rounds)
+    def create_default_optimizer(max_rounds: int = None,
+                                 skip: dict = None) -> MultiRoundOptimizer:
+        optimizer = MultiRoundOptimizer(max_rounds=max_rounds, skip=skip)
 
         optimizer.register_pass(
             PatternBasedFusionPass(
@@ -2018,11 +2030,11 @@ class FusionOptimizer:
         return optimizer
 
     @staticmethod
-    def optimize(dag_model, max_rounds: int = None):
+    def optimize(dag_model, max_rounds: int = None, skip: dict = None):
         # None -> VKOP_MAX_FUSE_ROUNDS env (default 10), same source the
         # MultiRoundOptimizer ctor uses; a caller passing an explicit int
-        # still wins.
-        optimizer = FusionOptimizer.create_default_optimizer(max_rounds)
+        # still wins. `skip` is {pass name: reason} (MultiRoundOptimizer).
+        optimizer = FusionOptimizer.create_default_optimizer(max_rounds, skip)
         optimizer.optimize(dag_model, verbose=True)
         return dag_model
 
