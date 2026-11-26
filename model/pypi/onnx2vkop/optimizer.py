@@ -6045,17 +6045,50 @@ class FusionOptimizer:
         return matches
 
     @staticmethod
+    def _fold_weight_entry(name, *sources, init=None):
+        """A folded node's input entry for weight `name`, WITH a dtype.
+
+        GraphFp16._decls (fp16_graph.py) only sees a tensor through a dtype'd
+        entry, so a bare {"name": ...} kept a fold's weight out of the FP16
+        domain: an fp32 export's folded weight shipped as fp32 bytes that the
+        fold kernels (fp16-only) then read as halves -- all-NaN output on a
+        D=256/F=512 SwiGLU MLP. Real LLM exports store fp16 weights already,
+        which is why they never showed it.
+
+        The dtype is the one the graph DECLARED for the source weight (the
+        first entry in `sources` that has one), exactly what an unfolded
+        MatMul's weight entry carries -- not the payload's current type, which
+        a streamed 4-bit weight already holds as its placeholder. With no
+        declared dtype, a FLOAT-family payload (`init`) stands in for one."""
+        for entry in sources:
+            if entry is not None and "dtype" in entry:
+                return {"name": name, "dtype": entry["dtype"]}
+        if init is not None and int(init.data_type) in (
+                TensorProto.FLOAT, TensorProto.FLOAT16, TensorProto.BFLOAT16):
+            return {"name": name, "dtype": int(init.data_type)}
+        return {"name": name}
+
+    @staticmethod
+    def _input_entry(node, name):
+        return next((i for i in node.inputs if i.get("name") == name), None)
+
+    @staticmethod
     def fold_swiglu_down_proj(dag_model, match) -> bool:
         down = match["down"]
+        entry = FusionOptimizer._input_entry
+        weight = FusionOptimizer._fold_weight_entry
         fused = Node(
             op_type="MatMul",
             name=down.name,
             attributes=dict(down.attributes),
             inputs=[
                 match["x"],
-                {"name": match["wd"]},
-                {"name": match["wg"]},
-                {"name": match["wu"]},
+                weight(match["wd"], entry(down, match["wd"]),
+                       init=dag_model.initializers.get(match["wd"])),
+                weight(match["wg"], entry(match["gate"], match["wg"]),
+                       init=dag_model.initializers.get(match["wg"])),
+                weight(match["wu"], entry(match["up"], match["wu"]),
+                       init=dag_model.initializers.get(match["wu"])),
             ],
             outputs=down.outputs[:],
         )
@@ -6430,7 +6463,9 @@ class FusionOptimizer:
         inits[name] = t
         del inits[wg]
         del inits[wu]
-        inputs = [match["x"], {"name": name}]
+        inputs = [match["x"], FusionOptimizer._fold_weight_entry(
+            name, FusionOptimizer._input_entry(match["gate"], wg),
+            FusionOptimizer._input_entry(match["up"], wu), init=t)]
         if match.get("quant"):
             inputs.append(quant_scale)
         fused = Node(
@@ -9328,11 +9363,14 @@ class Quantizer:
                 f"merged scale {int(scale.size)})"
             )
             converted += 1
-        Quantizer._validate_down_act_nodes(dag_model)
+        # Mid-pipeline: a weight this pass declined is still at its source
+        # width; the converter's final check (allow_fp32=False) decides
+        # whether that width is one the kernel reads.
+        Quantizer._validate_down_act_nodes(dag_model, allow_fp32=True)
         return converted
 
     @staticmethod
-    def _validate_folded_weights(dag_model):
+    def _validate_folded_weights(dag_model, allow_fp32=False):
         """Refuse to emit a FOLDED MatMul whose weight the kernel cannot read.
 
         Two folds exist and each has a weight ABI the quantizers do not
@@ -9355,7 +9393,20 @@ class Quantizer:
         check; it grew the swiglu arm because that fold arrived later and had
         no equivalent.
         """
-        float_kinds = (onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16)
+        # 16-bit floats only: the fold kernels read B as 16-bit words, and the
+        # runtime has no fp32 build of either fold (MatMul swiglu needs fp16_,
+        # matmul_down_act exists only as _fp16). An fp32 weight here used to
+        # pass and decode as pairs of halves -- all-NaN output -- either from a
+        # -q fp32 conversion or from the half-domain pass missing the fold's
+        # weight (its entry carried no dtype; see _fold_weight_entry).
+        float_kinds = (onnx.TensorProto.FLOAT16, onnx.TensorProto.BFLOAT16)
+        if allow_fp32:
+            float_kinds += (onnx.TensorProto.FLOAT,)
+        fp32_hint = (
+            " An fp32 weight means the graph never entered the FP16 domain "
+            "(--act fp32 / -q fp32, or a non-buffer --target-backend): "
+            "reconvert with --act fp16/bf16, or with --no-fusions "
+            "fuse_swiglu_gate_up,fuse_swiglu_down_proj.")
         for node in dag_model.nodes.values():
             if node.attributes.get("down_act"):
                 kinds = []
@@ -9373,7 +9424,7 @@ class Quantizer:
                     want = "three int8 weights plus one fp32 scale table"
                 else:
                     ok = all(k in float_kinds for k in kinds)
-                    want = "three float weights"
+                    want = "three fp16/bf16 weights"
                 if not ok:
                     out_name = node.outputs[0]["name"] if node.outputs else "?"
                     got = [onnx.TensorProto.DataType.Name(k) if k is not None
@@ -9382,7 +9433,8 @@ class Quantizer:
                         f"vkop: SwiGLU-fold MatMul '{out_name}' has weight "
                         f"types {got} but the runtime expects {want} "
                         f"(see ops/Matmul.hpp's down_act gate)"
-                    )
+                        + (fp32_hint if onnx.TensorProto.FLOAT in kinds
+                           else ""))
                 continue
             if not node.attributes.get("swiglu"):
                 continue
@@ -9408,6 +9460,12 @@ class Quantizer:
             out_name = node.outputs[0]["name"] if node.outputs else "?"
             got = (onnx.TensorProto.DataType.Name(payload.data_type)
                    if payload is not None else "?")
+            if got == "FLOAT":
+                raise ValueError(
+                    f"vkop: SwiGLU-fold MatMul '{out_name}' has an fp32 "
+                    f"interleaved weight, but the swiglu kernels read B as "
+                    f"fp16/bf16 only (ops/Matmul.hpp's swiglu gate)." +
+                    fp32_hint)
             raise ValueError(
                 f"vkop: SwiGLU-fold MatMul '{out_name}' has "
                 f"{len(node.inputs)} input(s) and a {got} weight, but the "

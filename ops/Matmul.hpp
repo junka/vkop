@@ -1084,6 +1084,29 @@ class MatMulBuffer : public BufferFactory {
                 "N_up % 4 == 0 and no transB (got N = " +
                 std::to_string(n) + ")");
         }
+        // Both SwiGLU folds read their float weights as 16-bit words (fp16, or
+        // bf16 through unpackB2). An fp32 weight here is a converter bug -- the
+        // fold's weight entry once carried no dtype, so the half-domain pass
+        // never downcast it -- and decoding its bytes as halves gave all-NaN
+        // output on an fp32 export. Refuse it by name instead.
+        {
+            const auto is_f32 = [&](size_t i) {
+                return i < inputs.size() &&
+                       inputs[i]->elem_kind() == core::ElemKind::kFloat32;
+            };
+            const bool fold_f32 =
+                (swiglu_ && is_f32(1)) ||
+                (down_act_ && !down_act_byte &&
+                 (is_f32(1) || is_f32(2) || is_f32(3)));
+            if (fold_f32) {
+                throw std::runtime_error(
+                    "vkop: MatMul " + get_name() + " is a SwiGLU fold (" +
+                    (swiglu_ ? "swiglu" : "down_act") +
+                    ") with an fp32 weight; the fold kernels read fp16/bf16 "
+                    "only. Reconvert with a current onnx2vkop, or without "
+                    "fuse_swiglu_gate_up / fuse_swiglu_down_proj.");
+            }
+        }
         const int n_out = swiglu_ ? n / 2 : n;
         if (rank_b >= 2)
             out_shape.push_back(n_out);

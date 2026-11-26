@@ -296,6 +296,31 @@ TEST(MatMulTest, MatMulSwigluGateUp) {
     }
 }
 
+// The fold kernels read B as 16-bit words. An fp32 interleaved weight reached
+// them from an fp32 export (the converter's fold entry had no dtype, so the
+// FP16 domain pass never downcast it) and decoded as pairs of halves: every
+// output NaN, on every route. The host now refuses it by name.
+TEST(MatMulTest, MatMulSwigluRefusesFp32Weight) {
+    vkop::tests::ScopedBufferBackend buffer;
+    for (int m : {1, 20}) {
+        MatMulSwigluTest<uint16_t> t(1, m, 128, 96);
+        auto wide = std::make_shared<Tensor<float>>(std::vector<int>{128, 192});
+        wide->fillToCPU(std::vector<float>(128 * 192, 0.01F));
+        std::string what;
+        try {
+            t.run_test({t.inputa, wide}, {t.output},
+                       [](std::unique_ptr<vkop::ops::Operator> &op) {
+                           op->setAttribute({{"swiglu", "1"}});
+                       });
+        } catch (const std::runtime_error &e) {
+            what = e.what();
+        }
+        EXPECT_NE(what.find("fp32 weight"), std::string::npos)
+            << "m=" << m << ": expected the fold's fp32 refusal, got '"
+            << what << "'";
+    }
+}
+
 // ONNX MatMul with a 1-D operand: a rank-1 A is a single row [K] (promoted to
 // [1,K]), a rank-1 B a single column [K] (promoted to [K,1]), and the promoted
 // dim is dropped from the output again — {K}x{K,N} -> {N}, {M,K}x{K} -> {M}.
