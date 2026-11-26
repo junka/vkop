@@ -442,8 +442,12 @@ class GraphFp16:
             if tuple(n.op_type for n in chain) != _VARIANCE_CHAIN:
                 continue
             src = node.inputs[0].get("name")
-            if src not in candidates:
-                # Already wide (or untyped): nothing to insert.
+            if src not in candidates or src in forced:
+                # Already wide (untyped, or held FP32 by the propagation -- an
+                # export's own Cast(to=fp32) feeding the norm): nothing to
+                # insert. Inserting anyway declared the fp32 tensor half, and
+                # the new Cast read its fp32 bytes as halves (tiny Qwen-Image
+                # DiT prefill: /Pow at cos 0.68, present_kv at 0.91).
                 continue
             wide = src + "__fp32"
             producer = dag_model.nodes.get(producer_of.get(src, ""))

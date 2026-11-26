@@ -493,3 +493,23 @@ def test_a_sin_on_a_long_activation_chain_is_not_a_phase():
               initializers={"b": numpy.ones((1,), numpy.float32)})
     plan = GraphFp16.plan(m)
     assert "x" in plan["domain"] and "out" in plan["domain"]
+
+
+def test_a_variance_chain_behind_an_fp32_cast_gets_no_second_cast():
+    """The export's own Cast(to=fp32) already makes the square wide. Inserting
+    the widening Cast anyway declared that fp32 tensor half and read its bytes
+    as halves (tiny Qwen-Image DiT prefill: /Pow at cos 0.68)."""
+    nodes = [
+        node("Cast", "up", [ref("x16", F16)], ["x"], to=F),
+        node("Pow", "sq", ["x", "two"], ["xsq"]),
+        node("Reduce", "mean", ["xsq"], ["var"]),
+        node("FusedElemwise", "rsqrt", ["var"], ["normed"]),
+    ]
+    m = build(nodes, inputs=[], outputs=["normed"],
+              initializers={"two": numpy.asarray(2.0, dtype=numpy.float32)})
+    m.inputs = [{"name": "x16", "shape": [1, 4], "dtype": "float16"}]
+    apply(m)
+    casts = [n for n in m.nodes.values() if n.op_type == "Cast"]
+    assert [c.name for c in casts] == ["up"]
+    assert dtype_of(m, "x") == F
+    assert m.nodes["sq"].inputs[0]["name"] == "x"
