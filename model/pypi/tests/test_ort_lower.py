@@ -246,6 +246,21 @@ def test_matmul_transb_and_gqa_b():
     close(y, a @ np.repeat(b, 2, 1).transpose(0, 1, 3, 2), 1e-4)
 
 
+def test_matmul_gqa_b_with_a_dynamic_a_takes_heads_from_the_output():
+    """Phi-4's QK^T: A declared [-1,-1,-1,-1], B [-1,8,-1,128], Y [-1,24,..];
+    with the epilogue scale + mask folded in."""
+    a, b, m = rnd(1, 4, 3, 8), rnd(1, 2, 5, 8), rnd(1, 1, 3, 5)
+    dag = make_dag([Node("MatMul", "mm",
+                         {"transB": 1, "epi_scale": 0.5, "epi_bias": 1},
+                         [td("a", [-1, -1, -1, -1]), td("b", [-1, 2, -1, 8]),
+                          td("m", [-1, 1, -1, -1])],
+                         [td("y", [-1, 4, -1, -1])])],
+                   [td("a", a.shape), td("b", b.shape), td("m", m.shape)],
+                   [td("y", [1, 4, 3, 5])])
+    y = run_lowered(dag, {"a": a, "b": b, "m": m})["y"]
+    close(y, a @ np.repeat(b, 2, 1).transpose(0, 1, 3, 2) * 0.5 + m, 1e-4)
+
+
 def test_matmul_swiglu_interleaved_weight():
     K, N = 8, 12
     x, g, u = rnd(2, K), rnd(K, N), rnd(K, N)

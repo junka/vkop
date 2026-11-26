@@ -816,7 +816,7 @@ class _Lowerer:
                 b_rank = len(b_shape) if b_shape else 2
                 perm = list(range(b_rank - 2)) + [b_rank - 1, b_rank - 2]
                 b = self.emit("Transpose", [b], perm=perm)
-            b = self._gqa_operand(ins[0], ins[1], b, trans_b_done=True)
+            b = self._gqa_operand(ins[0], ins[1], b, node.outputs[0])
             last = not (epi_scale is not None or bias or attn_softmax)
             y = self.emit("MatMul", [a, b], out if last else None,
                           name=node.name if last else None)
@@ -831,13 +831,18 @@ class _Lowerer:
             elif not bias:
                 self.emit("Identity", [y], out)
 
-    def _gqa_operand(self, a_td, b_td, b, trans_b_done):
+    def _gqa_operand(self, a_td, b_td, b, out_td):
         """MatMul B with fewer heads than A (fold_repeat_kv_expand removed the
-        repeat_kv Expand; the runtime broadcasts h -> h // rep)."""
-        sa, sb = _tshape(a_td), _tshape(b_td)
-        if not sa or not sb or len(sa) < 3 or len(sa) != len(sb):
+        repeat_kv Expand; the runtime broadcasts h -> h // rep). A's head count
+        comes from A's shape, or from the output's when A's is dynamic (Phi-4:
+        A [-1,-1,-1,-1], B [-1,8,-1,128], Y [-1,24,-1,-1])."""
+        sa, sb, so = _tshape(a_td), _tshape(b_td), _tshape(out_td)
+        if not sb or len(sb) != 4:
             return b
-        ha, hb = sa[-3], sb[-3]
+        ha = sa[-3] if sa and len(sa) == 4 else -1
+        if ha <= 0 and so and len(so) == 4:
+            ha = so[-3]
+        hb = sb[-3]
         if ha > 0 and hb > 1 and ha != hb and ha % hb == 0 and len(sb) == 4:
             return self._repeat_kv(b, ha, hb)
         return b
