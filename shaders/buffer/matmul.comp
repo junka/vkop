@@ -623,21 +623,30 @@ float w4u_val(uint word, int e) {
 }
 
 // One E2M1 nibble -- sign, 2 exponent bits, 1 mantissa bit -- so its eight
-// magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. Same field slide as fp8: with the
-// sign stripped, a normal code is an fp32 whose exponent is (code >> 1) - 1 and
-// whose mantissa is the low bit, i.e. bits = ((code + 252) >> 1) << 23 with the
-// mantissa bit at 1 << 22. `(code + 252) >> 1` is bias-adjusted for both
-// mantissas of a pair, so one expression covers the whole normal range; only
-// exponent 0 needs its own term, where the value is a multiple of the subnormal
-// step 2^-1. There is no Inf or NaN encoding: all 16 nibbles are values.
+// magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6, and the sign bit gives the other
+// eight (code 8 is -0.0). There is no Inf or NaN encoding: all 16 nibbles are
+// values, so the decode is a 16-entry table exactly like nf4_code.
+//
+// A table, not the fp32 field slide (exponent (m >> 1) - 1, mantissa m & 1,
+// a separate subnormal arm, then a sign select): that arithmetic is ~8 ALU ops
+// per nibble, and on the WIDE GEMV -- eight nibbles per 32-bit load -- it made
+// NVFP4 ALU-bound on Apple M5 Max: 2048x59264 0.271 ms (224 GB/s) against
+// 0.172 ms (353 GB/s) through the table, which is int4's rate. Metal keeps the
+// constant table in registers / the constant cache, the same as nf4_code's.
 float e2m1_val(uint c) {
-    uint m = c & 7u;
-    float v = m > 1u
-                  ? uintBitsToFloat((((m + 252u) >> 1u) << 23u) |
-                                    ((m & 1u) << 22u))
-                  : float(m) * 0.5;
-    return (c & 8u) != 0u ? -v : v;
+    const float cb[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0,
+                                   -6.0);
+    return cb[c & 15u];
 }
+
+// Single-nibble decoders for the non-int4 payloads, in w4_val's (word, e)
+// shape so the WIDE group walk and W4_QUAD can take any of them as a macro
+// argument. e is the nibble position 0..7, low nibble first.
+float w4_nf4(uint word, int e) {
+    return nf4_code(int((word >> uint(e * 4)) & 15u));
+}
+float w4_e2m1(uint word, int e) { return e2m1_val((word >> uint(e * 4)) & 15u); }
 
 // One nibble of `word` at position `e` (0..7), decoded by the payload's
 // meaning. The single-value form of unpack_w4, split out because the WIDE GEMV
@@ -647,33 +656,39 @@ float e2m1_val(uint c) {
 // projection by default) was decoded as if it were int4. The nibble grid still
 // has plausible magnitudes, so the mismatch surfaced only as a wrong answer:
 // measured N=2048 on ARL, nf4 460.5 vs -25.5 expected, uint4 -8.16 vs -10.41.
+//
+// w4_at tests the format PER NIBBLE, and Metal via MoltenVK does not hoist
+// those uniform tests out of a K loop. No hot loop may call it: the WIDE GEMV
+// decodes through a workgroup table built from it once (w4_lut), the other
+// kernels pick the decoder once per word (unpack_w4). It is left for that
+// table fill and the fp32 build's per-element path.
+//
 // True when the 4-bit payload is the plain signed int4 grid -- the one case
 // where w4_at reduces to w4_val. Uniform over a dispatch, so a hot loop can
-// test it ONCE and run a w4_val body: w4_at's three per-nibble format tests
-// are not hoisted out of the K loop by every compiler (Metal via MoltenVK kept
-// them inside, doubling the WIDE GEMV's decode cost: Qwen3-VL-2B int4 decode
-// 11.7 -> 21.5 ms/token).
+// test it ONCE and run a w4_val body (Qwen3-VL-2B int4 decode was 11.7 -> 21.5
+// ms/token while the WIDE loop called w4_at for every format).
 bool w4_plain() {
     return uPC.nvfp4 == 0 && uPC.uint4 == 0 && uPC.nf4 == 0;
 }
 
 float w4_at(uint word, int e) {
-    if (uPC.nvfp4 != 0) return e2m1_val((word >> uint(e * 4)) & 15u);
+    if (uPC.nvfp4 != 0) return w4_e2m1(word, e);
     if (uPC.uint4 != 0) return w4u_val(word, e);
-    if (uPC.nf4 != 0) return nf4_code(int((word >> uint(e * 4)) & 15u));
+    if (uPC.nf4 != 0) return w4_nf4(word, e);
     return w4_val(word, e);
 }
 
 // Four consecutive 4-bit weights starting at nibble `base` (0 or 4) of a word.
+// The format is tested once per call, each arm decoding all four nibbles with
+// its own decoder -- never w4_at, whose three tests would run per nibble.
+#define W4_QUAD(DEC, word, base) \
+    vec4(DEC(word, base), DEC(word, base + 1), DEC(word, base + 2), \
+         DEC(word, base + 3))
 vec4 unpack_w4(uint word, int base) {
-    // Plain signed int4 -- the common payload -- skips w4_at's per-nibble
-    // format tests; every other format still decodes through w4_at.
-    if (w4_plain()) {
-        return vec4(w4_val(word, base), w4_val(word, base + 1),
-                    w4_val(word, base + 2), w4_val(word, base + 3));
-    }
-    return vec4(w4_at(word, base), w4_at(word, base + 1),
-                w4_at(word, base + 2), w4_at(word, base + 3));
+    if (w4_plain()) return W4_QUAD(w4_val, word, base);
+    if (uPC.nf4 != 0) return W4_QUAD(w4_nf4, word, base);
+    if (uPC.uint4 != 0) return W4_QUAD(w4u_val, word, base);
+    return W4_QUAD(w4_e2m1, word, base);
 }
 
 // One weight by its index in the logical [K, N] matrix.
@@ -1521,8 +1536,12 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
 // ks_store_wide (eight columns, no column scale) is reused; the per-group
 // scale is applied where the group boundary falls, see the two loops.
 // The K walk of matmul16_w4_ksplit_wide over this lane's groups, with the
-// nibble decoder as a parameter so the kernel can pick it once per dispatch
-// (see w4_plain): w4_val for plain int4, w4_at for every other 4-bit format.
+// nibble decoder as a parameter. The kernel passes w4_lutv (the workgroup's
+// decoded 16-entry table, see w4_lut) for every format -- never w4_at. A w4_at
+// expansion (which served nf4 / uint4 / nvfp4 before) kept its uniform format
+// tests inside the loop on Metal, three per nibble and eight nibbles per word:
+// nf4 ran 2048x59264 at 0.58 ms (105 GB/s) against int4's 0.16 ms, and
+// GLM-Edge-1.5B nf4 decoded at 18.3 ms/token vs fp16's 12.7.
 // Eight k's per trip, the shape the int8 WIDE GEMV uses: the two-at-a-time form
 // kept only two loads in flight per lane and stalled on DRAM latency. The group
 // boundary bounds the trip -- a scale covers `uPC.group` consecutive k, so the
@@ -1597,10 +1616,29 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
             s1 += acc2 * scale4(g * uPC.N + ja + 4);                          \
         }
 
+// The 16 values a nibble decodes to under this dispatch's format (int4 -8..7,
+// uint4 0..15, the nf4 codebook, or E2M1), staged once per workgroup by
+// matmul16_w4_ksplit_wide from w4_at itself, so the table is bit-identical to
+// the per-format decoders. One expansion of the WIDE group walk then serves
+// every 4-bit format, with no format test inside the K loop at all.
+//
+// Shared memory rather than the decoders' own constant tables: with those
+// (one W4_WIDE_GROUPS expansion per format) the large shapes matched int4, but
+// a latency-bound small N did not -- M5 Max K=2048 N=512 nf4 / uint4 / nvfp4
+// 0.032-0.034 ms vs int4 0.011-0.016 ms; through this table 0.010-0.016. It
+// also beats int4's own bitfieldExtract + convert: K=2048 N=12288 0.034 ->
+// 0.027 ms, N=59264 0.163 -> 0.155 ms.
+shared float w4_lut[16];
+float w4_lutv(uint word, int e) { return w4_lut[(word >> uint(e * 4)) & 15u]; }
+
 void matmul16_w4_ksplit_wide() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
     int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+    // Before any lane can leave (the ja >= N octets still reach ks_store_wide's
+    // barrier, so this one is in uniform control flow too).
+    if (lane < 16) w4_lut[lane] = w4_at(uint(lane), 0);
+    barrier();
     int q = uPC.ksplit_q;
     int n_slice = KS_LANES / q;
     int oct = lane % q;
@@ -1622,11 +1660,7 @@ void matmul16_w4_ksplit_wide() {
     vec4 s0 = vec4(0.0);  // cols ja .. ja+3
     vec4 s1 = vec4(0.0);  // cols ja+4 .. ja+7
     if (ja < uPC.N) {
-        if (w4_plain()) {
-            W4_WIDE_GROUPS(w4_val)
-        } else {
-            W4_WIDE_GROUPS(w4_at)
-        }
+        W4_WIDE_GROUPS(w4_lutv)
     }
     ks_store_wide(s0, s1, row, ja);
 }

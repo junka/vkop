@@ -36,15 +36,22 @@
 //      differs, so the pair is the A/B for the bf16 read.
 //      BENCH_BF16_WIDE=1 (with BENCH_BF16) sets the bf16_wide attribute, which
 //      keeps the bf16 weight off the half-staging tile routes.
+//      BENCH_W4=int4|nf4|uint4|nvfp4 swaps B for a nibble-packed 4-bit
+//      weight (group 64 fp32 scales; nvfp4: 16-value blocks of e4m3 scales
+//      plus a global fp32 scale). GB/s counts the nibble payload only.
+//      BENCH_W4_GROUP=<g> overrides the int4/nf4/uint4 group (default 64).
+//      BENCH_GPU_MED=1 adds a median-of-reps per-replay GPU span row.
 //      BENCH_PATTERN=1 times the column-ramp weight instead of refilling it
 //      with incompressible bytes after the correctness probe. The A/B against
 //      the default; on a part that does not compress storage-buffer reads the
 //      two agree (measured on the 560X).
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -89,6 +96,22 @@ void fill_ones(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
 // offset. A remap or a scale phase error makes out[j] come out as K*wpat(j')
 // for the wrong j', which the all-ones probe cannot see.
 inline int wpat(int j) { return (j % 7) - 3; }
+
+// 4-bit probe: the column-only nibble code and its decoded value (scale 1).
+const float kNf4[16] = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f,
+    0.33791524171829224f, 0.44070982933044434f, 0.5626170039176941f,
+    0.7229568362236023f, 1.0f};
+const float kE2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+inline int w4code(int j) { return j % 16; }
+float w4dec(const char *fmt, int c) {
+    if (!strcmp(fmt, "nf4")) return kNf4[c];
+    if (!strcmp(fmt, "uint4")) return static_cast<float>(c);
+    if (!strcmp(fmt, "nvfp4")) return (c & 8) ? -kE2m1[c & 7] : kE2m1[c & 7];
+    return static_cast<float>(c >= 8 ? c - 16 : c);
+}
 
 // The timed weight is incompressible by default. The ramp is seven repeated
 // values per column, which is not a bandwidth stimulus on a part that compresses
@@ -206,6 +229,16 @@ int main(int argc, char **argv) {
     const int reps = (argc > 3) ? std::atoi(argv[3]) : 30;
     const bool int8_mode = std::getenv("BENCH_INT8") != nullptr;
     const bool bf16_mode = std::getenv("BENCH_BF16") != nullptr;
+    const char *w4_fmt = std::getenv("BENCH_W4");
+    const bool w4_mode = w4_fmt != nullptr && *w4_fmt;
+    const int w4_group = [] {
+        const char *v = std::getenv("BENCH_W4_GROUP");
+        return (v && *v) ? std::atoi(v) : 64;
+    }();
+    if (w4_mode) {
+        printf("weight: %s (4-bit, group %d)\n", w4_fmt,
+               strcmp(w4_fmt, "nvfp4") ? w4_group : 16);
+    }
     if (int8_mode) {
         printf("weight: int8 (byte WIDE path)\n");
     }
@@ -305,9 +338,57 @@ int main(int argc, char **argv) {
         // B is either an fp16 weight [K, N] or, in int8 mode, an int8 weight
         // [K, N] plus the per-column fp32 dequant scale the byte kernels read
         // (A fp16 x int8 weight x scale -> fp16 out is the W8A16 path).
-        std::shared_ptr<core::ITensor> b_keep, s_keep;
+        std::shared_ptr<core::ITensor> b_keep, s_keep, keep_g;
         std::vector<std::shared_ptr<core::ITensor>> in;
-        if (int8_mode) {
+        if (w4_mode) {
+            const bool nv = !strcmp(w4_fmt, "nvfp4");
+            const int grp = nv ? 16 : w4_group;
+            const int ngroups = s.K / grp;
+            auto B4 = std::make_shared<core::Tensor<int8_t>>(
+                std::vector<int>{s.K, s.N});
+            B4->set_elem_kind(!strcmp(w4_fmt, "nf4")     ? core::ElemKind::kNF4
+                              : !strcmp(w4_fmt, "uint4") ? core::ElemKind::kUint4
+                              : nv ? core::ElemKind::kFloat4E2M1
+                                   : core::ElemKind::kInt4);
+            const size_t nbytes = static_cast<size_t>(s.K) * s.N / 2;
+            B4->set_payload_bytes(static_cast<int>(nbytes));
+            std::vector<int8_t> wb(nbytes);
+            for (size_t i = 0; i < nbytes; ++i) {
+                const int j0 = static_cast<int>((2 * i) % s.N);
+                wb[i] = static_cast<int8_t>((w4code(j0) & 15) |
+                                            ((w4code(j0 + 1) & 15) << 4));
+            }
+            B4->fillToCPU(wb);
+            B4->as_storage_buffer(dev);
+            B4->copyToGPU(cmdpool);
+            b_keep = B4;
+            if (nv) {
+                auto S8 = std::make_shared<core::Tensor<int8_t>>(
+                    std::vector<int>{ngroups * s.N});
+                S8->set_elem_kind(core::ElemKind::kFloat8E4M3FN);
+                S8->fillToCPU(std::vector<int8_t>(
+                    static_cast<size_t>(ngroups) * s.N, 0x38)); // e4m3 1.0
+                auto G = std::make_shared<core::Tensor<float>>(
+                    std::vector<int>{1});
+                G->fillToCPU(std::vector<float>{1.0f});
+                S8->as_storage_buffer(dev);
+                S8->copyToGPU(cmdpool);
+                G->as_storage_buffer(dev);
+                G->copyToGPU(cmdpool);
+                s_keep = S8;
+                in = {A, B4, S8, G};
+                keep_g = G;
+            } else {
+                auto S = std::make_shared<core::Tensor<float>>(
+                    std::vector<int>{ngroups * s.N});
+                S->fillToCPU(std::vector<float>(
+                    static_cast<size_t>(ngroups) * s.N, 1.0f));
+                S->as_storage_buffer(dev);
+                S->copyToGPU(cmdpool);
+                s_keep = S;
+                in = {A, B4, S};
+            }
+        } else if (int8_mode) {
             auto B8 = std::make_shared<core::Tensor<int8_t>>(
                 std::vector<int>{s.K, s.N});
             B8->reserveOnCPU();
@@ -412,8 +493,12 @@ int main(int argc, char **argv) {
             uint16_t v = O->data()[j];
             float f = vkop::core::ITensor::fp16_to_fp32(v);
             float want =
-                static_cast<float>(s.K) * static_cast<float>(wpat(j));
-            if (f != want) {
+                w4_mode ? core::ITensor::fp16_to_fp32(core::ITensor::fp32_to_fp16(
+                              static_cast<float>(s.K) *
+                              w4dec(w4_fmt, w4code(j))))
+                        : static_cast<float>(s.K) * static_cast<float>(wpat(j));
+            if (w4_mode ? std::fabs(f - want) > 2e-3f * std::fabs(want) + 1e-2f
+                        : f != want) {
                 ok = false;
                 printf("  MISMATCH at col %d: got %f, want %f (K*wpat(%d))\n",
                        j, f, want, j);
@@ -431,7 +516,7 @@ int main(int argc, char **argv) {
         // binds -- toCPU() clears the on-GPU flag, without which copyToGPU is a
         // no-op and the timed loop would still read the ramp.
         if (std::getenv("BENCH_PATTERN") == nullptr) {
-            if (int8_mode) {
+            if (int8_mode || w4_mode) {
                 auto b8 = std::dynamic_pointer_cast<core::Tensor<int8_t>>(b_keep);
                 fill_random_i8(b8);
                 b8->toCPU();
@@ -455,6 +540,33 @@ int main(int argc, char **argv) {
         // between replays and wall is 1.3-2.5x the kernel span. wall GB/s is
         // therefore labelled wall, not presented as bandwidth. A device that
         // returns no usable timestamps gets the wall row alone, labelled.
+        // BENCH_GPU_MED=1: submit+wait each replay on its own and report the
+        // median of the per-replay timestamp spans. A single replay's span is
+        // noisy at the 0.05-0.2 ms decode sizes (2x between identical runs).
+        if (std::getenv("BENCH_GPU_MED") != nullptr) {
+            std::vector<double> spans;
+            for (int r = 0; r < reps; ++r) {
+                ts.reset();
+                cmd->submit(queue);
+                dev->wait_all_done();
+                auto tk = ts.getResults();
+                if (tk[1] > tk[0]) {
+                    spans.push_back(static_cast<double>(tk[1] - tk[0]) *
+                                    static_cast<double>(
+                                        dev->getTimestampPeriod()) *
+                                    1e-6);
+                }
+            }
+            if (!spans.empty()) {
+                std::sort(spans.begin(), spans.end());
+                const double med = spans[spans.size() / 2];
+                const double wb = static_cast<double>(s.K) * s.N *
+                                  (w4_mode ? 0.5 : int8_mode ? 1 : 2);
+                printf("%-9s K=%-6d N=%-6d : %8.4f ms  %7.1f GB/s  (gpu-med, "
+                       "min %.4f)\n",
+                       s.name, s.K, s.N, med, wb / med / 1e6, spans.front());
+            }
+        }
         ts.reset();
         auto t0 = std::chrono::steady_clock::now();
         for (int r = 0; r < reps; ++r) {
@@ -468,7 +580,7 @@ int main(int argc, char **argv) {
         double gpu_ms = static_cast<double>(ticks[1] - ticks[0]) *
                         static_cast<double>(dev->getTimestampPeriod()) * 1e-6;
         double bytes = static_cast<double>(s.K) * s.N *
-                       (int8_mode ? 1 : 2); // weight bytes
+                       (w4_mode ? 0.5 : int8_mode ? 1 : 2); // weight bytes
         // ticks[1] > ticks[0] is part of the test, not decoration: the unsigned
         // subtraction wraps to ~1.8e19 if a driver ever writes them out of
         // order, which would print a near-zero GB/s as if it were a measurement.

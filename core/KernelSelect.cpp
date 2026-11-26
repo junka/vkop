@@ -75,6 +75,11 @@ DeviceProfile with_ksplit_floor(DeviceProfile p, int floor) {
     return p;
 }
 
+DeviceProfile with_w4_wide_threshold(DeviceProfile p, int n) {
+    p.wide_threshold_w4 = n;
+    return p;
+}
+
 // One row per DeviceClass, indexed by the enum. Values come from the
 // calibration measurements that used to be written three times as if-blocks in
 // VulkanDevice::getProperties() and again as comments in ops/Matmul.hpp.
@@ -114,9 +119,15 @@ const DeviceProfile kProfiles[static_cast<int>(DeviceClass::kCount)] = {
     // ksplit_floor 32: at the old floor 8 the byte WIDE GEMV launched 8
     // blocks for every N <= 32768 (int8 K=2048 N=8192 123 us, N=32768 459 us);
     // floor 32 gives 47 / 170 us (2.6-2.7x), 64 ties, >= 128 regresses.
-    with_ksplit_floor(make_profile(DeviceClass::kMoltenVkApple,
-                                   "moltenvk-apple", 9, 9, 0, 9, 9, 128),
-                      32),
+    // 4-bit WIDE from N >= 512 (fp16 keeps 2048): GLM-Edge-1.5B nf4 k/v_proj
+    // (K=2048 N=512) on matmul16_w4_ksplit cost 34 us vs 24 us WIDE, and the
+    // model's decode went 9.8 -> 8.2 ms/token, tokens identical. The same
+    // threshold for fp16 measured 12.6 -> 13.0 ms/token on the fp16 model.
+    with_w4_wide_threshold(
+        with_ksplit_floor(make_profile(DeviceClass::kMoltenVkApple,
+                                       "moltenvk-apple", 9, 9, 0, 9, 9, 128),
+                          32),
+        512),
 };
 
 // ---------------------------------------------------------------------------
@@ -155,6 +166,7 @@ struct Ctx {
     // the predicates never reach back into the knobs.
     int wide_thr_fp16 = 0;
     int wide_thr_byte = 0;
+    int wide_thr_w4 = 0;
     int ksplit_floor = 0;
     // Configured by the winning row:
     int q = 16;
@@ -319,6 +331,9 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
                                                  : prof.wide_threshold_fp16;
     c.wide_thr_byte = kn.wide_threshold_byte > 0 ? kn.wide_threshold_byte
                                                  : prof.wide_threshold_byte;
+    c.wide_thr_w4 = kn.wide_threshold_w4 > 0     ? kn.wide_threshold_w4
+                    : prof.wide_threshold_w4 > 0 ? prof.wide_threshold_w4
+                                                 : c.wide_thr_fp16;
     c.ksplit_floor = kn.ksplit_floor > 0 ? kn.ksplit_floor : prof.ksplit_floor;
     c.ks512 = kn.ksplit512_enabled && !c.weight_4bit;
     return c;
@@ -674,7 +689,7 @@ bool ksplit_w4_wide_applies(const Ctx &c) {
     return c.weight_4bit && c.ksplit_ok && !c.wide_disabled &&
            !c.weight_byte && (c.s->n % 8) == 0 && f.group_size > 0 &&
            (c.s->k % f.group_size) == 0 &&
-           (c.wide_forced || c.s->n >= c.wide_thr_fp16);
+           (c.wide_forced || c.s->n >= c.wide_thr_w4);
 }
 
 bool ksplit_512_applies(const Ctx &c) {
@@ -1248,6 +1263,7 @@ MatmulKnobs matmul_knobs_from_env() {
             if (v >= 0) {
                 k.wide_threshold_fp16 = v;
                 k.wide_threshold_byte = v;
+                k.wide_threshold_w4 = v;
             }
         }
     }

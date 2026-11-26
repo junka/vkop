@@ -142,6 +142,11 @@ struct DeviceProfile {
     // columns/lane byte) GEMV variants.
     int wide_threshold_fp16 = 2048;
     int wide_threshold_byte = 896;
+    // Same, for the 4-bit WIDE GEMV (matmul16_w4_ksplit_wide). 0 = use
+    // wide_threshold_fp16. Its own knob because below the fp16 threshold the
+    // 4-bit alternative is matmul16_w4_ksplit, which splits K by whole scale
+    // groups over only 16 lanes -- a different trade than fp16's.
+    int wide_threshold_w4 = 0;
     // Weight bytes (K * row bytes) that still fit the cache the GEMV re-reads
     // through. Above this the tile's single weight pass wins earlier.
     uint64_t cache_resident_bytes = 32ull << 20;
@@ -331,6 +336,7 @@ struct MatmulKnobs {
     // 0 = take the device profile's threshold.
     int wide_threshold_fp16 = 0;
     int wide_threshold_byte = 0;
+    int wide_threshold_w4 = 0;
     // VKOP_KSPLIT512: opt into the 512-lane split-K builds.
     bool ksplit512_enabled = false;
     // VKOP_DP4A: opt into the int8 x int8 packed-dot-product GEMV. Default
