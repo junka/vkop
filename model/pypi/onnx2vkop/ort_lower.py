@@ -83,15 +83,13 @@ _EXEC_ONLY_ATTRS = {
 
 # Op names the runtime accepts as aliases of a standard op.
 _ALIASES = {
+    "GatedDeltaNet": "LinearAttention", "Conv1D": "Conv1d",
     "Conv2d": "Conv", "MaxPool2d": "MaxPool", "BatchNorm": "BatchNormalization",
     "InstanceNorm": "InstanceNormalization", "LayerNorm": "LayerNormalization",
     "Cumsum": "CumSum",
 }
 
-_NOT_LOWERABLE = {
-    "LinearAttention", "GatedDeltaNet", "Conv1d", "Conv1D", "EmbeddingForward",
-    "Nms",
-}
+_NOT_LOWERABLE = {"EmbeddingForward", "Nms"}
 
 _REDUCE_OPS = {
     "sum": "ReduceSum", "mean": "ReduceMean", "max": "ReduceMax",
@@ -391,7 +389,7 @@ class _Lowerer:
         return model
 
     # ---------------------------------------------- rank/shape reconciliation
-    def _reconcile_shapes(self, inputs, rounds: int = 4):
+    def _reconcile_shapes(self, inputs, rounds: int = 64):
         """Make each vkop node's operands carry the shape it was converted with.
 
         Several passes alias a Squeeze/Unsqueeze/Reshape output to its input
@@ -406,20 +404,36 @@ class _Lowerer:
             inferred = _infer_shapes(self._build(inputs))
             if not inferred:
                 return
-            fixes = {}                       # group -> [(name, nodes, new)]
+            producer_group = {o: g for n, g in zip(self.nodes, self.group)
+                              for o in n.output}
+            cands = []
             for gi, td in self.expect:
                 name, want = _tname(td), _tshape(td)
                 have = inferred.get(name)
                 if (gi, name) in done or want is None or have is None or \
                         not _mismatch(have, want):
                     continue
+                cands.append((gi, name, have, want))
+            if not cands:
+                return
+            # A fix changes shapes only at and after its own node, so in one
+            # round take just the fixes whose tensor is produced upstream of
+            # every node fixed in it; the rest wait for a fresh inference.
+            # (Fixing all at once read the conv state's post-fix rank from the
+            # pre-fix inference: Qwen3.5's state_out reshaped to [3,3].)
+            g0 = min(c[0] for c in cands)
+            fixes = {}                       # group -> [(name, nodes, new)]
+            for gi, name, have, want in cands:
+                if producer_group.get(name, -1) >= g0:
+                    continue
                 made = self._reshape_to(name, have, want)
                 if made is None:
+                    done.add((gi, name))
                     continue
                 done.add((gi, name))
                 fixes.setdefault(gi, []).append((name,) + made)
             if not fixes:
-                return
+                continue
             new_nodes, new_groups, placed = [], [], set()
             for n, gi in zip(self.nodes, self.group):
                 if gi in fixes:
@@ -532,6 +546,18 @@ class _Lowerer:
         if len(ins) < 2 and k is not None:
             ins.append({"name": self.i64([k])})
         self._lower_generic(_shallow(node, inputs=ins), "TopK", attrs)
+
+    def _lower_Split(self, node, attrs):
+        # The converter keeps the split sizes as an attribute (the opset < 13
+        # spelling); from 13 on ONNX reads them from input 1.
+        split = attrs.pop("split", None)
+        ins = [dict(i) for i in node.inputs]
+        if split is not None:
+            if self.opset >= 13 and len(ins) < 2:
+                ins.append({"name": self.i64(list(split))})
+            elif self.opset < 13:
+                attrs["split"] = split
+        self._lower_generic(_shallow(node, inputs=ins), "Split", attrs)
 
     def _lower_GlobalAveragePool(self, node, attrs):
         self._lower_generic(node, "GlobalAveragePool", attrs)
@@ -668,13 +694,27 @@ class _Lowerer:
             self.emit("Gather", [shp, self.i64([3])], axis=0)], axis=0)
         return self.emit("Reshape", [e, tgt])
 
+    def _repeat_kv_like(self, t, q):
+        """[B,Hkv,S,D] -> [B,H,S,D] with H = q.shape[1], all from runtime
+        shapes; head h reads kv head h // (H / Hkv)."""
+        ts, qs = self.emit("Shape", [t]), self.emit("Shape", [q])
+        dim = lambda shp, i: self.emit("Gather", [shp, self.i64([i])], axis=0)
+        h, hkv = dim(qs, 1), dim(ts, 1)
+        rep = self.emit("Div", [h, hkv])
+        u = self.unsqueeze(t, [2])
+        e = self.emit("Expand", [u, self.emit("Concat", [
+            self.i64([1, 1]), rep, self.i64([1, 1])], axis=0)])
+        tgt = self.emit("Concat", [dim(ts, 0), h, self.i64([-1]), dim(ts, 3)],
+                        axis=0)
+        return self.emit("Reshape", [e, tgt])
+
     def _lower_Attention(self, node, attrs):
         if attrs.get("has_ring"):
             raise LoweringError("the sliding-window (ring) KV cache is not "
                                 "lowered yet")
         if attrs.get("cache_scale") is not None:
             raise LoweringError("the fp8 KV cache is not lowered yet")
-        heads = int(attrs["num_heads"])
+        heads = int(attrs.get("num_heads", -1))
         kv_heads = int(attrs.get("num_kv_heads", heads))
         scale = float(attrs.get("scale", 1.0))
         seq_major = bool(attrs.get("seq_major", 0))
@@ -718,8 +758,15 @@ class _Lowerer:
                                      self.unsqueeze(v, [1])],
                           _tname(node.outputs[1]), axis=1)
 
-        k = self._repeat_kv(k, heads, kv_heads)
-        v = self._repeat_kv(v, heads, kv_heads)
+        if heads > 0 and kv_heads > 0:
+            k = self._repeat_kv(k, heads, kv_heads)
+            v = self._repeat_kv(v, heads, kv_heads)
+        else:
+            # The fold records -1 when Q's head axis was dynamic at conversion
+            # (Qwen3.5's gated q_proj); the runtime reads heads off Q's shape
+            # at execute time, so the lowering does the same, in-graph.
+            k = self._repeat_kv_like(k, q)
+            v = self._repeat_kv_like(v, q)
         s = self.emit("MatMul", [q, self.emit("Transpose", [k],
                                               perm=[0, 1, 3, 2])])
         if scale != 1.0:
@@ -744,6 +791,144 @@ class _Lowerer:
             self.emit("Transpose", [y], out, perm=[0, 2, 1, 3])
         else:
             self.emit("MatMul", [p, v], out, name=node.name)
+
+    def _lower_Conv1d(self, node, attrs):
+        """Qwen3.5's causal depthwise conv (ops/Conv1d.hpp): x [C,S] (or
+        [1,C,S]), weight [C,K], state [C,K-1] holding the previous round's last
+        K-1 samples. y[c,t] = sum_k w[c,k] * hist[c, t+k] over
+        hist = concat(state, x); state_out = hist's last K-1 columns."""
+        x, w, st = (_tname(t) for t in node.inputs[:3])
+        k = int(attrs.get("kernel", 0))
+        w_arr = self.init_array(w)
+        if w_arr is not None:
+            c = int(w_arr.shape[0])
+            k = k or int(w_arr.shape[-1])
+            w3 = self.const(np.ascontiguousarray(
+                w_arr.reshape(c, 1, -1)).astype(np.float32), hint=w)
+        else:
+            ws = _tshape(node.inputs[1])
+            if not ws or ws[0] <= 0:
+                raise LoweringError("Conv1d needs a static channel count")
+            c = ws[0]
+            k = k or ws[-1]
+            w3 = self.emit("Reshape", [w, self.i64([c, 1, -1])])
+        if k <= 0:
+            raise LoweringError("Conv1d needs its kernel size")
+        x3 = self.emit("Reshape", [x, self.i64([1, c, -1])])
+        s3 = self.emit("Reshape", [st, self.i64([1, c, k - 1])])
+        hist = self.emit("Concat", [s3, x3], axis=-1)
+        y = self.emit("Conv", [hist, w3], group=c, kernel_shape=[k])
+        self.emit("Reshape", [y, self.emit("Shape", [x])],
+                  _tname(node.outputs[0]))
+        if len(node.outputs) > 1 and _tname(node.outputs[1]):
+            tail = self.slice_(hist, -(k - 1), 2 ** 62, -1)
+            self.emit("Reshape", [tail, self.emit("Shape", [st])],
+                      _tname(node.outputs[1]))
+
+    def _lower_LinearAttention(self, node, attrs):
+        """The gated delta rule (ops/LinearAttention.hpp) as an ONNX Scan over
+        the sequence, the recurrent state [H,Dk,Dv] carried in fp32.
+
+        Layouts: rank 4 is the exporter's [1,S,H,D] (g/beta [1,S,H]); rank 3
+        is [H,S,D] (g/beta [H,S]). q/k have Hk heads; value head h reads key
+        head h // (H/Hk) -- repeat_interleave, done here before the loop."""
+        if self.opset < 13:
+            raise LoweringError("the LinearAttention Scan body needs opset >= 13")
+        q, k, v, g, b, st = (_tname(t) for t in node.inputs[:6])
+        qs = _tshape(node.inputs[0])
+        vs = _tshape(node.inputs[2])
+        if not qs or len(qs) not in (3, 4) or not vs:
+            raise LoweringError("LinearAttention needs q/v ranks")
+        rank4 = len(qs) == 4
+        hk = qs[2] if rank4 else qs[0]
+        h = int(attrs.get("heads", 0)) or (vs[2] if rank4 else vs[0])
+        dk = int(attrs.get("dk", 0)) or qs[-1]
+        dv = int(attrs.get("dv", 0)) or vs[-1]
+        if min(hk, h, dk, dv) <= 0 or h % hk:
+            raise LoweringError(f"LinearAttention: heads {h}/{hk}, dk {dk}, "
+                                f"dv {dv} must be static and Hk | H")
+
+        def seq_major(t, d):        # -> [S, heads, d] (or [S, heads] if d=0)
+            if rank4:
+                return self.squeeze(t, [0])
+            return self.emit("Transpose", [t], perm=[1, 0, 2] if d else [1, 0])
+
+        q3, k3 = seq_major(q, dk), seq_major(k, dk)
+        v3 = seq_major(v, dv)
+        g2, b2 = seq_major(g, 0), seq_major(b, 0)
+        eps = self.f32(1e-6)
+
+        def l2n(t):
+            ss = self.reduce("ReduceSum", self.emit("Mul", [t, t]), [-1], 1)
+            return self.emit("Mul", [t, self.emit("Reciprocal", [
+                self.emit("Sqrt", [self.emit("Add", [ss, eps])])])])
+
+        qn = self.emit("Mul", [l2n(q3), self.f32(1.0 / np.sqrt(dk))])
+        kn = l2n(k3)
+        if h != hk:
+            rep = h // hk
+
+            def expand(t):
+                u = self.unsqueeze(t, [2])
+                e = self.emit("Expand", [u, self.i64([1, 1, rep, 1])])
+                return self.emit("Reshape", [e, self.i64([-1, h, dk])])
+            qn, kn = expand(qn), expand(kn)
+        st3 = self.emit("Reshape", [st, self.i64([h, dk, dv])])
+
+        # Scan body: (state; q_t, k_t, v_t, g_t, b_t) -> (state'; out_t)
+        n = self.fresh("la")
+        S0, Q, K, V, G, B = (f"{n}_{x}" for x in ("s", "q", "k", "v", "g", "b"))
+        c_ax1 = f"{n}_ax1"
+        c_ax12 = f"{n}_ax12"
+        body = [
+            helper.make_node("Constant", [], [c_ax1], value=numpy_helper.from_array(
+                np.array([1], np.int64))),
+            helper.make_node("Constant", [], [c_ax12], value=numpy_helper.from_array(
+                np.array([1, 2], np.int64))),
+            helper.make_node("Exp", [G], [f"{n}_eg"]),
+            helper.make_node("Unsqueeze", [f"{n}_eg", c_ax12], [f"{n}_eg3"]),
+            helper.make_node("Mul", [S0, f"{n}_eg3"], [f"{n}_sd"]),
+            helper.make_node("Unsqueeze", [K, f"{n}_ax2"], [f"{n}_k3"]),
+            helper.make_node("Mul", [f"{n}_sd", f"{n}_k3"], [f"{n}_sk"]),
+            helper.make_node("ReduceSum", [f"{n}_sk", c_ax1], [f"{n}_kv"],
+                             keepdims=0),
+            helper.make_node("Sub", [V, f"{n}_kv"], [f"{n}_vd"]),
+            helper.make_node("Unsqueeze", [B, c_ax1], [f"{n}_b2"]),
+            helper.make_node("Mul", [f"{n}_vd", f"{n}_b2"], [f"{n}_delta"]),
+            helper.make_node("Unsqueeze", [f"{n}_delta", c_ax1], [f"{n}_d3"]),
+            helper.make_node("Mul", [f"{n}_k3", f"{n}_d3"], [f"{n}_upd"]),
+            helper.make_node("Add", [f"{n}_sd", f"{n}_upd"], [f"{n}_s1"]),
+            helper.make_node("Unsqueeze", [Q, f"{n}_ax2"], [f"{n}_q3"]),
+            helper.make_node("Mul", [f"{n}_s1", f"{n}_q3"], [f"{n}_sq"]),
+            helper.make_node("ReduceSum", [f"{n}_sq", c_ax1], [f"{n}_o"],
+                             keepdims=0),
+        ]
+        body.insert(0, helper.make_node(
+            "Constant", [], [f"{n}_ax2"],
+            value=numpy_helper.from_array(np.array([2], np.int64))))
+        f32 = TensorProto.FLOAT
+        graph = helper.make_graph(
+            body, f"{n}_body",
+            [helper.make_tensor_value_info(S0, f32, [h, dk, dv]),
+             helper.make_tensor_value_info(Q, f32, [h, dk]),
+             helper.make_tensor_value_info(K, f32, [h, dk]),
+             helper.make_tensor_value_info(V, f32, [h, dv]),
+             helper.make_tensor_value_info(G, f32, [h]),
+             helper.make_tensor_value_info(B, f32, [h])],
+            [helper.make_tensor_value_info(f"{n}_s1", f32, [h, dk, dv]),
+             helper.make_tensor_value_info(f"{n}_o", f32, [h, dv])])
+        st_last, outs = self.fresh("la_state"), self.fresh("la_out")
+        self.emit("Scan", [st3, qn, kn, v3, g2, b2], [st_last, outs],
+                  body=graph, num_scan_inputs=5)
+        # outs [S, H, Dv]
+        if rank4:
+            self.unsqueeze(outs, [0], _tname(node.outputs[0]))
+        else:
+            self.emit("Transpose", [outs], _tname(node.outputs[0]),
+                      perm=[1, 0, 2])
+        if len(node.outputs) > 1 and _tname(node.outputs[1]):
+            self.emit("Reshape", [st_last, self.emit("Shape", [st])],
+                      _tname(node.outputs[1]))
 
     def _lower_MatMul(self, node, attrs):
         ins = list(node.inputs)

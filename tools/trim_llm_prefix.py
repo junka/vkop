@@ -9,7 +9,9 @@ runs in fp32):
     onnx2vkop -i /tmp/l2/llm2.onnx -o /tmp/l2/llm2.vkopbin --emit-ort-onnx /tmp/l2/llm2.ort.onnx ...
     python3 tools/vkop_vs_ort.py /tmp/l2/llm2.vkopbin --onnx /tmp/l2/llm2.ort.onnx --inputs DIR --node-dump
 
-The new graph outputs are `present_key_values_0..N-1` plus the normalized
+The new graph outputs are the kept layers' state outputs (every graph output
+named `<stem>_<i>` with i < N: present_key_values_i, conv_state_out_i,
+recurrent_state_out_i, ...) plus the normalized
 hidden state entering layer N (the Mul applying `*layers.N.input_layernorm.
 weight`, which depends on all of layer N-1's residual). Everything else is the
 backward cone of those tensors: nodes, initializers and graph inputs nothing
@@ -41,11 +43,16 @@ def trim(src: str, out: str, keep: int) -> dict:
            if n.op_type == "Mul" and norm_w[0] in n.input]
     if len(hid) != 1:
         raise SystemExit(f"expected one Mul applying {norm_w[0]}, found {hid}")
-    have = {o.name for o in g.output}
-    outs = [f"present_key_values_{i}" for i in range(keep)]
-    missing = [o for o in outs if o not in have]
-    if missing:
-        raise SystemExit(f"graph has no outputs {missing}")
+    # Every per-layer state output of the kept layers: present_key_values_i
+    # for full attention, conv_state_out_i / recurrent_state_out_i for
+    # Qwen3.5's linear-attention layers -- whatever the export names "<x>_<i>".
+    outs = []
+    for o in g.output:
+        stem, _, idx = o.name.rpartition("_")
+        if stem and idx.isdigit() and int(idx) < keep:
+            outs.append(o.name)
+    if not outs:
+        raise SystemExit(f"no per-layer outputs with index < {keep}")
     outs += hid
 
     prod = {o: n for n in g.node for o in n.output}

@@ -185,6 +185,21 @@ def test_attention_gqa_mask_scale():
     close(y, attn_ref(q, k, v, 0.3, mask), 1e-4)
 
 
+def test_attention_with_unknown_head_count_reads_it_from_q():
+    """num_heads = -1 (Q's head axis dynamic at conversion, Qwen3.5): the
+    repeat factor comes from the runtime shapes."""
+    B, H, Hkv, S, KV, D = 1, 4, 2, 3, 5, 8
+    q, k, v = rnd(B, H, S, D), rnd(B, Hkv, KV, D), rnd(B, Hkv, KV, D)
+    dag = make_dag([Node("Attention", "a",
+                         {"num_heads": -1, "num_kv_heads": Hkv, "causal": 0},
+                         [td("q", [-1, -1, -1, D]), td("k", [-1, Hkv, -1, D]),
+                          td("v", [-1, Hkv, -1, D])], [td("y", [-1, -1, -1, D])])],
+                   [td(n, a.shape) for n, a in (("q", q), ("k", k), ("v", v))],
+                   [td("y", q.shape)])
+    y = run_lowered(dag, {"q": q, "k": k, "v": v})["y"]
+    close(y, attn_ref(q, k, v, 1.0), 1e-4)
+
+
 def test_attention_causal():
     B, H, S, KV, D = 1, 2, 3, 6, 4
     q, k, v = rnd(B, H, S, D), rnd(B, H, KV, D), rnd(B, H, KV, D)
@@ -387,11 +402,81 @@ def test_unknown_semantic_attribute_is_refused():
 
 
 def test_ops_without_ort_counterpart_are_refused():
-    dag = make_dag([Node("LinearAttention", "la", {},
+    dag = make_dag([Node("EmbeddingForward", "e", {},
                          [td("a", [2])], [td("y", [2])])],
                    [td("a", [2])], [td("y", [2])])
-    with pytest.raises(LoweringError, match="LinearAttention"):
+    with pytest.raises(LoweringError, match="EmbeddingForward"):
         lower_dag(dag)
+
+
+@pytest.mark.parametrize("rank3", [False, True])
+def test_conv1d_reads_the_state_as_history(rank3):
+    C, S, K = 6, 5, 4
+    x, w, st = rnd(C, S), rnd(C, K), rnd(C, K - 1)
+    xs = [C, S] if rank3 else [1, C, S]
+    dag = make_dag([Node("Conv1d", "cv", {"kernel": K},
+                         [td("x", xs), td("w", [C, K]), td("st", [C, K - 1])],
+                         [td("y", xs), td("st_out", [C, K - 1])])],
+                   [td("x", xs), td("st", [C, K - 1])],
+                   [td("y", xs), td("st_out", [C, K - 1])], {"w": w})
+    r = run_lowered(dag, {"x": x.reshape(xs), "st": st})
+    hist = np.concatenate([st, x], 1)
+    ref = np.stack([(hist[:, t:t + K] * w).sum(1) for t in range(S)], 1)
+    close(r["y"].reshape(C, S), ref)
+    close(r["st_out"], hist[:, -(K - 1):])
+
+
+def gated_delta_ref(q, k, v, g, beta, state):
+    """ops/LinearAttention.hpp's recurrence; q/k [S,Hk,Dk], v [S,H,Dv],
+    g/beta [S,H], state [H,Dk,Dv]."""
+    l2 = lambda t: t / np.sqrt((t * t).sum(-1, keepdims=True) + 1e-6)
+    rep = v.shape[1] // q.shape[1]
+    qn = np.repeat(l2(q) / np.sqrt(q.shape[-1]), rep, 1)
+    kn = np.repeat(l2(k), rep, 1)
+    st = state.astype(np.float64).copy()
+    outs = []
+    for t in range(q.shape[0]):
+        st = st * np.exp(g[t])[:, None, None]
+        kv = (st * kn[t][:, :, None]).sum(1)
+        delta = (v[t] - kv) * beta[t][:, None]
+        st = st + kn[t][:, :, None] * delta[:, None, :]
+        outs.append((st * qn[t][:, :, None]).sum(1))
+    return np.stack(outs), st
+
+
+@pytest.mark.parametrize("rank4", [True, False])
+def test_linear_attention_scan_matches_the_recurrence(rank4):
+    S, Hk, H, Dk, Dv = 5, 2, 4, 8, 6
+    q, k, v = rnd(S, Hk, Dk), rnd(S, Hk, Dk), rnd(S, H, Dv)
+    g = -np.abs(rnd(S, H)) * 0.3
+    beta = 1 / (1 + np.exp(-rnd(S, H)))
+    st = rnd(H, Dk, Dv) * 0.1
+    if rank4:
+        feeds = {"q": q[None], "k": k[None], "v": v[None], "g": g[None],
+                 "b": beta[None], "st": st[None]}
+        shapes = {"q": [1, S, Hk, Dk], "k": [1, S, Hk, Dk], "v": [1, S, H, Dv],
+                  "g": [1, S, H], "b": [1, S, H], "st": [1, H, Dk, Dv]}
+        out_shape = [1, S, H, Dv]
+    else:
+        feeds = {"q": q.transpose(1, 0, 2), "k": k.transpose(1, 0, 2),
+                 "v": v.transpose(1, 0, 2), "g": g.T.copy(), "b": beta.T.copy(),
+                 "st": st}
+        shapes = {"q": [Hk, S, Dk], "k": [Hk, S, Dk], "v": [H, S, Dv],
+                  "g": [H, S], "b": [H, S], "st": [H, Dk, Dv]}
+        out_shape = [H, S, Dv]
+    feeds = {n: np.ascontiguousarray(a, np.float32) for n, a in feeds.items()}
+    names = ["q", "k", "v", "g", "b", "st"]
+    dag = make_dag([Node("LinearAttention", "la",
+                         {"heads": H, "dk": Dk, "dv": Dv},
+                         [td(n, shapes[n]) for n in names],
+                         [td("o", out_shape), td("st_out", shapes["st"])])],
+                   [td(n, shapes[n]) for n in names],
+                   [td("o", out_shape), td("st_out", shapes["st"])])
+    r = run_lowered(dag, feeds)
+    ref_o, ref_st = gated_delta_ref(q, k, v, g, beta, st)
+    o = r["o"][0] if rank4 else r["o"].transpose(1, 0, 2)
+    close(o, ref_o, 1e-4)
+    close(r["st_out"].reshape(H, Dk, Dv), ref_st, 1e-4)
 
 
 # ---------------------------------------------------- end to end (fusion)
