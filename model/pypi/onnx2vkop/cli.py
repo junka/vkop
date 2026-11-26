@@ -520,6 +520,23 @@ Examples:
              "accuracy budget is the user's. See onnx2vkop/numeric_audit.py.",
     )
 
+    parser.add_argument(
+        "--emit-ort-onnx", metavar="PATH", default=None,
+        help="Also write the fused graph, lowered back to standard ONNX, to "
+             "PATH (see onnx2vkop/ort_lower.py). Every vkop node output keeps "
+             "its tensor name and is a graph output, so ONNX Runtime gives a "
+             "per-node reference for the converted graph: compare it with the "
+             "source ONNX to check the fusion passes, or with a vkop node dump "
+             "to check the kernels. Taken right after fusion, before the FP16 "
+             "domain and weight quantization. Forces --stream-weights off.",
+    )
+    parser.add_argument(
+        "--ort-keep-dtype", action="store_true",
+        help="With --emit-ort-onnx: keep the export's float widths instead of "
+             "computing everything in fp32 (the default, and the better "
+             "reference: ORT's CPU EP lacks fp16 kernels for many ops).",
+    )
+
     return parser.parse_args()
 
 
@@ -600,6 +617,11 @@ def main():
                  "weight contract covers plain MatMul/Gemm B and Gather table "
                  "initializers only).")
     _force_payloads_for_exclusion(args)
+    if args.emit_ort_onnx and args.stream_weights != "off":
+        # The lowered graph needs every weight's bytes; a streamed one never
+        # enters RAM.
+        args.stream_weights = "off"
+        print("[ort] --emit-ort-onnx: --stream-weights off", file=sys.stderr)
     _apply_build_knobs(args)
 
     # Validate input file
@@ -638,7 +660,7 @@ def main():
             def __init__(self, quant, unify, rgba, group_size, awq_format,
                          awq_stats, awq_alpha, awq_grid, exclude_nodes,
                          exclude_scopes, exclude_downstream_of, w8a8,
-                         keep_bf16):
+                         keep_bf16, emit_ort_onnx, ort_keep_dtype):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
@@ -652,6 +674,8 @@ def main():
                 self.exclude_downstream_of = exclude_downstream_of
                 self.w8a8 = w8a8
                 self.keep_bf16 = keep_bf16
+                self.emit_ort_onnx = emit_ort_onnx
+                self.ort_keep_dtype = ort_keep_dtype
 
         converter.apply_optimizations(
             dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
@@ -659,7 +683,8 @@ def main():
                             args.awq_grid, args.exclude_nodes,
                             args.exclude_scopes,
                             args.exclude_downstream_of, args.w8a8,
-                            args.keep_bf16))
+                            args.keep_bf16, args.emit_ort_onnx,
+                            args.ort_keep_dtype))
 
         # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can
         # neither create nor remove them: the extra census is set after the

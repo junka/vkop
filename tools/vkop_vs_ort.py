@@ -60,6 +60,7 @@ reported with the fix rather than as a traceback.
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -162,15 +163,24 @@ def read_output(outdir: Path, row):
     return np.frombuffer(raw, dtype=dt).reshape(row["dims"])
 
 
-def run_vkopbench(bench, vkopbin, inputs_dir, out_dir, args):
-    """Exactly one Run(), then its outputs dumped. Returns the manifest rows."""
-    cmd = [str(bench), str(vkopbin), "--load-inputs", str(inputs_dir),
-           "--save-outputs", str(out_dir), "--iters", "1", "--warmup", "0",
-           "--precision", args.precision, "--backend", args.backend]
+def run_vkopbench(bench, vkopbin, inputs_dir, out_dir, args, node_dump_cwd=None):
+    """Exactly one Run(), then its outputs dumped. Returns the manifest rows.
+
+    With `node_dump_cwd`, the run also writes every node's output
+    (VKOP_NODE_DUMP) into `<node_dump_cwd>/node_dump/`."""
+    cmd = [str(Path(bench).resolve()), str(Path(vkopbin).resolve()),
+           "--load-inputs", str(Path(inputs_dir).resolve()),
+           "--save-outputs", str(Path(out_dir).resolve()), "--iters", "1",
+           "--warmup", "0", "--precision", args.precision,
+           "--backend", args.backend]
     for shape in args.shape or []:
         cmd += ["--shape", shape]
     out_dir.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    env = None
+    if node_dump_cwd is not None:
+        env = dict(os.environ, VKOP_NODE_DUMP="1")
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                          cwd=str(node_dump_cwd) if node_dump_cwd else None)
     if args.verbose:
         sys.stdout.write(proc.stdout)
         sys.stderr.write(proc.stderr)
@@ -436,6 +446,104 @@ def find_bench(explicit):
                     "or pass --bench")
 
 
+# ------------------------------------------------------------ per-node dump
+
+NODE_OUTPUTS_KEY = "vkop_node_outputs"   # onnx2vkop.ort_lower.NODE_OUTPUTS_KEY
+_DUMP_RE = re.compile(r"^(\d+)_lvl\d+_n\d+_(.+)_out(\d+)\.raw$")
+
+
+def node_output_map(onnx_path: Path):
+    """{vkop node name: [output tensor names]} from a graph written by
+    `onnx2vkop --emit-ort-onnx`, or None for any other ONNX file."""
+    import json
+
+    import onnx
+    m = onnx.load(str(onnx_path), load_external_data=False)
+    for p in m.metadata_props:
+        if p.key == NODE_OUTPUTS_KEY:
+            return json.loads(p.value)
+    return None
+
+
+def read_node_dumps(dump_dir: Path):
+    """{(sanitized node name, k): (seq, path)}, first occurrence per key (a
+    decode loop dumps every round; the first is the run that was fed)."""
+    found = {}
+    for f in dump_dir.glob("*.raw"):
+        m = _DUMP_RE.match(f.name)
+        if m:
+            key = (m.group(2), int(m.group(3)))
+            seq = int(m.group(1))
+            if key not in found or seq < found[key][0]:
+                found[key] = (seq, f)
+    return found
+
+
+def decode_dump(path: Path, ref: np.ndarray):
+    """The dump's bytes as an array of ref's shape. The runtime writes fp32,
+    fp16 or int64 with no header, so the width is read off the byte count."""
+    raw = path.read_bytes()
+    n = ref.size
+    for dt in (np.float32, np.float16, np.int64):
+        if n and len(raw) == n * np.dtype(dt).itemsize:
+            got = np.frombuffer(raw, dtype=dt).reshape(ref.shape)
+            if np.issubdtype(ref.dtype, np.inexact):
+                got = got.astype(np.float32)
+            return got, np.dtype(dt).name
+    return None, f"{len(raw)} bytes for {n} elements"
+
+
+def report_nodes(node_map, dumps, refs, args):
+    """Every dumped node output against its ORT tensor, in execution order.
+    Returns the number of failing tensors."""
+    rows, missing = [], 0
+    for node, outs in node_map.items():
+        key = node.replace("/", "_")
+        for k, tensor in enumerate(outs):
+            hit = dumps.get((key, k))
+            ref = refs.get(tensor)
+            if hit is None or ref is None:
+                missing += hit is not None
+                continue
+            seq, path = hit
+            got, how = decode_dump(path, ref)
+            if got is None:
+                rows.append((seq, node, tensor, None, how))
+                continue
+            rows.append((seq, node, tensor,
+                         compare(ref, got, args.rtol, args.atol, args.cos_min,
+                                 args.bad_frac_max), how))
+    rows.sort(key=lambda r: r[0])
+    print(f"\nper-node outputs ({len(rows)} dumped tensors matched to ORT)")
+    print(f"{'seq':>6} {'tensor':<48} {'dt':<8} {'maxabs':>9} {'relL2':>9} "
+          f"{'cos':>10} {'out%':>8}")
+    failed, first = 0, None
+    for seq, node, tensor, m, how in rows:
+        if m is None:
+            print(f"{seq:>6} {tensor:<48} ! cannot decode the dump ({how})")
+            failed += 1
+            first = first or tensor
+            continue
+        mark = ""
+        if not m["ok"]:
+            failed += 1
+            mark = "  <-- FIRST DIVERGENCE" if first is None else "  FAIL"
+            first = first or tensor
+        if args.verbose or not m["ok"] or mark:
+            print(f"{seq:>6} {tensor[-48:]:<48} {how:<8} "
+                  f"{_cell(m['maxabs'], 9, '.3e')} {_cell(m['rel_l2'], 9, '.3e')} "
+                  f"{_cell(m['cos'], 10, '.6f')} "
+                  f"{_cell(100 * m['bad_frac'], 8, '.4f')}{mark}")
+            for reason in m["reasons"] if mark else []:
+                print(f"{'':>6} {'':<48} ! {reason}")
+    if missing:
+        print(f"({missing} dumped tensor(s) have no ORT counterpart)")
+    print(f"per-node: {len(rows) - failed}/{len(rows)} pass"
+          + (f", first divergence at {first}" if first else "")
+          + ("" if args.verbose else " (passing rows hidden; -v lists them)"))
+    return failed
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -503,6 +611,14 @@ def main():
     ap.add_argument("--work-dir", help="stage/dump directory (default: a temp "
                                        "directory, removed unless --keep)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--node-dump", action="store_true",
+                    help="also compare EVERY node's output: --onnx must be the "
+                         "graph `onnx2vkop --emit-ort-onnx` wrote for this "
+                         ".vkopbin (it keeps the runtime's tensor names and "
+                         "maps node -> tensors); the run sets VKOP_NODE_DUMP "
+                         "and the report names the first node that diverges. "
+                         "Report-only: the exit code still follows the graph "
+                         "outputs.")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="echo vkop-bench's stdout and stderr")
     args = ap.parse_args()
@@ -543,7 +659,17 @@ def run(args):
     try:
         for name, arr in arrays.items():
             np.save(in_dir / f"{name}.npy", arr)
-        rows = run_vkopbench(bench, vkopbin, in_dir, out_dir, args)
+        node_map = None
+        if getattr(args, "node_dump", False):
+            node_map = node_output_map(onnx_path)
+            if node_map is None:
+                raise LoopError(
+                    f"--node-dump: {onnx_path} carries no '{NODE_OUTPUTS_KEY}' "
+                    "metadata; convert with `onnx2vkop --emit-ort-onnx PATH` "
+                    "and pass that PATH as --onnx")
+            shutil.rmtree(work / "node_dump", ignore_errors=True)
+        rows = run_vkopbench(bench, vkopbin, in_dir, out_dir, args,
+                             node_dump_cwd=work if node_map else None)
         refs = ort_reference(sess, arrays)
 
         spec = ", ".join(f"{n} {v.dtype}{list(v.shape)}"
@@ -582,6 +708,9 @@ def run(args):
                   f"(--limit {args.limit})")
         print(f"\nRESULT: {len(shown) - failed}/{len(shown)} shown output(s) "
               f"pass" + ("" if not failed else f", {failed} FAIL"))
+        if node_map is not None:
+            report_nodes(node_map, read_node_dumps(work / "node_dump"), refs,
+                         args)
         print(f"work dir: {work}" + ("" if keep else " (removed)"))
         return 0 if failed == 0 else 1
     finally:

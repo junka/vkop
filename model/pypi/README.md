@@ -50,3 +50,36 @@ Convert twice -- once with the flag, once without -- and run
 `tools/vkop_vs_ort.py` on both artifacts to read which number moved; the two
 runs share the input tensor and the shaders, so the delta belongs to the layer
 the flag named. See the accuracy-loop section of the repository README.
+
+### A per-node ONNX Runtime reference (`--emit-ort-onnx`)
+
+The fused graph speaks vkop's own vocabulary (RMSNorm, FusedElemwise, the
+rotate-half RotaryEmbedding, the vkop Attention, MatMul `swiglu`/`down_act`/
+`epi_*`, Conv `activation`, ...), which no other runtime can execute, and its
+fused nodes have names the source graph never had. `--emit-ort-onnx` writes
+that graph lowered back to standard ONNX (`onnx2vkop/ort_lower.py`): each vkop
+node becomes a plain subgraph whose last node writes the vkop node's own output
+tensor, every such tensor is a graph output, and the `vkop_node_outputs`
+metadata maps node names to them.
+
+```
+onnx2vkop -i model.onnx -o model.vkopbin --master-archive build/vkop_shaders.bin \
+    --emit-ort-onnx model.ort.onnx
+python3 tools/vkop_vs_ort.py model.vkopbin --onnx model.ort.onnx --random-fill --node-dump
+```
+
+`--node-dump` runs vkop-bench once with `VKOP_NODE_DUMP` and compares every
+dumped node output with its ORT tensor in execution order, marking the first
+divergence (report-only; the exit code still follows the graph outputs).
+Comparing the source ONNX with `model.ort.onnx` in ORT, on the tensor names both
+keep, checks the fusion passes themselves without a GPU (tests/test_ort_lower.py
+does this per pass).
+
+The cut is taken right after fusion: before the FP16 domain, weight
+quantization and the weight re-layouts, so the reference is the export's own
+math. Floats are computed in fp32 unless `--ort-keep-dtype` is given. The flag
+forces `--stream-weights off` (the lowering needs the weight bytes), so on a
+large LLM it costs the full model in RAM twice over -- prefer a trimmed or tiny
+model there. Not lowered yet: LinearAttention/GatedDeltaNet, the Qwen3.5
+Conv1d, EmbeddingForward, Nms, and the ring / fp8 KV cache; these raise an
+error naming the node.

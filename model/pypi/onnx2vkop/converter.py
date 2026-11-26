@@ -486,6 +486,11 @@ class ModelConverter:
         # single-file limit. The DAG converter reads model.graph directly
         # from the in-memory object.
         dag_model = DAGBasedModel()
+        # The default-domain opset, for ort_lower: the DAG keeps each node in
+        # its source opset's form (axes as attribute vs input, ...).
+        dag_model.onnx_opset = next(
+            (o.version for o in model.opset_import if o.domain in ("", "ai.onnx")),
+            None)
         dag_model.moe_keep_alive = set(moe_slots)
         dag_model.moe_slots = moe_slots
         dag_model.moe_sources = moe_sources
@@ -1122,6 +1127,23 @@ class ModelConverter:
         self._cleanup_orphan_inputs(dag_model, pre_producer)
 
         dag_model.build_dependencies()
+
+        # The ORT reference graph is cut here: every fusion has run, and
+        # nothing below has touched a weight's value or an activation's width
+        # yet (FP16 domain, quantization, KnWeightLayout, RGBA/unify all
+        # follow). See ort_lower.py.
+        ort_path = getattr(args, "emit_ort_onnx", None)
+        if ort_path:
+            try:
+                from .ort_lower import lower_dag, save_lowered
+            except ImportError:
+                from ort_lower import lower_dag, save_lowered
+            lowered = lower_dag(
+                dag_model, fp32=not getattr(args, "ort_keep_dtype", False))
+            save_lowered(lowered, ort_path)
+            print(f"[ort] wrote {ort_path}: {len(lowered.graph.node)} nodes, "
+                  f"{len(lowered.graph.output)} outputs")
+            del lowered
 
         # A graph from outside can arrive with its Linear weights already on a
         # quantization grid (DequantizeLinear over a payload initializer). Fold
