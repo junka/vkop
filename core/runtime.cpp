@@ -59,7 +59,7 @@ bool bf16_consumer_ok(ops::OpType type, size_t input_index) {
 //
 // This is the ACTIVATION-side query and is orthogonal to bf16_consumer_ok
 // above, which whitelists the weight slots that decode bf16 bytes. A graph may
-// carry bf16 activations (--half-precision bf16) whose every half-width op has
+// carry bf16 activations (--act bf16) whose every half-width op has
 // a _bf16 build; LoadModel's consumer check is what still refuses a bf16
 // WEIGHT reaching a kernel that would read it as fp16.
 int half_width_kind(const ITensor *t) {
@@ -80,7 +80,7 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     //    storage is bf16 but it is not the activation width, so the build
     //    follows the OUTPUT's dtype: an fp16/fp32 build that decodes the
     //    table itself (gather.comp's -DBF16_TABLE, para_.bf16).
-    //  * as an ACTIVATION (--half-precision bf16). Then the output is bf16
+    //  * as an ACTIVATION (--act bf16). Then the output is bf16
     //    too, and the build is the _bf16 module (2).
     //
     // half_width_kind(output) says both: 1/0 for the weight role exactly as

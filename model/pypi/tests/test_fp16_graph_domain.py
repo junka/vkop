@@ -517,7 +517,7 @@ def test_a_variance_chain_behind_an_fp32_cast_gets_no_second_cast():
 
 # ------------------------------------------------------- bf16 as the half --
 def test_bf16_writes_a_bfloat16_domain():
-    """--half-precision bf16 writes BFLOAT16 declarations instead of FLOAT16.
+    """--act bf16 writes BFLOAT16 declarations instead of FLOAT16.
 
     Same storage width, packing and arithmetic as fp16; 8 exponent bits instead
     of 5. That is what a graph whose activations exceed fp16's 65504 needs, and

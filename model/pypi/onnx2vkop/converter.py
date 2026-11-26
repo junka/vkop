@@ -131,6 +131,72 @@ def _declared_widths_backend(args) -> str:
     return "image" if backend == "image" else "buffer"
 
 
+# Activation dtypes (--act). The two precision axes are independent knobs:
+#   -q     WEIGHT format: how initializer payloads are stored (fp16, bf16,
+#          int8, fp8*, int4, nf4, nvfp4, awq; fp32 = keep the export's bytes).
+#   --act  ACTIVATION dtype: the width the domain pass (fp16_graph.py)
+#          declares every half-capable tensor at. fp32 = keep the export's
+#          declarations and skip the pass.
+# A new activation format goes here first, then into fp16_graph.GraphFp16
+# (its element type and range rules) and shader_map (its shader suffix).
+ACTIVATION_DTYPES = ("fp16", "bf16", "fp32")
+
+# Weight formats whose kernels have run with an fp32 activation domain. That
+# was the only domain for weight-only formats before the FP16 domain became
+# the default (2ebbbae). -q bf16 and -q fp16 never had one.
+_FP32_ACT_WEIGHT_FORMATS = ("fp32", "int8", "fp8e4m3", "fp8e5m2", "int4",
+                            "nf4", "nvfp4", "awq")
+
+
+def resolve_precision(quant, act=None, legacy_half=None):
+    """Settle (-q, --act) into one consistent pair, or raise ValueError.
+
+    `legacy_half` is the deprecated --half-precision spelling of --act.
+    Defaults keep every existing command line meaning what it meant:
+    no --act gives fp16, except -q fp32, which has always also meant "keep
+    the export's activation widths". --act fp32 without -q keeps the weights
+    too, i.e. it is -q fp32.
+    """
+    if legacy_half is not None:
+        if act is not None and act != legacy_half:
+            raise ValueError(
+                f"--half-precision {legacy_half} contradicts --act {act}; "
+                f"--half-precision is a deprecated spelling of --act")
+        act = legacy_half
+    if act is None:
+        act = "fp32" if quant == "fp32" else "fp16"
+    if act not in ACTIVATION_DTYPES:
+        raise ValueError(f"--act {act!r}: expected one of {ACTIVATION_DTYPES}")
+    if act == "fp32":
+        if quant is None:
+            quant = "fp32"
+        elif quant not in _FP32_ACT_WEIGHT_FORMATS:
+            raise ValueError(
+                f"-q {quant} --act fp32: -q {quant} has no fp32-activation "
+                f"build (it IS a half-width artifact). Use --act fp16/bf16, "
+                f"or -q fp32 to keep the export's widths")
+    elif quant == "fp32":
+        raise ValueError(
+            f"-q fp32 --act {act}: -q fp32 keeps the export's bytes, and a "
+            f"half activation domain rewrites the weights it covers. Drop -q "
+            f"(weights follow the activation width) or pick a weight format")
+    return quant, act
+
+
+def activation_dtype(args) -> str:
+    """The activation dtype an args object asks for.
+
+    Reads --act when the caller resolved it; otherwise derives it the way
+    resolve_precision would, so programmatic callers that only set `quant`
+    (and maybe the legacy `half_precision`) keep their old meaning.
+    """
+    act = getattr(args, "act", None)
+    if act is not None:
+        return act
+    if getattr(args, "quant", None) == "fp32":
+        return "fp32"
+    return getattr(args, "half_precision", None) or "fp16"
+
 class UnsupportedOpError(RuntimeError):
     """A graph contains an op_type the runtime cannot execute.
 
@@ -1190,12 +1256,15 @@ class ModelConverter:
         # ~60 GB at the real 1024-row geometry, of which half was pure width.
         #
         # So the domain pass runs for every float weight format; only an
-        # explicit request to keep the export's width (-q fp32) skips it. A
+        # explicit request to keep the export's width (--act fp32, which
+        # -q fp32 implies) skips it. The activation width is its own knob
+        # (activation_dtype / resolve_precision), not a -q value. A
         # REFUSED pass is reported and the conversion continues: for a
         # weight-only format, leaving the graph at its exported width is the
         # artifact the user already had. -q fp16 turns the refusal into an
         # error below, because there the flip IS the request.
-        want_fp16_domain = args.quant != "fp32"
+        act = activation_dtype(args)
+        want_fp16_domain = act != "fp32"
         bf16_only = None
         fp16_summary = {"converted": 0, "declared": 0, "skipped_backend": False,
                         "refused": False, "out_of_range": [], "domain": set(),
@@ -1223,10 +1292,10 @@ class ModelConverter:
             fp16_summary = GraphFp16.apply(
                 dag_model, _declared_widths_backend(args),
                 skip_weights=skip,
-                half=getattr(args, "half_precision", "fp16"))
-        elif (args.quant == "fp32"
+                half=act)
+        elif (act == "fp32"
               and _declared_widths_backend(args) == "buffer"):
-            # -q fp32 keeps the export's widths, so a node the export already
+            # --act fp32 keeps the export's widths, so a node the export already
             # declares with FP16 and FP32 operands side by side reaches the
             # runtime as-is -- and runs one shader picked from its data input
             # over both. Measured on a ModelOpt NVFP4 export (Cast(to=fp16) on
@@ -1238,11 +1307,11 @@ class ModelConverter:
                 for line in conflicts[:10]:
                     print(f"[fp32-widths]   {line}", file=sys.stderr)
                 raise RuntimeError(
-                    f"onnx2vkop: -q fp32 keeps the export's widths, and "
+                    f"onnx2vkop: --act fp32 / -q fp32 keeps the export's widths, and "
                     f"{len(conflicts)} node(s) declare FP16 and FP32 operands "
                     f"in one op, which the runtime cannot execute (one shader "
                     f"per node, picked from the data input's dtype). First: "
-                    f"{conflicts[0]}. Convert without -q fp32 (the FP16 domain "
+                    f"{conflicts[0]}. Convert with --act fp16/bf16 (the half domain "
                     f"pass reconciles the widths) or fix the export's dtype "
                     f"coherence.")
 
@@ -1281,7 +1350,7 @@ class ModelConverter:
                     "name the nodes; the usual cause is an activation chain "
                     "traced in one width while its inputs or weights are "
                     "declared in the other, so fix the export's dtype "
-                    "coherence (or convert -q fp32) rather than forcing it.")
+                    "coherence (or convert --act fp32) rather than forcing it.")
             # Then the weight pass, for what the domain pass cannot own: an
             # export that already declares FP16 activations but ships its
             # weights FP32. On a graph the domain pass just flipped it finds

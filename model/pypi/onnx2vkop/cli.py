@@ -17,11 +17,11 @@ if _osp.isdir(_TOOLS) and _TOOLS not in sys.path:
     sys.path.append(_TOOLS)
 
 try:
-    from .converter import ModelConverter
+    from .converter import ModelConverter, resolve_precision
     from . import shader_map
     from . import weight_stream
 except ImportError:
-    from converter import ModelConverter
+    from converter import ModelConverter, resolve_precision
     import shader_map
     import weight_stream
 
@@ -259,8 +259,12 @@ Examples:
   # Basic conversion
   onnx2vkop -i model.onnx
 
-  # With quantization
+  # Two independent precision knobs:
+  #   -q    weight format       --act  activation dtype (default fp16)
   onnx2vkop -i model.onnx -q fp16
+  onnx2vkop -i model.onnx -q int4 --act bf16     # int4 weights, bf16 activations
+  onnx2vkop -i model.onnx -q int8 --act fp32     # weight-only, export's fp32 activations
+  onnx2vkop -i model.onnx --act fp32             # keep the export's widths (= -q fp32)
   onnx2vkop -i model.onnx -q int8
   onnx2vkop -i model.onnx -q fp8e4m3
   onnx2vkop -i model.onnx -q int4 --group-size 64
@@ -286,25 +290,25 @@ Examples:
     parser.add_argument(
         "-q", "--quant", choices=["fp32", "fp16", "bf16", "int8", "fp8e4m3",
                                   "fp8e5m2", "int4", "nf4", "nvfp4", "awq"],
-        help="Quantization type: fp32 (keep the export's activation width; "
-             "every other format defaults its activations to an FP16 domain, "
-             "see onnx2vkop/fp16_graph.py), fp16 (an FP16 artifact: the FP16 "
-             "domain "
-             "pass rewrites the activations' declarations and the weights' "
-             "bytes together, and an op whose shader build does not follow "
-             "the tensor dtype stays FP32 along with every tensor it "
-             "touches; see onnx2vkop/fp16_graph.py), int8 (per-column "
+        help="WEIGHT format, i.e. how initializer payloads are stored. The "
+             "activation dtype is --act, a separate knob. fp32 (keep the "
+             "export's weight bytes; implies --act fp32), fp16 (an FP16 "
+             "artifact: weights follow the activation domain, and an op "
+             "whose shader build does not follow the tensor dtype stays FP32 "
+             "along with every tensor it touches; a refused domain pass is "
+             "an error; see onnx2vkop/fp16_graph.py), int8 (per-column "
              "scale), an fp8 "
              "weight-only MatMul payload with a per-column scale (e4m3 or e5m2, "
              "one byte per value), a 4-bit weight-only MatMul payload with a "
              "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index, "
              "nvfp4 = E2M1 nibble with an fp8 e4m3 scale per 16 values plus a "
-             "per-tensor fp32 factor), bf16 (FP16 activation domain; every "
+             "per-tensor fp32 factor), bf16 (every "
              "float MatMul/Gemm B weight and Gather table becomes bfloat16, "
              "rounded to nearest even -- a bf16 source keeps its exact bits; "
              "no scale tensor; implies --keep-bf16), or awq (activation-aware "
              "rescaling in "
-             "front of the format named by --awq-format). Every byte format "
+             "front of the format named by --awq-format). Without -q the "
+             "float weights follow --act. Every byte format "
              "here, awq and bf16 included, skips the weights named by "
              "--exclude-node / "
              "--exclude-scope / --exclude-downstream-of; fp16 does not, see "
@@ -395,16 +399,24 @@ Examples:
              "buffer/image only shrinks the file.",
     )
     parser.add_argument(
-        "--half-precision", choices=["fp16", "bf16"], default="fp16",
-        help="Which 16-bit float the FP16 domain writes (see fp16_graph.py). "
-             "fp16 is the default: 5 exponent bits, 11 significand bits. bf16 "
-             "has 8 exponent bits and 7 significand bits -- fp32's RANGE with "
-             "less precision -- for a model whose activations legitimately "
-             "exceed fp16's 65504: MiniMax-H3's hidden states reach ~4200 and a "
+        "--act", choices=["fp16", "bf16", "fp32"], default=None,
+        help="ACTIVATION dtype: the width the half-domain pass "
+             "(fp16_graph.py) declares every half-capable tensor at; ops that "
+             "must stay wide keep FP32 behind a Cast. Independent of -q. "
+             "fp16 (default; 5 exponent bits, 11 significand bits), bf16 (8 "
+             "exponent bits, 7 significand bits -- fp32's RANGE with less "
+             "precision -- for a model whose activations legitimately exceed "
+             "fp16's 65504: MiniMax-H3's hidden states reach ~4200 and a "
              "14336-wide FFN accumulation crosses the ceiling, which poisons "
-             "the graph with Inf/NaN. Both use the same storage, packing, "
-             "dispatch geometry and 32-bit arithmetic, so this only changes "
-             "which shader module the ops resolve to (<key>_bf16).",
+             "the graph with Inf/NaN; same storage, packing, dispatch and "
+             "32-bit arithmetic as fp16, only the shader module differs, "
+             "<key>_bf16), or fp32 (skip the pass and keep the export's "
+             "declarations; the default under -q fp32, and allowed beside "
+             "the weight-only formats int8/fp8/int4/nf4/nvfp4/awq).",
+    )
+    parser.add_argument(
+        "--half-precision", choices=["fp16", "bf16"], default=None,
+        dest="half_precision", help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--extra-shaders", metavar="A,B,C", default=None,
@@ -623,6 +635,17 @@ def _force_payloads_for_exclusion(args) -> None:
 def main():
     """Main entry point for the CLI."""
     args = parse_args()
+    if args.half_precision is not None:
+        print("[precision] --half-precision is deprecated; it is --act "
+              f"{args.half_precision} (the activation dtype, independent of "
+              "-q)", file=sys.stderr)
+    try:
+        args.quant, args.act = resolve_precision(
+            args.quant, args.act, args.half_precision)
+    except ValueError as e:
+        sys.exit(f"Error: {e}")
+    print(f"[precision] weights: {args.quant or 'follow --act'}, "
+          f"activations: {args.act}")
     if (args.keep_bf16 or args.quant == "bf16") and (args.unify or args.rgba):
         sys.exit("Error: --keep-bf16 / -q bf16 cannot be combined with "
                  "--unify or --rgba (both repack weight payloads; the bf16 "
@@ -673,7 +696,7 @@ def main():
                          awq_stats, awq_alpha, awq_grid, exclude_nodes,
                          exclude_scopes, exclude_downstream_of, w8a8,
                          keep_bf16, emit_ort_onnx, ort_keep_dtype,
-                         half_precision="fp16", target_backend="auto"):
+                         act="fp16", target_backend="auto"):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
@@ -694,7 +717,7 @@ def main():
                 # plain attributes read with getattr() downstream; a knob that
                 # is NOT forwarded here silently takes its default, which is
                 # how --half-precision bf16 produced a float16 artifact.
-                self.half_precision = half_precision
+                self.act = act
                 self.target_backend = target_backend
 
         converter.apply_optimizations(
@@ -705,7 +728,7 @@ def main():
                             args.exclude_downstream_of, args.w8a8,
                             args.keep_bf16, args.emit_ort_onnx,
                             args.ort_keep_dtype,
-                            getattr(args, "half_precision", "fp16"),
+                            args.act,
                             getattr(args, "target_backend", "auto")))
 
         # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can

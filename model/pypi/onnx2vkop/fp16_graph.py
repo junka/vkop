@@ -414,7 +414,7 @@ class GraphFp16:
                 stack.extend(i.get("name") for i in src.inputs)
             if not ok or not cone:
                 continue
-            # (Not reached under --half-precision bf16: the caller skips this
+            # (Not reached under --act bf16: the caller skips this
             # rule there, because bf16's 8 exponent bits hold any phase.)
             force(cone, f"phase of {node.op_type} '{node.name}': fp16 cannot "
                         "hold t*freq")
@@ -487,7 +487,7 @@ class GraphFp16:
             node.inputs[0]["name"] = wide
             node.inputs[0]["dtype"] = _FLOAT
             # The Cast's input must be declared at the graph's own half width
-            # so the boundary is real -- bf16 under --half-precision bf16.
+            # so the boundary is real -- bf16 under --act bf16.
             # Writing FLOAT16 here unconditionally gave one tensor two
             # declarations (the producer said bfloat16, this Cast said
             # float16), and the loader took the Cast's side: measured as an Add
@@ -721,7 +721,7 @@ class GraphFp16:
 
         if verbose:
             # The tag says the DOMAIN pass, not the width: under
-            # --half-precision bf16 the tensors are BFLOAT16 and a "FP16
+            # --act bf16 the tensors are BFLOAT16 and a "FP16
             # domain" line reads as if the flag had been ignored (it did
             # exactly that in a debugging session). Report the actual target.
             print(f"[half-domain:{half}] {len(plan['domain'])} tensor(s) half, "

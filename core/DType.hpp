@@ -257,7 +257,7 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     // bfloat16: weights are read natively by the buffer MatMul/Gemm kernels
     // (B) and by Gather (the table), on uint16_t storage with elem_kind
     // recording the encoding; any other WEIGHT consumer is refused at
-    // LoadModel. As an activation format (--half-precision bf16) it rides the
+    // LoadModel. As an activation format (--act bf16) it rides the
     // fp16 kernels: same two-per-word storage, same dispatch geometry, same
     // 32-bit arithmetic, with the BF16 build of each shader unpacking the
     // other bit layout (see the BF16 block in
@@ -314,7 +314,7 @@ void require_float_elem(ElemKind kind, const char *op, const char *what);
 //     layout (MatMul/Gemm B via para_.bf16, Gather's table via -DBF16_TABLE),
 //     and the ops gate it before this query, so answering true here would let
 //     e.g. the SwiGLU fold accept a bf16 B that has no such read;
-//   * as an ACTIVATION (--half-precision bf16) the shader must be the _bf16
+//   * as an ACTIVATION (--act bf16) the shader must be the _bf16
 //     build, which is not something this predicate can see.
 // A kernel handed a bf16 tensor it cannot decode should fail closed, so the
 // answer that keeps it out of the generic path is false.
