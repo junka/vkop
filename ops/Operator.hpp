@@ -510,6 +510,9 @@ class Operator {
     virtual void enable_trace() { trace_ = true; }
     virtual void disable_trace() { trace_ = false; }
 
+    // Only call after the GPU has completed this operator's commands.
+    virtual void release_completed_bindings() { objs_.clear(); }
+
     virtual void set_name(const std::string &name) { name_ = name; }
     virtual std::string get_name() const { return name_; }
 

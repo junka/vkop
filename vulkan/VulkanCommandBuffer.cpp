@@ -49,6 +49,16 @@ void VulkanCommandBuffer::pipelineBarrier() {
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+void VulkanCommandBuffer::fullMemoryBarrier() {
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(m_commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+}
+
 void VulkanCommandBuffer::execute_commands(
     const std::vector<VkCommandBuffer> &secondaries) {
     if (secondaries.empty())

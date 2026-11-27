@@ -1431,6 +1431,9 @@ foreach(check ArenaSeamPagingCheck WeightPagerCheck WeightPagerModelCheck
     target_link_libraries(${check} PRIVATE vkop vload)
 endforeach()
 
+add_executable(ActivationReuseCheck EXCLUDE_FROM_ALL tests/ActivationReuseCheck.cpp)
+target_link_libraries(ActivationReuseCheck PRIVATE vkop vload)
+
 # LLM conversational driver (Qwen3-VL, buffer backend). Text in → text out.
 # Links vkop + vload (graph runtime + model loader) and the standalone Qwen
 # tokenizer (BBPE encode/decode + chat template). The tokenizer ships its own

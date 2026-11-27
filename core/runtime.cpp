@@ -2804,6 +2804,42 @@ int Runtime::compute_live_levels() {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
+    const char *reuse_env = std::getenv("VKOP_ACTIVATION_REUSE");
+    const bool explicit_reuse = reuse_env && reuse_env[0] == '1';
+    const auto enabled = [](const char *name) {
+        const char *value = std::getenv(name);
+        return value && value[0] != '\0' && value[0] != '0';
+    };
+    const char *reuse_level_stat = std::getenv("VKOP_LEVEL_STAT");
+    const bool reuse_compatible =
+        backend_buffer_ && !replay_mode_ && !enabled("VKOP_REPLAY") &&
+        !enabled("VKOP_SEGMENT_REPLAY") && !enabled("VKOP_NAN_SCAN") &&
+        !enabled("VKOP_LEVEL_STAT") &&
+        !(reuse_level_stat && std::strchr(reuse_level_stat, ',')) &&
+        dump_matches_.empty() && !enabled("VKOP_DUMP_NODE") &&
+        !std::getenv("VKOP_NODE_DUMP") && !level_hook_;
+    if (explicit_reuse && !reuse_compatible) {
+        throw std::runtime_error(
+            "VKOP_ACTIVATION_REUSE requires the buffer backend and "
+            "does not support replay, tensor dumps, level statistics, "
+            "NaN scan, or a level hook");
+    }
+    const bool activation_reuse =
+        reuse_compatible && (!reuse_env || explicit_reuse);
+    if (activation_reuse) {
+        if (!activation_buffer_pool_) {
+            activation_buffer_pool_ = std::make_unique<ActivationBufferPool>();
+        }
+    } else {
+        if (activation_buffer_pool_) {
+            // A subsequent non-graph round must not record into the previous
+            // reuse round's already-submitted shared command buffer.
+            for (auto &op : node_ops_) op->set_graph_cmd(nullptr);
+        }
+        activation_buffer_pool_.reset();
+    }
+    ActivationBufferPool::Scope reuse_scope(
+        activation_reuse ? activation_buffer_pool_.get() : nullptr);
     // Ops build some pipelines lazily on the first dispatch of a shape (the
     // decode-shape re-create after a prefill, Matmul's coop/pack variants), so
     // that compilation has to stay separable from the load-phase one.
@@ -2834,6 +2870,59 @@ double Runtime::Run() {
     // hole would shift every later ordinal, and the consequence is the
     // corruption documented in the segment-split block below.
     const size_t n_levels = live_levels_;
+    std::vector<std::vector<std::shared_ptr<ITensor>>> retire_at_level;
+    if (activation_reuse) {
+        struct Lifetime {
+            std::shared_ptr<ITensor> tensor;
+            size_t last_level = 0;
+            size_t producers = 0;
+        };
+        std::unordered_set<const ITensor *> pinned;
+        for (const auto &entry : inputs_) pinned.insert(entry.second.get());
+        for (const auto &entry : initializers_) pinned.insert(entry.second.get());
+        for (const auto &entry : outputs_) pinned.insert(entry.second.get());
+        for (const auto &entry : real_outputs_) pinned.insert(entry.second.get());
+
+        std::unordered_map<const ITensor *, Lifetime> lifetimes;
+        for (size_t li = 0; li < level_node_indices_.size(); ++li) {
+            for (size_t ni : level_node_indices_[li]) {
+                for (const auto &tensor : node_output_tensors_[ni]) {
+                    if (!tensor || pinned.count(tensor.get())) continue;
+                    auto &life = lifetimes[tensor.get()];
+                    life.tensor = tensor;
+                    life.last_level = li;
+                    ++life.producers;
+                }
+            }
+        }
+        for (size_t li = 0; li < level_node_indices_.size(); ++li) {
+            for (size_t ni : level_node_indices_[li]) {
+                for (const auto &tensor : node_input_tensors_[ni]) {
+                    if (!tensor) continue;
+                    auto it = lifetimes.find(tensor.get());
+                    if (it != lifetimes.end()) {
+                        it->second.last_level =
+                            std::max(it->second.last_level, li);
+                    }
+                }
+            }
+        }
+        retire_at_level.resize(n_levels);
+        for (const auto &entry : lifetimes) {
+            const auto &life = entry.second;
+            const auto &tensor = life.tensor;
+            if (life.producers != 1 || life.last_level >= n_levels ||
+                (tensor->dtype() != typeid(float) &&
+                 tensor->dtype() != typeid(uint16_t)) ||
+                tensor->is_read_only_leaf() || tensor->get_prealloc_keep() ||
+                tensor->ref_cnt() == std::numeric_limits<uint16_t>::max() ||
+                tensor->get_host_authoritative() ||
+                tensor->get_host_copy_valid()) {
+                continue;
+            }
+            retire_at_level[life.last_level].push_back(tensor);
+        }
+    }
     // One [dswrite] line per dispatch round, on whichever path Run() returns
     // through: the guard spans the whole round, so its percentages line up with
     // the round time the driver reports. Prints nothing when the gate is off.
@@ -3686,7 +3775,7 @@ double Runtime::Run() {
     // for the final level at the end.
     const char *lsync_env = std::getenv("VKOP_LEVEL_SYNC");
     int level_sync = lsync_env ? std::atoi(lsync_env) : 0;
-    bool per_level_wait = (level_sync == 1);
+    bool per_level_wait = activation_reuse || (level_sync == 1);
     // VKOP_NO_ALIAS_BARRIER=1 drops the anti-aliasing prev-level wait (see
     // below), keeping ONLY true data-dependency waits. The barrier was added
     // as a belt-and-suspenders guard against the outshape_tensor_map buffer-
@@ -3700,7 +3789,8 @@ double Runtime::Run() {
     // gated (default off) because the recycling race is graph-dependent: a
     // graph where a non-data-dependent producer/reader share a recycled
     // buffer would still need it. Enable for the validated LLM decode path.
-    bool no_alias_barrier = std::getenv("VKOP_NO_ALIAS_BARRIER") != nullptr;
+    bool no_alias_barrier = !activation_reuse &&
+                            std::getenv("VKOP_NO_ALIAS_BARRIER") != nullptr;
 
     // VKOP_RUN_PROFILE=1 splits Run() wall time into record (onExecute) vs
     // submit (vkQueueSubmit) vs gpu-wait, printed once per Run() call. Used to
@@ -3777,6 +3867,7 @@ double Runtime::Run() {
         if (batch_levels < 0)
             batch_levels = 0;
     }
+    if (activation_reuse) batch_levels = 0;
     auto flush_batched = [&](std::vector<std::vector<VkSubmitInfo>> &bsis,
                              int nlanes) {
         for (int ci = 0; ci < nlanes; ci++) {
@@ -3835,7 +3926,7 @@ double Runtime::Run() {
     // queue. The per-level path's lane spread is unavailable here, but the
     // level's ops are already recorded in order and the graph's parallelism is
     // intra-level anyway.
-    bool graph_mode = !(gs_env && gs_env[0] == '0');
+    bool graph_mode = activation_reuse || !(gs_env && gs_env[0] == '0');
     if (graph_mode && replay_mode_) {
         // A recording shared with other ops cannot be cached per op, and replay
         // buys nothing here: record is ~18ms/round against the ~324ms of submit
@@ -3896,7 +3987,7 @@ double Runtime::Run() {
     // ONE vkQueueSubmit, which is what graph mode's coarse segments were only
     // achieving by packing levels.
     bool sec_cmd = false;
-    if (graph_mode) {
+    if (graph_mode && !activation_reuse) {
         if (const char *sc = std::getenv("VKOP_SEC_CMD"))
             sec_cmd = sc[0] == '1';
     }
@@ -3988,6 +4079,7 @@ double Runtime::Run() {
         graph_seg->set_replayable(true);  // SIMULTANEOUS_USE, 允许跨轮持久化
         graph_seg->clearWaits();
         graph_seg->begin();
+        if (activation_reuse) graph_seg->fullMemoryBarrier();
         graph_seg_start = level_idx;
         if (std::getenv("VKOP_SEG_TRACE"))
             std::fprintf(stderr, "[seg-open] ord=%zu lvl=%zu\n",
@@ -4501,6 +4593,27 @@ double Runtime::Run() {
             }
         }
     }
+
+    auto finish_reuse_level = [&](size_t level_idx) {
+        for (size_t ni : level_node_indices_[level_idx]) {
+            node_ops_[ni]->release_completed_bindings();
+        }
+        for (const auto &tensor : retire_at_level[level_idx]) {
+            if (tensor->get_prealloc_keep() || tensor->has_shape_ssbo() ||
+                tensor->is_read_only_leaf() ||
+                tensor->get_host_authoritative() ||
+                tensor->get_host_copy_valid() ||
+                tensor->ref_cnt() == std::numeric_limits<uint16_t>::max())
+                continue;
+            auto resource = tensor->gpu_buffer();
+            auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(resource);
+            resource.reset();
+            if (!buffer) continue;
+            tensor->retire_activation_buffer();
+            activation_buffer_pool_->recycle(std::move(buffer));
+        }
+        activation_buffer_pool_->finish_level();
+    };
 
     for (size_t level_idx = 0; level_idx < n_levels;
          level_idx++) {
@@ -5163,6 +5276,19 @@ double Runtime::Run() {
                 n_readback_levels++;
                 level_readback_[level_idx] = true;
             }
+            if (activation_reuse) {
+                auto completed = graph_seg;
+                graph_submit();
+                flush_seg_batch();
+                completed->wait();
+                completed->clearWaits();
+                graph_prev_sem = VK_NULL_HANDLE;
+                finish_reuse_level(level_idx);
+                // Every segment in this level has completed (a readback waits
+                // its preceding segment). Reuse its command buffers instead
+                // of retaining one timeline semaphore for every graph level.
+                graph_next_seg = 0;
+            }
             if (run_profile) {
                 auto sub_t1 = std::chrono::steady_clock::now();
                 prof_submit_ms +=
@@ -5536,6 +5662,10 @@ double Runtime::Run() {
     // the GPU timings so the profiling block sits with the other reports.
     if (weight_prof_) {
         weight_prof_finish_round();
+    }
+
+    if (activation_reuse && std::getenv("VKOP_ACTIVATION_REUSE_STATS")) {
+        activation_buffer_pool_->report();
     }
 
     auto end = std::chrono::steady_clock::now();

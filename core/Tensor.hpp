@@ -11,6 +11,7 @@
 #include "vulkan/VulkanResource.hpp"
 
 #include "core/DType.hpp"
+#include "core/ActivationBufferPool.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -221,6 +222,10 @@ class ITensor {
     virtual int gpu_buffer_view_writer() const { return -1; }
     virtual void set_gpu_buffer_view_writer(int /* node_idx */) {}
     virtual void drop_gpu_buffer() {}
+    void retire_activation_buffer() {
+        drop_gpu_buffer();
+        activation_storage_retired_ = true;
+    }
 
     // ---- GPU-driven shape-meta side-channel accessors (Phase 2-4) ----
     // True when this tensor carries an authoritative GPU-resident shape SSBO
@@ -548,6 +553,7 @@ class ITensor {
     // safe). Without this, make_vkbuff would drop and reallocate the buffer
     // every round because aligned changes as kv_len grows.
     bool prealloc_keep_ = false;
+    bool activation_storage_retired_ = false;
     // data_ is the source of truth for this tensor's lifetime (read-only
     // initializer); copyToCPU skips the GPU->CPU round trip. See setter doc.
     bool host_authoritative_ = false;
@@ -901,6 +907,7 @@ template <typename T> class Tensor : public ITensor {
     alias_storage_buffer(std::shared_ptr<VulkanBuffer> src,
                          const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         vkobj_ = src; // share the same VkBuffer (shared_ptr refcount)
+        activation_storage_retired_ = false;
         // The bytes belong to the producer: this tensor is a read-only view of
         // them. Marking the buffer tells the producer side the same thing, and
         // lets Runtime::Run hand a buffer to the node that actually owns the
@@ -956,6 +963,7 @@ template <typename T> class Tensor : public ITensor {
                 std::make_shared<VulkanBuffer>(src, byte_offset, byte_len);
         }
         vkobj_ = view_range_;
+        activation_storage_retired_ = false;
         src->mark_view_aliased();
         shape_view_stats().buffer_aliases++;
         if (shape_debug_enabled()) {
@@ -1533,6 +1541,11 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void copyToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+        if (activation_storage_retired_ && !vkobj_) {
+            throw std::runtime_error(
+                "vkop: intermediate activation was retired by "
+                "VKOP_ACTIVATION_REUSE and cannot be read after Run");
+        }
         // Host-authoritative tensor (read-only int64/int32 initializer, or a
         // driver-filled graph input): data_ was filled at model-load / by the
         // driver and never overwritten by a GPU write, so the GPU->CPU copy
@@ -1830,7 +1843,12 @@ template <typename T> class Tensor : public ITensor {
             props |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         }
-        vkobj_ = std::make_shared<VulkanBuffer>(vd, aligned, flags, props);
+        if (auto *pool = ActivationBufferPool::active()) {
+            vkobj_ = pool->acquire(vd, aligned, flags, props);
+        } else {
+            vkobj_ = std::make_shared<VulkanBuffer>(vd, aligned, flags, props);
+        }
+        activation_storage_retired_ = false;
     }
     bool upload_in_place_eligible(const std::shared_ptr<VulkanDevice> &vd) {
         static const bool in_place =

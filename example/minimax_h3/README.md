@@ -82,6 +82,32 @@ rasterizer proves nothing about the target.
 Knobs: `--steps`, `--text-tokens`, `--latent-frames`, `--latent-h`,
 `--latent-w`, `--audio-latents`, `--no-audio`, `--save DIR`.
 
+### Experimental activation reuse
+
+By default, compatible buffer-backend runs use a conservative, Runtime-local
+activation buffer pool. Set `VKOP_ACTIVATION_REUSE=0` to disable it.
+The buffer backend records, submits and waits for each execution level before retiring
+dead floating-point intermediates. It uses exact-size buffer matches and keeps
+graph inputs, outputs, weights, KV caches, and shared/view buffers out of the
+pool. MatMul scratch uses separate per-level leases. Set
+`VKOP_ACTIVATION_REUSE_STATS=1` to report allocation and reuse counts.
+
+This mode trades throughput for lower peak memory. The default automatically
+falls back to the normal path for non-buffer backends, replay, level hooks,
+level statistics, NaN scans, or intermediate tensor dumps. Explicitly setting
+`VKOP_ACTIVATION_REUSE=1` instead requires compatibility and fails if any of
+those modes are requested. Retired intermediate tensors remain in the graph,
+but reading their old GPU values after `Run()` is an error.
+Free buffers remain cached until the Runtime is destroyed or the switch is
+disabled for a subsequent run; varying shapes can therefore grow the cache.
+The normal graph-submit path remains unchanged when the switch is off.
+
+The optional `ActivationReuseCheck` build target exercises dynamic shapes,
+branching, aliases and switch transitions. Generate its input with
+`tests/make_activation_reuse_fixture.py` and the build's shader archive.
+On b3, set `VKOP_TEST_SKIP_ATEXIT=1` for this test to bypass the known NVIDIA
+EGL exit-handler crash after the test has already torn down its Runtimes.
+
 ### Split artifacts: `--prelude`
 
 The released canvas does not fit beside the denoiser's full resident set: the

@@ -125,6 +125,8 @@ class VulkanCommandBuffer {
     // pair the graph can produce (shader, transfer via vkCmdCopyBuffer/
     // vkCmdUpdateBuffer, indirect dispatch reads).
     void pipelineBarrier();
+    // Full cross-submission memory dependency for synchronous level reuse.
+    void fullMemoryBarrier();
 
     // Append secondary command buffers to this (primary) recording, in array
     // order. A secondary stays EXECUTABLE after vkEndCommandBuffer AND after

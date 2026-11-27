@@ -388,6 +388,15 @@ class MatMulBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    void release_completed_bindings() override {
+        BufferFactory::release_completed_bindings();
+        if (scratch_is_level_lease_) {
+            scratch_.reset();
+            scratch_bytes_ = 0;
+            scratch_is_level_lease_ = false;
+        }
+    }
+
     // BDA variant: the push constant is already 128 B, so the addresses live
     // in a single table descriptor (see MatMulBdaArgs).
     bool supports_bda_variant() const override { return true; }
@@ -1703,7 +1712,11 @@ class MatMulBuffer : public BufferFactory {
             }
             // Grow-only pool: recreating a GPU buffer on every execute churns
             // allocations when shapes are stable across rounds.
-            if (!scratch_ || scratch_bytes_ < scratch_bytes) {
+            if (auto *pool = core::ActivationBufferPool::active()) {
+                scratch_ = pool->acquire_scratch(m_dev_, scratch_bytes);
+                scratch_bytes_ = scratch_bytes;
+                scratch_is_level_lease_ = true;
+            } else if (!scratch_ || scratch_bytes_ < scratch_bytes) {
                 scratch_ = std::make_shared<VulkanBuffer>(
                     m_dev_, scratch_bytes,
                     STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -4082,6 +4095,7 @@ class MatMulBuffer : public BufferFactory {
 
     matmul::GpuMatMulParam para_;
     std::shared_ptr<VulkanBuffer> scratch_;
+    bool scratch_is_level_lease_ = false;
     // SwiGLU-fold scratch: the split-K GEMV's fp32 partials. One 64x64-word
     // slot per (batch, output tile, K slice).
     std::shared_ptr<VulkanBuffer> scratch_da_;
