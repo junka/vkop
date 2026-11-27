@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <functional>
@@ -936,6 +937,144 @@ TEST(Bf16ActivationTest, AttentionRoutesMatchFp32) {
         LOG_INFO("bf16 Attention %s: route %s (fp16 %s), worst |err| %g", c.why,
                  r.route.c_str(), f16.route.c_str(), worst);
     }
+}
+
+// H3's unfused graph materializes BF16 QK and BF16 softmax; the experimental
+// fold transposes its already-scaled K back and uses online attention instead.
+TEST(Bf16ActivationTest, H3AttentionMatchesUnfusedBf16) {
+    Env e;
+    for (const auto &c : std::vector<std::pair<int, int>>{{56, 1018}, {2, 1019}}) {
+        const int H = c.first, S = c.second, D = 128;
+        const std::vector<int> shape{1, H, S, D};
+        const std::vector<int> kt_shape{1, H, D, S};
+        const std::vector<int> score_shape{1, H, S, S};
+        auto qv = bf16_values(numel(shape), 201);
+        auto kv = bf16_values(numel(shape), 202);
+        auto vv = bf16_values(numel(shape), 203);
+        std::vector<float> ktv(kv.size());
+        for (int h = 0; h < H; ++h)
+            for (int s = 0; s < S; ++s)
+                for (int d = 0; d < D; ++d)
+                    ktv[(static_cast<size_t>(h) * D + d) * S + s] =
+                        kv[(static_cast<size_t>(h) * S + s) * D + d];
+
+        auto q = bf16_in(e, shape, qv);
+        auto kt = bf16_in(e, kt_shape, ktv);
+        auto v = bf16_in(e, shape, vv);
+        auto score = out<uint16_t>(e, score_shape, ElemKind::kBFloat16);
+        auto prob = out<uint16_t>(e, score_shape, ElemKind::kBFloat16);
+        auto baseline = out<uint16_t>(e, shape, ElemKind::kBFloat16);
+        auto qk = make_op(e, OpType::MATMUL, 2);
+        qk->onExecute({q, kt}, {score}, 0);
+        submit(e, qk.get());
+        auto sx = make_op(e, OpType::SOFTMAX, 2, {{"axis", "-1"}});
+        sx->onExecute({score}, {prob}, 0);
+        submit(e, sx.get());
+        auto pv = make_op(e, OpType::MATMUL, 2);
+        pv->onExecute({prob, v}, {baseline}, 0);
+        submit(e, pv.get());
+
+        auto k = out<uint16_t>(e, shape, ElemKind::kBFloat16);
+        auto tp = make_op(e, OpType::TRANSPOSE, 2, {{"perm", "[0, 1, 3, 2]"}});
+        tp->onExecute({kt}, {k}, 0);
+        submit(e, tp.get());
+        auto fused = out<uint16_t>(e, shape, ElemKind::kBFloat16);
+        auto attention = make_op(e, OpType::ATTENTION, 2,
+                                 {{"h3_self_attention", "1"}});
+        attention->onExecute({q, k, v}, {fused}, 0);
+        submit(e, attention.get());
+        EXPECT_EQ(attention->route_tag(), "flash");
+
+        const auto ref = read_bf16(e, baseline);
+        const auto got = read_bf16(e, fused);
+        double max_abs = 0.0, sum_abs = 0.0;
+        size_t nonfinite = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) {
+                ++nonfinite;
+                continue;
+            }
+            const double err = std::fabs(static_cast<double>(got[i]) - ref[i]);
+            max_abs = std::max(max_abs, err);
+            sum_abs += err;
+        }
+        // Independent CPU references on rows distributed across heads and
+        // sequence: one rounds both intermediates to BF16, one does not.
+        double baseline_cpu_max = 0.0, fused_cpu_max = 0.0;
+        double expected_rounding_max = 0.0;
+        int baseline_bad = 0, fused_bad = 0;
+        constexpr int kSamples = 8;
+        std::vector<float> scores(S), probs(S), bf16_probs(S);
+        for (int sample = 0; sample < kSamples; ++sample) {
+            const int h = (H - 1) * sample / (kSamples - 1);
+            const int row = (S - 1) * sample / (kSamples - 1);
+            const size_t qbase = (static_cast<size_t>(h) * S + row) * D;
+            float full_max = -std::numeric_limits<float>::infinity();
+            float rounded_max = full_max;
+            for (int j = 0; j < S; ++j) {
+                const size_t kbase = (static_cast<size_t>(h) * S + j) * D;
+                float dot = 0.0F;
+                for (int d = 0; d < D; ++d)
+                    dot += qv[qbase + d] * kv[kbase + d];
+                scores[j] = dot;
+                full_max = std::max(full_max, dot);
+                rounded_max = std::max(
+                    rounded_max, bf16_to_float(float_to_bf16(dot)));
+            }
+            float full_sum = 0.0F, rounded_sum = 0.0F;
+            for (int j = 0; j < S; ++j) {
+                probs[j] = std::exp(scores[j] - full_max);
+                bf16_probs[j] = std::exp(
+                    bf16_to_float(float_to_bf16(scores[j])) - rounded_max);
+                full_sum += probs[j];
+                rounded_sum += bf16_probs[j];
+            }
+            for (int j = 0; j < S; ++j) {
+                probs[j] /= full_sum;
+                bf16_probs[j] =
+                    bf16_to_float(float_to_bf16(bf16_probs[j] / rounded_sum));
+            }
+            for (int d = 0; d < D; ++d) {
+                float full = 0.0F, rounded = 0.0F;
+                for (int j = 0; j < S; ++j) {
+                    const float value = vv[(static_cast<size_t>(h) * S + j) * D + d];
+                    full += probs[j] * value;
+                    rounded += bf16_probs[j] * value;
+                }
+                full = bf16_to_float(float_to_bf16(full));
+                rounded = bf16_to_float(float_to_bf16(rounded));
+                const double be = std::fabs(ref[qbase + d] - rounded);
+                const double fe = std::fabs(got[qbase + d] - full);
+                baseline_cpu_max = std::max(baseline_cpu_max, be);
+                fused_cpu_max = std::max(fused_cpu_max, fe);
+                expected_rounding_max = std::max(
+                    expected_rounding_max, double(std::fabs(full - rounded)));
+                if (!(be <= 0.004 + 0.01 * std::fabs(rounded))) ++baseline_bad;
+                if (!(fe <= 0.004 + 0.01 * std::fabs(full))) ++fused_bad;
+            }
+        }
+        std::fprintf(stderr,
+                     "H3 attention H=%d S=%d route=%s max_abs=%g mean_abs=%g "
+                     "nonfinite=%zu sampled_cpu_baseline=%g sampled_cpu_fused=%g "
+                     "sampled_rounding_difference=%g\n",
+                     H, S, attention->route_tag().c_str(), max_abs,
+                     sum_abs / got.size(), nonfinite, baseline_cpu_max,
+                     fused_cpu_max, expected_rounding_max);
+        EXPECT_EQ(nonfinite, 0u);
+        EXPECT_EQ(baseline_bad, 0);
+        EXPECT_EQ(fused_bad, 0);
+    }
+}
+
+TEST(Bf16ActivationTest, H3AttentionRejectsMismatchedDynamicShapes) {
+    Env e;
+    auto q = bf16_in(e, {1, 2, 4, 128}, bf16_values(2 * 4 * 128, 211));
+    auto k = bf16_in(e, {1, 1, 4, 128}, bf16_values(4 * 128, 212));
+    auto v = bf16_in(e, {1, 2, 4, 128}, bf16_values(2 * 4 * 128, 213));
+    auto y = out<uint16_t>(e, {1, 2, 4, 128}, ElemKind::kBFloat16);
+    auto op = make_op(e, OpType::ATTENTION, 2, {{"h3_self_attention", "1"}});
+    expect_refused([&] { op->onExecute({q, k, v}, {y}, 0); },
+                   "H3 self-attention");
 }
 
 // Split-KV decode on a bf16 KV cache: the -DBF16 build of attention.comp's

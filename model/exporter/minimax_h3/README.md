@@ -152,6 +152,29 @@ config-only tree like `/tmp/h3cfg/h3` (it reads `*/config.json` only).
 
 ## Run order
 
+### Experimental BF16 fused attention
+
+`VKOP_H3_FUSED_ATTENTION=1` is a conversion-time, opt-in experiment for the
+buffer backend with `--act bf16`. It folds the H3 self-attention chain and
+reuses the existing BF16 Attention implementation (normally the Flash route
+for sufficiently large inputs), while retaining the original Q/K scaling and
+adding a K transpose. It does not modify an already-converted
+`.vkopbin`; reconvert the transformer body into a separate output for A/B
+testing. `--unify` and `--rgba` are not supported by this experiment.
+
+The fused kernel does not round the score and softmax intermediates to BF16 as
+the original chain does. Its outputs are therefore approximate, not bitwise
+equivalent. Validate model outputs and speed on the target GPU before use; a
+successful run or finite values alone do not establish quality. Leave the
+variable unset (or set it to `0`) to retain the original conversion.
+
+```bash
+VKOP_H3_FUSED_ATTENTION=1 python3 -m onnx2vkop.cli \
+    -i /path/to/transformer_body.onnx -o /path/to/body_fused.vkopbin \
+    -q int4 --group-size 128 --act bf16 --target-backend buffer \
+    --master-archive /path/to/build/vkop_shaders.bin
+```
+
 ```bash
 # 0. what would each graph contain, with no weights on disk? (do this first)
 python3 h3_export.py --component transformer  --dry-run --model /path/to/MiniMax-H3

@@ -1487,6 +1487,20 @@ class ModelConverter:
                 dag_model, keep=True, quantize=args.quant == "bf16",
                 exclude=excluded_weights, only=bf16_only)
 
+        if os.environ.get("VKOP_H3_FUSED_ATTENTION") == "1":
+            if act != "bf16" or _declared_widths_backend(args) != "buffer":
+                raise ValueError(
+                    "VKOP_H3_FUSED_ATTENTION=1 requires --act bf16 and "
+                    "the buffer backend")
+            if getattr(args, "unify", False) or getattr(args, "rgba", False):
+                raise ValueError(
+                    "VKOP_H3_FUSED_ATTENTION=1 does not support --unify "
+                    "or --rgba")
+            from .h3_attention import apply as apply_h3_attention
+            count = apply_h3_attention(dag_model)
+            print(f"[h3-attention] fused {count} BF16 attention patterns "
+                  "(approximate; validate output before use)")
+
         if act == "bf16" and _declared_widths_backend(args) == "buffer":
             # The runtime refuses a node binding bf16 beside fp16/fp32 (its
             # _bf16 module decodes every 16-bit operand as bf16). Weight

@@ -167,6 +167,10 @@ class AttentionBuffer : public BufferFactory {
             seq_major_ =
                 static_cast<int>(std::stol(attributes.at("seq_major")));
         }
+        if (attributes.find("h3_self_attention") != attributes.end()) {
+            h3_self_attention_ =
+                static_cast<int>(std::stol(attributes.at("h3_self_attention")));
+        }
         // v_component: V is the vision tower's rank-4 qkv tensor
         // [S, C, Hkv, D] and this op reads component `v_component`, which is
         // the V half of the Split the converter folded away (see
@@ -485,6 +489,17 @@ class AttentionBuffer : public BufferFactory {
         // Fresh rows: S with a cache, kv without.
         int kv_new = rank3 ? dim(k_shape, 0)
                            : (seq_major ? dim(k_shape, 1) : dim(k_shape, 2));
+
+        if (h3_self_attention_) {
+            const auto v_shape = inputs[2]->getShape();
+            if (rank3 || seq_major || has_cache || batch <= 0 || heads <= 0 ||
+                seq <= 0 || head_dim != 128 || k_shape != q_shape ||
+                v_shape != q_shape) {
+                throw std::runtime_error(
+                    "Attention: H3 self-attention requires equal nonempty "
+                    "Q/K/V shapes [B,H,S,128]");
+            }
+        }
 
         // GQA: kv_heads divides heads; group-contiguous h_kv = h / rep.
         if (kv_heads <= 0 || heads % kv_heads != 0) {
@@ -1253,6 +1268,7 @@ class AttentionBuffer : public BufferFactory {
     // head-reorder feeding this op; 0 keeps the native [B,H,S,D] addressing
     // every existing graph relies on.
     int seq_major_ = 0;
+    int h3_self_attention_ = 0;
     // Read V as component `v_component_` of a rank-4 [S,C,Hkv,D] qkv tensor;
     // -1 (default) keeps the native V addressing. Set by the converter's
     // fuse_qkv_components, always together with seq_major_ and never with a
