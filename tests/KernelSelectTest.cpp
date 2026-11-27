@@ -787,11 +787,12 @@ void test_mvk_apple_routes() {
 // A bf16 weight holding |w| > 65504 (bf16_wide): every tile route stages B as
 // half and would clamp it, so none of them may be picked on any device, shape
 // or availability; the in-range bf16 weight still takes the tile.
-// A bf16 ACTIVATION (MatmulFeatures::act_bf16) may only take the routes whose
-// _bf16 module reads A through the bf16 decode: never a cooperative-matrix
-// route, tile-split-K, the 512-lane split-K, a fold, or reduce_pack. When a
-// kept route fits it must be chosen; odd N has none, and the plan then names
-// the route the op will refuse.
+// A bf16 ACTIVATION (MatmulFeatures::act_bf16) takes the route the fp16
+// graph takes whenever that route has a bf16 build -- the GEMVs (256- and
+// 512-lane, WIDE), fused, the tile family (64x64 / 128x128 / Apple coop8),
+// tile-split-K, reduce_pack and attn_softmax -- and never a KHR
+// cooperative-matrix route or the down_act fold. Every shape now has a kept
+// route (odd N lands on reduce_pack, whose pack pass encodes bf16).
 void test_bf16_act_routes() {
     const DeviceTraits devs[] = {traits_native_discrete(), traits_ada(),
                                  traits_mvk_apple(), traits_mvk_amd(),
@@ -802,7 +803,7 @@ void test_bf16_act_routes() {
     MatmulKnobs ks512;
     ks512.ksplit512_enabled = true;
     const MatmulAvailability avs[] = {fp16_only(), fp16_splitk(), all};
-    int kept = 0, refused = 0;
+    int same = 0, diverted = 0;
     for (const auto &dev : devs) {
         for (const auto &av : avs) {
             for (const MatmulKnobs &kn : {MatmulKnobs{}, ks512}) {
@@ -810,20 +811,24 @@ void test_bf16_act_routes() {
                     for (int k : {64, 256, 1024}) {
                         for (int n : {7, 12, 64, 192, 2056, 4096}) {
                             for (bool tb : {false, true}) {
+                                MatmulFeatures f16 = fp16_w(tb);
                                 MatmulFeatures f = fp16_w(tb);
                                 f.weight = WeightKind::kBf16;
                                 f.act_bf16 = true;
-                                f.attn_softmax = true; // must not be honoured
                                 MatmulPlan p = select_matmul(
                                     dev, sh(1, m, k, n), f, av, kn);
-                                if (matmul_route_takes_bf16_act(p.route)) {
-                                    CHECK(p.ks_n == 0);
-                                    CHECK(p.coop_split == 0);
-                                    ++kept;
+                                MatmulPlan q = select_matmul(
+                                    dev, sh(1, m, k, n), f16, av, kn);
+                                CHECK(matmul_route_takes_bf16_act(p.route));
+                                CHECK(p.coop_split == 0);
+                                if (matmul_route_takes_bf16_act(q.route)) {
+                                    CHECK(p.route == q.route);
+                                    CHECK(p.ks_n == q.ks_n);
+                                    CHECK(p.ksplit_q == q.ksplit_q);
+                                    ++same;
                                 } else {
-                                    // Only a shape no kept route serves.
-                                    CHECK((n & 1) != 0);
-                                    ++refused;
+                                    // fp16 took a KHR coopmat route.
+                                    ++diverted;
                                 }
                             }
                         }
@@ -832,19 +837,51 @@ void test_bf16_act_routes() {
             }
         }
     }
-    CHECK(kept > 0 && refused > 0);
-    CHECK(matmul_route_takes_bf16_act(MatmulRoute::kKsplit));
-    CHECK(matmul_route_takes_bf16_act(MatmulRoute::kKsplitWide));
-    CHECK(matmul_route_takes_bf16_act(MatmulRoute::kFusedFp16));
-    CHECK(matmul_route_takes_bf16_act(MatmulRoute::kTiled));
-    for (MatmulRoute r : {MatmulRoute::kTiledKs, MatmulRoute::kCoopmat,
-                          MatmulRoute::kKsplit512, MatmulRoute::kReducePack,
-                          MatmulRoute::kDownActFold,
-                          MatmulRoute::kAttnSoftmax}) {
+    CHECK(same > 0 && diverted > 0);
+    // The fused QK^T + softmax row kernel takes a bf16 K beside a bf16 Q.
+    {
+        MatmulFeatures f = fp16_w(true);
+        f.weight = WeightKind::kBf16;
+        f.act_bf16 = true;
+        f.attn_softmax = true;
+        f.epi_bias = true;
+        MatmulPlan p = select_matmul(traits_mvk_apple(), sh(16, 1, 128, 512),
+                                     f, fp16_only());
+        CHECK(p.route == MatmulRoute::kAttnSoftmax);
+        // ... but not a bf16 weight beside an fp16 activation.
+        f.act_bf16 = false;
+        p = select_matmul(traits_mvk_apple(), sh(16, 1, 128, 512), f,
+                          fp16_only());
+        CHECK(p.route != MatmulRoute::kAttnSoftmax);
+    }
+    // bf16_wide (|w| > 65504) keeps an fp16 activation off the tile routes,
+    // but the _bf16 module's tiles decode B as bf16 and coop8 scales it.
+    {
+        MatmulFeatures f = fp16_w();
+        f.weight = WeightKind::kBf16;
+        f.bf16_wide = true;
+        f.act_bf16 = true;
+        MatmulPlan p = select_matmul(traits_mvk_apple(), sh(1, 256, 1024, 2048),
+                                     f, fp16_only());
+        CHECK(p.tiled);
+    }
+    for (MatmulRoute r :
+         {MatmulRoute::kKsplit, MatmulRoute::kKsplitWide, MatmulRoute::kFusedFp16,
+          MatmulRoute::kTiled, MatmulRoute::kTiledKs, MatmulRoute::kKsplit512,
+          MatmulRoute::kKsplitWide512, MatmulRoute::kReducePack,
+          MatmulRoute::kAttnSoftmax}) {
+        CHECK(matmul_route_takes_bf16_act(r));
+    }
+    for (MatmulRoute r : {MatmulRoute::kCoopmat, MatmulRoute::kCoopmatSplitK,
+                          MatmulRoute::kCoopmatInwg, MatmulRoute::kCoopmatSkLast,
+                          MatmulRoute::kCoopmatI8, MatmulRoute::kDownActFold,
+                          MatmulRoute::kKsplitW8Wide, MatmulRoute::kKsplitW4Wide,
+                          MatmulRoute::kQuad4}) {
         CHECK(!matmul_route_takes_bf16_act(r));
     }
-    std::printf("bf16 activation routes: %d kept, %d refused (odd N)\n",
-                kept, refused);
+    std::printf("bf16 activation routes: %d same as fp16, %d diverted from "
+                "a KHR coopmat route\n",
+                same, diverted);
 }
 
 void test_bf16_wide_routes() {

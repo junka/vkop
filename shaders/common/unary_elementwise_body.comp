@@ -71,7 +71,7 @@ void main() {
 #ifdef FP16
     int nwords = (uPC.total + 1) / 2;
     if (gid >= nwords) return;
-    vec2 p = unpackHalf2x16(U_INPUT(gid));
+    vec2 p = UDEC2(U_INPUT(gid));
     p.x = apply(p.x);
     if (2 * gid + 1 < uPC.total) {
         p.y = apply(p.y);

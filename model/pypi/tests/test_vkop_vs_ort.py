@@ -425,7 +425,7 @@ def test_random_fill_is_deterministic_and_dtype_true():
 def test_an_input_dtype_the_reader_does_not_know_fails(tmp_path):
     np.save(tmp_path / "x.npy", np.zeros(4, dtype=np.float32))
     with pytest.raises(loop.LoopError, match="no numpy view"):
-        loop.build_inputs([spec("x", "bfloat16")], args(inputs=str(tmp_path)))
+        loop.build_inputs([spec("x", "complex64")], args(inputs=str(tmp_path)))
 
 
 # ------------------------------------------------------------ vkop-bench run
@@ -692,3 +692,118 @@ def test_read_output_finds_a_slashed_name_under_its_file_name(tmp_path):
     row = {"name": "/layer/Mul_output_0", "bytes_as": "float32",
            "dims": [1, 4], "nbytes": arr.nbytes}
     assert np.array_equal(loop.read_output(out, row), arr)
+
+
+# ------------------------------------------------------------ bf16 I/O
+# An --act bf16 artifact declares bfloat16 inputs and outputs. numpy has no
+# bf16 (and ml_dtypes is not a dependency), so the words travel as uint16 and
+# the values as float32 -- exact, since bf16 is fp32's upper half.
+
+
+def test_bf16_words_round_trip_with_round_to_nearest_even():
+    x = np.array([1.0, -2.5, 3.140625, 1.0 + 2 ** -8, 1.0 + 3 * 2 ** -8,
+                  65504.0, np.inf, -0.0], dtype=np.float32)
+    w = loop.f32_to_bf16(x)
+    assert w.dtype == np.uint16
+    # 1+2^-8 is a tie -> even (1.0); 1+3*2^-8 is a tie -> even (1+2^-6).
+    assert list(w[:5]) == [0x3F80, 0xC020, 0x4049, 0x3F80, 0x3F82]
+    assert w[5] == 0x4780 and w[6] == 0x7F80 and w[7] == 0x8000
+    back = loop.bf16_to_f32(w)
+    assert back.dtype == np.float32
+    assert np.array_equal(loop.f32_to_bf16(back), w)  # exact both ways
+    assert np.isnan(loop.bf16_to_f32(loop.f32_to_bf16(
+        np.array([np.nan], np.float32))))[0]
+
+
+def test_read_output_decodes_bf16_words(tmp_path):
+    vals = np.array([[1.0, -2.5, 0.375, 1024.0]], dtype=np.float32)
+    words = loop.f32_to_bf16(vals)
+    out = tmp_path / "out"
+    out.mkdir()
+    words.tofile(out / "y.bin")
+    write_manifest(out, [{"name": "y", "bytes_as": "bfloat16",
+                          "dims": [1, 4], "nbytes": words.nbytes}])
+    row, = loop.parse_manifest(out / "manifest.tsv")
+    got = loop.read_output(out, row)
+    assert got.dtype == np.float32 and got.shape == (1, 4)
+    assert np.array_equal(got, vals)
+
+
+def test_a_bf16_input_is_fed_as_values_and_written_as_words(tmp_path, capsys):
+    x = np.array([[1.0, 1.0 + 2 ** -10, -3.0, 0.1]], dtype=np.float32)
+    np.save(tmp_path / "x.npy", x)
+    arrays = loop.build_inputs([spec("x", "bfloat16")],
+                               args(inputs=str(tmp_path)))
+    got = arrays["x"]
+    # ORT sees float32 values that are exactly representable in bf16 ...
+    assert got.dtype == np.float32
+    assert np.array_equal(got, loop.bf16_to_f32(loop.f32_to_bf16(x))
+                          .reshape(x.shape))
+    assert "rounded to bfloat16" in capsys.readouterr().out
+    # ... and vkop-bench gets the same values as uint16 words.
+    loop.write_input(tmp_path / "w.npy", got, "bfloat16")
+    w = np.load(tmp_path / "w.npy")
+    assert w.dtype == np.uint16
+    assert np.array_equal(loop.bf16_to_f32(w).reshape(x.shape), got)
+    # A uint16 .npy is taken as bf16 words already.
+    np.save(tmp_path / "x.npy", w)
+    again = loop.build_inputs([spec("x", "bfloat16")],
+                              args(inputs=str(tmp_path)))
+    assert np.array_equal(again["x"], got)
+
+
+def test_random_fill_covers_a_bf16_input():
+    a = loop.random_input(spec("x", "bfloat16"), 7)
+    assert a.dtype == np.float32 and a.shape == (1, 4)
+
+
+# The real thing, on the GPU (opt-in like the other end-to-end tests): an
+# fp16-declared export converted with --act bf16 has bf16 I/O, and the loop
+# feeds and reads it through the real vkop-bench against onnxruntime.
+_PYPI = Path(__file__).resolve().parents[1]
+_REPO = _PYPI.parents[1]
+BENCH = os.environ.get("VKOP_BENCH")
+ARCHIVE = os.environ.get("VKOP_MASTER_ARCHIVE",
+                         str(_REPO / "build" / "vkop_shaders.bin"))
+
+
+@pytest.mark.skipif(not BENCH or not os.path.exists(ARCHIVE),
+                    reason="set VKOP_BENCH (a vkop-bench, or a wrapper that "
+                           "exports the Vulkan loader env) and a shader archive")
+def test_bf16_io_round_trip_against_onnxruntime(tmp_path):
+    pytest.importorskip("onnxruntime")
+    import onnx
+    from onnx import TensorProto as T, helper as h, numpy_helper as nh
+
+    rng = np.random.default_rng(3)
+    k, n = 64, 64
+    w = (rng.standard_normal((k, n)) / 8).astype(np.float16)
+    b = (rng.standard_normal(n) / 4).astype(np.float16)
+    g = h.make_graph(
+        [h.make_node("MatMul", ["x", "w"], ["y"]),
+         h.make_node("Add", ["y", "b"], ["z"]),
+         h.make_node("Mul", ["z", "z"], ["out"])],
+        "g", [h.make_tensor_value_info("x", T.FLOAT16, [4, k])],
+        [h.make_tensor_value_info("out", T.FLOAT16, [4, n])],
+        [nh.from_array(w, "w"), nh.from_array(b, "b")])
+    m = h.make_model(g, opset_imports=[h.make_opsetid("", 17)])
+    m.ir_version = 8
+    src, out = str(tmp_path / "m.onnx"), str(tmp_path / "m.vkopbin")
+    onnx.save(m, src)
+    p = subprocess.run(
+        [sys.executable, "-m", "onnx2vkop.cli", "-i", src, "-o", out,
+         "--target-backend", "buffer", "--act", "bf16",
+         "--master-archive", ARCHIVE],
+        capture_output=True, text=True, cwd=str(_PYPI))
+    assert p.returncode == 0, (p.stdout + p.stderr)[-2000:]
+    p = subprocess.run(
+        [sys.executable, str(_REPO / "tools" / "vkop_vs_ort.py"), out,
+         "--onnx", src, "--bench", BENCH, "--random-fill",
+         # bf16 keeps 8 significant bits: the gates are bf16's, not fp16's.
+         "--cos-min", "0.999", "--rtol", "3e-2", "--atol", "3e-2",
+         "--bad-frac-max", "0.01"],
+        capture_output=True, text=True)
+    report = p.stdout + p.stderr
+    assert p.returncode == 0, report[-2000:]
+    assert "x bfloat16" not in report  # the values ORT got are float32
+    assert "RESULT: 1/1" in report, report[-2000:]

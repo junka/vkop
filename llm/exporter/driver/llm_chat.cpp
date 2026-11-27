@@ -76,6 +76,7 @@ using vkop::llm::embed_lookup;
 using vkop::llm::fill_fp16_input;
 using vkop::llm::fill_i64_input;
 using vkop::llm::fp16_to_f32;
+using vkop::llm::half_to_f32;
 using vkop::llm::upload_input;
 
 namespace {
@@ -176,10 +177,12 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         q = total / vocab;
     }
     const uint16_t* row = p + (q - 1) * vocab;
+    // fp16 unless the artifact left `logits` bf16 (--act bf16 keeps it fp16).
+    const ElemKind lk = lg->elem_kind();
     int best = 0;
     float bestv = -1e30f;
     for (int i = 0; i < vocab; ++i) {
-        float v = fp16_to_f32(row[i]);
+        float v = half_to_f32(row[i], lk);
         if (v > bestv) { bestv = v; best = i; }
     }
     if (component_timer_on())
@@ -190,7 +193,7 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         // top5 for sanity vs ORT.
         std::vector<std::pair<float,int>> tp;
         tp.reserve(vocab);
-        for (int i = 0; i < vocab; ++i) tp.push_back({fp16_to_f32(row[i]), i});
+        for (int i = 0; i < vocab; ++i) tp.push_back({half_to_f32(row[i], lk), i});
         std::partial_sort(tp.begin(), tp.begin()+5, tp.end(),
                           [](auto&a,auto&b){return a.first>b.first;});
         std::printf("  [logits] q=%d vocab=%d top5: ", q, vocab);
@@ -364,7 +367,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
             "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new] "
             "[--image <img>]... --visual <visual.vkopbin> [--max-kv N] "
-            "[--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
+            "[--kv-kind {auto,fp16,bf16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
             argv[0]);
         return 1;
     }
@@ -395,7 +398,7 @@ int main(int argc, char** argv) {
                 "unknown arg: %s\n"
                 "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
                 "[max_new] [--image <img>]... --visual <visual.vkopbin> "
-                "[--max-kv N] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
+                "[--max-kv N] [--kv-kind {auto,fp16,bf16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
                 argv[i], argv[0]);
             return 1;
         }
@@ -464,6 +467,7 @@ int main(int argc, char** argv) {
         const ElemKind pk0_kind = rt->GetInput(arch.kv_in(0))->elem_kind();
         static const std::pair<const char*, ElemKind> kKinds[] = {
             {"fp16", ElemKind::kFloat16},
+            {"bf16", ElemKind::kBFloat16},
             {"fp8e4m3", ElemKind::kFloat8E4M3FN},
             {"fp8e5m2", ElemKind::kFloat8E5M2},
             {"int4", ElemKind::kInt4},
@@ -474,7 +478,7 @@ int main(int argc, char** argv) {
             if (kv_kind_opt == k.first) { arch.cache_kind = k.second; ok = true; break; }
         }
         if (!ok) {
-            std::fprintf(stderr, "[error] --kv-kind %s 未知（auto/fp16/fp8e4m3/"
+            std::fprintf(stderr, "[error] --kv-kind %s 未知（auto/fp16/bf16/fp8e4m3/"
                          "fp8e5m2/int4/nf4）\n", kv_kind_opt.c_str());
             return 1;
         }

@@ -143,10 +143,10 @@ void main() {
     int nwords = inner >> 1;
     for (int w = int(lid); w < nwords; w += int(gl_WorkGroupSize.x)) {
         int word = base / 2 + w;
-        vec2 x = unpackHalf2x16(uInput.data[word]);
+        vec2 x = BUF_UNPACK2(uInput.data[word]);
         float r0 = (x.x - mean) * inv_std * g_scale + g_bias;
         float r1 = (x.y - mean) * inv_std * g_scale + g_bias;
-        uOutput.data[word] = packHalf2x16(vec2(r0, r1));
+        uOutput.data[word] = BUF_PACK2(vec2(r0, r1));
     }
 #else
     for (int i = int(lid); i < inner; i += int(gl_WorkGroupSize.x)) {

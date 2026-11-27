@@ -55,7 +55,7 @@ layout(push_constant) uniform PC_uPC {
 
 float load_in(int linear) {
 #ifdef FP16
-    return unpackHalf2x16(uInput.data[linear >> 1])[linear & 1];
+    return BUF_UNPACK2(uInput.data[linear >> 1])[linear & 1];
 #else
     return uintBitsToFloat(uInput.data[linear]);
 #endif
@@ -66,7 +66,7 @@ float load_slope(int linear) {
         ? linear
         : broadcast_index(linear, uPC.outDims, uPC.in1Dims, uPC.rank);
 #ifdef FP16
-    return unpackHalf2x16(uSlope.data[s >> 1])[s & 1];
+    return BUF_UNPACK2(uSlope.data[s >> 1])[s & 1];
 #else
     return uintBitsToFloat(uSlope.data[s]);
 #endif
@@ -92,7 +92,7 @@ void main() {
     } else {
         p.y = 0.0;
     }
-    uOutput.data[w] = packHalf2x16(p);
+    uOutput.data[w] = BUF_PACK2(p);
 #else
     if (gid >= uPC.total) return;
     float x = load_in(gid);

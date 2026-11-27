@@ -149,8 +149,9 @@ void Operator::try_build_bda_pipeline(VkPipelineCache cache) {
     }
     // No -DBDA -DBF16 module exists: the key below would name the fp16 BDA
     // build, which decodes bf16 words as fp16. A bf16 op keeps its
-    // descriptor pipeline (the _bf16 module).
-    if (fp16_ == 2) {
+    // descriptor pipeline (the _bf16 module). Cast is the exception: its one
+    // module (and its one BDA build) picks the bf16 modes from the PC.
+    if (fp16_ == 2 && type_ != OpType::CAST) {
         return;
     }
     // Packed fp16 kernels load uint words. Descriptor offsets (the only way a
@@ -439,13 +440,13 @@ void Operator::onExecute(
         const std::string op_name = convert_optype_to_string(type_);
         if (core::check_bf16_activation(type_, op_name, name_, inputs, outputs,
                                         uses_buffer_backend()) &&
-            fp16_ != 2 && type_ != OpType::SHAPE &&
-            type_ != OpType::SQUEEZE && type_ != OpType::UNSQUEEZE) {
+            !core::bf16_build_matches(type_, fp16_, outputs)) {
             throw std::runtime_error(
                 "vkop: " + op_name + " '" + (name_.empty() ? op_name : name_) +
                 "' was handed bfloat16 activations but was built for " +
-                (fp16_ == 1 ? "fp16" : "fp32") +
-                " (create it with fp16 = 2 to get the _bf16 module)");
+                (fp16_ == 2 ? "bf16" : fp16_ == 1 ? "fp16" : "fp32") +
+                " (create it with fp16 = 2 to get the _bf16 module; "
+                "FusedElemwise/Gather build for their output's format)");
         }
     }
     if (!m_cmd_ && !graph_cmd_) {

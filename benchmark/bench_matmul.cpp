@@ -36,6 +36,11 @@
 //      differs, so the pair is the A/B for the bf16 read.
 //      BENCH_BF16_WIDE=1 (with BENCH_BF16) sets the bf16_wide attribute, which
 //      keeps the bf16 weight off the half-staging tile routes.
+//      BENCH_ACT_BF16=1 runs the --act bf16 form: A, B and the output are all
+//      bfloat16 and the op is the _bf16 module (fp16 = 2), so the pair against
+//      the default is the cost of bf16 ACTIVATIONS per route (same shapes,
+//      same routes). Values stay in [1, 2) like the fp16 fill, so the Apple
+//      coop8 GEMM never needs its out-of-range second pass here.
 //      BENCH_W4=int4|nf4|uint4|nvfp4 swaps B for a nibble-packed 4-bit
 //      weight (group 64 fp32 scales; nvfp4: 16-value blocks of e4m3 scales
 //      plus a global fp32 scale). GB/s counts the nibble payload only.
@@ -160,6 +165,20 @@ void fill_random_f16(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
     }
 }
 
+// The bf16 twin of fill_random_f16: random 7-bit mantissas under the
+// exponent of 1.0 (0x3F80), so every value is a normal bf16 in [1,2) or
+// [-2,-1) -- in range for every staging path.
+void fill_random_bf16(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
+    t->data().resize(static_cast<size_t>(t->num_elements())); // see fill_random_i8
+    uint32_t st = 0x12345678u;
+    uint16_t *p = t->data().data();
+    for (size_t i = 0; i < t->data().size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        p[i] = static_cast<uint16_t>(0x3F80 | ((st >> 16) & 0x007F) |
+                                     ((st >> 31) << 15));
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -228,7 +247,10 @@ int main(int argc, char **argv) {
 
     const int reps = (argc > 3) ? std::atoi(argv[3]) : 30;
     const bool int8_mode = std::getenv("BENCH_INT8") != nullptr;
-    const bool bf16_mode = std::getenv("BENCH_BF16") != nullptr;
+    const bool act_bf16 = std::getenv("BENCH_ACT_BF16") != nullptr;
+    // A bf16 activation implies a bf16 B (the bf16 gate admits no fp16 or
+    // quantized operand beside it).
+    const bool bf16_mode = act_bf16 || std::getenv("BENCH_BF16") != nullptr;
     const char *w4_fmt = std::getenv("BENCH_W4");
     const bool w4_mode = w4_fmt != nullptr && *w4_fmt;
     const int w4_group = [] {
@@ -329,6 +351,11 @@ int main(int argc, char **argv) {
         auto O = std::make_shared<core::Tensor<uint16_t>>(
             std::vector<int>{bench_m, s.N});
         fill_ones(A);
+        if (act_bf16) {
+            std::fill(A->data().begin(), A->data().end(), 0x3F80); // bf16 1.0
+            A->set_elem_kind(core::ElemKind::kBFloat16);
+            O->set_elem_kind(core::ElemKind::kBFloat16);
+        }
         // Allocate + upload BEFORE binding: as_storage_buffer only allocates
         // (make_vkbuff), the upload is copyToGPU's staging copy. Binding an
         // unuploaded tensor silently computes on zeros.
@@ -436,7 +463,8 @@ int main(int argc, char **argv) {
         }
         std::vector<std::shared_ptr<core::ITensor>> out = {O};
 
-        auto op = ops::create_from_type(ops::OpType::MATMUL, /*fp16=*/1,
+        auto op = ops::create_from_type(ops::OpType::MATMUL,
+                                        /*fp16=*/act_bf16 ? 2 : 1,
                                         /*use_tensorcore=*/0,
                                         /*backend_buffer=*/true);
         op->set_name(s.name);
@@ -484,19 +512,25 @@ int main(int argc, char **argv) {
         dev->wait_all_done();
         O->reserveOnCPU();
         O->copyToCPU(cmdpool);
-        printf("  probe: O[0]=%f O[1]=%f O[N-1]=%f\n",
-               core::ITensor::fp16_to_fp32(O->data()[0]),
-               core::ITensor::fp16_to_fp32(O->data()[1]),
-               core::ITensor::fp16_to_fp32(O->data()[s.N - 1]));
+        // The output's own decode (bf16 under BENCH_ACT_BF16).
+        auto out_f = [&](uint16_t v) {
+            return act_bf16 ? core::bf16_to_float(v)
+                            : core::ITensor::fp16_to_fp32(v);
+        };
+        printf("  probe: O[0]=%f O[1]=%f O[N-1]=%f\n", out_f(O->data()[0]),
+               out_f(O->data()[1]), out_f(O->data()[s.N - 1]));
         bool ok = true;
         for (int j = 0; j < s.N; ++j) {
             uint16_t v = O->data()[j];
-            float f = vkop::core::ITensor::fp16_to_fp32(v);
+            float f = out_f(v);
             float want =
                 w4_mode ? core::ITensor::fp16_to_fp32(core::ITensor::fp32_to_fp16(
                               static_cast<float>(s.K) *
                               w4dec(w4_fmt, w4code(j))))
                         : static_cast<float>(s.K) * static_cast<float>(wpat(j));
+            if (act_bf16) {
+                want = core::bf16_to_float(core::float_to_bf16(want));
+            }
             if (w4_mode ? std::fabs(f - want) > 2e-3f * std::fabs(want) + 1e-2f
                         : f != want) {
                 ok = false;
@@ -524,7 +558,11 @@ int main(int argc, char **argv) {
             } else {
                 auto b16 =
                     std::dynamic_pointer_cast<core::Tensor<uint16_t>>(b_keep);
-                fill_random_f16(b16);
+                if (act_bf16) {
+                    fill_random_bf16(b16);
+                } else {
+                    fill_random_f16(b16);
+                }
                 b16->toCPU();
                 b16->copyToGPU(cmdpool);
             }

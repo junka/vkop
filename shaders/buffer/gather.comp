@@ -16,8 +16,21 @@
 // fp32 (exact) and then stored as DTYPE. Built as buffer_gather_bf16 /
 // buffer_gather_bf16_fp16; ops/Gather.hpp binds it on its own pipeline. There
 // is no -DBDA form of this build.
-#ifdef BF16_TABLE
+//
+// -DBF16_OUT: the OUTPUT is a bfloat16 activation (--act bf16), stored as
+// uint16_t bits (16-bit storage, one element per thread, so no two threads
+// share a word). The table is bf16 (-DBF16_TABLE: a raw 16-bit copy, bit
+// exact), fp16 (-DFP16) or fp32 (neither), the latter two narrowed with
+// float_to_bf16 (RNE). Keys buffer_gather_bf16_out_bf16 /
+// buffer_gather_fp16_out_bf16 / buffer_gather_fp32_out_bf16.
+#if defined(BF16_TABLE) || defined(BF16_OUT)
 #include "../common/bf16.comp"
+#endif
+#ifdef BF16_OUT
+#extension GL_EXT_shader_16bit_storage : require
+#ifdef BDA
+#error "buffer/gather.comp has no -DBDA -DBF16_OUT build"
+#endif
 #endif
 
 #ifdef BDA
@@ -44,7 +57,11 @@ layout(set=0, binding=0) readonly buffer BdaTable {
 #define uInput (uBdaTable.b1)
 #define uIndex (uBdaTable.b2)
 #else
+#ifdef BF16_OUT
+layout(set=0, binding=0) writeonly buffer outputBuffer { uint16_t data[]; } uOutput;
+#else
 layout(set=0, binding=0) writeonly buffer outputBuffer { DTYPE data[]; } uOutput;
+#endif
 #ifdef BF16_TABLE
 layout(set=0, binding=1) readonly buffer inputBuffer { uint data[]; } uInput;
 #else
@@ -140,7 +157,11 @@ void main()
     int axis_size = uGatherPara.inShape.v[uGatherPara.axis];
     if (gather_idx < 0) gather_idx += axis_size;
     if (gather_idx < 0 || gather_idx >= axis_size) {
+#ifdef BF16_OUT
+        uOutput.data[gid] = uint16_t(0u);
+#else
         uOutput.data[gid] = DTYPE(0.0);
+#endif
         return;
     }
 
@@ -164,7 +185,15 @@ void main()
     int input_linear_idx =
         gather_nd_to_linear(in_coord, uGatherPara.inShape, uGatherPara.idims);
     if (input_linear_idx >= 0) {
-#ifdef BF16_TABLE
+#if defined(BF16_OUT) && defined(BF16_TABLE)
+        // bf16 -> bf16: move the 16 bits untouched.
+        uOutput.data[gid] = uint16_t(
+            (uInput.data[input_linear_idx >> 1] >> ((input_linear_idx & 1) * 16)) &
+            0xFFFFu);
+#elif defined(BF16_OUT)
+        uOutput.data[gid] =
+            uint16_t(float_to_bf16(float(uInput.data[input_linear_idx])));
+#elif defined(BF16_TABLE)
         uOutput.data[gid] = DTYPE(bf16_to_float(
             uInput.data[input_linear_idx >> 1] >> ((input_linear_idx & 1) * 16)));
 #else

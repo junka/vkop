@@ -5,8 +5,9 @@
 #extension GL_EXT_buffer_reference2 : require
 #endif
 
-// Reduce SSBO op (fp32). General axes-mask reduction (up to 8-D). One
-// workgroup reduces the input elements mapping to one output element.
+// Reduce SSBO op (fp32 / fp16 / bf16: the 16-bit forms go through
+// BUF_LOAD / BUF_UNPACK2 / BUF_PACK2, which pick the build's format).
+// General axes-mask reduction (up to 8-D). One workgroup reduces the input elements mapping to one output element.
 // Dispatch: (out_total, 1, 1). Each workgroup iterates the reduction
 // hyperrectangle (the axes with a bit set in uReduce.axes_mask), accumulating.
 //
@@ -66,8 +67,10 @@ layout(push_constant) uniform PC_uReduce {
 #define REDUCE_SUMSQUARE 9
 
 float init_acc() {
-    if (uReduce.reduce_op == REDUCE_MAX) return -1e30f;
-    if (uReduce.reduce_op == REDUCE_MIN) return  1e30f;
+    // +-inf, not +-1e30: bf16 (like fp32) reaches 3.4e38, and a row of
+    // values past the sentinel must still reduce to its own max/min.
+    if (uReduce.reduce_op == REDUCE_MAX) return uintBitsToFloat(0xFF800000u);
+    if (uReduce.reduce_op == REDUCE_MIN) return uintBitsToFloat(0x7F800000u);
     if (uReduce.reduce_op == REDUCE_PROD) return 1.0f;
     return 0.0f;
 }
@@ -215,18 +218,18 @@ void main() {
             int step = inner >> 1;
             float a0 = init_acc(), a1 = init_acc();
             for (int r = 0; r < R; ++r) {
-                vec2 v = unpackHalf2x16(uInput.data[base + r * step]);
+                vec2 v = BUF_UNPACK2(uInput.data[base + r * step]);
                 a0 = combine(a0, transform_val(v.x));
                 a1 = combine(a1, transform_val(v.y));
             }
-            uOutput.data[out_gid] = packHalf2x16(vec2(finish(a0, R), finish(a1, R)));
+            uOutput.data[out_gid] = BUF_PACK2(vec2(finish(a0, R), finish(a1, R)));
             return;
         }
         vec2 res = vec2(0.0);
         for (int h = 0; h < 2; ++h) {
             int o = o0 + h;
             if (o >= out_total) {
-                res[h] = unpackHalf2x16(uOutput.data[out_gid])[1];
+                res[h] = BUF_UNPACK2(uOutput.data[out_gid])[1];
                 continue;
             }
             int base = (o / inner) * R * inner + o % inner;
@@ -236,7 +239,7 @@ void main() {
             }
             res[h] = finish(acc, R);
         }
-        uOutput.data[out_gid] = packHalf2x16(res);
+        uOutput.data[out_gid] = BUF_PACK2(res);
         return;
 #else
         if (out_gid >= out_total) return;
@@ -263,8 +266,8 @@ void main() {
     float r0 = reduce_one(i0, rank);
     vec2 out_pair;
     out_pair[0] = (i0 < out_total) ? r0 : 0.0;
-    out_pair[1] = (i1 < out_total) ? reduce_one(i1, rank) : unpackHalf2x16(uOutput.data[out_gid])[1];
-    uOutput.data[out_gid] = packHalf2x16(out_pair);
+    out_pair[1] = (i1 < out_total) ? reduce_one(i1, rank) : BUF_UNPACK2(uOutput.data[out_gid])[1];
+    uOutput.data[out_gid] = BUF_PACK2(out_pair);
 #else
     int out_total = 1;
     for (int i = 0; i < rank; ++i) out_total *= uReduce.outDims.v[i];

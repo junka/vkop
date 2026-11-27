@@ -222,12 +222,12 @@ void main() {
         int i1 = i0 + (w1 - w0);
         float v0 = BUF_LOAD(uInput.data, i0);
         float v1 = (i1 == i0) ? v0 : BUF_LOAD(uInput.data, i1);
-        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, v1));
         return;
     }
     float v0 = one(e0);
     float v1 = (e1 < out_total) ? one(e1) : 0.0;
-    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    uOutput.data[gid] = BUF_PACK2(vec2(v0, v1));
 #else
     if (gid >= out_total) return;
     BUF_STORE(uOutput.data, gid, one(gid));

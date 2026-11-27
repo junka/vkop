@@ -25,6 +25,33 @@
 // Per BK-deep K step, A[BM x BK] and B[BK x BN] are staged in shared memory
 // (rows padded by 8 halves against bank conflicts), with the next step's
 // global words prefetched into registers while this step multiplies.
+//
+// bf16 ACTIVATIONS: the -DACT_BF16 build (archive key buffer_matmul_coop8_bf16,
+// the module MatMulBuffer::coop8_pipeline resolves for its _bf16 op; --act
+// bf16, uPC.bf16 bit 1). A separate module so the fp16 one stays exactly the
+// kernel it was (measured: carrying the pass loop in it cost fp16 1-4%). The
+// simdgroup MMA only takes
+// fp16, and bf16 activations exist precisely to carry |x| > 65504, so the stage
+// cannot just re-encode them (a clamp there is a silent wrong answer). Instead
+// every A row and every B column gets a power-of-two scale 2^-e that brings
+// its largest finite value under 2^15; multiplying by a power of two is exact
+// for a bf16 value (an exponent shift; bf16's 8 significant bits fit fp16's 11),
+// and the fp32 epilogue undoes it with 2^(e_row + e_col) per element, which is
+// also exact. The exponents are not known before the K loop, so the loop runs
+// at most twice:
+//   pass 0: e = 0 everywhere; staging records, per row/column, the largest
+//           finite |value| that exceeds the fp16 range (a shared atomicMax,
+//           taken only on such a value -- never on the common path).
+//   pass 1: only when pass 0 saw one: the accumulators restart from zero and
+//           the K loop reruns with the recorded exponents.
+// The common case (every value inside fp16 range) costs one bf16 -> fp16
+// conversion per staged word and a max over its bits; only a tile that holds
+// an out-of-range value pays for the second pass. Precision: a value far below
+// its row's (or column's) maximum may land on fp16's subnormal grid after the
+// shift (relative step 2^-24 of the scaled maximum), the same loss an fp16 GEMM
+// has for small entries beside large ones. +-Inf and NaN pass through the
+// stage unchanged (no clamp) and so propagate like the fp32 reference.
+// The output (and the SwiGLU epilogue's) is bf16 in this build.
 
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_shader_subgroup_basic : enable
@@ -101,10 +128,15 @@ layout(push_constant) uniform PC {
     int attn_softmax;
     int b_shared;
     int ks_part;
-    // 1 = B is a bfloat16 weight (GpuMatMulParam::bf16, offset 124). Same
-    // packing as fp16, so only the B stage changes: each staged word is
-    // re-encoded bf16 -> half before it lands in shB (see bf16x2_to_half2 for
-    // the range clamp), and the fp16 coopmat fragments read it as before.
+    // BITFIELD (GpuMatMulParam::bf16, offset 124), as in matmul.comp:
+    //   bit 0 = B is bfloat16. Same packing as fp16, so only the B stage
+    //           changes: each staged word is re-encoded bf16 -> half before it
+    //           lands in shB (bf16x2_to_half2's range clamp for a weight beside
+    //           an fp16 activation; the scaled form below under bit 1).
+    //   bit 1 = A is a bfloat16 ACTIVATION (and so is the output; B is bf16 too
+    //           -- the bf16 gate allows no other float beside it).
+    // Testing the whole int made an fp16 weight beside a bf16 activation decode
+    // as bf16, and a bf16 weight beside an fp16 activation is bit 0 only.
     int bf16;
 } uPC;
 
@@ -138,6 +170,62 @@ shared uvec4 shA[SHA_SZ];
 #define SHB_N (BK * LDB / 8)
 #define SHB_T (BN * LDBT / 8)
 shared uvec4 shB[SHB_N > SHB_T ? SHB_N : SHB_T];
+
+#ifdef ACT_BF16
+// bf16-activation scaling state (see the header). sc_rmax / sc_cmax hold the
+// largest out-of-range finite |value| (fp32 bits, sign cleared; 0 = none) per
+// tile row of A / tile column of B; sc_re / sc_ce the exponents pass 1 uses.
+shared uint sc_rmax[BM];
+shared uint sc_cmax[BN];
+shared int sc_re[BM];
+shared int sc_ce[BN];
+shared uint sc_any;
+
+// 65504 = the largest finite half; strictly above it (and finite) overflows.
+#define HALF_MAX_BITS 0x477FE000u
+#define F32_INF_BITS 0x7F800000u
+
+// Exponent e >= 0 with |v| * 2^-e < 2^15 for the recorded maximum bits.
+int sc_exp(uint bits) {
+    if (bits == 0u) return 0;
+    return max(0, int(bits >> 23) - 127 - 14);
+}
+
+// Eight bf16 of one staged word -> eight halves, scaled by 2^-e. No clamp:
+// with e from pass 0 every finite value lands inside fp16, and Inf/NaN stay
+// what they are.
+uvec4 bf16x8_scaled(uvec4 w, float s) {
+    return uvec4(packHalf2x16(unpackBF16x2(w.x) * s),
+                 packHalf2x16(unpackBF16x2(w.y) * s),
+                 packHalf2x16(unpackBF16x2(w.z) * s),
+                 packHalf2x16(unpackBF16x2(w.w) * s));
+}
+
+// Eight bf16 -> eight halves, unscaled (pass 0). Values past 65504 come out
+// as +-Inf here, which is harmless: such a tile always reruns as pass 1.
+uvec4 bf16x8_half(uvec4 w) {
+    return uvec4(packHalf2x16(unpackBF16x2(w.x)), packHalf2x16(unpackBF16x2(w.y)),
+                 packHalf2x16(unpackBF16x2(w.z)), packHalf2x16(unpackBF16x2(w.w)));
+}
+
+// Largest |bf16| of the eight, as fp32 bits with the sign cleared (the 16-bit
+// halves ARE the top halves of the fp32 bits). Inf/NaN included: this is only
+// the cheap screen, see bf16_over_finite.
+uint bf16x8_absmax(uvec4 w) {
+    uvec4 m = max((w << 16) & 0x7FFF0000u, w & 0x7FFF0000u);
+    return max(max(m.x, m.y), max(m.z, m.w));
+}
+
+// Largest FINITE |bf16| of one word past fp16's range (fp32 bits), else 0.
+uint bf16_over(uint w) {
+    uint lo = (w << 16) & 0x7FFF0000u;
+    uint hi = w & 0x7FFF0000u;
+    uint r = 0u;
+    if (lo > HALF_MAX_BITS && lo < F32_INF_BITS) r = lo;
+    if (hi > HALF_MAX_BITS && hi < F32_INF_BITS) r = max(r, hi);
+    return r;
+}
+#endif // ACT_BF16
 
 // uvec4 = 8 halves. Per K step each thread moves A_V / B_V of them.
 #define A_V (BM * BK / 8 / NT)
@@ -174,6 +262,9 @@ void main() {
     int a_idx[A_V];
     uint a_sh[A_V];
     bool a_ok[A_V];
+#ifdef ACT_BF16
+    int a_row[A_V]; // tile row of the staged word (8 k of one row)
+#endif
     for (int i = 0; i < A_V; ++i) {
         int e = int(tid) + i * NT;
         int r = e / (BK / 8);
@@ -181,10 +272,16 @@ void main() {
         a_ok[i] = row0 + r < M;
         a_idx[i] = a_off + (row0 + r) * k8 + c;
         a_sh[i] = uint(r * LDA + c * 8);
+#ifdef ACT_BF16
+        a_row[i] = r;
+#endif
     }
     // B: BK rows x (BN/8) uvec4 per K step.
     int b_idx[B_V];
     uint b_sh[B_V];
+#ifdef ACT_BF16
+    int b_col[B_V]; // first tile column of the staged word (transB: its only)
+#endif
     for (int i = 0; i < B_V; ++i) {
         int e = int(tid) + i * NT;
         if (tb) {
@@ -193,14 +290,205 @@ void main() {
             int c = e % (BK / 8);
             b_idx[i] = b_off + (col0 + r) * k8 + c;
             b_sh[i] = uint(r * LDBT + c * 8);
+#ifdef ACT_BF16
+            b_col[i] = r;
+#endif
         } else {
             int r = e / (BN / 8);
             int c = e % (BN / 8);
             b_idx[i] = b_off + r * n8 + (col0 >> 3) + c;
             b_sh[i] = uint(r * LDB + c * 8);
+#ifdef ACT_BF16
+            b_col[i] = c * 8;
+#endif
         }
     }
 
+#ifdef ACT_BF16
+    uvec4 ra[A_V];
+    uvec4 rb[B_V];
+
+#define DECL_ROW(i) ACC c##i##0 = ACC(0.0); ACC c##i##1 = ACC(0.0); \
+                    ACC c##i##2 = ACC(0.0); ACC c##i##3 = ACC(0.0);
+    DECL_ROW(0)
+    DECL_ROW(1)
+    DECL_ROW(2)
+    DECL_ROW(3)
+
+    const uint a_base = sgm * (WM * 8) * LDA;
+    const uint b_base = sgn * (WN * 8);
+    const int nk = K / BK;
+    const int bstep = tb ? (BK / 8) : BK * n8;
+    const int astep = BK / 8;
+
+    // The MMA over one staged K step (shared by both builds).
+#define MMA_STEP()                                                             \
+    for (int kk = 0; kk < BK; kk += 8) {                                       \
+        FRA a0; FRA a1; FRA a2; FRA a3;                                        \
+        FRB b0; FRB b1; FRB b2; FRB b3;                                        \
+        coopMatLoad(a0, shA, (a_base + 0 * 8 * LDA + kk) / 8, LDA / 8,         \
+                    gl_CooperativeMatrixLayoutRowMajor);                       \
+        coopMatLoad(a1, shA, (a_base + 1 * 8 * LDA + kk) / 8, LDA / 8,         \
+                    gl_CooperativeMatrixLayoutRowMajor);                       \
+        coopMatLoad(a2, shA, (a_base + 2 * 8 * LDA + kk) / 8, LDA / 8,         \
+                    gl_CooperativeMatrixLayoutRowMajor);                       \
+        coopMatLoad(a3, shA, (a_base + 3 * 8 * LDA + kk) / 8, LDA / 8,         \
+                    gl_CooperativeMatrixLayoutRowMajor);                       \
+        if (tb) {                                                              \
+            coopMatLoad(b0, shB, ((b_base + 0) * LDBT + kk) / 8, LDBT / 8,     \
+                        gl_CooperativeMatrixLayoutColumnMajor);                \
+            coopMatLoad(b1, shB, ((b_base + 8) * LDBT + kk) / 8, LDBT / 8,     \
+                        gl_CooperativeMatrixLayoutColumnMajor);                \
+            coopMatLoad(b2, shB, ((b_base + 16) * LDBT + kk) / 8, LDBT / 8,    \
+                        gl_CooperativeMatrixLayoutColumnMajor);                \
+            coopMatLoad(b3, shB, ((b_base + 24) * LDBT + kk) / 8, LDBT / 8,    \
+                        gl_CooperativeMatrixLayoutColumnMajor);                \
+        } else {                                                               \
+            coopMatLoad(b0, shB, (kk * LDB + b_base + 0) / 8, LDB / 8,         \
+                        gl_CooperativeMatrixLayoutRowMajor);                   \
+            coopMatLoad(b1, shB, (kk * LDB + b_base + 8) / 8, LDB / 8,         \
+                        gl_CooperativeMatrixLayoutRowMajor);                   \
+            coopMatLoad(b2, shB, (kk * LDB + b_base + 16) / 8, LDB / 8,        \
+                        gl_CooperativeMatrixLayoutRowMajor);                   \
+            coopMatLoad(b3, shB, (kk * LDB + b_base + 24) / 8, LDB / 8,        \
+                        gl_CooperativeMatrixLayoutRowMajor);                   \
+        }                                                                      \
+        MMA_ROW(0)                                                             \
+        MMA_ROW(1)                                                             \
+        MMA_ROW(2)                                                             \
+        MMA_ROW(3)                                                             \
+    }
+#define MMA_ROW(i) c##i##0 = coopMatMulAdd(a##i, b0, c##i##0); \
+                   c##i##1 = coopMatMulAdd(a##i, b1, c##i##1); \
+                   c##i##2 = coopMatMulAdd(a##i, b2, c##i##2); \
+                   c##i##3 = coopMatMulAdd(a##i, b3, c##i##3);
+    // Prefetch the next step's global words into registers.
+#define PREFETCH(t)                                                            \
+    if ((t) + 1 < nk) {                                                        \
+        for (int i = 0; i < A_V; ++i) {                                        \
+            ra[i] = a_ok[i] ? uInputA.data[a_idx[i] + ((t) + 1) * astep]       \
+                            : uvec4(0u);                                       \
+        }                                                                      \
+        for (int i = 0; i < B_V; ++i) {                                        \
+            rb[i] = uInputB.data[b_idx[i] + ((t) + 1) * bstep];                \
+        }                                                                      \
+    }
+
+#define ZERO_ROW(i) c##i##0 = ACC(0.0); c##i##1 = ACC(0.0); \
+                    c##i##2 = ACC(0.0); c##i##3 = ACC(0.0);
+    for (uint i = tid; i < uint(BM); i += uint(NT)) {
+        sc_rmax[i] = 0u;
+        sc_re[i] = 0;
+    }
+    for (uint i = tid; i < uint(BN); i += uint(NT)) {
+        sc_cmax[i] = 0u;
+        sc_ce[i] = 0;
+    }
+    if (tid == 0u) sc_any = 0u;
+    // ra/rb (bf16) -> ha/hb (half). Pass 0 converts unscaled and records the
+    // out-of-range maxima: only a word whose bits exceed 65504 (Inf/NaN
+    // included -- the screen is one vector max) takes the careful look that
+    // keeps finite values only. Pass 1 applies the recorded scales.
+#define CVT_STAGE(PASS)                                                        \
+    if ((PASS) == 0) {                                                         \
+        for (int i = 0; i < A_V; ++i) {                                        \
+            if (bf16x8_absmax(ra[i]) > HALF_MAX_BITS) {                        \
+                uint o = max(max(bf16_over(ra[i].x), bf16_over(ra[i].y)),      \
+                             max(bf16_over(ra[i].z), bf16_over(ra[i].w)));     \
+                if (o != 0u) {                                                 \
+                    atomicMax(sc_rmax[a_row[i]], o);                           \
+                    sc_any = 1u;                                               \
+                }                                                              \
+            }                                                                  \
+            ha[i] = bf16x8_half(ra[i]);                                        \
+        }                                                                      \
+        for (int i = 0; i < B_V; ++i) {                                        \
+            uvec4 w = rb[i];                                                   \
+            if (bf16x8_absmax(w) > HALF_MAX_BITS) {                            \
+                if (tb) {                                                      \
+                    uint o = max(max(bf16_over(w.x), bf16_over(w.y)),          \
+                                 max(bf16_over(w.z), bf16_over(w.w)));         \
+                    if (o != 0u) {                                             \
+                        atomicMax(sc_cmax[b_col[i]], o);                       \
+                        sc_any = 1u;                                           \
+                    }                                                          \
+                } else {                                                       \
+                    for (int q = 0; q < 4; ++q) {                              \
+                        uint lo = (w[q] << 16) & 0x7FFF0000u;                  \
+                        uint hi = w[q] & 0x7FFF0000u;                          \
+                        if (lo > HALF_MAX_BITS && lo < F32_INF_BITS) {         \
+                            atomicMax(sc_cmax[b_col[i] + 2 * q], lo);          \
+                            sc_any = 1u;                                       \
+                        }                                                      \
+                        if (hi > HALF_MAX_BITS && hi < F32_INF_BITS) {         \
+                            atomicMax(sc_cmax[b_col[i] + 2 * q + 1], hi);      \
+                            sc_any = 1u;                                       \
+                        }                                                      \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+            hb[i] = bf16x8_half(w);                                            \
+        }                                                                      \
+    } else {                                                                   \
+        for (int i = 0; i < A_V; ++i) {                                        \
+            ha[i] = bf16x8_scaled(ra[i], exp2(-float(sc_re[a_row[i]])));       \
+        }                                                                      \
+        for (int i = 0; i < B_V; ++i) {                                        \
+            if (tb) {                                                          \
+                hb[i] = bf16x8_scaled(rb[i], exp2(-float(sc_ce[b_col[i]])));   \
+            } else {                                                           \
+                for (int q = 0; q < 4; ++q) {                                  \
+                    vec2 s2 = exp2(-vec2(float(sc_ce[b_col[i] + 2 * q]),       \
+                                         float(sc_ce[b_col[i] + 2 * q + 1]))); \
+                    hb[i][q] = packHalf2x16(unpackBF16x2(rb[i][q]) * s2);      \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }
+    // Pass 1 exists only for a tile that holds a value past fp16's range (see
+    // the header); every other tile leaves after pass 0.
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            // Every pass-0 stage ended in a barrier; this one orders the last
+            // stage's sc_* writes before the read. Uniform: all lanes read the
+            // same shared word.
+            barrier();
+            if (sc_any == 0u) break;
+            for (uint i = tid; i < uint(BM); i += uint(NT)) sc_re[i] = sc_exp(sc_rmax[i]);
+            for (uint i = tid; i < uint(BN); i += uint(NT)) sc_ce[i] = sc_exp(sc_cmax[i]);
+            barrier(); // sc_re / sc_ce before the first conversion reads them
+            ZERO_ROW(0)
+            ZERO_ROW(1)
+            ZERO_ROW(2)
+            ZERO_ROW(3)
+        }
+        for (int i = 0; i < A_V; ++i) {
+            ra[i] = a_ok[i] ? uInputA.data[a_idx[i]] : uvec4(0u);
+        }
+        for (int i = 0; i < B_V; ++i) {
+            rb[i] = uInputB.data[b_idx[i]];
+        }
+        // The converted (half) words of the next stage. Converting right
+        // after the MMA step that overlapped their loads -- not between the
+        // two staging barriers -- keeps the conversion off the critical
+        // section every subgroup waits through (measured: 12.2 -> 11.3 ms at
+        // 512x2048x59264).
+        uvec4 ha[A_V];
+        uvec4 hb[B_V];
+        CVT_STAGE(pass)
+        for (int t = 0; t < nk; ++t) {
+            barrier();
+            for (int i = 0; i < A_V; ++i) store8(a_sh[i], ha[i]);
+            for (int i = 0; i < B_V; ++i) store8b(b_sh[i], hb[i]);
+            barrier();
+            PREFETCH(t)
+            MMA_STEP()
+            if (t + 1 < nk) {
+                CVT_STAGE(pass)
+            }
+        }
+    } // pass
+#else
     uvec4 ra[A_V];
     uvec4 rb[B_V];
     for (int i = 0; i < A_V; ++i) {
@@ -225,7 +513,10 @@ void main() {
     for (int t = 0; t < nk; ++t) {
         barrier();
         for (int i = 0; i < A_V; ++i) store8(a_sh[i], ra[i]);
-        if (uPC.bf16 != 0) {
+        // A bf16 WEIGHT beside the fp16 activation is bit 0 of the
+        // bitfield; testing the whole int would also fire on bit 1 (a bf16
+        // activation, which runs the -DACT_BF16 module, never this one).
+        if ((uPC.bf16 & 1) != 0) {
             for (int i = 0; i < B_V; ++i) store8b(b_sh[i], bf16x8_to_half8(rb[i]));
         } else {
             for (int i = 0; i < B_V; ++i) store8b(b_sh[i], rb[i]);
@@ -281,6 +572,9 @@ void main() {
         }
     }
 
+
+#endif
+
     // Epilogue, one accumulator row (8 x WN*8) at a time: the subgroup spills
     // it to its own 1 KB shC slot and each lane packs one uvec4 (8 halves) of
     // it -- 8 rows x 4 uvec4 = 32 lanes. Only this subgroup touches the slot,
@@ -294,6 +588,50 @@ void main() {
     const uint lr = lane >> 2;
     const uint lq = lane & 3u;
     const int ocol8 = (col0 + int(sgn) * (WN * 8)) / 8 + int(lq);
+#ifdef ACT_BF16
+    // Pass 1 ran: undo the row/column power-of-two scales here, in fp32,
+    // before the encode. Exact (a power of two), and uniform.
+    const bool scaled = sc_any != 0u;
+#define PACK2(v) packBF16x2(v)
+#endif
+#ifdef ACT_BF16
+#define SCALE_ROW(i)                                                           \
+    if (scaled) {                                                              \
+        int lrow = int(sgm) * (WM * 8) + i * 8 + int(lr);                      \
+        int lcol = int(sgn) * (WN * 8) + int(lq) * 8;                          \
+        float re = float(sc_re[lrow]);                                         \
+        f0 *= exp2(re + vec4(float(sc_ce[lcol + 0]), float(sc_ce[lcol + 1]),   \
+                             float(sc_ce[lcol + 2]), float(sc_ce[lcol + 3]))); \
+        f1 *= exp2(re + vec4(float(sc_ce[lcol + 4]), float(sc_ce[lcol + 5]),   \
+                             float(sc_ce[lcol + 6]), float(sc_ce[lcol + 7]))); \
+    }
+#define ST_ROW(i) \
+    coopMatStore(c##i##0, shA, (c_base + 0) / 4, LDC / 4, gl_CooperativeMatrixLayoutRowMajor); \
+    coopMatStore(c##i##1, shA, (c_base + 8) / 4, LDC / 4, gl_CooperativeMatrixLayoutRowMajor); \
+    coopMatStore(c##i##2, shA, (c_base + 16) / 4, LDC / 4, gl_CooperativeMatrixLayoutRowMajor); \
+    coopMatStore(c##i##3, shA, (c_base + 24) / 4, LDC / 4, gl_CooperativeMatrixLayoutRowMajor); \
+    subgroupMemoryBarrierShared(); \
+    subgroupBarrier(); \
+    { \
+        int grow = row0 + int(sgm) * (WM * 8) + i * 8 + int(lr); \
+        uint s = c_base + lr * LDC + lq * 8u; \
+        if (grow < M) { \
+            vec4 f0 = uintBitsToFloat(shA[s / 4]); \
+            vec4 f1 = uintBitsToFloat(shA[s / 4 + 1]); \
+            SCALE_ROW(i) \
+            if (uPC.wide == 2) { \
+                vec4 hv = f0 / (1.0 + exp(-f0)) * f1; \
+                int o = (b * M + grow) * (N >> 1) + ocol8 * 4; \
+                uOut2.data[o >> 2] = uvec2(PACK2(hv.xy), PACK2(hv.zw)); \
+            } else { \
+                uOutput.data[(b * M + grow) * n8 + ocol8] = \
+                    uvec4(PACK2(f0.xy), PACK2(f0.zw), PACK2(f1.xy), PACK2(f1.zw)); \
+            } \
+        } \
+    } \
+    subgroupMemoryBarrierShared(); \
+    subgroupBarrier();
+#else
 #define ST_ROW(i) \
     coopMatStore(c##i##0, shA, (c_base + 0) / 4, LDC / 4, gl_CooperativeMatrixLayoutRowMajor); \
     coopMatStore(c##i##1, shA, (c_base + 8) / 4, LDC / 4, gl_CooperativeMatrixLayoutRowMajor); \
@@ -323,6 +661,7 @@ void main() {
     } \
     subgroupMemoryBarrierShared(); \
     subgroupBarrier();
+#endif
     ST_ROW(0)
     ST_ROW(1)
     ST_ROW(2)

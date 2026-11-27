@@ -24,9 +24,10 @@
 //                 [4..4+rank)             OUTPUT dims (left-aligned)
 //                 [4+rank..4+rank*(1+nInputs))  input dims: input k at
 //                                          offset (k+1)*rank (right-aligned)
-//                 [...]    input dtypes: nInputs ints, 0=fp32, 1=fp16
-//                                          (per-input load stride; enables
-//                                          fusion across dtype-crossing Cast)
+//                 [...]    input dtypes: nInputs ints, 0=fp32, 1=fp16,
+//                                          2=bf16 (per-input load stride and
+//                                          16-bit format; enables fusion
+//                                          across dtype-crossing Cast)
 //                 [...]    op words: 4 ints/op {op, dst, a, b}
 //                 [...]    scalar constants (float-as-uint), 1 int each
 //
@@ -52,6 +53,15 @@
 // at the load/store boundary based on the per-input/output dtype.
 
 #include "../common/buffer_common.comp"
+#include "../common/bf16.comp"
+
+// One packed 16-bit word of an input, decoded by THAT input's format (dtype
+// code 2 = bf16, else fp16). Per input, not per build: a bf16 chain may read
+// an fp32 or fp16 leaf across a fused Cast, and an fp16/fp32 terminal may read
+// a bf16 leaf. In the specialized path `bf` is a spec constant and folds away.
+vec2 dec16(uint w, bool bf) {
+    return bf ? unpackBF16x2(w) : unpackHalf2x16(w);
+}
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -142,36 +152,38 @@ layout(push_constant) uniform PC_uPC {
 } uPC;
 
 // Read input `k` at linear element index `lin` (already broadcast-mapped by
-// the caller). `isFp16` selects the load stride: fp16 inputs are packed
-// two-per-uint-word (read by unpackHalf2x16), fp32 inputs are one-per-uint
+// the caller). `dt` selects the load stride and format: fp16 (1) and bf16 (2)
+// inputs are packed two-per-uint-word (read by dec16), fp32 (0) inputs are one-per-uint
 // (uintBitsToFloat). The if-ladder is necessary because GLSL buffer blocks
 // can't be indexed by a dynamic variable. Mixed-dtype inputs let a chain
 // fuse across a dtype-crossing Cast (the Cast is a register no-op; the
 // conversion happens here at the load boundary).
-float load_input_raw(int k, int lin, bool isFp16) {
+float load_input_raw(int k, int lin, int dt) {
+    bool isFp16 = dt != 0;
+    bool bf = dt == 2;
     if (k == 0) {
-        return isFp16 ? unpackHalf2x16(uIn0.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn0.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn0.data[lin]);
     } else if (k == 1) {
-        return isFp16 ? unpackHalf2x16(uIn1.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn1.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn1.data[lin]);
     } else if (k == 2) {
-        return isFp16 ? unpackHalf2x16(uIn2.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn2.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn2.data[lin]);
     } else if (k == 3) {
-        return isFp16 ? unpackHalf2x16(uIn3.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn3.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn3.data[lin]);
     } else if (k == 4) {
-        return isFp16 ? unpackHalf2x16(uIn4.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn4.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn4.data[lin]);
     } else if (k == 5) {
-        return isFp16 ? unpackHalf2x16(uIn5.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn5.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn5.data[lin]);
     } else if (k == 6) {
-        return isFp16 ? unpackHalf2x16(uIn6.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn6.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn6.data[lin]);
     } else {
-        return isFp16 ? unpackHalf2x16(uIn7.data[lin >> 1])[lin & 1]
+        return isFp16 ? dec16(uIn7.data[lin >> 1], bf)[lin & 1]
                       : uintBitsToFloat(uIn7.data[lin]);
     }
 }
@@ -231,7 +243,7 @@ int input_index(int k, int lin, int bcBase, int dimsBase, int rank) {
 // pattern, not individual lines.
 //   id 0          SC_ON
 //   id 1, 2       SC_NOPS, SC_NIN
-//   id 3 + k      SC_DT<k>  input k dtype (0 fp32, 1 fp16)
+//   id 3 + k      SC_DT<k>  input k dtype (0 fp32, 1 fp16, 2 bf16)
 //   id 11 + k     SC_BK<k>  input k broadcast kind: 0 identity (lin), 1 scalar,
 //                           2 affine (lin/div)%mod from the SSBO, 3 general N-d
 //   id 19 + 4i+j  op i word j {op, dst, a, b}
@@ -423,19 +435,20 @@ int spec_index(int kind, int k, int lin, int bcBase, int dimsBase, int rank) {
 
 vec2 spec_load0(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT0 != 0;
+    bool bf = SC_DT0 == 2;
 #ifdef FP16
-    if (SC_BK0 == 0 && f16) return unpackHalf2x16(uIn0.data[gid]);
+    if (SC_BK0 == 0 && f16) return dec16(uIn0.data[gid], bf);
 #endif
     if (SC_BK0 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn0.data[0]).x : uintBitsToFloat(uIn0.data[0]);
+        float s = f16 ? dec16(uIn0.data[0], bf).x : uintBitsToFloat(uIn0.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK0, 0, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK0, 0, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn0.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn0.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn0.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn0.data[a0 >> 1], bf);
+        float v0 = dec16(uIn0.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn0.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn0.data[a0]);
@@ -444,19 +457,20 @@ vec2 spec_load0(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load1(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT1 != 0;
+    bool bf = SC_DT1 == 2;
 #ifdef FP16
-    if (SC_BK1 == 0 && f16) return unpackHalf2x16(uIn1.data[gid]);
+    if (SC_BK1 == 0 && f16) return dec16(uIn1.data[gid], bf);
 #endif
     if (SC_BK1 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn1.data[0]).x : uintBitsToFloat(uIn1.data[0]);
+        float s = f16 ? dec16(uIn1.data[0], bf).x : uintBitsToFloat(uIn1.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK1, 1, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK1, 1, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn1.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn1.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn1.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn1.data[a0 >> 1], bf);
+        float v0 = dec16(uIn1.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn1.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn1.data[a0]);
@@ -465,19 +479,20 @@ vec2 spec_load1(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load2(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT2 != 0;
+    bool bf = SC_DT2 == 2;
 #ifdef FP16
-    if (SC_BK2 == 0 && f16) return unpackHalf2x16(uIn2.data[gid]);
+    if (SC_BK2 == 0 && f16) return dec16(uIn2.data[gid], bf);
 #endif
     if (SC_BK2 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn2.data[0]).x : uintBitsToFloat(uIn2.data[0]);
+        float s = f16 ? dec16(uIn2.data[0], bf).x : uintBitsToFloat(uIn2.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK2, 2, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK2, 2, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn2.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn2.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn2.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn2.data[a0 >> 1], bf);
+        float v0 = dec16(uIn2.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn2.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn2.data[a0]);
@@ -486,19 +501,20 @@ vec2 spec_load2(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load3(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT3 != 0;
+    bool bf = SC_DT3 == 2;
 #ifdef FP16
-    if (SC_BK3 == 0 && f16) return unpackHalf2x16(uIn3.data[gid]);
+    if (SC_BK3 == 0 && f16) return dec16(uIn3.data[gid], bf);
 #endif
     if (SC_BK3 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn3.data[0]).x : uintBitsToFloat(uIn3.data[0]);
+        float s = f16 ? dec16(uIn3.data[0], bf).x : uintBitsToFloat(uIn3.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK3, 3, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK3, 3, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn3.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn3.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn3.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn3.data[a0 >> 1], bf);
+        float v0 = dec16(uIn3.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn3.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn3.data[a0]);
@@ -507,19 +523,20 @@ vec2 spec_load3(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load4(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT4 != 0;
+    bool bf = SC_DT4 == 2;
 #ifdef FP16
-    if (SC_BK4 == 0 && f16) return unpackHalf2x16(uIn4.data[gid]);
+    if (SC_BK4 == 0 && f16) return dec16(uIn4.data[gid], bf);
 #endif
     if (SC_BK4 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn4.data[0]).x : uintBitsToFloat(uIn4.data[0]);
+        float s = f16 ? dec16(uIn4.data[0], bf).x : uintBitsToFloat(uIn4.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK4, 4, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK4, 4, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn4.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn4.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn4.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn4.data[a0 >> 1], bf);
+        float v0 = dec16(uIn4.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn4.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn4.data[a0]);
@@ -528,19 +545,20 @@ vec2 spec_load4(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load5(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT5 != 0;
+    bool bf = SC_DT5 == 2;
 #ifdef FP16
-    if (SC_BK5 == 0 && f16) return unpackHalf2x16(uIn5.data[gid]);
+    if (SC_BK5 == 0 && f16) return dec16(uIn5.data[gid], bf);
 #endif
     if (SC_BK5 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn5.data[0]).x : uintBitsToFloat(uIn5.data[0]);
+        float s = f16 ? dec16(uIn5.data[0], bf).x : uintBitsToFloat(uIn5.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK5, 5, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK5, 5, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn5.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn5.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn5.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn5.data[a0 >> 1], bf);
+        float v0 = dec16(uIn5.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn5.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn5.data[a0]);
@@ -549,19 +567,20 @@ vec2 spec_load5(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load6(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT6 != 0;
+    bool bf = SC_DT6 == 2;
 #ifdef FP16
-    if (SC_BK6 == 0 && f16) return unpackHalf2x16(uIn6.data[gid]);
+    if (SC_BK6 == 0 && f16) return dec16(uIn6.data[gid], bf);
 #endif
     if (SC_BK6 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn6.data[0]).x : uintBitsToFloat(uIn6.data[0]);
+        float s = f16 ? dec16(uIn6.data[0], bf).x : uintBitsToFloat(uIn6.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK6, 6, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK6, 6, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn6.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn6.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn6.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn6.data[a0 >> 1], bf);
+        float v0 = dec16(uIn6.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn6.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn6.data[a0]);
@@ -570,19 +589,20 @@ vec2 spec_load6(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
 }
 vec2 spec_load7(int gid, int i0, int i1, int bcBase, int dimsBase, int rank) {
     bool f16 = SC_DT7 != 0;
+    bool bf = SC_DT7 == 2;
 #ifdef FP16
-    if (SC_BK7 == 0 && f16) return unpackHalf2x16(uIn7.data[gid]);
+    if (SC_BK7 == 0 && f16) return dec16(uIn7.data[gid], bf);
 #endif
     if (SC_BK7 == 1) {
-        float s = f16 ? unpackHalf2x16(uIn7.data[0]).x : uintBitsToFloat(uIn7.data[0]);
+        float s = f16 ? dec16(uIn7.data[0], bf).x : uintBitsToFloat(uIn7.data[0]);
         return vec2(s);
     }
     int a0 = spec_index(SC_BK7, 7, i0, bcBase, dimsBase, rank);
     int a1 = spec_index(SC_BK7, 7, i1, bcBase, dimsBase, rank);
     if (f16) {
-        if (a1 == a0 + 1 && (a0 & 1) == 0) return unpackHalf2x16(uIn7.data[a0 >> 1]);
-        float v0 = unpackHalf2x16(uIn7.data[a0 >> 1])[a0 & 1];
-        float v1 = (a1 == a0) ? v0 : unpackHalf2x16(uIn7.data[a1 >> 1])[a1 & 1];
+        if (a1 == a0 + 1 && (a0 & 1) == 0) return dec16(uIn7.data[a0 >> 1], bf);
+        float v0 = dec16(uIn7.data[a0 >> 1], bf)[a0 & 1];
+        float v1 = (a1 == a0) ? v0 : dec16(uIn7.data[a1 >> 1], bf)[a1 & 1];
         return vec2(v0, v1);
     }
     float v0 = uintBitsToFloat(uIn7.data[a0]);
@@ -781,7 +801,7 @@ void main_spec() {
 #ifdef FP16
     vec2 o = reg[0];
     if (2 * gid + 1 >= uPC.total) o.y = 0.0;
-    uOutput.data[gid] = packHalf2x16(o);
+    uOutput.data[gid] = BUF_PACK2(o); // bf16 under -DBF16
 #else
     uOutput.data[gid] = floatBitsToUint(reg[0].x);
 #endif
@@ -826,7 +846,8 @@ void main() {
     for (int i = 0; i < MAX_REGS; ++i) reg[i] = vec2(0.0);
 
     for (int k = 0; k < nInputs && k < MAX_INPUTS; ++k) {
-        bool inFp16 = uProg.data[dtypesBase + k] != 0;
+        int inDt = uProg.data[dtypesBase + k];
+        bool inFp16 = inDt != 0;
         int a0 = input_index(k, i0, bcBase, dimsBase, rank);
         int a1 = input_index(k, i1, bcBase, dimsBase, rank);
         float v0;
@@ -842,12 +863,12 @@ void main() {
             else if (k == 5) w = uIn5.data[a0 >> 1];
             else if (k == 6) w = uIn6.data[a0 >> 1];
             else w = uIn7.data[a0 >> 1];
-            vec2 h = unpackHalf2x16(w);
+            vec2 h = dec16(w, inDt == 2);
             v0 = h.x;
             v1 = h.y;
         } else {
-            v0 = load_input_raw(k, a0, inFp16);
-            v1 = (a1 == a0) ? v0 : load_input_raw(k, a1, inFp16);
+            v0 = load_input_raw(k, a0, inDt);
+            v1 = (a1 == a0) ? v0 : load_input_raw(k, a1, inDt);
         }
         reg[k] = vec2(v0, v1);
     }
@@ -880,7 +901,7 @@ void main() {
     // there (the word is still owned by this thread alone).
     vec2 o = reg[0];
     if (2 * gid + 1 >= uPC.total) o.y = 0.0;
-    uOutput.data[gid] = packHalf2x16(o);
+    uOutput.data[gid] = BUF_PACK2(o); // bf16 under -DBF16
 #else
     uOutput.data[gid] = floatBitsToUint(reg[0].x);
 #endif

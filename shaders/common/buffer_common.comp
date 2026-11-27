@@ -88,6 +88,7 @@ struct IArr8 { int v[8]; };
 // exported so a shader that re-packs (Split, Transpose, ...) does not switch
 // formats halfway.
 #define BUF_PACK2(v) packBF16x2(v)
+#define BUF_UNPACK2(w) unpackBF16x2(w)
 #define BUF_LOAD(data, idx) \
     (unpackBF16x2((data)[(idx) >> 1])[(idx) & 1])
 #define BUF_STORE(data, idx, v) do { \
@@ -98,6 +99,7 @@ struct IArr8 { int v[8]; };
     } while (false)
 #else
 #define BUF_PACK2(v) packHalf2x16(v)
+#define BUF_UNPACK2(w) unpackHalf2x16(w)
 #define BUF_LOAD(data, idx) \
     (unpackHalf2x16((data)[(idx) >> 1])[(idx) & 1])
 #define BUF_STORE(data, idx, v) do { \
@@ -107,6 +109,11 @@ struct IArr8 { int v[8]; };
         (data)[_w] = packHalf2x16(_p); \
     } while (false)
 #endif
+// The raw 16-bit word of element idx (low 16 bits of the result), for kernels
+// that only MOVE elements (Transpose, ...): no decode, so the same code is
+// exact for fp16 and bf16 alike, and a NaN payload survives the move.
+#define BUF_BITS16(data, idx) \
+    (((data)[(idx) >> 1] >> (((idx) & 1) << 4)) & 0xFFFFu)
 #else
 #define BUF_LOAD(data, idx)  uintBitsToFloat((data)[(idx)])
 #define BUF_STORE(data, idx, v) (data)[(idx)] = floatBitsToUint(float(v))

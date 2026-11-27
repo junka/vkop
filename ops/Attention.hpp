@@ -230,6 +230,10 @@ class AttentionBuffer : public BufferFactory {
         }
     }
     bool has_host_side_effects() const override { return true; }
+    // The kernel the last execute() recorded: "row" (attention.comp),
+    // "split_kv" (its -DKV_SPLIT pair), "flash" (attention_flash.comp) or
+    // "flash_coop8" (attention_flash_coop8.comp). For tests and route logs.
+    std::string route_tag() const override { return route_tag_; }
     // The INSTANCE answer. The only host work execute() does is the ring head
     // readback (a 1-element int32) — and once the dynamic form is live that
     // readback has moved to refresh_dynamic_params(), which the runtime calls
@@ -408,7 +412,7 @@ class AttentionBuffer : public BufferFactory {
         const int head_dim = dim(q_shape, q_shape.size() - 1);
         const bool flash = flash_route(
             batch, heads, seq, head_dim,
-            fp16_q(inputs[0]), /*cache_fp8=*/false);
+            half_q(inputs[0]), /*cache_fp8=*/false);
         return publish_dyn(kv_len, /*kv_past=*/0, /*ring_head=*/0,
                            flash ? batch * heads * flash_row_tiles(seq)
                                  : batch * heads * seq);
@@ -724,7 +728,7 @@ class AttentionBuffer : public BufferFactory {
         // instead of one per query row (see flash_route for what it serves).
         const bool use_flash =
             flash_route(batch, heads, seq, head_dim,
-                        fp16_q(inputs[0]), cache_fp8);
+                        half_q(inputs[0]), cache_fp8);
         int grid = use_flash ? batch * heads * flash_row_tiles(seq)
                              : batch * heads * seq;
         flash_cache_last_ = use_flash && has_cache;
@@ -732,8 +736,11 @@ class AttentionBuffer : public BufferFactory {
         const int rows = batch * heads * seq;
         const bool use_split =
             !use_flash && split_route(rows, head_dim, has_cache,
-                                      fp16_q(inputs[0]));
+                                      half_q(inputs[0]));
         split_last_ = use_split;
+        route_tag_ = use_flash ? (flash_is_coop8_ ? "flash_coop8" : "flash")
+                     : use_split ? "split_kv"
+                                 : "row";
         const int splits = use_split ? kv_splits_for(rows, kv_len) : 0;
         if (use_split) {
             grid = rows * splits;
@@ -945,13 +952,14 @@ class AttentionBuffer : public BufferFactory {
         }
     }
 
-    // Whether Q is true fp16 -- the only width the flash and split-KV routes
-    // have a module for. Their keys are the `_fp16` builds by name
-    // (flash_pipeline / split_pipeline), so a bf16 Q (same uint16_t container)
-    // must stay on the row kernel, whose _bf16 build decodes through dec2.
-    static bool fp16_q(const std::shared_ptr<core::ITensor> &q) {
-        return q->dtype() == typeid(uint16_t) &&
-               q->elem_kind() != core::ElemKind::kBFloat16;
+    // Whether Q is 16-bit storage (fp16, or a bf16 activation) -- the widths
+    // the flash and split-KV routes have modules for. The module follows the
+    // op's build: fp16_ == 2 (a bf16 activation) resolves the -DBF16 builds
+    // (buffer_attention_flash_bf16 / buffer_attention_split_bf16[_sg]),
+    // anything else the _fp16 ones. Operator::onExecute has already refused a
+    // bf16 Q on an op built for fp16 (and the reverse), so the two agree.
+    static bool half_q(const std::shared_ptr<core::ITensor> &q) {
+        return q->dtype() == typeid(uint16_t);
     }
 
     // ---- tiled many-row route (shaders/buffer/attention_flash.comp) ----
@@ -1000,7 +1008,12 @@ class AttentionBuffer : public BufferFactory {
         // Apple-GPU capability, so the coopmat build is chosen by device
         // (MoltenVK + vendor 0x106B); a missing key or a refused pipeline
         // falls through to the SIMT tiled kernel.
-        if (flash_coop8_ &&
+        // Not for a bf16 activation (fp16_ == 2): the coopmat build stages
+        // Q/K/V as fp16 fragments, which would clamp bf16 values past 65504,
+        // and its lazily rescaled online softmax leaves no place to undo a
+        // per-tile operand scale. bf16 takes the SIMT kernel's -DBF16 build
+        // (fp32 math on bf16 decodes).
+        if (flash_coop8_ && fp16_ != 2 &&
             core::device_supports_apple_coop8(m_dev_->device_traits())) {
             std::pair<const uint32_t *, uint32_t> c8{nullptr, 0};
             try {
@@ -1014,6 +1027,7 @@ class AttentionBuffer : public BufferFactory {
                     m_dev_->getLogicalDevice(), types_, sizeof(AttentionPC),
                     c8.first, static_cast<int>(c8.second), use_uab, 0,
                     pipeline_cache_);
+                flash_is_coop8_ = true;
                 return flash_pipe_.get();
             } catch (const std::exception &e) {
                 flash_pipe_.reset();
@@ -1025,7 +1039,8 @@ class AttentionBuffer : public BufferFactory {
         }
         std::pair<const uint32_t *, uint32_t> spv;
         try {
-            spv = resolve_spv("buffer_attention_flash_fp16");
+            spv = resolve_spv(fp16_ == 2 ? "buffer_attention_flash_bf16"
+                                         : "buffer_attention_flash_fp16");
         } catch (const std::exception &e) {
             flash_unavailable_ = true;
             std::fprintf(stderr,
@@ -1114,11 +1129,15 @@ class AttentionBuffer : public BufferFactory {
         if (split_unavailable_ || m_dev_ == nullptr) return nullptr;
         const bool use_uab = update_after_bind_ &&
                              m_dev_->is_support_descriptor_update_after_bind();
+        // A bf16 activation (fp16_ == 2) takes the -DBF16 builds of the same
+        // two modules (bf16 Q/K/V/mask decode, bf16 store).
+        const std::string base = fp16_ == 2 ? "buffer_attention_split_bf16"
+                                            : "buffer_attention_split_fp16";
         std::vector<std::string> keys;
         if (m_dev_->supportsSubgroupArithmetic()) {
-            keys.emplace_back("buffer_attention_split_fp16_sg");
+            keys.emplace_back(base + "_sg");
         }
-        keys.emplace_back("buffer_attention_split_fp16");
+        keys.emplace_back(base);
         for (const auto &key : keys) {
             std::pair<const uint32_t *, uint32_t> spv{nullptr, 0};
             try {
@@ -1287,6 +1306,10 @@ class AttentionBuffer : public BufferFactory {
     int flash_min_rows_ = 48;
     int flash_min_wgs_ = 16;
     bool flash_unavailable_ = false;
+    // flash_pipe_ is the coopmat build (attention_flash_coop8.comp).
+    bool flash_is_coop8_ = false;
+    // Which kernel the last execute() recorded (route_tag()).
+    const char *route_tag_ = "";
     // The last execute() was a cache-form round on the tiled route.
     bool flash_cache_last_ = false;
     std::unique_ptr<VulkanPipeline> flash_pipe_;

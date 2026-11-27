@@ -8,15 +8,25 @@
 // instead of computing on bf16 words read as fp16.
 //
 // Two halves:
-//   * refusals: a unary op, Transpose, Cast, a Gather writing a bf16 output,
-//     an operand-kind mix, MatMul shapes/folds with no bf16 route -- both as
-//     single ops and as .vkopbin graphs through Runtime::LoadModel;
+//   * refusals: an op with no bf16 kernel (AveragePool), an operand-kind
+//     mix, the MatMul down_act fold -- both as single ops and as .vkopbin
+//     graphs through Runtime::LoadModel (the unary family, Cast,
+//     Gather's bf16 output, FusedElemwise, Expand and Concat have bf16
+//     kernels: tests/Bf16ElementwiseTest.cpp; Transpose, Pad, Rotary, Resize,
+//     pools, reductions, InstanceNorm, PRelu, CumSum, ScatterElements:
+//     tests/Bf16DataMoveTest.cpp; Reshape/Slice: the byte movers below);
 //   * the allow-listed kernels against an fp32 reference computed from the
-//     same bf16 inputs: a binary op, RMSNorm, Softmax and every MatMul route a
-//     bf16 activation may take (including the shapes that would otherwise go
-//     to the Apple coop8 GEMM, the 128x128 tile and tile-split-K).
+//     same bf16 inputs: a binary op, RMSNorm, Softmax, every MatMul route a
+//     bf16 activation takes (GEMVs, fused, the 64x64 and 128x128 tiles,
+//     tile-split-K, the Apple coop8 GEMM, reduce_pack, the epi_bias and
+//     attn_softmax epilogues, the SwiGLU gate/up fold) and Attention's row,
+//     flash and split-KV kernels -- with values past fp16's 65504 and masks
+//     of finfo(bf16).min / -inf.
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -26,6 +36,7 @@
 
 #include "core/Bf16Gate.hpp"
 #include "core/DType.hpp"
+#include "core/KernelSelect.hpp"
 #include "core/runtime.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "setup.hpp"
@@ -173,17 +184,26 @@ TEST(Bf16ActivationTest, AllowListIsTheVerifiedKernels) {
     for (OpType t : {OpType::ADD, OpType::SUB, OpType::MUL, OpType::DIV,
                      OpType::POW, OpType::MIN, OpType::MAX, OpType::MOD,
                      OpType::SPLIT, OpType::LAYERNORM, OpType::RMSNORM,
-                     OpType::SOFTMAX, OpType::MATMUL, OpType::ATTENTION}) {
+                     OpType::SOFTMAX, OpType::MATMUL, OpType::ATTENTION,
+                     // byte movers (ByteMoversKeepBf16Bits below)
+                     OpType::SHAPE, OpType::SQUEEZE, OpType::UNSQUEEZE,
+                     OpType::RESHAPE, OpType::SLICE,
+                     // tests/Bf16ElementwiseTest.cpp
+                     OpType::RELU, OpType::SIGMOID, OpType::CLIP,
+                     OpType::EXPAND, OpType::CONCAT, OpType::FUSED_ELEMWISE,
+                     OpType::CAST, OpType::GATHER,
+                     // tests/Bf16DataMoveTest.cpp
+                     OpType::TRANSPOSE, OpType::ROTARY_EMBEDDING, OpType::PAD,
+                     OpType::RESIZE, OpType::MAXPOOL2D,
+                     OpType::GLOBALAVERAGEPOOL, OpType::REDUCE,
+                     OpType::REDUCEMEAN, OpType::INSTANCENORM, OpType::PRELU,
+                     OpType::CUMSUM, OpType::SCATTER_ELEMENTS}) {
         EXPECT_TRUE(bf16_activation_op(t)) << vkop::ops::convert_optype_to_string(t);
     }
     // Each of these has a _bf16 key in the archive (or falls back to the fp32
-    // module) and still decodes fp16: the old archive-lookup gate let them in.
-    for (OpType t : {OpType::RELU, OpType::SIGMOID, OpType::TRANSPOSE,
-                     OpType::EXPAND, OpType::CONCAT, OpType::SLICE,
-                     OpType::RESHAPE, OpType::CAST, OpType::GATHER,
-                     OpType::GEMM, OpType::FUSED_ELEMWISE, OpType::REDUCE,
-                     OpType::ROTARY_EMBEDDING, OpType::CLIP, OpType::CONV2D,
-                     OpType::INSTANCENORM, OpType::CUMSUM, OpType::TOPK}) {
+    // module) and still decodes fp16 somewhere, or has no dual build at all.
+    for (OpType t : {OpType::GEMM, OpType::CONV2D, OpType::TOPK,
+                     OpType::AVERAGEPOOL, OpType::WHERE}) {
         EXPECT_FALSE(bf16_activation_op(t)) << vkop::ops::convert_optype_to_string(t);
     }
     // bf16 WEIGHT slots are a separate role and stay as they were.
@@ -196,38 +216,19 @@ TEST(Bf16ActivationTest, AllowListIsTheVerifiedKernels) {
 
 // ------------------------------------------------------ single-op refusals
 
-TEST(Bf16ActivationTest, UnaryOpRefusesBf16) {
+TEST(Bf16ActivationTest, GatedOpRefusesBf16) {
     Env e;
-    auto x = bf16_in(e, {4, 8}, bf16_values(32, 1));
-    auto y = out<uint16_t>(e, {4, 8}, ElemKind::kBFloat16);
-    auto op = make_op(e, OpType::RELU, 2);
+    auto x = bf16_in(e, {1, 2, 2, 8}, bf16_values(32, 1));
+    auto y = out<uint16_t>(e, {1, 2, 1, 4}, ElemKind::kBFloat16);
+    auto op = make_op(e, OpType::AVERAGEPOOL, 2,
+                      {{"kernel_shape", "[2, 2]"}, {"strides", "[2, 2]"}});
     expect_refused([&] { op->onExecute({x}, {y}, 0); },
-                   "vkop: no bf16 activation kernel for Relu");
+                   "vkop: no bf16 activation kernel for AveragePool");
 }
 
-TEST(Bf16ActivationTest, TransposeRefusesBf16) {
-    Env e;
-    auto x = bf16_in(e, {4, 8}, bf16_values(32, 2));
-    auto y = out<uint16_t>(e, {8, 4}, ElemKind::kBFloat16);
-    auto op = make_op(e, OpType::TRANSPOSE, 2, {{"perm", "[1, 0]"}});
-    expect_refused([&] { op->onExecute({x}, {y}, 0); },
-                   "vkop: no bf16 activation kernel for Transpose");
-}
-
-TEST(Bf16ActivationTest, CastRefusesBf16) {
-    // cast.comp's fp16 -> fp32 path would decode the bf16 words as fp16.
-    Env e;
-    auto x = bf16_in(e, {4, 8}, bf16_values(32, 3));
-    auto y = out<float>(e, {4, 8}, ElemKind::kFloat32);
-    auto op = make_op(e, OpType::CAST, 0, {{"to", "1"}});
-    expect_refused([&] { op->onExecute({x}, {y}, 0); },
-                   "vkop: no bf16 activation kernel for Cast");
-}
-
-TEST(Bf16ActivationTest, GatherWithBf16OutputRefused) {
-    // A bf16 TABLE is a weight and stays legal with an fp16/fp32 output
-    // (GatherTest.GatherBf16Table); a bf16 OUTPUT is an activation, and
-    // gather.comp -DBF16_TABLE writes fp32/fp16 only.
+TEST(Bf16ActivationTest, PerOperandOpsStillNeedTheirOutputBuild) {
+    // FusedElemwise and Gather build for their OUTPUT format: a bf16 output
+    // from an op built for fp16 would pack fp16 bits.
     Env e;
     auto table = bf16_in(e, {4, 8}, bf16_values(32, 4));
     auto idx = std::make_shared<Tensor<int64_t>>(std::vector<int>{2});
@@ -236,9 +237,16 @@ TEST(Bf16ActivationTest, GatherWithBf16OutputRefused) {
     idx->as_storage_buffer(e.dev);
     idx->copyToGPU(e.cmdpool, keep.data());
     auto y = out<uint16_t>(e, {2, 8}, ElemKind::kBFloat16);
-    auto op = make_op(e, OpType::GATHER, 2, {{"axis", "0"}});
+    auto op = make_op(e, OpType::GATHER, 1, {{"axis", "0"}});
     expect_refused([&] { op->onExecute({table, idx}, {y}, 0); },
-                   "vkop: no bf16 activation kernel for Gather");
+                   "built for fp16");
+    // ...and an fp16 operand of a NON-per-operand op is still a mix.
+    auto x = bf16_in(e, {4, 8}, bf16_values(32, 3));
+    auto f = fp16_in(e, {4, 8}, bf16_values(32, 2));
+    auto cat = make_op(e, OpType::CONCAT, 2, {{"axis", "0"}});
+    auto z2 = out<uint16_t>(e, {8, 8}, ElemKind::kBFloat16);
+    expect_refused([&] { cat->onExecute({x, f}, {z2}, 0); },
+                   "mixes bfloat16 activations with a float16 input 1");
 }
 
 TEST(Bf16ActivationTest, Fp16BesideBf16Refused) {
@@ -264,25 +272,14 @@ TEST(Bf16ActivationTest, OpBuiltForFp16RefusesBf16) {
 
 TEST(Bf16ActivationTest, MatMulWithoutABf16RouteRefused) {
     Env e;
-    // Odd N: the only route is reduce_pack, whose pack pass writes fp16.
+    // The SwiGLU down fold (matmul_down_act.comp) reads fp16 only.
     {
-        auto a = bf16_in(e, {4, 64}, bf16_values(4 * 64, 9));
-        auto b = bf16_in(e, {64, 7}, bf16_values(64 * 7, 10));
-        auto y = out<uint16_t>(e, {4, 7}, ElemKind::kBFloat16);
-        auto op = make_op(e, OpType::MATMUL, 2);
+        auto a = bf16_in(e, {1, 64}, bf16_values(64, 9));
+        auto b = bf16_in(e, {64, 8}, bf16_values(64 * 8, 10));
+        auto y = out<uint16_t>(e, {1, 8}, ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::MATMUL, 2, {{"down_act", "1"}});
         expect_refused([&] { op->onExecute({a, b}, {y}, 0); },
-                       "vkop: no bf16 activation kernel for MatMul");
-    }
-    // The QK^T epilogue (mask/bias read) has no bf16 form.
-    {
-        auto a = bf16_in(e, {4, 64}, bf16_values(4 * 64, 11));
-        auto b = bf16_in(e, {64, 8}, bf16_values(64 * 8, 12));
-        auto bias = bf16_in(e, {4, 8}, bf16_values(32, 13));
-        auto y = out<uint16_t>(e, {4, 8}, ElemKind::kBFloat16);
-        auto op = make_op(e, OpType::MATMUL, 2,
-                          {{"epi_bias", "1"}, {"epi_scale", "0.5"}});
-        expect_refused([&] { op->onExecute({a, b, bias}, {y}, 0); },
-                       "epi_bias");
+                       "down_act SwiGLU fold");
     }
     // A quantized/fp16 weight beside a bf16 activation: the _bf16 module
     // would decode the fp16 B as bf16.
@@ -411,26 +408,173 @@ TEST(Bf16ActivationTest, SoftmaxMatchesFp32) {
     }
 }
 
+// ------------------------------------------ MatMul / Attention bf16 routes
+//
+// Every MatMul route a bf16 activation takes now runs the same kernel family
+// the fp16 graph would (the selector walks the same table; only the KHR
+// cooperative-matrix GEMMs and the down_act fold stay fenced), so these tests
+// assert two things per shape: the bf16 route EQUALS the fp16 route for the
+// same shape, and the bf16 result matches an fp64 reference computed from the
+// same bf16-rounded inputs -- including inputs past fp16's 65504, which a
+// half-staged kernel would clamp.
+
+namespace bf16act {
+
+// finfo(torch.bfloat16).min and -inf, the two additive-mask values a bf16
+// graph carries. Neither exists in fp16.
+const float kBf16Min = bf16_to_float(0xFF7Fu);
+const float kNegInf = -std::numeric_limits<float>::infinity();
+
+std::shared_ptr<Tensor<uint16_t>> half_in(Env &e, bool bf16,
+                                          const std::vector<int> &shape,
+                                          const std::vector<float> &vals) {
+    return bf16 ? bf16_in(e, shape, vals) : fp16_in(e, shape, vals);
+}
+
+std::vector<float> read_half(Env &e, bool bf16,
+                             const std::shared_ptr<Tensor<uint16_t>> &t) {
+    if (bf16) return read_bf16(e, t);
+    t->copyToCPU(e.cmdpool);
+    std::vector<float> v(t->num_elements());
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = ITensor::fp16_to_fp32((*t)[i]);
+    return v;
+}
+
+// Runs one MatMul on 16-bit operands: bf16 (the _bf16 module) or fp16.
+struct MMRun {
+    std::vector<float> y;
+    std::string route;
+};
+MMRun run_matmul(Env &e, bool bf16, const std::vector<int> &ashape,
+                 const std::vector<float> &av, const std::vector<int> &bshape,
+                 const std::vector<float> &bv, const std::vector<int> &yshape,
+                 const Attrs &attrs, const std::vector<int> *biasshape = nullptr,
+                 const std::vector<float> *biasv = nullptr) {
+    auto a = half_in(e, bf16, ashape, av);
+    auto b = half_in(e, bf16, bshape, bv);
+    auto y = out<uint16_t>(e, yshape,
+                           bf16 ? ElemKind::kBFloat16 : ElemKind::kFloat16);
+    std::vector<std::shared_ptr<ITensor>> ins{a, b};
+    if (biasshape != nullptr) ins.push_back(half_in(e, bf16, *biasshape, *biasv));
+    auto op = make_op(e, OpType::MATMUL, bf16 ? 2 : 1, attrs);
+    op->onExecute(ins, {y}, 0);
+    submit(e, op.get());
+    return {read_half(e, bf16, y), op->route_tag()};
+}
+
+// The route the fp16 graph takes for this shape (same attributes, small
+// in-range inputs): the bf16 route must be the same one now.
+std::string fp16_route(Env &e, const std::vector<int> &ashape,
+                       const std::vector<int> &bshape,
+                       const std::vector<int> &yshape, const Attrs &attrs,
+                       const std::vector<int> *biasshape = nullptr) {
+    std::vector<float> bias;
+    if (biasshape != nullptr) bias.assign(numel(*biasshape), 0.0F);
+    return run_matmul(e, false, ashape, bf16_values(numel(ashape), 1), bshape,
+                      bf16_values(numel(bshape), 2), yshape, attrs, biasshape,
+                      biasshape != nullptr ? &bias : nullptr)
+        .route;
+}
+
+// |got - ref| <= rtol*|ref| + atol_i, atol_i = max(atol, slack*sum_k|a||b|)
+// per element: the fp32 accumulation (and, on coop8, the scaled stage's
+// subnormal grid) is bounded by the magnitude of the products, not of their
+// sum. A clamped 3e5 entry misses by ~2.3e5*|b|, far outside this.
+int count_bad_mm(const std::vector<float> &got, const std::vector<double> &ref,
+                 const std::vector<double> &mag, double rtol, double atol,
+                 double slack, double *worst) {
+    int bad = 0;
+    *worst = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double d = std::fabs(static_cast<double>(got[i]) - ref[i]);
+        const double tol = rtol * std::fabs(ref[i]) + std::max(atol, slack * mag[i]);
+        *worst = std::max(*worst, std::isfinite(d) ? d / tol : 1e30);
+        if (!(d <= tol)) ++bad;
+    }
+    return bad;
+}
+
+// Plain [batch, M, K] x [K, N] (or [N, K]) reference with per-element
+// magnitude sum_k |a||b|. B is shared over the batch when bbatch == 1.
+void mm_ref(int batch, int bbatch, int m, int k, int n, bool transB,
+            const std::vector<float> &av, const std::vector<float> &bv,
+            std::vector<double> *ref, std::vector<double> *mag) {
+    ref->assign(static_cast<size_t>(batch) * m * n, 0.0);
+    mag->assign(ref->size(), 0.0);
+    for (int bt = 0; bt < batch; ++bt) {
+        const size_t boff = static_cast<size_t>(bbatch == 1 ? 0 : bt) * k * n;
+        for (int i = 0; i < m; ++i)
+            for (int j = 0; j < n; ++j) {
+                double s = 0, g = 0;
+                for (int kk = 0; kk < k; ++kk) {
+                    const double a = av[(static_cast<size_t>(bt) * m + i) * k + kk];
+                    const double b = transB ? bv[boff + static_cast<size_t>(j) * k + kk]
+                                            : bv[boff + static_cast<size_t>(kk) * n + j];
+                    s += a * b;
+                    g += std::fabs(a * b);
+                }
+                (*ref)[(static_cast<size_t>(bt) * m + i) * n + j] = s;
+                (*mag)[(static_cast<size_t>(bt) * m + i) * n + j] = g;
+            }
+    }
+}
+
+// Sprinkles bf16 values past fp16's range: A rows `rows` get one entry each
+// (alternating sign, 7e4 .. 3e6), B columns `cols` one each (2e5).
+void add_outliers(std::vector<float> *av, int m, int k, const std::vector<int> &rows,
+                  std::vector<float> *bv, int n, bool transB,
+                  const std::vector<int> &cols, int batch = 1) {
+    for (int bt = 0; bt < batch; ++bt)
+        for (size_t r = 0; r < rows.size(); ++r) {
+            const float v = (r & 1 ? -1.0F : 1.0F) * (7.0e4F * float(1 + 7 * r));
+            const int kk = static_cast<int>((r * 37 + 5) % k);
+            (*av)[(static_cast<size_t>(bt) * m + rows[r]) * k + kk] =
+                bf16_to_float(float_to_bf16(v));
+        }
+    for (size_t c = 0; c < cols.size(); ++c) {
+        const int kk = static_cast<int>((c * 53 + 11) % k);
+        const float v = bf16_to_float(float_to_bf16(c & 1 ? -2.0e5F : 2.5e5F));
+        if (transB)
+            (*bv)[static_cast<size_t>(cols[c]) * k + kk] = v;
+        else
+            (*bv)[static_cast<size_t>(kk) * n + cols[c]] = v;
+    }
+}
+
+} // namespace bf16act
+
 TEST(Bf16ActivationTest, MatMulRoutesMatchFp32) {
     Env e;
+    // Apple with coop8 left on: the "coop8" shapes must really reach it.
+    const char *c8env = std::getenv("VKOP_COOP8");
+    const bool apple = vkop::core::device_supports_apple_coop8(
+                           e.dev->device_traits()) &&
+                       (c8env == nullptr || std::atoi(c8env) != 0);
     struct Case {
         int batch, m, k, n;
         bool transB;
+        bool outliers; // A rows / B columns past 65504
         const char *why;
     };
     const std::vector<Case> cases = {
-        {1, 1, 512, 256, false, "decode: split-K GEMV"},
-        {1, 1, 258, 260, false, "decode: split-K GEMV, K tail"},
-        {1, 1, 512, 4096, false, "decode: WIDE split-K GEMV"},
-        {1, 3, 64, 12, false, "even N, K < 256: fused even-N kernel"},
-        {1, 2, 64, 12, true, "fused even-N, transB"},
-        {2, 3, 32, 10, false, "batched A, shared 2-D weight"},
-        {1, 20, 128, 96, false, "64x64 SIMT tile"},
-        {1, 20, 128, 96, true, "64x64 SIMT tile, transB"},
-        {1, 16, 1024, 64, false, "fp16 would take tile split-K"},
-        {1, 130, 256, 192, false, "fp16 would take the Apple coop8 GEMM"},
-        {3, 70, 128, 64, false, "coop8 shape, batched A"},
-        {1, 256, 64, 2056, false, "fp16 would take the 128x128 tile"},
+        {1, 1, 512, 256, false, false, "decode: split-K GEMV"},
+        {1, 1, 258, 260, false, false, "decode: split-K GEMV, K tail"},
+        {1, 1, 512, 4096, false, true, "decode: WIDE split-K GEMV"},
+        {1, 3, 64, 12, false, false, "even N, K < 256: fused even-N kernel"},
+        {1, 2, 64, 12, true, false, "fused even-N, transB"},
+        {2, 3, 32, 10, false, false, "batched A, shared 2-D weight"},
+        {1, 20, 128, 96, false, true, "64x64 SIMT tile"},
+        {1, 20, 128, 96, true, true, "64x64 SIMT tile, transB"},
+        {1, 16, 1024, 64, false, true, "tile split-K"},
+        {1, 130, 256, 192, false, true, "tile split-K, M > 128"},
+        {1, 512, 256, 1024, false, false, "Apple coop8 GEMM"},
+        {1, 512, 256, 1024, false, true, "Apple coop8 GEMM, outliers"},
+        {1, 128, 128, 128, true, true, "Apple coop8 GEMM, transB, outliers"},
+        {3, 70, 128, 64, false, true, "coop8 shape, batched A, outliers"},
+        {1, 256, 64, 2056, false, true, "128x128 tile"},
+        {1, 4, 64, 7, false, true, "odd N: reduce + bf16 pack"},
+        {2, 5, 96, 33, true, false, "odd N, transB, batched"},
     };
     for (const Case &c : cases) {
         const std::vector<int> ashape =
@@ -441,37 +585,450 @@ TEST(Bf16ActivationTest, MatMulRoutesMatchFp32) {
         const std::vector<int> yshape =
             c.batch > 1 ? std::vector<int>{c.batch, c.m, c.n}
                         : std::vector<int>{c.m, c.n};
-        const auto av = bf16_values(numel(ashape), 51 + c.m);
-        const auto bv = bf16_values(numel(bshape), 52 + c.n);
-        auto a = bf16_in(e, ashape, av);
-        auto b = bf16_in(e, bshape, bv);
-        auto y = out<uint16_t>(e, yshape, ElemKind::kBFloat16);
-        auto op = make_op(e, OpType::MATMUL, 2,
-                          {{"transB", c.transB ? "1" : "0"}});
-        op->onExecute({a, b}, {y}, 0);
-        submit(e, op.get());
-        const std::string route = op->route_tag();
-        EXPECT_TRUE(route.rfind("coop", 0) != 0 && route != "tiled_ks" &&
-                    route != "reduce_pack" && route.find("512") == std::string::npos)
-            << c.why << ": bf16 took route " << route;
-        std::vector<double> ref(numel(yshape));
-        for (int bt = 0; bt < c.batch; ++bt)
+        auto av = bf16_values(numel(ashape), 51 + c.m);
+        auto bv = bf16_values(numel(bshape), 52 + c.n);
+        if (c.outliers) {
+            std::vector<int> rows{0};
+            if (c.m > 3) rows.push_back(3);
+            if (c.m > 70) rows.push_back(70);
+            if (c.m > 129) rows.push_back(129);
+            if (c.m > 300) rows.push_back(300);
+            if (c.m > 500) rows.push_back(511);
+            std::vector<int> cols{c.n - 1};
+            if (c.n > 5) cols.push_back(5);
+            add_outliers(&av, c.m, c.k, rows, &bv, c.n, c.transB, cols, c.batch);
+        }
+        const Attrs attrs{{"transB", c.transB ? "1" : "0"}};
+        const std::string want = fp16_route(e, ashape, bshape, yshape, attrs);
+        const MMRun r = run_matmul(e, true, ashape, av, bshape, bv, yshape, attrs);
+        EXPECT_EQ(r.route, want) << c.why << ": bf16 and fp16 routes differ";
+        if (apple && std::string(c.why).find("coop8") != std::string::npos) {
+            EXPECT_EQ(r.route, "coop8") << c.why;
+        }
+        std::vector<double> ref, mag;
+        mm_ref(c.batch, 1, c.m, c.k, c.n, c.transB, av, bv, &ref, &mag);
+        double worst = 0;
+        const int bad = count_bad_mm(r.y, ref, mag, 8e-3, 0.03, 2e-3, &worst);
+        EXPECT_EQ(bad, 0) << c.why << " (route " << r.route << ") m=" << c.m
+                          << " k=" << c.k << " n=" << c.n << " worst/tol "
+                          << worst;
+        LOG_INFO("bf16 MatMul %s: route %s (fp16 %s), worst err/tol %g", c.why,
+                 r.route.c_str(), want.c_str(), worst);
+    }
+}
+
+// The 512-lane split-K builds are opt-in (VKOP_KSPLIT512=1, read once per
+// process), so this only runs in a process started with it.
+TEST(Bf16ActivationTest, MatMulKsplit512MatchesFp32) {
+    if (!vkop::core::matmul_knobs().ksplit512_enabled) {
+        GTEST_SKIP() << "run with VKOP_KSPLIT512=1";
+    }
+    Env e;
+    struct Case {
+        int m, k, n;
+    } cases[] = {{1, 2048, 256}, {1, 2048, 4096}, {2, 1024, 512}};
+    for (const Case &c : cases) {
+        auto av = bf16_values(c.m * c.k, 61);
+        auto bv = bf16_values(c.k * c.n, 62);
+        add_outliers(&av, c.m, c.k, {0}, &bv, c.n, false, {3});
+        const MMRun r = run_matmul(e, true, {c.m, c.k}, av, {c.k, c.n}, bv,
+                                   {c.m, c.n}, {});
+        EXPECT_NE(r.route.find("512"), std::string::npos) << r.route;
+        std::vector<double> ref, mag;
+        mm_ref(1, 1, c.m, c.k, c.n, false, av, bv, &ref, &mag);
+        double worst = 0;
+        EXPECT_EQ(count_bad_mm(r.y, ref, mag, 8e-3, 0.03, 2e-3, &worst), 0)
+            << "route " << r.route << " worst/tol " << worst;
+    }
+}
+
+// The attention QK^T epilogue: out = acc * scale + bias, with a bf16 bias
+// carrying finfo(bf16).min and -inf. The fp16 decode of the bias read those as
+// NaN; now -inf stays -inf and finfo.min stays finite.
+TEST(Bf16ActivationTest, MatMulEpiBiasBf16Mask) {
+    Env e;
+    struct Case {
+        int heads, m, k, n;
+        bool transB;
+    } cases[] = {{2, 4, 64, 8, true},    {2, 20, 128, 96, true},
+                 {2, 3, 64, 7, true},    {4, 1, 512, 64, true},
+                 {2, 70, 64, 128, false}};
+    for (const Case &c : cases) {
+        const int B = 1;
+        const int batch = B * c.heads;
+        const std::vector<int> ashape{batch, c.m, c.k};
+        const std::vector<int> bshape = c.transB
+                                            ? std::vector<int>{batch, c.n, c.k}
+                                            : std::vector<int>{batch, c.k, c.n};
+        const std::vector<int> yshape{batch, c.m, c.n};
+        const std::vector<int> biasshape{B, c.m, c.n};
+        auto av = bf16_values(numel(ashape), 71);
+        auto bv = bf16_values(numel(bshape), 72);
+        std::vector<float> bias = bf16_values(numel(biasshape), 73);
+        for (int i = 0; i < c.m; ++i)
+            for (int j = 0; j < c.n; ++j) {
+                float &v = bias[static_cast<size_t>(i) * c.n + j];
+                if (j > i + c.n / 2) v = kBf16Min;      // causal-style
+                if (i == c.m - 1 && j % 3 == 0) v = kNegInf;
+            }
+        const float scale = 0.125F;
+        const Attrs attrs{{"transB", c.transB ? "1" : "0"},
+                          {"epi_bias", "1"},
+                          {"epi_scale", std::to_string(scale)}};
+        const std::string want = fp16_route(e, ashape, bshape, yshape, attrs, &biasshape);
+        const MMRun r = run_matmul(e, true, ashape, av, bshape, bv, yshape,
+                                   attrs, &biasshape, &bias);
+        EXPECT_EQ(r.route, want);
+        std::vector<double> ref, mag;
+        // B is per-batch here (bbatch = batch).
+        mm_ref(batch, batch, c.m, c.k, c.n, c.transB, av, bv, &ref, &mag);
+        int bad = 0;
+        for (int bt = 0; bt < batch; ++bt)
             for (int i = 0; i < c.m; ++i)
                 for (int j = 0; j < c.n; ++j) {
-                    double s = 0;
-                    for (int kk = 0; kk < c.k; ++kk) {
-                        const float bvv = c.transB ? bv[j * c.k + kk]
-                                                   : bv[kk * c.n + j];
-                        s += double(av[(bt * c.m + i) * c.k + kk]) * bvv;
+                    const size_t o = (static_cast<size_t>(bt) * c.m + i) * c.n + j;
+                    const double bb = bias[static_cast<size_t>(i) * c.n + j];
+                    const double want_v = ref[o] * scale + bb;
+                    const float got = r.y[o];
+                    bool ok;
+                    if (std::isinf(want_v)) {
+                        ok = std::isinf(got) && got < 0;
+                    } else {
+                        ok = std::fabs(got - want_v) <=
+                             8e-3 * std::fabs(want_v) + 0.02 + 2e-3 * mag[o] * scale;
                     }
-                    ref[(bt * c.m + i) * c.n + j] = s;
+                    if (!ok && bad++ < 5)
+                        ADD_FAILURE() << "epi_bias (route " << r.route << ") at "
+                                      << bt << "," << i << "," << j << ": got "
+                                      << got << " want " << want_v;
                 }
+        EXPECT_EQ(bad, 0) << "route " << r.route << " m=" << c.m << " n=" << c.n;
+        LOG_INFO("bf16 MatMul epi_bias m=%d n=%d: route %s", c.m, c.n,
+                 r.route.c_str());
+    }
+}
+
+// The fused QK^T + scale + bias + softmax row kernel (attn_softmax). Head 0's
+// rows mix real scores, finfo(bf16).min and -inf; head 1's bias masks every
+// column with finfo.min, whose reference softmax is uniform (all scores equal
+// once the mask swamps them) -- the old -1e30 running max gave zeros there.
+TEST(Bf16ActivationTest, MatMulAttnSoftmaxBf16Mask) {
+    Env e;
+    const int B = 2, H = 2, m = 1, k = 64, n = 128;
+    const int batch = B * H;
+    const std::vector<int> ashape{batch, m, k};
+    const std::vector<int> bshape{batch, n, k};
+    const std::vector<int> yshape{batch, m, n};
+    const std::vector<int> biasshape{B, m, n};
+    auto av = bf16_values(numel(ashape), 81);
+    auto bv = bf16_values(numel(bshape), 82);
+    std::vector<float> bias(numel(biasshape), 0.0F);
+    for (int j = 0; j < n; ++j) {
+        bias[j] = j < 40 ? 0.0F : (j % 2 ? kBf16Min : kNegInf);
+        bias[n + j] = kBf16Min;
+    }
+    const float scale = 0.125F;
+    const Attrs attrs{{"transB", "1"},
+                      {"epi_bias", "1"},
+                      {"epi_scale", std::to_string(scale)},
+                      {"attn_softmax", "1"}};
+    const std::string want = fp16_route(e, ashape, bshape, yshape, attrs, &biasshape);
+    const MMRun r = run_matmul(e, true, ashape, av, bshape, bv, yshape, attrs,
+                               &biasshape, &bias);
+    EXPECT_EQ(r.route, want);
+    EXPECT_EQ(r.route, "attn_softmax");
+    std::vector<double> ref, mag;
+    mm_ref(batch, batch, m, k, n, true, av, bv, &ref, &mag);
+    std::vector<double> sm(ref.size());
+    for (int bt = 0; bt < batch; ++bt) {
+        const int bb = bt / H;
+        std::vector<double> x(n);
+        double mx = -std::numeric_limits<double>::infinity();
+        for (int j = 0; j < n; ++j) {
+            x[j] = ref[static_cast<size_t>(bt) * n + j] * scale +
+                   double(bias[static_cast<size_t>(bb) * n + j]);
+            // fp32 cannot tell finfo.min + O(1) apart: neither can the GPU.
+            x[j] = double(static_cast<float>(x[j]));
+            mx = std::max(mx, x[j]);
+        }
+        double s = 0;
+        for (int j = 0; j < n; ++j) s += std::exp(x[j] - mx);
+        for (int j = 0; j < n; ++j)
+            sm[static_cast<size_t>(bt) * n + j] = std::exp(x[j] - mx) / s;
+    }
+    double worst = 0;
+    EXPECT_EQ(count_bad(r.y, sm, 1.2e-2, 1e-4, &worst), 0)
+        << "attn_softmax worst " << worst;
+    // The fully masked head: uniform 1/n.
+    EXPECT_NEAR(r.y[static_cast<size_t>(2) * n + 5], 1.0 / n, 1e-4);
+}
+
+// The SwiGLU gate/up fold: B interleaves Wg and Wu four columns at a time and
+// the result is silu(x.Wg) * (x.Wu), [M, N_up]. Each shape reaches a
+// different epilogue: the WIDE GEMV's, coop8's, and the scratch +
+// matmul_swiglu_pack pass behind the tile.
+TEST(Bf16ActivationTest, MatMulSwigluFoldMatchesFp32) {
+    Env e;
+    struct Case {
+        int m, k, nup;
+        const char *why;
+    } cases[] = {{1, 256, 512, "decode GEMV + swiglu_pack"},
+                 {1, 256, 2048, "decode WIDE GEMV epilogue"},
+                 {64, 64, 64, "coop8 epilogue"},
+                 {20, 128, 48, "tile + swiglu_pack"},
+                 {3, 64, 16, "fused + swiglu_pack"}};
+    for (const Case &c : cases) {
+        const int n = 2 * c.nup;
+        auto av = bf16_values(static_cast<size_t>(c.m) * c.k, 91);
+        auto bv = bf16_values(static_cast<size_t>(c.k) * n, 92);
+        const Attrs attrs{{"swiglu", "1"}};
+        const std::string want =
+            fp16_route(e, {c.m, c.k}, {c.k, n}, {c.m, c.nup}, attrs);
+        const MMRun r = run_matmul(e, true, {c.m, c.k}, av, {c.k, n}, bv,
+                                   {c.m, c.nup}, attrs);
+        EXPECT_EQ(r.route, want) << c.why;
+        std::vector<double> ref, mag;
+        mm_ref(1, 1, c.m, c.k, n, false, av, bv, &ref, &mag);
+        std::vector<double> h(static_cast<size_t>(c.m) * c.nup);
+        for (int i = 0; i < c.m; ++i)
+            for (int j = 0; j < c.nup; ++j) {
+                const int oct = j / 4, q = j % 4;
+                // The kernel rounds the plain product to the output width
+                // before the pack pass applies silu on the routes without an
+                // epilogue; the reference uses exact products, so allow for it.
+                const double g = ref[static_cast<size_t>(i) * n + oct * 8 + q];
+                const double u = ref[static_cast<size_t>(i) * n + oct * 8 + 4 + q];
+                h[static_cast<size_t>(i) * c.nup + j] = g / (1.0 + std::exp(-g)) * u;
+            }
         double worst = 0;
-        const int bad = count_bad(read_bf16(e, y), ref, 1.6e-2, 0.03, &worst);
-        EXPECT_EQ(bad, 0) << c.why << " (route " << route << ") m=" << c.m
-                          << " k=" << c.k << " n=" << c.n << " worst " << worst;
-        LOG_INFO("bf16 MatMul %s: route %s, worst |err| %g", c.why,
-                 route.c_str(), worst);
+        EXPECT_EQ(count_bad(r.y, h, 2.5e-2, 0.03, &worst), 0)
+            << c.why << " (route " << r.route << ") worst " << worst;
+        LOG_INFO("bf16 SwiGLU fold %s: route %s", c.why, r.route.c_str());
+    }
+}
+
+// ----------------------------------------------------------- Attention
+
+namespace bf16act {
+
+// Q [1,H,S,D], K/V [1,Hkv,kv,D], optional mask [1,1,S,kv]; fp64 reference.
+// A row whose scores are all -inf has no reference softmax (0/0); the kernels
+// store zeros for it, which is what is checked there.
+std::vector<double> attn_ref(int H, int Hkv, int S, int D, int kv,
+                             const std::vector<float> &q, const std::vector<float> &k,
+                             const std::vector<float> &v,
+                             const std::vector<float> *mask, float scale,
+                             bool causal) {
+    const int rep = H / Hkv;
+    std::vector<double> y(static_cast<size_t>(H) * S * D, 0.0);
+    for (int h = 0; h < H; ++h)
+        for (int s = 0; s < S; ++s) {
+            std::vector<double> x(kv);
+            double mx = -std::numeric_limits<double>::infinity();
+            for (int j = 0; j < kv; ++j) {
+                double dot = 0;
+                for (int d = 0; d < D; ++d)
+                    dot += double(q[(static_cast<size_t>(h) * S + s) * D + d]) *
+                           k[(static_cast<size_t>(h / rep) * kv + j) * D + d];
+                double sc = dot * scale;
+                if (mask) sc += (*mask)[static_cast<size_t>(s) * kv + j];
+                sc = double(static_cast<float>(sc)); // the kernels' fp32 sum
+                if (causal && j > kv - S + s) sc = -std::numeric_limits<double>::infinity();
+                x[j] = sc;
+                mx = std::max(mx, sc);
+            }
+            if (std::isinf(mx)) continue; // all -inf: zeros
+            double l = 0;
+            for (int j = 0; j < kv; ++j) l += std::exp(x[j] - mx);
+            for (int j = 0; j < kv; ++j) {
+                const double p = std::exp(x[j] - mx) / l;
+                for (int d = 0; d < D; ++d)
+                    y[(static_cast<size_t>(h) * S + s) * D + d] +=
+                        p * v[(static_cast<size_t>(h / rep) * kv + j) * D + d];
+            }
+        }
+    return y;
+}
+
+// A bf16 mask exercising every form: real values, finfo(bf16).min columns,
+// -inf columns, one row fully finfo.min (uniform reference) and, when
+// `neg_inf_row`, one row fully -inf (zeros).
+std::vector<float> attn_mask(int S, int kv, bool neg_inf_row) {
+    std::vector<float> m = bf16_values(static_cast<size_t>(S) * kv, 99);
+    for (int s = 0; s < S; ++s)
+        for (int j = 0; j < kv; ++j) {
+            float &x = m[static_cast<size_t>(s) * kv + j];
+            if ((j + s) % 7 == 3) x = kBf16Min;
+            if ((j + 2 * s) % 11 == 5) x = kNegInf;
+            if (s == 1) x = kBf16Min;
+            if (neg_inf_row && s == S - 1) x = kNegInf;
+        }
+    return m;
+}
+
+struct AttnRun {
+    std::vector<float> y;
+    std::string route;
+};
+
+} // namespace bf16act
+
+// Row kernel and the tiled (flash) kernel, bf16 Q/K/V/mask/Y. V carries
+// entries past fp16's range (outlier channel), so a half stage would clamp
+// them; the output then sits past 65504 as well. Each shape is run against the
+// fp16 graph's route for the same shape: bf16 now reaches the flash kernel
+// (its SIMT -DBF16 build; the coop8 build has no bf16 form).
+TEST(Bf16ActivationTest, AttentionRoutesMatchFp32) {
+    Env e;
+    struct Case {
+        int H, Hkv, S, D, kv;
+        bool mask, causal;
+        const char *why;
+    } cases[] = {
+        {4, 2, 3, 64, 300, true, false, "row kernel, multi-tile kv"},
+        {4, 4, 1, 128, 77, true, false, "row kernel, decode"},
+        {16, 8, 128, 64, 128, true, false, "flash"},
+        {16, 8, 130, 128, 200, false, true, "flash, causal with a history"},
+        {16, 16, 96, 64, 131, true, false, "flash, odd kv mask"},
+    };
+    for (const Case &c : cases) {
+        const float scale = 1.0F / std::sqrt(static_cast<float>(c.D));
+        auto q = bf16_values(static_cast<size_t>(c.H) * c.S * c.D, 101);
+        auto k = bf16_values(static_cast<size_t>(c.Hkv) * c.kv * c.D, 102);
+        auto v = bf16_values(static_cast<size_t>(c.Hkv) * c.kv * c.D, 103);
+        for (size_t i = 7; i < v.size(); i += static_cast<size_t>(c.D) * 5)
+            v[i] = bf16_to_float(float_to_bf16(1.5e5F));
+        std::vector<float> mask = attn_mask(c.S, c.kv, c.S > 2);
+        const Attrs attrs{{"scale", std::to_string(scale)},
+                          {"num_heads", std::to_string(c.H)},
+                          {"num_kv_heads", std::to_string(c.Hkv)},
+                          {"causal", c.causal ? "1" : "0"}};
+        auto run = [&](bool bf16) {
+            std::vector<float> qv = q, kvv = k, vv = v, mv = mask;
+            if (!bf16) { // in-range data: only the route matters here
+                vv = bf16_values(v.size(), 3);
+                for (float &x : mv) x = std::max(x, -65504.0F);
+            }
+            std::vector<std::shared_ptr<ITensor>> ins{
+                half_in(e, bf16, {1, c.H, c.S, c.D}, qv),
+                half_in(e, bf16, {1, c.Hkv, c.kv, c.D}, kvv),
+                half_in(e, bf16, {1, c.Hkv, c.kv, c.D}, vv)};
+            if (c.mask) ins.push_back(half_in(e, bf16, {1, 1, c.S, c.kv}, mv));
+            auto y = out<uint16_t>(e, {1, c.H, c.S, c.D},
+                                   bf16 ? ElemKind::kBFloat16 : ElemKind::kFloat16);
+            auto op = make_op(e, OpType::ATTENTION, bf16 ? 2 : 1, attrs);
+            op->onExecute(ins, {y}, 0);
+            submit(e, op.get());
+            return AttnRun{read_half(e, bf16, y), op->route_tag()};
+        };
+        const AttnRun f16 = run(false);
+        const AttnRun r = run(true);
+        // The coop8 flash build is fp16-only: bf16 takes the SIMT flash.
+        const std::string want = f16.route == "flash_coop8" ? "flash" : f16.route;
+        EXPECT_EQ(r.route, want) << c.why;
+        const auto ref = attn_ref(c.H, c.Hkv, c.S, c.D, c.kv, q, k, v,
+                                  c.mask ? &mask : nullptr, scale, c.causal);
+        double worst = 0;
+        // rtol: bf16 output; atol: P (fp16 in the flash stage) times the
+        // 1.5e5 outlier channel.
+        EXPECT_EQ(count_bad(r.y, ref, 1.2e-2, 0.02 + 1.5e5 * 2e-3, &worst), 0)
+            << c.why << " (route " << r.route << ") worst " << worst;
+        LOG_INFO("bf16 Attention %s: route %s (fp16 %s), worst |err| %g", c.why,
+                 r.route.c_str(), f16.route.c_str(), worst);
+    }
+}
+
+// Split-KV decode on a bf16 KV cache: the -DBF16 build of attention.comp's
+// KV_SPLIT pair, with the history in the cache and one fresh row.
+TEST(Bf16ActivationTest, AttentionSplitKvDecodeBf16) {
+    Env e;
+    const int H = 16, Hkv = 8, D = 128, past = 2000, S = 1, kv = past + S;
+    const float scale = 1.0F / std::sqrt(static_cast<float>(D));
+    auto q = bf16_values(static_cast<size_t>(H) * D, 111);
+    auto kall = bf16_values(static_cast<size_t>(Hkv) * kv * D, 112);
+    auto vall = bf16_values(static_cast<size_t>(Hkv) * kv * D, 113);
+    for (size_t i = 3; i < vall.size(); i += static_cast<size_t>(D) * 9)
+        vall[i] = bf16_to_float(float_to_bf16(-1.2e5F));
+    std::vector<float> mask(kv, 0.0F);
+    for (int j = 0; j < kv; ++j)
+        if (j % 5 == 1) mask[j] = (j % 2) ? kBf16Min : kNegInf;
+    // past: [1,2,Hkv,past,D] (K then V); fresh K/V: [1,Hkv,1,D].
+    std::vector<float> cache(static_cast<size_t>(2) * Hkv * past * D);
+    std::vector<float> kn(static_cast<size_t>(Hkv) * D), vn(kn.size());
+    for (int h = 0; h < Hkv; ++h)
+        for (int j = 0; j < kv; ++j)
+            for (int d = 0; d < D; ++d) {
+                const size_t src = (static_cast<size_t>(h) * kv + j) * D + d;
+                if (j < past) {
+                    cache[(static_cast<size_t>(h) * past + j) * D + d] = kall[src];
+                    cache[(static_cast<size_t>(Hkv + h) * past + j) * D + d] = vall[src];
+                } else {
+                    kn[static_cast<size_t>(h) * D + d] = kall[src];
+                    vn[static_cast<size_t>(h) * D + d] = vall[src];
+                }
+            }
+    auto pastt = bf16_in(e, {1, 2, Hkv, past, D}, cache);
+    auto pres = out<uint16_t>(e, {1, 2, Hkv, kv, D}, ElemKind::kBFloat16);
+    auto y = out<uint16_t>(e, {1, H, S, D}, ElemKind::kBFloat16);
+    auto op = make_op(e, OpType::ATTENTION, 2,
+                      {{"scale", std::to_string(scale)},
+                       {"num_heads", std::to_string(H)},
+                       {"num_kv_heads", std::to_string(Hkv)},
+                       {"causal", "1"},
+                       {"has_cache", "1"}});
+    op->onExecute({bf16_in(e, {1, H, S, D}, q), bf16_in(e, {1, Hkv, S, D}, kn),
+                   bf16_in(e, {1, Hkv, S, D}, vn), pastt,
+                   bf16_in(e, {1, 1, S, kv}, mask)},
+                  {y, pres}, 0);
+    submit(e, op.get());
+    const char *split_env = std::getenv("VKOP_ATTN_SPLIT");
+    if (split_env == nullptr || split_env[0] != '0') {
+        EXPECT_EQ(op->route_tag(), "split_kv");
+    }
+    const auto ref =
+        attn_ref(H, Hkv, S, D, kv, q, kall, vall, &mask, scale, true);
+    double worst = 0;
+    EXPECT_EQ(count_bad(read_bf16(e, y), ref, 1.2e-2, 0.02 + 1.2e5 * 1e-3, &worst), 0)
+        << "split-KV worst " << worst;
+    // present = history + the fresh row, bit-exact (a word copy).
+    const auto pv = read_bf16(e, pres);
+    int bad = 0;
+    for (int c2 = 0; c2 < 2; ++c2)
+        for (int h = 0; h < Hkv; ++h)
+            for (int j = 0; j < kv; ++j)
+                for (int d = 0; d < D; ++d) {
+                    const size_t src = (static_cast<size_t>(h) * kv + j) * D + d;
+                    const float want = c2 == 0 ? kall[src] : vall[src];
+                    const float got =
+                        pv[((static_cast<size_t>(c2) * Hkv + h) * kv + j) * D + d];
+                    if (got != want) ++bad;
+                }
+    EXPECT_EQ(bad, 0) << "present cache";
+}
+
+// Softmax over a bf16 row that is entirely finfo(bf16).min (uniform) or
+// entirely -inf (zeros, not NaN), beside an ordinary row.
+TEST(Bf16ActivationTest, SoftmaxFullyMaskedBf16Rows) {
+    Env e;
+    const int rows = 3, n = 64;
+    std::vector<float> x = bf16_values(static_cast<size_t>(rows) * n, 121);
+    for (int j = 0; j < n; ++j) {
+        x[n + j] = kBf16Min;
+        x[2 * n + j] = kNegInf;
+    }
+    auto xi = bf16_in(e, {rows, n}, x);
+    auto y = out<uint16_t>(e, {rows, n}, ElemKind::kBFloat16);
+    auto op = make_op(e, OpType::SOFTMAX, 2, {{"axis", "-1"}});
+    op->onExecute({xi}, {y}, 0);
+    submit(e, op.get());
+    const auto got = read_bf16(e, y);
+    double mx = -1e300, s = 0;
+    for (int j = 0; j < n; ++j) mx = std::max(mx, double(x[j]));
+    for (int j = 0; j < n; ++j) s += std::exp(x[j] - mx);
+    for (int j = 0; j < n; ++j) {
+        EXPECT_NEAR(got[j], std::exp(x[j] - mx) / s, 1e-2 * std::exp(x[j] - mx) / s + 1e-5);
+        EXPECT_NEAR(got[n + j], 1.0 / n, 1e-4) << "finfo.min row, col " << j;
+        EXPECT_EQ(got[2 * n + j], 0.0F) << "-inf row, col " << j;
     }
 }
 
@@ -520,13 +1077,186 @@ TEST(Bf16ActivationTest, LoadModelRunsAnAllowListedGraph) {
 }
 
 TEST(Bf16ActivationTest, LoadModelRefusesGatedGraphs) {
-    expect_refused([] { load("bf16_gate_relu.vkopbin"); },
-                   "vkop: no bf16 activation kernel for Relu 'relu0'");
-    expect_refused([] { load("bf16_gate_cast.vkopbin"); },
-                   "vkop: no bf16 activation kernel for Cast 'cast0'");
-    expect_refused([] { load("bf16_gate_gather.vkopbin"); },
-                   "vkop: no bf16 activation kernel for Gather 'gather0'");
+    expect_refused([] { load("bf16_gate_avgpool.vkopbin"); },
+                   "vkop: no bf16 activation kernel for AveragePool "
+                   "'pool0'");
     expect_refused([] { load("bf16_gate_mixed.vkopbin"); },
                    "vkop: Add 'add_mixed' mixes bfloat16 activations with a "
                    "float16 input 1");
+}
+
+// The graphs the gate used to refuse, run through LoadModel: the loader's
+// dtype inference (Cast to=16, Gather's recorded bf16 output) and
+// op_shader_fp16 have to land each node on its bf16 route.
+TEST(Bf16ActivationTest, LoadModelRunsTheNewBf16Graphs) {
+    Env e;
+    // Relu(x bf16) -> y bf16. x holds values past fp16's range.
+    {
+        auto rt = load("bf16_gate_relu.vkopbin");
+        auto x = vkop::core::as_tensor<uint16_t>(rt->GetInput("x"));
+        auto y = vkop::core::as_tensor<uint16_t>(rt->GetOutput("y"));
+        ASSERT_TRUE(x && y);
+        EXPECT_EQ(y->elem_kind(), ElemKind::kBFloat16);
+        std::vector<uint16_t> bits(16);
+        for (int i = 0; i < 16; ++i)
+            bits[i] = float_to_bf16((i - 8) * 70000.0F);
+        x->fillToCPU(bits);
+        x->copyToGPU(e.cmdpool);
+        rt->Run();
+        rt->ReadResult();
+        const auto got = read_bf16(e, y);
+        for (int i = 0; i < 16; ++i)
+            EXPECT_EQ(got[i], bf16_to_float(bits[i]) > 0
+                                  ? bf16_to_float(bits[i])
+                                  : 0.0F)
+                << "relu element " << i;
+    }
+    // Cast(x bf16, to=FLOAT) -> y fp32: exact widening.
+    {
+        auto rt = load("bf16_gate_cast.vkopbin");
+        auto x = vkop::core::as_tensor<uint16_t>(rt->GetInput("x"));
+        auto y = vkop::core::as_tensor<float>(rt->GetOutput("y"));
+        ASSERT_TRUE(x && y);
+        std::vector<uint16_t> bits(16);
+        for (int i = 0; i < 16; ++i)
+            bits[i] = float_to_bf16((i - 8) * 12345.0F);
+        x->fillToCPU(bits);
+        x->copyToGPU(e.cmdpool);
+        rt->Run();
+        rt->ReadResult();
+        y->copyToCPU(e.cmdpool);
+        for (int i = 0; i < 16; ++i)
+            EXPECT_EQ((*y)[i], bf16_to_float(bits[i])) << "cast element " << i;
+    }
+    // Cast(x fp32, to=BFLOAT16) -> y bf16: the loader's to=16 output.
+    {
+        auto rt = load("bf16_gate_cast16.vkopbin");
+        auto x = vkop::core::as_tensor<float>(rt->GetInput("x"));
+        auto y = vkop::core::as_tensor<uint16_t>(rt->GetOutput("y"));
+        ASSERT_TRUE(x && y);
+        EXPECT_EQ(y->elem_kind(), ElemKind::kBFloat16);
+        std::vector<float> xv(16);
+        for (int i = 0; i < 16; ++i) xv[i] = (i - 8) * 10001.37F;
+        x->fillToCPU(xv);
+        x->copyToGPU(e.cmdpool);
+        rt->Run();
+        rt->ReadResult();
+        y->copyToCPU(e.cmdpool);
+        for (int i = 0; i < 16; ++i)
+            EXPECT_EQ((*y)[i], float_to_bf16(xv[i])) << "cast16 element " << i;
+    }
+    // Gather(table bf16, idx) -> y bf16: a bit copy of rows 3 and 1.
+    {
+        auto rt = load("bf16_gate_gather.vkopbin");
+        auto idx = vkop::core::as_tensor<int64_t>(rt->GetInput("idx"));
+        auto y = vkop::core::as_tensor<uint16_t>(rt->GetOutput("y"));
+        ASSERT_TRUE(idx && y);
+        EXPECT_EQ(y->elem_kind(), ElemKind::kBFloat16);
+        std::vector<int64_t> iv{3, 1};
+        idx->fillToCPU(iv);
+        idx->copyToGPU(e.cmdpool, iv.data());
+        rt->Run();
+        rt->ReadResult();
+        const auto got = read_bf16(e, y);
+        for (int c = 0; c < 8; ++c) {
+            EXPECT_EQ(got[c], float(3 * 8 + c));
+            EXPECT_EQ(got[8 + c], float(1 * 8 + c));
+        }
+    }
+}
+
+// ------------------------------------------------------------ byte movers
+
+// Reshape and Slice never decode an element: a bf16 tensor must come out bit
+// for bit, and with its bf16 KIND (the next op's gate keys on it).
+TEST(Bf16ActivationTest, ByteMoversKeepBf16Bits) {
+    Env e;
+    // A non-trivial pattern, including NaN/-inf/-0 words that an fp16
+    // decode/encode would canonicalize or round.
+    std::vector<uint16_t> bits(48);
+    for (size_t i = 0; i < bits.size(); ++i)
+        bits[i] = static_cast<uint16_t>(0x3F80u + 37u * i);
+    bits[3] = 0x7FC1; // NaN with payload
+    bits[4] = 0xFF80; // -inf
+    bits[5] = 0x8000; // -0
+    auto make = [&](const std::vector<int> &shape) {
+        auto t = std::make_shared<Tensor<uint16_t>>(shape);
+        t->set_elem_kind(ElemKind::kBFloat16);
+        t->fillToCPU(bits);
+        t->as_storage_buffer(e.dev);
+        t->copyToGPU(e.cmdpool);
+        return t;
+    };
+    auto i64 = [&](const std::vector<int64_t> &v) {
+        auto t = std::make_shared<Tensor<int64_t>>(
+            std::vector<int>{static_cast<int>(v.size())});
+        t->fillToCPU(v);
+        auto keep = t->data();
+        t->as_storage_buffer(e.dev);
+        t->copyToGPU(e.cmdpool, keep.data());
+        return t;
+    };
+    // Slice on the inner axis of [6, 8]: columns 1..6 step 2 -> [6, 3]. Not
+    // contiguous, so it runs slice.comp's _bf16 module (an odd row length
+    // also exercises the half-word split).
+    {
+        auto x = make({6, 8});
+        auto y = out<uint16_t>(e, {6, 3}, ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::SLICE, 2);
+        op->onExecute({x, i64({1}), i64({7}), i64({1}), i64({2})}, {y}, 0);
+        submit(e, op.get());
+        y->copyToCPU(e.cmdpool);
+        EXPECT_EQ(y->elem_kind(), ElemKind::kBFloat16);
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 3; ++c)
+                EXPECT_EQ((*y)[r * 3 + c], bits[r * 8 + 1 + 2 * c])
+                    << "Slice r=" << r << " c=" << c;
+    }
+    // Reshape [6, 8] -> [4, 12]: an alias of the input buffer.
+    {
+        auto x = make({6, 8});
+        auto y = out<uint16_t>(e, {4, 12}, ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::RESHAPE, 2);
+        op->onExecute({x, i64({4, 12})}, {y}, 0);
+        submit(e, op.get());
+        y->copyToCPU(e.cmdpool);
+        EXPECT_EQ(y->elem_kind(), ElemKind::kBFloat16);
+        ASSERT_EQ(y->num_elements(), 48);
+        for (int i = 0; i < 48; ++i)
+            EXPECT_EQ((*y)[i], bits[i]) << "Reshape element " << i;
+    }
+}
+
+// The same movers inside a loaded graph: Reshape -> Slice -> (output s, and
+// Add -> y). LoadModel's gate admits them, the runtime gives their outputs
+// the bf16 kind, and the Add after them runs (it would refuse an fp16-kind
+// input beside its bf16 bias).
+TEST(Bf16ActivationTest, LoadModelMovesBf16BitsThroughByteMovers) {
+    Env e;
+    auto rt = load("bf16_gate_movers.vkopbin");
+    auto x = vkop::core::as_tensor<uint16_t>(rt->GetInput("x"));
+    auto s = vkop::core::as_tensor<uint16_t>(rt->GetOutput("s"));
+    auto y = vkop::core::as_tensor<uint16_t>(rt->GetOutput("y"));
+    ASSERT_TRUE(x && s && y);
+    EXPECT_EQ(s->elem_kind(), ElemKind::kBFloat16);
+    EXPECT_EQ(y->elem_kind(), ElemKind::kBFloat16);
+    std::vector<uint16_t> bits(16);
+    for (int i = 0; i < 16; ++i) bits[i] = float_to_bf16(256.0F + 2.0F * i);
+    x->fillToCPU(bits);
+    x->copyToGPU(e.cmdpool);
+    rt->Run();
+    rt->ReadResult();
+    s->copyToCPU(e.cmdpool);
+    const auto got = read_bf16(e, y);
+    // x viewed as [4, 4], columns 1..2.
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 2; ++c) {
+            const uint16_t src = bits[r * 4 + 1 + c];
+            EXPECT_EQ((*s)[r * 2 + c], src) << "s r=" << r << " c=" << c;
+            const float b = (static_cast<float>(r * 2 + c) - 3.0F) / 8.0F;
+            EXPECT_EQ(got[r * 2 + c],
+                      bf16_to_float(float_to_bf16(bf16_to_float(src) + b)))
+                << "y r=" << r << " c=" << c;
+        }
+    }
 }

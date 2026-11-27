@@ -138,6 +138,8 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_matmul_coop",
         # Apple 8x8x8 coopmat GEMM; only the MoltenVK driver builds it.
         "buffer_matmul_coop8",
+        # Its bf16-activation build (-DACT_BF16, scaled bf16 staging).
+        "buffer_matmul_coop8_bf16",
         # Pack pass of the SwiGLU gate/up fold (swiglu=1) on routes without
         # the swiglu epilogue.
         "buffer_matmul_swiglu_pack",
@@ -294,6 +296,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # tiled kernel.
         "buffer_matmul_tiled_ks_split_fp16",
         "buffer_matmul_tiled_ks_fold_fp16",
+        # The bf16-activation (--act bf16) builds of the 512-lane split-K and
+        # the tile-split-K pair (-DFP16 -DBF16): the _bf16 MatMul resolves
+        # these by name in place of the _fp16 keys above.
+        "buffer_matmul_ksplit512_bf16",
+        "buffer_matmul_tiled_ks_split_bf16",
+        "buffer_matmul_tiled_ks_fold_bf16",
         # coopmat + split-K hybrid: SPLITK_DEPOSIT main pass (fp32 partial to
         # scratch) and SPLITK_FOLD reduce pass (fp32-sum partials, pack half2
         # to binding 0). ARL's 8x8x16 source (matmul_coop.comp) and Ada's
@@ -393,6 +401,11 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # cannot see, so they ride along with every buffer Gather.
         "buffer_gather_bf16",
         "buffer_gather_bf16_fp16",
+        # bf16 OUTPUT (--act bf16; -DBF16_OUT), from a bf16 / fp16 / fp32
+        # table. Same reason: the choice is the tensors' elem_kind at load.
+        "buffer_gather_bf16_out_bf16",
+        "buffer_gather_fp16_out_bf16",
+        "buffer_gather_fp32_out_bf16",
     ],
     ("Equal", "buffer"): [
         "buffer_equal_int64",
@@ -507,6 +520,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # AttentionBuffer::split_route for few-row cache-form rounds.
         "buffer_attention_split_fp16",
         "buffer_attention_split_fp16_sg",
+        # The bf16-activation (--act bf16) builds of the tiled and split-KV
+        # kernels; the _bf16 Attention resolves these in place of the _fp16
+        # keys (the coop8 flash build has no bf16 form).
+        "buffer_attention_flash_bf16",
+        "buffer_attention_split_bf16",
+        "buffer_attention_split_bf16_sg",
     ],
     ("FusedElemwise", "buffer"): [
         "buffer_fused_elemwise_bda",

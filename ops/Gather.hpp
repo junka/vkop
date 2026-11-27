@@ -160,6 +160,34 @@ class Gather : public Operator {
         }
     }
 
+    // A bfloat16 OUTPUT (--act bf16) stores bf16 bits through gather.comp
+    // -DBF16_OUT, one module per table format: bf16 (a bit copy), fp16 or
+    // fp32 (narrowed RNE). Index 0/1/2 = bf16/fp16/fp32 table.
+    void ensure_bf16_out_pipeline(int table_fmt) {
+        auto &pipe = pipeline_bf16_out_[table_fmt];
+        if (pipe) {
+            return;
+        }
+        static const char *const kKeys[3] = {"buffer_gather_bf16_out_bf16",
+                                             "buffer_gather_fp16_out_bf16",
+                                             "buffer_gather_fp32_out_bf16"};
+        auto spv = resolve_spv(kKeys[table_fmt]);
+        if (spv.first == nullptr) {
+            throw std::runtime_error(
+                std::string("vkop: no bf16-output kernel for Gather: the "
+                            "shader archive has no ") +
+                kKeys[table_fmt] + " build (rebuild the shaders)");
+        }
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        pipe = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_, spv.first,
+            spv.second, use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_bf16_out_[table_fmt]) {
+            ds = pipe->allocDescriptorSets();
+        }
+    }
+
     void submit(void *ptr, int width, int height, int layers) override {
         if (bf16_pipe_ != nullptr) {
             VkDescriptorSet &ds = (*bf16_ds_)[m_id_];
@@ -510,9 +538,25 @@ class Gather : public Operator {
         }
         const bool table_bf16 =
             inputs[0]->elem_kind() == core::ElemKind::kBFloat16;
+        const bool out_bf16 =
+            outputs[0]->elem_kind() == core::ElemKind::kBFloat16;
         bf16_pipe_ = nullptr;
         bf16_ds_ = nullptr;
-        if (table_bf16) {
+        if (out_bf16) {
+            // bf16 ACTIVATION output: the table may be bf16, fp16 or fp32.
+            const int fmt = table_bf16                                ? 0
+                            : inputs[0]->dtype() == typeid(uint16_t) ? 1
+                            : inputs[0]->dtype() == typeid(float)    ? 2
+                                                                     : -1;
+            if (fmt < 0) {
+                throw std::runtime_error(
+                    std::string("vkop: no bf16-output kernel for Gather of a ") +
+                    core::elem_name(inputs[0]->elem_kind()) + " table");
+            }
+            ensure_bf16_out_pipeline(fmt);
+            bf16_pipe_ = pipeline_bf16_out_[fmt].get();
+            bf16_ds_ = &m_ds_bf16_out_[fmt];
+        } else if (table_bf16) {
             core::require_float_elem(outputs[0]->elem_kind(), "Gather",
                                      "output (of a bf16 table)");
             const bool out_fp16 = outputs[0]->dtype() == typeid(uint16_t);
@@ -550,7 +594,7 @@ class Gather : public Operator {
         // Needs a GPU data buffer and an aligned offset (device + fp16 parity).
         // The zero-copy alias hands the table's bytes over unconverted, so it
         // is only an option when table and output share one encoding.
-        if (!table_bf16 && inputs[1]->get_host_authoritative() &&
+        if (!table_bf16 && !out_bf16 && inputs[1]->get_host_authoritative() &&
             param_.axis >= 0 &&
             param_.axis < rank &&
             (inputs[0]->dtype() == typeid(uint16_t) ||
@@ -675,6 +719,10 @@ class Gather : public Operator {
     std::unique_ptr<VulkanPipeline> pipeline_bf16_f_;
     VkDescriptorSet m_ds_bf16_h_[vkop::kInflight] = {nullptr};
     VkDescriptorSet m_ds_bf16_f_[vkop::kInflight] = {nullptr};
+    // bf16-OUTPUT modules (gather.comp -DBF16_OUT), by table format
+    // (0 bf16, 1 fp16, 2 fp32); they ride the same bf16_pipe_ routing.
+    std::unique_ptr<VulkanPipeline> pipeline_bf16_out_[3];
+    VkDescriptorSet m_ds_bf16_out_[3][vkop::kInflight] = {};
     VulkanPipeline *bf16_pipe_ = nullptr;
     VkDescriptorSet (*bf16_ds_)[vkop::kInflight] = nullptr;
     // Whether the last execute() took the CPU int64 path. did_host_work_last_round

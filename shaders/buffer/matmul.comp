@@ -541,7 +541,13 @@ float epi_bias_at(int n, int i, int j) {
     int ratio = uPC.batch / max(uPC.epi_bias_batch, 1);
     int bn = n / max(ratio, 1);
     int idx = bn * uPC.M * uPC.N + i * uPC.N + j;
-#ifdef FP16
+#if defined(BF16)
+    // The _bf16 module's mask is bf16 (the gate admits no fp16 beside a bf16
+    // activation). An fp16 decode turned finfo(bf16).min and -inf into NaN
+    // (exponent 0xFF read as fp16's 5-bit field), so a masked score never
+    // masked; bf16 decodes both exactly and sum*scale + (-inf) stays -inf.
+    return unpackBF16x2(uEpiBias.data[idx >> 1])[idx & 1];
+#elif defined(FP16)
     return unpackHalf2x16(uEpiBias.data[idx >> 1])[idx & 1];
 #else
     return uintBitsToFloat(uEpiBias.data[idx]);
@@ -581,6 +587,31 @@ vec2 unpackA2(uint w) {
 }
 uint stageB2(uint w) { return (uPC.bf16 & 1) != 0 ? bf16x2_to_half2(w) : w; }
 uvec4 stageB8(uvec4 w) { return (uPC.bf16 & 1) != 0 ? bf16x8_to_half8(w) : w; }
+
+// The SIMT tiles' shared-memory stages (matmul16_tiled, its tile-split-K
+// pair, matmul16_tiled128) in the two 16-bit builds.
+//  * -DFP16: A is staged as the fp16 words it is; B is staged as half
+//    (stageB2/8 re-encode a bf16 WEIGHT, clamped to +-65504).
+//  * -DBF16 (the --act bf16 module): A, B and the output are bf16 -- the bf16
+//    gate lets no other float beside a bf16 activation -- so both stages keep
+//    the raw bf16 words and the FMA decodes them straight to fp32. Re-encoding
+//    to half there would clamp exactly the values bf16 activations exist to
+//    carry (a K or V operand of an unfused attention, an outlier channel). The
+//    byte-weight stage writes bf16 words too (int8 magnitudes and fp8 values
+//    are exact in bf16), so every reader of sB agrees on one encoding.
+#ifdef BF16
+#define TILE_STB2(w) (w)
+#define TILE_STB8(w) (w)
+#define TILE_UA2(w) unpackBF16x2(w)
+#define TILE_UB2(w) unpackBF16x2(w)
+#define TILE_PK2(v) packBF16x2(v)
+#else
+#define TILE_STB2(w) stageB2(w)
+#define TILE_STB8(w) stageB8(w)
+#define TILE_UA2(w) unpackHalf2x16(w)
+#define TILE_UB2(w) unpackHalf2x16(w)
+#define TILE_PK2(v) packHalf2x16(v)
+#endif
 
 #ifdef FP16
 // A and B are decoded SEPARATELY, and that is the whole point: a graph can run
@@ -2128,7 +2159,13 @@ void matmul16_softmax() {
     }
 
     // ---- pass 1: row max (online) ----
-    float local_max = -1e30f;
+    // -FLT_MAX, not -1e30: a bf16 mask carries finfo(bf16).min = -3.39e38
+    // (and -inf), below -1e30, so a fully masked row kept max = -1e30 and
+    // exp(x - max) underflowed to 0 for every column -- an all-zero row where
+    // the reference is uniform. From -FLT_MAX the max is the row's own; an
+    // all -inf row keeps -FLT_MAX, exp(-inf) = 0 and the row stores zeros
+    // instead of the NaN that -inf - -inf would give.
+    float local_max = -3.402823466e38;
     for (int t = 0; t < n_owned; ++t) {
         local_max = max(local_max, owned[t]);
     }
@@ -2252,12 +2289,12 @@ void tile_load_b_t(int b, int col0, int kw, int halfK) {
     int row = l >> 3;
     int kt = l & 7;
     sB[row * SROW + kt] = (col0 + row < uPC.N)
-                              ? stageB2(uInputB.data[(b * uPC.N + col0 + row) *
+                              ? TILE_STB2(uInputB.data[(b * uPC.N + col0 + row) *
                                                          halfK + kw + kt])
                               : 0u;
     int row2 = row + 32;
     sB[row2 * SROW + kt] = (col0 + row2 < uPC.N)
-                               ? stageB2(uInputB.data[(b * uPC.N + col0 + row2) *
+                               ? TILE_STB2(uInputB.data[(b * uPC.N + col0 + row2) *
                                                           halfK + kw + kt])
                                : 0u;
 }
@@ -2307,8 +2344,8 @@ void store_b_n(uint vb0, uint vb1) {
     int l = tile_tid();
     int kr = l >> 5;
     int cp = l & 31;
-    sB[kr * SBROW + cp] = stageB2(vb0);
-    sB[(kr + 8) * SBROW + cp] = stageB2(vb1);
+    sB[kr * SBROW + cp] = TILE_STB2(vb0);
+    sB[(kr + 8) * SBROW + cp] = TILE_STB2(vb1);
 }
 
 // Byte-quantized weight, B is [batch, K, N] (the only layout a quantizer can
@@ -2333,8 +2370,8 @@ void tile_load_b_w8(int b, int col0, int kk) {
     if (col < uPC.N) {
         w = unpack_w8(uInputB.data[((b * uPC.K + kk + kr) * uPC.N + col) >> 2]);
     }
-    sB[kr * SBROW + 2 * quad] = (col + 1 < uPC.N) ? packHalf2x16(w.xy) : 0u;
-    sB[kr * SBROW + 2 * quad + 1] = (col + 3 < uPC.N) ? packHalf2x16(w.zw) : 0u;
+    sB[kr * SBROW + 2 * quad] = (col + 1 < uPC.N) ? TILE_PK2(w.xy) : 0u;
+    sB[kr * SBROW + 2 * quad + 1] = (col + 3 < uPC.N) ? TILE_PK2(w.zw) : 0u;
 }
 
 // 4-bit weight (int4 / uint4 / nf4 / nvfp4), B is [batch, K, N] nibble-packed.
@@ -2393,10 +2430,10 @@ void tile_fma_n_w4(inout float acc[4][4], int lr, int lc) {
     for (int kt = 0; kt < TILE_K; ++kt) {
         // sA holds two k per word; take the half this kt selects.
         int aw = kt >> 1;
-        vec2 a0 = unpackA2(sA[(lr + 0) * SROW + aw]);
-        vec2 a1 = unpackA2(sA[(lr + 1) * SROW + aw]);
-        vec2 a2 = unpackA2(sA[(lr + 2) * SROW + aw]);
-        vec2 a3 = unpackA2(sA[(lr + 3) * SROW + aw]);
+        vec2 a0 = TILE_UA2(sA[(lr + 0) * SROW + aw]);
+        vec2 a1 = TILE_UA2(sA[(lr + 1) * SROW + aw]);
+        vec2 a2 = TILE_UA2(sA[(lr + 2) * SROW + aw]);
+        vec2 a3 = TILE_UA2(sA[(lr + 3) * SROW + aw]);
         bool hi = (kt & 1) != 0;
         float av0 = hi ? a0.y : a0.x;
         float av1 = hi ? a1.y : a1.x;
@@ -2431,14 +2468,14 @@ void tile_fma_n_w4(inout float acc[4][4], int lr, int lc) {
 void tile_fma_t(inout float acc[4][4], int lr, int lc) {
 #pragma unroll
     for (int kt = 0; kt < TILE_K / 2; ++kt) {
-        vec2 a0 = unpackA2(sA[(lr + 0) * SROW + kt]);
-        vec2 a1 = unpackA2(sA[(lr + 1) * SROW + kt]);
-        vec2 a2 = unpackA2(sA[(lr + 2) * SROW + kt]);
-        vec2 a3 = unpackA2(sA[(lr + 3) * SROW + kt]);
-        vec2 b0 = unpackHalf2x16(sB[(lc + 0) * SROW + kt]);
-        vec2 b1 = unpackHalf2x16(sB[(lc + 1) * SROW + kt]);
-        vec2 b2 = unpackHalf2x16(sB[(lc + 2) * SROW + kt]);
-        vec2 b3 = unpackHalf2x16(sB[(lc + 3) * SROW + kt]);
+        vec2 a0 = TILE_UA2(sA[(lr + 0) * SROW + kt]);
+        vec2 a1 = TILE_UA2(sA[(lr + 1) * SROW + kt]);
+        vec2 a2 = TILE_UA2(sA[(lr + 2) * SROW + kt]);
+        vec2 a3 = TILE_UA2(sA[(lr + 3) * SROW + kt]);
+        vec2 b0 = TILE_UB2(sB[(lc + 0) * SROW + kt]);
+        vec2 b1 = TILE_UB2(sB[(lc + 1) * SROW + kt]);
+        vec2 b2 = TILE_UB2(sB[(lc + 2) * SROW + kt]);
+        vec2 b3 = TILE_UB2(sB[(lc + 3) * SROW + kt]);
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             vec2 bv = c == 0 ? b0 : (c == 1 ? b1 : (c == 2 ? b2 : b3));
@@ -2456,16 +2493,16 @@ void tile_fma_n(inout float acc[4][4], int lr, int lc) {
     int cp = lc >> 1;
 #pragma unroll
     for (int kt = 0; kt < TILE_K / 2; ++kt) {
-        vec2 a0 = unpackA2(sA[(lr + 0) * SROW + kt]);
-        vec2 a1 = unpackA2(sA[(lr + 1) * SROW + kt]);
-        vec2 a2 = unpackA2(sA[(lr + 2) * SROW + kt]);
-        vec2 a3 = unpackA2(sA[(lr + 3) * SROW + kt]);
+        vec2 a0 = TILE_UA2(sA[(lr + 0) * SROW + kt]);
+        vec2 a1 = TILE_UA2(sA[(lr + 1) * SROW + kt]);
+        vec2 a2 = TILE_UA2(sA[(lr + 2) * SROW + kt]);
+        vec2 a3 = TILE_UA2(sA[(lr + 3) * SROW + kt]);
         int w0 = (2 * kt) * SBROW + cp;
         int w1 = (2 * kt + 1) * SBROW + cp;
-        vec2 p0 = unpackHalf2x16(sB[w0]);
-        vec2 p1 = unpackHalf2x16(sB[w0 + 1]);
-        vec2 q0 = unpackHalf2x16(sB[w1]);
-        vec2 q1 = unpackHalf2x16(sB[w1 + 1]);
+        vec2 p0 = TILE_UB2(sB[w0]);
+        vec2 p1 = TILE_UB2(sB[w0 + 1]);
+        vec2 q0 = TILE_UB2(sB[w1]);
+        vec2 q1 = TILE_UB2(sB[w1 + 1]);
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             vec2 av = r == 0 ? a0 : (r == 1 ? a1 : (r == 2 ? a2 : a3));
@@ -2688,7 +2725,7 @@ void matmul16_tiled128() {
         sB[(ar + 64) * 8 + akt] = wa2;
         sB[(ar + 96) * 8 + akt] = wa3;
         int bw = 1024 + bk * 64 + bo * 4;
-        uvec4 wbs = stageB8(wb);
+        uvec4 wbs = TILE_STB8(wb);
         sB[bw + 0] = wbs.x;
         sB[bw + 1] = wbs.y;
         sB[bw + 2] = wbs.z;
@@ -2704,20 +2741,20 @@ void matmul16_tiled128() {
         }
 #pragma unroll
         for (int kt = 0; kt < 8; ++kt) {
-            vec2 a00 = unpackHalf2x16(sB[(0 + ty * 4 + 0) * 8 + kt]);
-            vec2 a01 = unpackHalf2x16(sB[(0 + ty * 4 + 1) * 8 + kt]);
-            vec2 a02 = unpackHalf2x16(sB[(0 + ty * 4 + 2) * 8 + kt]);
-            vec2 a03 = unpackHalf2x16(sB[(0 + ty * 4 + 3) * 8 + kt]);
-            vec2 a10 = unpackHalf2x16(sB[(64 + ty * 4 + 0) * 8 + kt]);
-            vec2 a11 = unpackHalf2x16(sB[(64 + ty * 4 + 1) * 8 + kt]);
-            vec2 a12 = unpackHalf2x16(sB[(64 + ty * 4 + 2) * 8 + kt]);
-            vec2 a13 = unpackHalf2x16(sB[(64 + ty * 4 + 3) * 8 + kt]);
+            vec2 a00 = TILE_UA2(sB[(0 + ty * 4 + 0) * 8 + kt]);
+            vec2 a01 = TILE_UA2(sB[(0 + ty * 4 + 1) * 8 + kt]);
+            vec2 a02 = TILE_UA2(sB[(0 + ty * 4 + 2) * 8 + kt]);
+            vec2 a03 = TILE_UA2(sB[(0 + ty * 4 + 3) * 8 + kt]);
+            vec2 a10 = TILE_UA2(sB[(64 + ty * 4 + 0) * 8 + kt]);
+            vec2 a11 = TILE_UA2(sB[(64 + ty * 4 + 1) * 8 + kt]);
+            vec2 a12 = TILE_UA2(sB[(64 + ty * 4 + 2) * 8 + kt]);
+            vec2 a13 = TILE_UA2(sB[(64 + ty * 4 + 3) * 8 + kt]);
             int bw0_0 = 1024 + (2 * kt) * 64 + 0 + tx * 2;
-            vec4 p0 = vec4(unpackHalf2x16(sB[bw0_0]), unpackHalf2x16(sB[bw0_0 + 1]));
-            vec4 q0 = vec4(unpackHalf2x16(sB[bw0_0 + 64]), unpackHalf2x16(sB[bw0_0 + 64 + 1]));
+            vec4 p0 = vec4(TILE_UB2(sB[bw0_0]), TILE_UB2(sB[bw0_0 + 1]));
+            vec4 q0 = vec4(TILE_UB2(sB[bw0_0 + 64]), TILE_UB2(sB[bw0_0 + 64 + 1]));
             int bw0_1 = 1024 + (2 * kt) * 64 + 32 + tx * 2;
-            vec4 p1 = vec4(unpackHalf2x16(sB[bw0_1]), unpackHalf2x16(sB[bw0_1 + 1]));
-            vec4 q1 = vec4(unpackHalf2x16(sB[bw0_1 + 64]), unpackHalf2x16(sB[bw0_1 + 64 + 1]));
+            vec4 p1 = vec4(TILE_UB2(sB[bw0_1]), TILE_UB2(sB[bw0_1 + 1]));
+            vec4 q1 = vec4(TILE_UB2(sB[bw0_1 + 64]), TILE_UB2(sB[bw0_1 + 64 + 1]));
             acc[0][0] += a00.x * p0 + a00.y * q0;
             acc[0][1] += a00.x * p1 + a00.y * q1;
             acc[1][0] += a01.x * p0 + a01.y * q0;

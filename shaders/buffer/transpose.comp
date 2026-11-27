@@ -5,7 +5,7 @@
 #extension GL_EXT_buffer_reference2 : require
 #endif
 
-// Transpose SSBO op (fp32). Arbitrary perm up to 8-D. For each output
+// Transpose SSBO op (fp32 / 16-bit). Arbitrary perm up to 8-D. For each output
 // element, out_nd -> in_nd via in_nd[perm[i]] = out_nd[i], then copy.
 // perm is a permutation of [0..rank-1].
 
@@ -75,11 +75,14 @@ void main() {
         }
         return;
     }
-    // fp16 packs two halfs per uint word. One thread per output word: elements
-    // 2*gid (lo half) and 2*gid+1 (hi half). Each output element reads its own
-    // (non-contiguous under transpose) input element via BUF_LOAD (which
-    // unpacks the source half2), and the two results are packed into one word
-    // written once — no read-modify-write race.
+    // 16-bit (fp16 or bf16) packs two elements per uint word. One thread per
+    // output word: elements 2*gid (lo half) and 2*gid+1 (hi half). A transpose
+    // is a pure permutation, so each element is MOVED as its raw 16 bits
+    // (BUF_BITS16) -- never decoded and re-encoded. That makes the one build
+    // exact for both 16-bit formats (the old unpackHalf2x16/packHalf2x16 pair
+    // wrote bf16 words back as fp16 bits), and keeps NaN payloads intact. The
+    // two results are combined into one word written once -- no read-modify-
+    // write race.
     int nwords = (out_total + 1) / 2;
     if (gid >= nwords) return;
     int e0 = 2 * gid;
@@ -92,16 +95,17 @@ void main() {
         int stride = 1;
         for (int i = ax + 1; i < rank; ++i) stride *= uTrans.inDims.v[i];
         int i0 = transpose_elem(e0);
-        uOutput.data[gid] = packHalf2x16(vec2(BUF_LOAD(uInput.data, i0),
-                                              BUF_LOAD(uInput.data, i0 + stride)));
+        uOutput.data[gid] = BUF_BITS16(uInput.data, i0) |
+                            (BUF_BITS16(uInput.data, i0 + stride) << 16);
         return;
     }
-    float v0 = float(BUF_LOAD(uInput.data, transpose_elem(e0)));
+    uint b0 = BUF_BITS16(uInput.data, transpose_elem(e0));
     if (e1 >= out_total) {
-        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+        // Odd tail: the high half is padding past the last element.
+        uOutput.data[gid] = b0;
     } else {
-        float v1 = float(BUF_LOAD(uInput.data, transpose_elem(e1)));
-        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        uint b1 = BUF_BITS16(uInput.data, transpose_elem(e1));
+        uOutput.data[gid] = b0 | (b1 << 16);
     }
 #else
     if (gid >= out_total) return;

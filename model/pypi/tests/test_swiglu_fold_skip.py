@@ -92,6 +92,18 @@ def test_folds_still_run_on_half_activations(tmp_path, flags):
     assert "swiglu" in fold_attrs(out)
 
 
+def test_bf16_keeps_the_gate_up_fold_and_drops_the_down_fold(tmp_path):
+    """--act bf16: the gate/up fold has bf16 kernels, the down fold's
+    matmul_down_act.comp does not (its node would be held FP32 by the bf16
+    gate, and no fold kernel takes fp32)."""
+    src, out = str(tmp_path / "m.onnx"), str(tmp_path / "m.vkopbin")
+    swiglu_mlp(src)
+    log = convert(src, out, "--act", "bf16")
+    assert "[fusions] fuse_swiglu_down_proj skipped" in log
+    assert "[fusions] fuse_swiglu_gate_up skipped" not in log
+    assert fold_attrs(out) == {"swiglu"}
+
+
 BENCH = os.environ.get("VKOP_BENCH")
 ARCHIVE = os.environ.get("VKOP_MASTER_ARCHIVE",
                          os.path.join(REPO, "build", "vkop_shaders.bin"))

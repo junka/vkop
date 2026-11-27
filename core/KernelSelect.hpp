@@ -291,14 +291,16 @@ struct MatmulFeatures {
     // A is a bf16 ACTIVATION (--act bf16): the op runs its _bf16
     // module, and only some of its routes read A through the bf16 decode.
     // Selection keeps to those (matmul_route_takes_bf16_act): the split-K
-    // GEMV and its WIDE form, the even-N fused kernel and the 64x64 SIMT tile.
-    // Excluded: every cooperative-matrix route (KHR and the Apple coop8 GEMM
-    // the op reaches through kTiled -- it stages A as fp16), the 128x128 tile,
-    // tile-split-K and the 512-lane split-K (the host binds their `_fp16`
-    // secondary modules), the down_act/attn_softmax folds and reduce_pack
-    // (its pack pass writes fp16). When none of the kept routes fits the
-    // shape, the plan is whatever the full table picks, and the op refuses
-    // it by name.
+    // GEMV (256- and 512-lane) and its WIDE forms, the even-N fused kernel,
+    // the tile route (the 64x64 and 128x128 SIMT tiles and the Apple coop8
+    // GEMM, which stages bf16 under exact power-of-two row/column scales),
+    // tile-split-K (its own _bf16 deposit/fold builds), reduce_pack (the pack
+    // pass encodes bf16) and the fused attn_softmax row kernel. Excluded:
+    // the KHR cooperative-matrix routes (fp16-only fragments with no scaled
+    // stage, and no device here to verify one) and the down_act fold
+    // (matmul_down_act.comp reads fp16 only). When none of the kept routes
+    // fits the shape, the plan is whatever the full table picks, and the op
+    // refuses it by name.
     bool act_bf16 = false;
 };
 

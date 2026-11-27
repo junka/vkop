@@ -485,7 +485,7 @@ TEST(RobustnessTest, RMSNormAxisOutOfRangeThrows) {
 // The Cast implementation reads the element widths off the tensors, so a `to=`
 // that disagrees with the output the runtime allocated means one of the two is
 // stale — and the shader would reinterpret the buffer at the wrong stride.
-// (The runtime rejects a `to` outside {FLOAT, FLOAT16} at load time.)
+// (The runtime rejects a `to` outside {FLOAT, FLOAT16, BFLOAT16} at load time.)
 TEST(RobustnessTest, CastToAttributeMismatchThrows) {
     auto in = rt_make<float>({2}, {1.f, 2.f});
     auto out = std::make_shared<Tensor<float>>(std::vector<int>{2});
@@ -494,7 +494,7 @@ TEST(RobustnessTest, CastToAttributeMismatchThrows) {
     ASSERT_NE(op, nullptr);
     op->setAttribute({{"to", "7"}}); // ONNX INT64
     expect_throw_contains([&] { op->onExecute({in}, {out}, 0); },
-                          "only FLOAT and FLOAT16");
+                          "only FLOAT, FLOAT16 and BFLOAT16");
 }
 
 TEST(RobustnessTest, CastToAttributesAgree) {

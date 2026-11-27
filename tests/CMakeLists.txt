@@ -92,6 +92,8 @@ set(TEST_SOURCES
     ConvWeightLayoutTest.cpp
     ConvTransposeTest.cpp
     Bf16ActivationTest.cpp
+    Bf16ElementwiseTest.cpp
+    Bf16DataMoveTest.cpp
 )
 
 # Test sources are compiled one TU per file. That used to be a bad deal: every
@@ -610,8 +612,11 @@ set(BF16_GATE_FIXTURES
     ${BF16_GATE_DIR}/bf16_gate_add.vkopbin
     ${BF16_GATE_DIR}/bf16_gate_relu.vkopbin
     ${BF16_GATE_DIR}/bf16_gate_cast.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_cast16.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_avgpool.vkopbin
     ${BF16_GATE_DIR}/bf16_gate_gather.vkopbin
-    ${BF16_GATE_DIR}/bf16_gate_mixed.vkopbin)
+    ${BF16_GATE_DIR}/bf16_gate_mixed.vkopbin
+    ${BF16_GATE_DIR}/bf16_gate_movers.vkopbin)
 add_custom_command(
     OUTPUT ${BF16_GATE_FIXTURES}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${BF16_GATE_DIR}

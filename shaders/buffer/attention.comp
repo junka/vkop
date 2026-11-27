@@ -181,7 +181,7 @@ layout(push_constant) uniform PC_ATTN {
 //            M = max m_k, Y = sum o_k e^(m_k-M) / sum l_k e^(m_k-M).
 // The host records the two dispatches back to back with a shader-write barrier
 // on binding 8 between them. A slice with no tiles (never planned by the host,
-// but harmless) writes m = -1e30, l = 0 and drops out of the merge.
+// but harmless) writes m = -FLT_MAX, l = 0 and drops out of the merge.
 layout(set = 0, binding = 8) buffer Partials {
     float data[];
 } uPart;
@@ -223,6 +223,19 @@ int dyn_ring_head() {
 }
 #define TILE_KV 256
 #define MAX_HD 256
+
+// Masking constants of the online softmax. The running max starts at -FLT_MAX
+// (not -1e30) and a position that must not contribute scores -inf (not fp16's
+// -65504): a bf16 graph's additive mask is finfo(bf16).min = -3.39e38 (or
+// -inf), BELOW -1e30, so the old constants made a fully masked row sum
+// exp(-3.39e38 + 1e30) = 0 everywhere -- zeros where the reference is the
+// uniform average of V -- and a causal -65504 outranked a finfo.min position.
+// With these, every max is finite (max(-FLT_MAX, -inf) = -FLT_MAX), so
+// exp(x - m) never sees -inf - -inf, and an all -inf row ends with l = 0 and
+// stores zeros. fp16 scores never go below -65504, so their results do not
+// change.
+#define ATTN_M_INIT (-3.402823466e38)
+#define ATTN_NEG_INF uintBitsToFloat(0xFF800000u)
 
 // Physical slot of logical key position j. Without the ring this is the
 // identity: the cache rows are written in order and j < kv_len <= capacity, so
@@ -533,6 +546,11 @@ void copy_cache(int cwg) {
 // but one byte-word per lane and an encode on the fresh rows, whose source is
 // the fp16 compute domain. A lane writes 4 bytes, so it reads two packed half2
 // words there; the history is a straight byte-word copy.
+#ifdef BF16
+#define F8_SRC2(w) unpackBF16x2(w)
+#else
+#define F8_SRC2(w) unpackHalf2x16(w)
+#endif
 void copy_cache_f8(int cwg) {
     int D = uA.head_dim;
     int nkv = uA.kv_heads;
@@ -569,19 +587,19 @@ void copy_cache_f8(int cwg) {
         // it. Scalars compile clean on the same path.
         float a0, a1, b0, b1;
         // This is the fp8 KV-cache requantise path: K/V here are the incoming
-        // fp16 cache rows, unconditionally -- an fp8 cache does not exist in a
-        // bf16 artifact, so this decode stays `unpackHalf2x16` rather than
-        // following the graph's activation width.
+        // rows in the compute dtype. They are decoded with that dtype's own
+        // unpack (F8_SRC2): the _bf16 build used to read them with
+        // unpackHalf2x16, which turns a bf16 word into an unrelated half.
         if (c == 0) {
-            a0 = unpackHalf2x16(uK.data[krow]).x;
-            a1 = unpackHalf2x16(uK.data[krow]).y;
-            b0 = unpackHalf2x16(uK.data[krow + 1]).x;
-            b1 = unpackHalf2x16(uK.data[krow + 1]).y;
+            a0 = F8_SRC2(uK.data[krow]).x;
+            a1 = F8_SRC2(uK.data[krow]).y;
+            b0 = F8_SRC2(uK.data[krow + 1]).x;
+            b1 = F8_SRC2(uK.data[krow + 1]).y;
         } else {
-            a0 = unpackHalf2x16(uV.data[krow]).x;
-            a1 = unpackHalf2x16(uV.data[krow]).y;
-            b0 = unpackHalf2x16(uV.data[krow + 1]).x;
-            b1 = unpackHalf2x16(uV.data[krow + 1]).y;
+            a0 = F8_SRC2(uV.data[krow]).x;
+            a1 = F8_SRC2(uV.data[krow]).y;
+            b0 = F8_SRC2(uV.data[krow + 1]).x;
+            b1 = F8_SRC2(uV.data[krow + 1]).y;
         }
         float inv = 1.0 / uA.cache_scale;
         word = e4m3_encode(a0 * inv) | (e4m3_encode(a1 * inv) << 8u) |
@@ -609,7 +627,7 @@ void combine_partials(int row) {
     if (lid < (D >> 1)) {
         int d0 = lid * 2;
         int base = row * KS * PD;
-        float M = -1e30;
+        float M = ATTN_M_INIT;
         for (int k = 0; k < KS; ++k) {
             M = max(M, uPart.data[base + k * PD]);
         }
@@ -729,7 +747,7 @@ void attend() {
     }
     float o0 = 0.0;
     float o1 = 0.0;
-    float m = -1e30; // running row max
+    float m = ATTN_M_INIT; // running row max (see ATTN_M_INIT)
     float l = 0.0;   // running sum of exp(x - m)
 
     // Causal rows only need the tiles up to their own diagonal: every position
@@ -783,14 +801,16 @@ void attend() {
                 sc += LOADF(uMask, (b * S + s) * kv + j);
             }
             if (uA.causal != 0 && j > past + s) {
-                sc = -65504.0; // fp16 min; exp() -> 0 (not -inf, which NaNs)
+                // -inf: exp(-inf - m) = 0 for the always-finite m. (fp16's
+                // -65504 outranked a bf16 finfo.min = -3.39e38 mask entry.)
+                sc = ATTN_NEG_INF;
             }
             sS[lid] = sc;
         }
         barrier();
 
         // ---- running max ----
-        REDUCE_MAX((lid < tn) ? sS[lid] : -1e30);
+        REDUCE_MAX((lid < tn) ? sS[lid] : ATTN_NEG_INF);
         float tile_max = s_red[0];
         // Latch tile_max before s_red is reused as the sum accumulator: lane 0
         // overwrites s_red[0], and a warp that read it late would take a
@@ -798,7 +818,9 @@ void attend() {
         // whole-row kernel shipped without it and failed nondeterministically.)
         barrier();
         float m_new = max(m, tile_max);
-        float alpha = exp(m - m_new); // m starts at -1e30 -> first tile: 0
+        // m starts at -FLT_MAX: a first tile with a real score gives 0, an
+        // all-masked one exp(0) = 1 over l = o = 0.
+        float alpha = exp(m - m_new);
 
         // ---- exp + running sum ----
         float lp = 0.0;

@@ -57,7 +57,9 @@ float maxpool_elem(int gid) {
     int ow = rem % uParam.W_out;
 
     // Initialize with very small value
-    float max_val = -100000.0;
+    // -inf, not a large finite sentinel: bf16 (and fp32) values reach far
+    // below -100000, and a window of them must still return its maximum.
+    float max_val = uintBitsToFloat(0xFF800000u);
 
     for (int kh = 0; kh < uParam.kernel_h; ++kh) {
         for (int kw = 0; kw < uParam.kernel_w; ++kw) {
@@ -83,10 +85,10 @@ void main() {
     int e1 = 2 * gid + 1;
     float v0 = maxpool_elem(e0);
     if (e1 >= out_total) {
-        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, 0.0));
     } else {
         float v1 = maxpool_elem(e1);
-        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, v1));
     }
 #else
     if (gid >= out_total) return;

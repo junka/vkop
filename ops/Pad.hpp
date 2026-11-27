@@ -223,7 +223,10 @@ class PadBuffer : public BufferFactory {
     // reads: a uint16_t storage is fp16, not an integer 16-bit value.
     float read_scalar_float(const std::shared_ptr<core::ITensor> &input) {
         float v = 0.0F;
-        const bool is_fp16 = input->dtype() == typeid(uint16_t);
+        const bool is_16 = input->dtype() == typeid(uint16_t);
+        // A uint16_t container is fp16 unless its elem_kind says bf16.
+        const bool is_bf16 =
+            input->elem_kind() == core::ElemKind::kBFloat16;
         dispatch_by_dtype(input->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto t = core::as_tensor<T>(input);
@@ -232,9 +235,10 @@ class PadBuffer : public BufferFactory {
             // host vector until the readback fills one.
             t->copyToCPU(m_cmdpool_);
             if (t->data().empty()) return;
-            v = is_fp16 ? core::ITensor::fp16_to_fp32(
-                              static_cast<uint16_t>(t->data()[0]))
-                        : static_cast<float>(t->data()[0]);
+            const auto h = static_cast<uint16_t>(t->data()[0]);
+            v = is_bf16  ? core::bf16_to_float(h)
+                : is_16  ? core::ITensor::fp16_to_fp32(h)
+                         : static_cast<float>(t->data()[0]);
         });
         return v;
     }
@@ -243,8 +247,14 @@ class PadBuffer : public BufferFactory {
     // writes. Pad is a word mover: an fp32 output word is float bits, an int32
     // word is integer bits, and an fp16 output word holds two halves, so the
     // constant goes in the low 16 bits (in_half masks it there).
+    // A bf16 output (the _bf16 module, fp16_ == 2) takes the bf16 bits of the
+    // constant: the kernel only moves words, so this is the one place the
+    // 16-bit format matters.
     static uint32_t encode_constant(float value, const std::type_info &dtype,
-                                    bool fp16) {
+                                    bool fp16, bool bf16 = false) {
+        if (bf16) {
+            return static_cast<uint32_t>(core::float_to_bf16(value));
+        }
         if (fp16 || dtype == typeid(uint16_t)) {
             return static_cast<uint32_t>(
                 core::ITensor::fp32_to_fp16(value));
@@ -363,8 +373,9 @@ class PadBuffer : public BufferFactory {
             pc.padBegin[d] = (d < rank) ? begins[static_cast<size_t>(d)] : 0;
         }
         pc.mode = static_cast<int>(mode_);
-        pc.constant_word = encode_constant(constant_value, inputs[0]->dtype(),
-                                           fp16_ != 0);
+        pc.constant_word = encode_constant(
+            constant_value, inputs[0]->dtype(), fp16_ != 0,
+            inputs[0]->elem_kind() == core::ElemKind::kBFloat16);
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);

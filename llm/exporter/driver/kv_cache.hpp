@@ -97,6 +97,7 @@ public:
         }
         layers_ = std::move(layers);
         if (cache_kind != core::ElemKind::kFloat16 &&
+            cache_kind != core::ElemKind::kBFloat16 &&
             cache_kind != core::ElemKind::kFloat8E4M3FN &&
             cache_kind != core::ElemKind::kFloat8E5M2 &&
             cache_kind != core::ElemKind::kInt4 &&
@@ -198,6 +199,13 @@ private:
     std::vector<int> layers_;
     core::ElemKind cache_kind_;
 
+    // fp16 and bf16 (an --act bf16 artifact's cache) share the 2-byte
+    // uint16_t container; the cache only moves their bytes, never decodes.
+    bool u16_() const {
+        return cache_kind_ == core::ElemKind::kFloat16 ||
+               cache_kind_ == core::ElemKind::kBFloat16;
+    }
+
     // past 的逻辑长度跟上写出的历史。ResizeInput 会把 converted_ 置回 false
     // （buffer 走 prealloc_keep_ 复用，不重分配），所以最后要把 past 标回「数据
     // 在 GPU 上」——那块 buffer 里装的正是本轮的历史，不需要任何上传。
@@ -216,7 +224,7 @@ private:
     void preallocate_kv_(const std::shared_ptr<core::ITensor>& t,
                          std::shared_ptr<VulkanDevice>& dev,
                          std::size_t kv_elems) {
-        if (cache_kind_ == core::ElemKind::kFloat16) {
+        if (u16_()) {
             core::as_tensor<uint16_t>(t)->preallocate_buffer(dev, kv_elems);
         } else if (cache_kind_ == core::ElemKind::kInt4 ||
                    cache_kind_ == core::ElemKind::kNF4) {
@@ -226,7 +234,7 @@ private:
         }
     }
     void upload_kv_(const std::shared_ptr<core::ITensor>& t) {
-        if (cache_kind_ == core::ElemKind::kFloat16) {
+        if (u16_()) {
             core::as_tensor<uint16_t>(t)->copyToGPU(cmdpool_);
         } else {
             core::as_tensor<int8_t>(t)->copyToGPU(cmdpool_);
@@ -236,7 +244,7 @@ private:
     // num_elements() 是字节数（容器槽位），要乘 2 才是值数 —— 否则 feedback()
     // 会把 kv_len 算成一半，下一轮的 attention_bias/位置就全错位。
     int num_kv_elems_(const std::shared_ptr<core::ITensor>& t) {
-        if (cache_kind_ == core::ElemKind::kFloat16) {
+        if (u16_()) {
             return core::as_tensor<uint16_t>(t)->num_elements();
         }
         const int slots = core::as_tensor<int8_t>(t)->num_elements();
@@ -256,7 +264,7 @@ private:
     // 事实上不会 —— preallocate_kv_ 按同一个 cache_kind_ 分派。
     void share_kv_(const std::shared_ptr<core::ITensor>& dst,
                    const std::shared_ptr<core::ITensor>& src) {
-        if (cache_kind_ == core::ElemKind::kFloat16) {
+        if (u16_()) {
             core::as_tensor<uint16_t>(dst)->alias_gpu_buffer(
                 *core::as_tensor<uint16_t>(src));
         } else {
@@ -265,7 +273,7 @@ private:
         }
     }
     void mark_gpu_(const std::shared_ptr<core::ITensor>& t) {
-        if (cache_kind_ == core::ElemKind::kFloat16) {
+        if (u16_()) {
             core::as_tensor<uint16_t>(t)->toGPU();
         } else {
             core::as_tensor<int8_t>(t)->toGPU();

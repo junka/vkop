@@ -11,7 +11,8 @@ namespace ops {
 
 namespace cast {
 struct alignas(16) CastPC {
-    int mode;  // 0 = fp32->fp16, 1 = fp16->fp32
+    int mode;  // 0 fp32->fp16, 1 fp16->fp32, 2 word copy, 3 fp32->bf16,
+               // 4 bf16->fp32, 5 fp16->bf16, 6 bf16->fp16 (buffer/cast.comp)
     int total; // input element count
     int _pad0;
     int _pad1;
@@ -139,23 +140,28 @@ class Cast : public BufferFactory {
         auto shape = inputs[0]->getShape();
         int total = total_elems(shape);
 
-        // `to_` (ONNX's TensorProto id: 1 = fp32, 10 = fp16) and the output
-        // tensor's dtype must agree. The runtime sizes the output tensor from
+        // `to_` (ONNX's TensorProto id: 1 = fp32, 10 = fp16, 16 = bf16) and
+        // the output tensor's dtype must agree. The runtime sizes the output tensor from
         // this same attribute and the mode selection below reads the tensor
         // dtypes, so a disagreement means one of the two is stale — and the
         // shader would then reinterpret the buffer at the wrong element
         // stride. A third dtype (int64 indices, int8, bool) has no kernel at
         // all: it must not fall through to a float word copy.
-        const int to_dtype = outputs[0]->dtype() == typeid(uint16_t) ? 10
-                             : outputs[0]->dtype() == typeid(float)  ? 1
-                                                                     : 0;
+        // bf16 and fp16 share the uint16_t container; the element kind is
+        // what tells them apart.
+        const bool out_bf16 =
+            outputs[0]->elem_kind() == core::ElemKind::kBFloat16;
+        const int to_dtype = outputs[0]->dtype() == typeid(uint16_t)
+                                 ? (out_bf16 ? 16 : 10)
+                             : outputs[0]->dtype() == typeid(float) ? 1
+                                                                    : 0;
         if (to_ != 0 && to_ != to_dtype) {
             throw std::runtime_error(
                 std::string("Cast: the graph says to=") + std::to_string(to_) +
                 " but the output tensor is " +
                 core::elem_name(outputs[0]->elem_kind()) +
                 " (node's input is " + core::elem_name(inputs[0]->elem_kind()) +
-                "); only FLOAT and FLOAT16 are supported");
+                "); only FLOAT, FLOAT16 and BFLOAT16 are supported");
         }
 
         // int64 -> fp32 cast (the rotary position-id Cast).
@@ -253,18 +259,34 @@ class Cast : public BufferFactory {
         // Anything else is a conversion no kernel implements: the old code
         // treated "not fp16" as fp32 and would have run the f32->f16 packing
         // over, say, an int8 buffer.
+        //
+        // bf16 rides the same uint16_t container as fp16, so the mode keys on
+        // the element KIND of each side: fp32 <-> bf16 (3/4) and fp16 <-> bf16
+        // (5/6) decode/encode through common/bf16.comp, and bf16 -> bf16 is
+        // the mode-2 word copy. Reading the container alone (as this did)
+        // picked the fp16 decode for a bf16 input.
         const auto &idt = inputs[0]->dtype();
         if (idt != typeid(float) && idt != typeid(uint16_t)) {
             throw std::runtime_error(
                 std::string("Cast: no kernel converts from ") +
                 core::elem_name(inputs[0]->elem_kind()) +
-                " (only fp32<->fp16, plus the int64->fp32 host path)");
+                " (only fp32/fp16/bf16 among themselves, plus the "
+                "int64->fp32 host path)");
         }
-        if (idt == outputs[0]->dtype()) {
-            pc.mode = 2;
-        } else {
-            pc.mode = (idt == typeid(uint16_t)) ? 1 : 0;
-        }
+        // 0 fp32, 1 fp16, 2 bf16.
+        auto fmt = [](const std::shared_ptr<core::ITensor> &t) {
+            if (t->dtype() == typeid(float)) return 0;
+            return t->elem_kind() == core::ElemKind::kBFloat16 ? 2 : 1;
+        };
+        const int fin = fmt(inputs[0]);
+        const int fout = fmt(outputs[0]);
+        static constexpr int kMode[3][3] = {
+            // out: fp32 fp16 bf16
+            {2, 0, 3}, // in fp32
+            {1, 2, 5}, // in fp16
+            {4, 6, 2}, // in bf16
+        };
+        pc.mode = kMode[fin][fout];
         pc.total = total;
         const int groups = UP_DIV((total + 1) / 2, 256);
         if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&

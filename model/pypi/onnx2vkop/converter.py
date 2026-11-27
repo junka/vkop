@@ -217,6 +217,14 @@ def _fusions_the_target_cannot_run(args) -> dict:
                "only run on fp16/bf16 activations")
     elif _declared_widths_backend(args) == "image":
         why = "the image backend has no SwiGLU fold kernels"
+    elif activation_dtype(args) == "bf16":
+        # The gate/up fold runs on bf16 (coop8 / WIDE epilogues and the
+        # swiglu_pack pass read and write bf16); the down fold's module
+        # (matmul_down_act.comp) reads fp16 only, so its node would be held
+        # FP32 by the bf16 gate -- and no fold kernel takes fp32.
+        return {"fuse_swiglu_down_proj":
+                "--act bf16: the down-projection fold kernel reads fp16 "
+                "only (the gate/up fold still runs)"}
     else:
         return {}
     return {"fuse_swiglu_gate_up": why, "fuse_swiglu_down_proj": why}
@@ -1480,21 +1488,21 @@ class ModelConverter:
                 exclude=excluded_weights, only=bf16_only)
 
         if act == "bf16" and _declared_widths_backend(args) == "buffer":
-            # A graph that declares bf16 activations and float16 tensors has
-            # no way to run: the runtime has no fp16<->bf16 conversion and
-            # refuses a node binding both. Weight passes run after the domain
-            # pass (-q fp16's selective weight pass writes float16), and an
-            # fp16 export already declares FLOAT16 activations that the
-            # domain pass does not touch, so the check is made here, on the
-            # finished graph, rather than left for LoadModel to find.
+            # The runtime refuses a node binding bf16 beside fp16/fp32 (its
+            # _bf16 module decodes every 16-bit operand as bf16). Weight
+            # passes run after the domain pass (-q fp16's selective weight
+            # pass writes float16), so the check is made here, on the
+            # finished graph, rather than left for LoadModel to find. An fp16
+            # island behind a Cast is legal (cast.comp converts all three
+            # widths); only a per-node mix outside the own-format slots
+            # (fp16_graph._BF16_OTHER_FLOAT_SLOTS) is refused.
             mixed = GraphFp16.mixed_half_kinds(dag_model)
             if mixed:
                 raise RuntimeError(
                     "onnx2vkop: --act bf16 refused: the converted graph mixes "
-                    "fp16 and bf16 (" + mixed[0] + "). vkop has no kernel "
-                    "that converts between them and refuses a node that "
-                    "binds both. Use --act fp16, or a weight format other "
-                    "than -q fp16, or start from an fp32/bf16 export.")
+                    "fp16 and bf16 (" + mixed[0] + "). vkop refuses a node "
+                    "that binds bf16 beside another float width. Use "
+                    "--act fp16, or a weight format other than -q fp16.")
         numeric_audit.finish()
 
         # The folded-weight ABI, checked once for every format.

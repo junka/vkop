@@ -26,6 +26,7 @@
 //   -DFP16                 float16_t data[]  -- NATIVE half storage
 //   -DFP16 -DPACKED_FP16   uint words holding two halves, unpack/pack per
 //                          access (the convention most of this repo uses)
+//   -DFP16 -DBF16          uint16_t data[] -- native 16-bit bf16 words
 // The native build exists because the packed one pays a pack/unpack pair per
 // access and forces the writer discipline that pair implies; see
 // docs/fp16-storage-layouts.md for the measurement.
@@ -40,7 +41,17 @@
 // One accessor pair for all three builds. The accumulation stays fp32 even for
 // a half payload: a running sum carried in half loses the low bits of a long
 // line.
-#if defined(FP16) && !defined(PACKED_FP16)
+#if defined(BF16)
+// bf16 (the _bf16 module): NATIVE 16-bit storage like the fp16 build, as raw
+// uint16_t words (there is no bf16 storage type), decoded/encoded through
+// common/bf16.comp. Native, not packed: with an odd axis_stride the two lines
+// a thread owns do not share words, so a packed read-modify-write would race
+// with the neighbouring thread's line.
+#define ELEM16 uint16_t
+#define ACC_LOAD(data, idx) bf16_to_float(uint((data)[(idx)]))
+#define ACC_STORE(data, idx, v) ((data)[(idx)] = uint16_t(float_to_bf16(v)))
+#elif defined(FP16) && !defined(PACKED_FP16)
+#define ELEM16 float16_t
 #define ACC_LOAD(data, idx) float((data)[(idx)])
 #define ACC_STORE(data, idx, v) ((data)[(idx)] = float16_t(v))
 #else
@@ -53,7 +64,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #ifdef BDA
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
 #if defined(FP16) && !defined(PACKED_FP16)
-    float16_t data[];
+    ELEM16 data[];
 #else
     uint data[];
 #endif
@@ -63,10 +74,10 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
 #ifndef BDA
 #if defined(FP16) && !defined(PACKED_FP16)
 layout(set = 0, binding = 0) writeonly buffer Output {
-    float16_t data[];
+    ELEM16 data[];
 } uOutput;
 layout(set = 0, binding = 1) readonly buffer Input {
-    float16_t data[];
+    ELEM16 data[];
 } uInput;
 #else
 layout(set = 0, binding = 0) writeonly buffer Output {

@@ -72,6 +72,12 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     if (data_input->elem_kind() == ElemKind::kBFloat16 && output != nullptr) {
         return half_width_kind(output);
     }
+    // Gather is the one table op whose output may be a bf16 activation while
+    // its table is fp16/fp32 (gather.comp -DBF16_OUT): the build follows the
+    // output there too.
+    if (type == ops::OpType::GATHER && half_width_kind(output) == 2) {
+        return 2;
+    }
     switch (type) {
     case ops::OpType::MATMUL:
         // The int8 x int8 DP4A route reads a byte A but writes a float result,
@@ -1696,8 +1702,8 @@ void Runtime::LoadModel() {
                         if (it != n.attributes.end()) {
                             to = std::stoi(it->second);
                         }
-                        // Only the two float widths have a kernel (the shader
-                        // does fp32<->fp16 words; Cast::execute adds the
+                        // Only the three float widths have a kernel (the shader
+                        // converts fp32/fp16/bf16 words; Cast::execute adds the
                         // int64->fp32 host path). Allocating anything else —
                         // notably ONNX's default int64 indices — as fp32
                         // would hand every consumer a tensor whose container
@@ -1705,6 +1711,8 @@ void Runtime::LoadModel() {
                         // thing a wrong `to` cannot be allowed to do quietly.
                         if (to == 10) { // fp16
                             dtype_marker = "_f16_";
+                        } else if (to == 16) { // bf16 (cast.comp modes 3-6)
+                            dtype_marker = "_bf16_";
                         } else if (to == 1) { // fp32
                             dtype_marker = "_f32_";
                         } else {
@@ -1717,8 +1725,8 @@ void Runtime::LoadModel() {
                                      ? "(" + std::to_string(to) + ")"
                                      : std::to_string(to)) +
                                 " in node '" + n.name +
-                                "' is not supported (only FLOAT and FLOAT16 "
-                                "have a conversion kernel)");
+                                "' is not supported (only FLOAT, FLOAT16 and "
+                                "BFLOAT16 have a conversion kernel)");
                         }
                     } else if (type == vkop::ops::OpType::QUANTIZE_LINEAR) {
                         // fp16/fp32 -> int8/uint8/fp8 bytes: the output is an
@@ -1812,6 +1820,13 @@ void Runtime::LoadModel() {
                         dtype_marker = (out_shape.dtype == "float32")
                                            ? "_f32_"
                                            : "_f16_";
+                    } else if (type == vkop::ops::OpType::GATHER &&
+                               out_shape.dtype == "bfloat16") {
+                        // A bf16 ACTIVATION gathered from an fp16/fp32 (or
+                        // bf16) table: gather.comp -DBF16_OUT narrows the
+                        // table to bf16, so the output follows the recorded
+                        // dtype rather than the table's container.
+                        dtype_marker = "_bf16_";
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->elem_kind() ==
@@ -5062,6 +5077,15 @@ double Runtime::Run() {
                 fprintf(stderr, "[mmroute] %s | %s\n",
                         node_ops_[node_idx]->get_name().c_str(),
                         node_ops_[node_idx]->route_info().c_str());
+            }
+            // Attention's kernel (row / flash / flash_coop8 / split-KV) under
+            // the same switch: its route_tag() is what --act bf16 routing
+            // decides, and nothing else names it.
+            if (mmroute &&
+                node_ops_[node_idx]->get_type() == ops::OpType::ATTENTION) {
+                fprintf(stderr, "[attnroute] %s | %s\n",
+                        node_ops_[node_idx]->get_name().c_str(),
+                        node_ops_[node_idx]->route_tag().c_str());
             }
             auto aw_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};

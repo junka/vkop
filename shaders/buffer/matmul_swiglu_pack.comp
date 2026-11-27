@@ -18,14 +18,25 @@ layout(set = 0, binding = 1) readonly buffer In {
 layout(push_constant) uniform PC {
     int rows;
     int n_up;
-    int pad0;
+    // 1 = the product and the output are bf16 (a bf16 ACTIVATION MatMul: the
+    // routes ahead of this pass wrote bf16 words), 0 = fp16.
+    int bf16;
     int pad1;
 } uPC;
+
+#include "../common/bf16.comp"
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= uPC.rows * (uPC.n_up >> 2)) return;
     uvec4 w = uInput.data[gid];
+    if (uPC.bf16 != 0) {
+        vec4 g = vec4(unpackBF16x2(w.x), unpackBF16x2(w.y));
+        vec4 u = vec4(unpackBF16x2(w.z), unpackBF16x2(w.w));
+        vec4 h = g / (1.0 + exp(-g)) * u;
+        uOutput.data[gid] = uvec2(packBF16x2(h.xy), packBF16x2(h.zw));
+        return;
+    }
     vec4 g = vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
     vec4 u = vec4(unpackHalf2x16(w.z), unpackHalf2x16(w.w));
     vec4 h = g / (1.0 + exp(-g)) * u;

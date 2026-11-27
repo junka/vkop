@@ -5,8 +5,10 @@
 #extension GL_EXT_buffer_reference2 : require
 #endif
 
-// MatMul SSBO pack pass (fp16 only). Reads fp32 results from scratch,
-// packs as half2, writes to output. One thread per output WORD.
+// MatMul SSBO pack pass. Reads fp32 results from scratch, packs two values
+// per output word -- half2, or bf16x2 when uPC.swiglu bit 1 is set (a bf16
+// ACTIVATION MatMul, whose output is bf16: odd N lands here through the
+// reduce kernel). One thread per output WORD.
 // Separate shader to avoid Intel ANV push-constant interference between
 // reduce and pack dispatches of the same pipeline.
 //
@@ -34,9 +36,13 @@ layout(set = 0, binding = 3) readonly buffer Scratch {
 } uScratch;
 #endif
 
+#include "../common/bf16.comp"
+
 layout(push_constant) uniform PC {
     int total;   // output element count (the packed [.., N] result)
-    int swiglu;  // 1 = scratch holds [rows, 2*N]; apply silu(g)*u while packing
+    // Flags. bit 0: scratch holds [rows, 2*N]; apply silu(g)*u while packing.
+    //        bit 1: the output is bf16 (pack with packBF16x2, not half).
+    int swiglu;
     int rows;    // swiglu only: batch * m
     int n_up;    // swiglu only: output columns (== total / rows)
 #ifdef BDA
@@ -50,9 +56,13 @@ layout(push_constant) uniform PC {
 #define uScratch uPC.uScratch
 #endif
 
+uint pack2(vec2 v) {
+    return (uPC.swiglu & 2) != 0 ? packBF16x2(v) : packHalf2x16(v);
+}
+
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
-    if (uPC.swiglu != 0) {
+    if ((uPC.swiglu & 1) != 0) {
         // One thread per four output halves. The weight interleaves gate and up
         // four columns at a time, so a row of the plain [rows, 2*n_up] product
         // reads g0 g1 g2 g3 u0 u1 u2 u3 g4 g5 g6 g7 u4 ..., i.e. within each
@@ -72,8 +82,8 @@ void main() {
                       uintBitsToFloat(uScratch.data[in_base + 6]),
                       uintBitsToFloat(uScratch.data[in_base + 7]));
         vec4 h = g / (1.0 + exp(-g)) * u;
-        uOutput.data[2 * gid + 0] = packHalf2x16(h.xy);
-        uOutput.data[2 * gid + 1] = packHalf2x16(h.zw);
+        uOutput.data[2 * gid + 0] = pack2(h.xy);
+        uOutput.data[2 * gid + 1] = pack2(h.zw);
         return;
     }
     int nwords = (uPC.total + 1) / 2;
@@ -82,5 +92,5 @@ void main() {
     int e1 = e0 + 1;
     float v0 = uintBitsToFloat(uScratch.data[e0]);
     float v1 = (e1 < uPC.total) ? uintBitsToFloat(uScratch.data[e1]) : 0.0;
-    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    uOutput.data[gid] = pack2(vec2(v0, v1));
 }

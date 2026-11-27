@@ -99,7 +99,34 @@ BYTES_AS = {
     # A bool input is an int8_t tensor in the runtime; vkop-bench fills it
     # byte for byte from a 1-byte numpy bool array.
     "bool": np.dtype(np.bool_),
+    # An --act bf16 artifact's I/O. numpy has no bfloat16 (and ml_dtypes is
+    # deliberately not a dependency), so the WORDS travel as uint16 -- the .npy
+    # vkop-bench loads, the .bin it dumps -- and the VALUES are float32 here:
+    # bf16 is fp32's upper half, so the widening is exact (see bf16_to_f32).
+    "bfloat16": np.dtype(np.uint16),
 }
+
+
+def f32_to_bf16(values) -> np.ndarray:
+    """float32 -> bf16 words (uint16), round to nearest even -- the rounding
+    the shaders, core::float_to_bf16 and onnx2vkop's bf16 weights use."""
+    a = np.ascontiguousarray(values, dtype=np.float32)
+    u = a.view(np.uint32)
+    with np.errstate(over="ignore"):
+        r = (u + (np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1)))
+             ) >> np.uint32(16)
+    out = r.astype(np.uint16)
+    nan = np.isnan(a)
+    if nan.any():  # keep NaN a (quiet) NaN: the carry could make it inf
+        out[nan] = ((u[nan] >> np.uint32(16)) | np.uint32(0x40)).astype(
+            np.uint16)
+    return out
+
+
+def bf16_to_f32(words) -> np.ndarray:
+    """bf16 words (uint16) -> float32. Exact."""
+    w = np.ascontiguousarray(words, dtype=np.uint16)
+    return (w.astype(np.uint32) << np.uint32(16)).view(np.float32)
 # onnxruntime's spelling of an element type, for feeding the reference.
 ORT_TYPE = {
     "tensor(float)": np.float32, "tensor(float16)": np.float16,
@@ -164,7 +191,10 @@ def read_output(outdir: Path, row):
         raise LoopError(
             f"{row['name']}: dims={row['dims']} x {dt.itemsize}B = "
             f"{elems * dt.itemsize} != the {row['nbytes']} bytes written")
-    return np.frombuffer(raw, dtype=dt).reshape(row["dims"])
+    arr = np.frombuffer(raw, dtype=dt).reshape(row["dims"])
+    if row["bytes_as"] == "bfloat16":
+        return bf16_to_f32(arr).reshape(row["dims"])
+    return arr
 
 
 def run_vkopbench(bench, vkopbin, inputs_dir, out_dir, args, node_dump_cwd=None):
@@ -221,7 +251,7 @@ def declared_shape(spec):
 
 
 def random_input(spec, seed: int):
-    if spec["dtype"] not in ("float32", "float16"):
+    if spec["dtype"] not in ("float32", "float16", "bfloat16"):
         raise LoopError(
             f"input {spec['name']!r} is {spec['dtype']}, and random fill is "
             "only defined for float inputs: noise in an int64 token id or "
@@ -235,6 +265,8 @@ def random_input(spec, seed: int):
     # crc32, not hash(): Python salts str hashing per process, which would
     # make the "same input" array differ between two runs of this script.
     rng = np.random.default_rng(seed + zlib.crc32(spec["name"].encode()))
+    if spec["dtype"] == "bfloat16":
+        return rng.standard_normal(dims).astype(np.float32)
     return rng.standard_normal(dims).astype(spec["dtype"])
 
 
@@ -277,6 +309,19 @@ def build_inputs(vk_inputs, args):
             raise LoopError(
                 f"input {name!r}: the .vkopbin declares {dtype!r}, which has "
                 "no numpy view here")
+        if dtype == "bfloat16":
+            # The shared array holds the bf16 VALUES as float32 (exact), so
+            # ORT is fed exactly what the runtime decodes; write_input turns
+            # them into the words. A uint16 .npy is taken as bf16 words.
+            if arr.dtype == np.uint16:
+                arr = bf16_to_f32(arr).reshape(arr.shape)
+            else:
+                rounded = bf16_to_f32(f32_to_bf16(arr)).reshape(arr.shape)
+                if arr.dtype != np.float32 or not np.array_equal(
+                        rounded, arr.astype(np.float32), equal_nan=True):
+                    print(f"[input] {name}: {arr.dtype} rounded to bfloat16")
+                arr = rounded
+            np_dt = np.dtype(np.float32)
         if arr.dtype != np_dt:
             print(f"[input] {name}: cast {arr.dtype} -> {dtype}")
             arr = arr.astype(np_dt)
@@ -293,10 +338,23 @@ def build_inputs(vk_inputs, args):
     return arrays
 
 
+def write_input(path: Path, arr, dtype):
+    """The .npy vkop-bench loads: a bf16 input as its uint16 words (what
+    vkop_bench.cpp fill_bf16_from_npy copies verbatim), anything else as is."""
+    if dtype == "bfloat16":
+        arr = f32_to_bf16(arr).reshape(np.shape(arr))
+    np.save(path, arr)
+
+
 def ort_reference(sess, arrays):
     feed = {}
     for i in sess.get_inputs():
         arr = arrays[i.name]
+        if i.type == "tensor(bfloat16)":
+            raise LoopError(
+                f"onnxruntime input {i.name!r} is bfloat16, which numpy cannot "
+                "hold without ml_dtypes; compare against the fp32/fp16 export "
+                "the bf16 artifact was converted from")
         want = ORT_TYPE.get(i.type)
         if want is not None and arr.dtype != np.dtype(want):
             arr = arr.astype(want)
@@ -665,8 +723,9 @@ def run(args):
     in_dir.mkdir(parents=True, exist_ok=True)
     keep = args.keep or args.work_dir is not None
     try:
+        kinds = {s["name"]: s["dtype"] for s in vk_inputs}
         for name, arr in arrays.items():
-            np.save(in_dir / f"{name}.npy", arr)
+            write_input(in_dir / f"{name}.npy", arr, kinds.get(name))
         node_map = None
         if getattr(args, "node_dump", False):
             node_map = node_output_map(onnx_path)

@@ -161,6 +161,8 @@ def test_auto_backend_embeds_both_sides(tmp_path):
         "buffer_gather_bda", "buffer_gather_bda_fp16",
         "buffer_gather_int64_bda",
         "buffer_gather_bf16", "buffer_gather_bf16_fp16",
+        "buffer_gather_bf16_out_bf16", "buffer_gather_fp16_out_bf16",
+        "buffer_gather_fp32_out_bf16",
         "buffer_dispatch_from_shape", "buffer_dispatch_from_shape_bda"])
     m = tiny_dag()
     m.nodes["g"] = Node("Gather", "g", {"axis": 0},
@@ -171,8 +173,9 @@ def test_auto_backend_embeds_both_sides(tmp_path):
     subset, missing, count = build_shader_subset(m, master, backend="auto")
     assert "buffer_add" in subset and "image_add" in subset
     # 20 base keys + Add's and Mul's int64 twins (2 each: descriptor + BDA)
-    # + Gather's two bf16-table builds + Add's and Mul's buffer bf16 builds.
-    assert count == 28
+    # + Gather's two bf16-table builds + its three bf16-output builds + Add's
+    # and Mul's buffer bf16 builds.
+    assert count == 31
     assert not any(k.startswith("image_") and k.endswith("_bf16")
                    for k in subset)
     # Gather has no image variant: shader_map emits the phantom "image_gather"

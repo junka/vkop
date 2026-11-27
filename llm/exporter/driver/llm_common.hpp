@@ -43,6 +43,36 @@ constexpr uint16_t FP16_MIN = 0xFBFF;  // -65504
 
 inline float fp16_to_f32(uint16_t h) { return ITensor::fp16_to_fp32(h); }
 
+// ------------------------------------------------------ 16-bit float kinds ----
+// An --act bf16 artifact (onnx2vkop --act bf16) declares its float inputs,
+// its KV cache and (unless kept) its outputs bfloat16. bf16 rides the same
+// uint16_t container as fp16, so the container cannot tell the two apart:
+// every host read and write below goes by the tensor's elem_kind().
+//
+// The host side keeps producing fp16 (embed_tokens.bin is fp16, the causal
+// mask is fp16's -65504, vision features are fp16); the conversion happens
+// once, where the bits enter a bf16 input: fp16 -> fp32 (exact) -> bf16 with
+// round-to-nearest-even (core::float_to_bf16, the shaders' own rounding).
+inline bool is_half16(ElemKind k) {
+    return k == ElemKind::kFloat16 || k == ElemKind::kBFloat16;
+}
+
+inline float half_to_f32(uint16_t h, ElemKind kind) {
+    return kind == ElemKind::kBFloat16 ? core::bf16_to_float(h)
+                                       : fp16_to_f32(h);
+}
+
+// `n` fp16 words as `kind` words. fp16 is returned as-is (no copy); bf16 is
+// converted into `scratch`.
+inline const uint16_t *fp16_as_kind(ElemKind kind, const uint16_t *src,
+                                    size_t n, std::vector<uint16_t> &scratch) {
+    if (kind != ElemKind::kBFloat16) return src;
+    scratch.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        scratch[i] = core::float_to_bf16(fp16_to_f32(src[i]));
+    return scratch.data();
+}
+
 // ------------------------------------------------------------ architecture ----
 struct ModelArch {
     int hidden = 2048;
@@ -59,6 +89,8 @@ struct ModelArch {
     bool has_deepstack = false;  // deepstack_embeds_{0,1,2}
     bool has_image_pad_mask = false;
     ElemKind cache_kind = ElemKind::kFloat16;
+    // inputs_embeds' kind: kBFloat16 for an --act bf16 artifact.
+    ElemKind act_kind = ElemKind::kFloat16;
 
     std::string kv_in(int i) const {
         return "past_key_values_" + std::to_string(kv_layers[i]);
@@ -97,6 +129,7 @@ inline ModelArch infer_arch(const std::shared_ptr<Runtime> &rt,
     if (s.size() >= 5) a.hd = static_cast<int>(s[4]);
     a.cache_kind = pk0->elem_kind();
     if (a.cache_kind != ElemKind::kFloat16 &&
+        a.cache_kind != ElemKind::kBFloat16 &&
         a.cache_kind != ElemKind::kFloat8E4M3FN &&
         a.cache_kind != ElemKind::kFloat8E5M2 &&
         a.cache_kind != ElemKind::kInt4 && a.cache_kind != ElemKind::kNF4) {
@@ -104,8 +137,11 @@ inline ModelArch infer_arch(const std::shared_ptr<Runtime> &rt,
                      tag, core::elem_name(a.cache_kind));
         a.cache_kind = ElemKind::kFloat16;
     }
-    const auto es = rt->GetInput("inputs_embeds")->getShape();  // (B, q, hidden)
+    auto ie = rt->GetInput("inputs_embeds");
+    const auto es = ie->getShape();  // (B, q, hidden)
     if (es.size() >= 3) a.hidden = static_cast<int>(es.back());
+    a.act_kind = ie->elem_kind() == ElemKind::kBFloat16 ? ElemKind::kBFloat16
+                                                        : ElemKind::kFloat16;
     auto pid = rt->GetInput("position_ids");
     a.position_ids_dims = pid ? static_cast<int>(pid->getShape().size()) : 2;
     a.has_deepstack = rt->GetInput("deepstack_embeds_0") != nullptr;
@@ -155,13 +191,19 @@ inline std::vector<uint16_t> embed_lookup(const std::vector<uint16_t> &table,
 }
 
 // ------------------------------------------------------------------ inputs ----
+// `data` is fp16. A bf16 input (--act bf16) gets it rounded to bf16 (RNE);
+// an fp16 input gets the bits as they are.
 inline void fill_fp16_input(const std::shared_ptr<Runtime> &rt,
                             const std::string &name,
                             const std::vector<uint32_t> &shape,
                             const uint16_t *data) {
     rt->ResizeInput(name, shape);
     auto tg = as_tensor<uint16_t>(rt->GetInput(name));
-    if (tg->num_elements() > 0) tg->fillToCPU(data);
+    if (tg->num_elements() <= 0) return;
+    std::vector<uint16_t> scratch;
+    tg->fillToCPU(fp16_as_kind(tg->elem_kind(), data,
+                               static_cast<size_t>(tg->num_elements()),
+                               scratch));
 }
 
 inline void fill_i64_input(const std::shared_ptr<Runtime> &rt,
@@ -292,6 +334,14 @@ inline int register_gpu_topk(const std::shared_ptr<Runtime> &rt,
     }
     auto logits = rt->GetOutput("logits");
     if (!logits) return 0;
+    if (logits->elem_kind() == ElemKind::kBFloat16) {
+        // TopK has no bf16 kernel. onnx2vkop --act bf16 keeps `logits` at the
+        // export's width (fp16_graph._BF16_KEEP_OUTPUTS) for exactly this; an
+        // artifact that did not gets the host scan, which decodes bf16.
+        std::printf("[%s] argmax: host scan (bf16 logits: no bf16 TopK)\n",
+                    tag);
+        return 0;
+    }
     // The kernel keeps k per workgroup in shared memory and pads an odd k
     // for fp16; stay well inside both.
     k = std::max(1, std::min(k, 128));
@@ -349,6 +399,14 @@ class Sampler {
   public:
     explicit Sampler(uint64_t seed = 0) : rng_(seed) {}
 
+    // How the full logits row decodes (the `logits` output's elem_kind):
+    // fp16 by default, bf16 for an artifact that left logits bf16. The K
+    // candidate values of pick_topk come from the TopK post-process, which
+    // only runs on fp16 logits, so they stay fp16.
+    void set_logits_kind(ElemKind kind) {
+        logits_kind_ = kind == ElemKind::kBFloat16 ? kind : ElemKind::kFloat16;
+    }
+
     // Counters for the log line: how many picks needed the full row.
     int fast_picks = 0, full_picks = 0;
 
@@ -361,13 +419,13 @@ class Sampler {
             int best = 0;
             float bestv = -1e30f;
             for (int i = 0; i < vocab; ++i) {
-                const float v = fp16_to_f32(row[i]);
+                const float v = half_to_f32(row[i], logits_kind_);
                 if (v > bestv) { bestv = v; best = i; }
             }
             return best;
         }
         logits_.resize(static_cast<size_t>(vocab));
-        for (int i = 0; i < vocab; ++i) logits_[i] = fp16_to_f32(row[i]);
+        for (int i = 0; i < vocab; ++i) logits_[i] = half_to_f32(row[i], logits_kind_);
         apply_penalty_(history, vocab, sp);
         // max_element takes the first maximum, the strict-`>` scan's rule.
         if (sp.temperature <= 0.0f)
@@ -474,7 +532,7 @@ class Sampler {
         ++full_picks;
         const uint16_t *row = full_row();
         logits_.resize(static_cast<size_t>(vocab));
-        for (int i = 0; i < vocab; ++i) logits_[i] = fp16_to_f32(row[i]);
+        for (int i = 0; i < vocab; ++i) logits_[i] = half_to_f32(row[i], logits_kind_);
         apply_penalty_(history, vocab, sp);
         in_cand_.assign(static_cast<size_t>(vocab), 0);
         for (const auto &c : cand_) in_cand_[c.id] = 1;
@@ -566,6 +624,7 @@ class Sampler {
     }
 
     std::mt19937_64 rng_;
+    ElemKind logits_kind_ = ElemKind::kFloat16;
     std::vector<float> logits_;
     std::vector<int> idx_;
     std::vector<float> probs_;
@@ -695,6 +754,10 @@ class DecodeInputs {
                              {1u, 1u, static_cast<uint32_t>(arch_.hidden)});
             auto ie = as_tensor<uint16_t>(rt_->GetInput("inputs_embeds"));
             ie_imp = ie->is_host_imported();
+            // `emb` is an fp16 row of embed_tokens.bin; a bf16 graph gets it
+            // rounded to bf16 here (hidden words per step, ~microseconds).
+            emb = fp16_as_kind(ie->elem_kind(), emb,
+                               static_cast<size_t>(arch_.hidden), emb_bits_);
             if (ie_imp)
                 std::memcpy(ie->host_import_ptr(), emb,
                             static_cast<size_t>(arch_.hidden) * sizeof(uint16_t));
@@ -792,6 +855,7 @@ class DecodeInputs {
     std::vector<uint16_t> ds_zero_;
     std::vector<uint32_t> ds_shape_;
     std::vector<uint16_t> zeros_;
+    std::vector<uint16_t> emb_bits_;  // the bf16 copy of a decode row
     bool zerocopy_ = false;
     bool reported_ok_ = false;
     bool reported_unavailable_ = false;

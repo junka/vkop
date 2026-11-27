@@ -264,6 +264,8 @@ class LineReader {
 // (llm_common.hpp); only the server's own pieces live below.
 using vkop::llm::ModelArch;
 using vkop::llm::fp16_to_f32;
+using vkop::llm::half_to_f32;
+using vkop::llm::is_half16;
 
 // ------------------------------------------------------------- sampling ----
 using vkop::llm::SampleParams;
@@ -289,6 +291,11 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
                       const SampleParams &sp) {
     const bool logit_top = std::getenv("VKOP_LOGIT_TOP") != nullptr;
     const bool greedy = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+    // The full row decodes by the output's kind: fp16, or bf16 when the
+    // artifact left `logits` bf16 (onnx2vkop --act bf16 keeps it fp16).
+    ElemKind lk = ElemKind::kFloat16;
+    if (auto l = rt->GetOutput("logits")) lk = l->elem_kind();
+    sampler.set_logits_kind(lk);
     auto idx_out = topk_k > 0 ? rt->GetOutput("post_TopK1") : nullptr;
     if (idx_out && !logit_top && greedy) {
         auto ti = as_tensor<int>(idx_out);
@@ -341,7 +348,7 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
         if (std::getenv("VKOP_TOPK_VERIFY")) {
             const uint16_t *row = full_row();
             std::vector<float> all(static_cast<size_t>(vocab));
-            for (int i = 0; i < vocab; ++i) all[i] = fp16_to_f32(row[i]);
+            for (int i = 0; i < vocab; ++i) all[i] = half_to_f32(row[i], lk);
             std::partial_sort(all.begin(), all.begin() + k, all.end(),
                               std::greater<float>());
             std::vector<float> got(static_cast<size_t>(k));
@@ -350,7 +357,7 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
             bool ok = true;
             for (int i = 0; i < k; ++i) {
                 ok = ok && got[i] == all[i] && ids[i] >= 0 && ids[i] < vocab &&
-                     fp16_to_f32(row[ids[i]]) == fp16_to_f32(vals[i]);
+                     half_to_f32(row[ids[i]], lk) == fp16_to_f32(vals[i]);
             }
             std::fprintf(stderr, "[topk-verify] %s\n", ok ? "ok" : "MISMATCH");
         }
@@ -364,7 +371,7 @@ int sample_last_token(const std::shared_ptr<Runtime> &rt,
         // single token (often EOS) far above the rest.
         std::vector<std::pair<float, int>> top;
         for (int i = 0; i < vocab; ++i) {
-            const float v = fp16_to_f32(row[i]);
+            const float v = half_to_f32(row[i], lk);
             if (top.size() == 5 && v <= top.back().first) continue;
             top.emplace_back(v, i);
             std::sort(top.begin(), top.end(),
@@ -742,14 +749,14 @@ class InferenceServer {
     size_t kv_row_vals() const { return 2ull * arch_.nkv * arch_.hd; }
 
     size_t kv_elem_bytes() const {
-        return arch_.cache_kind == ElemKind::kFloat16 ? 2 : 1;
+        return is_half16(arch_.cache_kind) ? 2 : 1;
     }
 
     // Bytes one cache row occupies in the file for one layer. Zero means "no
     // layout": a 4-bit container packs two values per byte, so its rows are not
     // `values * 1 byte` (kv_cache.hpp), and the server has never served one.
     size_t kv_row_bytes() const {
-        if (arch_.cache_kind == ElemKind::kFloat16 ||
+        if (is_half16(arch_.cache_kind) ||
             arch_.cache_kind == ElemKind::kFloat8E4M3FN ||
             arch_.cache_kind == ElemKind::kFloat8E5M2)
             return kv_row_vals() * kv_elem_bytes();
@@ -859,7 +866,7 @@ class InferenceServer {
         auto t = rt_->GetInput(name);
         if (!t) throw std::runtime_error("--kv-cache: no " + name);
         size_t bytes = 0;
-        if (arch_.cache_kind == ElemKind::kFloat16)
+        if (is_half16(arch_.cache_kind))
             bytes = as_tensor<uint16_t>(t)->as_storage_buffer(dev_)->getSize();
         else
             bytes = as_tensor<int8_t>(t)->as_storage_buffer(dev_)->getSize();
@@ -873,7 +880,7 @@ class InferenceServer {
     std::shared_ptr<VulkanBuffer> kv_buffer_(int layer) {
         auto t = rt_->GetInput(arch_.kv_in(layer));
         if (!t) throw std::runtime_error("--kv-cache: no " + arch_.kv_in(layer));
-        if (arch_.cache_kind == ElemKind::kFloat16)
+        if (is_half16(arch_.cache_kind))
             return as_tensor<uint16_t>(t)->as_storage_buffer(dev_);
         return as_tensor<int8_t>(t)->as_storage_buffer(dev_);
     }
@@ -1549,6 +1556,7 @@ class InferenceServer {
 
     static ElemKind parse_kind(const std::string &s, ElemKind fallback) {
         if (s == "fp16") return ElemKind::kFloat16;
+        if (s == "bf16") return ElemKind::kBFloat16;
         if (s == "fp8e4m3") return ElemKind::kFloat8E4M3FN;
         if (s == "fp8e5m2") return ElemKind::kFloat8E5M2;
         if (s == "int4") return ElemKind::kInt4;

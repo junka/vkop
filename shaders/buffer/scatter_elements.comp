@@ -16,7 +16,8 @@
 //
 // Dispatch: n_idx threads (n_idx = indices.numel() = updates.numel()).
 //
-// FP16 packing: data/updates are packed two fp16 per uint word. Two adjacent
+// FP16 packing: data/updates are packed two 16-bit floats (fp16, or bf16 in
+// the _bf16 build) per uint word. Two adjacent
 // elements (col, col+1) share a word, so a thread updating one half MUST use a
 // CAS on the whole word to avoid clobbering the other half (which a sibling
 // thread may be updating concurrently). This is the fp16 word-CAS variant —
@@ -24,6 +25,18 @@
 // that cost ~16ms/call (48ms/round, the single biggest per-op readback cost).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// The 16-bit word format: fp16 under -DFP16, bf16 under -DFP16 -DBF16 (the
+// _bf16 module). This shader does not include buffer_common.comp, so it picks
+// the codec itself.
+#ifdef BF16
+#include "../common/bf16.comp"
+#define SE_UNPACK2(w) unpackBF16x2(w)
+#define SE_PACK2(v) packBF16x2(v)
+#else
+#define SE_UNPACK2(w) unpackHalf2x16(w)
+#define SE_PACK2(v) packHalf2x16(v)
+#endif
 
 #ifdef BDA
 #extension GL_EXT_buffer_reference : require
@@ -99,16 +112,18 @@ void main() {
     uint target_word = uint(target) >> 1;
     int target_slot = target & 1;
     uint upd_word = uUpdates.data[uint(gid) >> 1];
-    float update = unpackHalf2x16(upd_word)[gid & 1];
+    float update = SE_UNPACK2(upd_word)[gid & 1];
 
     // Word-level CAS: read the whole word, modify only our half, CAS. Every
     // reduction (including 'none') uses CAS because a sibling thread may own
-    // the other half of the same word (adjacent columns share a word).
+    // the other half of the same word (adjacent columns share a word). Only
+    // our 16 bits are re-encoded; the sibling half is kept as its raw bits.
+    const uint shift = uint(target_slot) << 4;
     uint old_w = uData.data[target_word];
     for (;;) {
-        vec2 p = unpackHalf2x16(old_w);
-        p[target_slot] = combine(p[target_slot], update);
-        uint new_w = packHalf2x16(p);
+        float cur = SE_UNPACK2(old_w)[target_slot];
+        uint enc = SE_PACK2(vec2(combine(cur, update), 0.0)) & 0xFFFFu;
+        uint new_w = (old_w & ~(0xFFFFu << shift)) | (enc << shift);
         uint result = atomicCompSwap(uData.data[target_word], old_w, new_w);
         if (result == old_w) break;
         old_w = result;

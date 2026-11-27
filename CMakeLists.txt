@@ -796,6 +796,12 @@ vkop_shader_variant(buffer_gather_int64_bda buffer/gather_int64 -DBDA)
 # the op resolves by name (ops/Gather.hpp ensure_bf16_pipeline); no BDA form.
 vkop_shader_variant(buffer_gather_bf16 buffer/gather -DBF16_TABLE)
 vkop_shader_variant(buffer_gather_bf16_fp16 buffer/gather -DFP16 -DBF16_TABLE)
+# Gather whose OUTPUT is a bf16 activation (--act bf16): -DBF16_OUT stores
+# uint16_t bf16 bits, from a bf16 table (bit copy), an fp16 table or an fp32
+# table (RNE narrowing). ops/Gather.hpp ensure_bf16_out_pipeline; no BDA form.
+vkop_shader_variant(buffer_gather_bf16_out_bf16 buffer/gather -DBF16_TABLE -DBF16_OUT)
+vkop_shader_variant(buffer_gather_fp16_out_bf16 buffer/gather -DFP16 -DBF16_OUT)
+vkop_shader_variant(buffer_gather_fp32_out_bf16 buffer/gather -DBF16_OUT)
 vkop_shader_variant(buffer_where_int64_bda buffer/where_int64 -DBDA)
 vkop_shader_variant(buffer_expand_int64_bda buffer/expand_int64 -DBDA)
 # int64 -> fp32 Cast (position ids). Needs shaderInt64 for the ARITHMETIC, not
@@ -835,6 +841,18 @@ vkop_shader_variant(buffer_nonzero_bda buffer/nonzero -DBDA)
 vkop_shader_variant(buffer_range_bda buffer/range -DBDA)
 vkop_shader_variant(buffer_argmax buffer/argmax)
 vkop_shader_variant(buffer_argmax_bda buffer/argmax -DBDA)
+
+# bf16-ACTIVATION builds (-DFP16 -DBF16) of the same-source MatMul secondary
+# modules the --act bf16 routes dispatch: the 512-lane split-K GEMV and the
+# tile-split-K deposit/fold pair. Same push constants and bindings as their
+# _fp16 twins; the host picks the _bf16 key when the op runs its _bf16 module
+# (fp16_ == 2). No BDA form: a bf16 op keeps its descriptor pipelines.
+vkop_shader_variant(buffer_matmul_ksplit512_bf16 buffer/matmul
+                    -DFP16 -DBF16 -DKSPLIT512)
+vkop_shader_variant(buffer_matmul_tiled_ks_split_bf16 buffer/matmul
+                    -DFP16 -DBF16 -DTILED_KS_SPLIT)
+vkop_shader_variant(buffer_matmul_tiled_ks_fold_bf16 buffer/matmul
+                    -DFP16 -DBF16 -DTILED_KS_FOLD)
 
 # The M>1 build of the SwiGLU fold source (no DA_M1_ONLY): keeps the multi-row
 # deposit walk that the M==1 module above compiles out.
@@ -901,6 +919,12 @@ vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm64bn8_bda buffer/matmul_coo
 # shape, the base build stays the 32x64 module, and an archive converted before
 # a key existed just keeps the base (resolve_spv throws by name, the op records
 # the miss and falls back).
+# The bf16-ACTIVATION build of the Apple coopmat GEMM (matmul_coop8.comp
+# -DACT_BF16): bf16 A/B staged into the fp16 fragments under exact
+# power-of-two row/column scales, bf16 store. Its own module so the fp16 one
+# is unchanged; MatMulBuffer::coop8_pipeline resolves it for a _bf16 op.
+vkop_shader_variant(buffer_matmul_coop8_bf16 buffer/matmul_coop8 -DACT_BF16)
+
 # Narrower-row builds of the Apple coopmat 3x3 conv (conv_coop8.comp, default
 # 256 output pixels per workgroup): 128 and 64 pixels for 128/64-wide maps.
 vkop_shader_variant(buffer_conv_coop8_p128 buffer/conv_coop8 -DSG_N=2)
@@ -1057,6 +1081,10 @@ vkop_shader_variant(buffer_attention_fp16_sg buffer/attention -DFP16 -DSUBGROUP)
 # when the archive has neither.
 vkop_shader_variant(buffer_attention_split_fp16 buffer/attention -DFP16 -DKV_SPLIT)
 vkop_shader_variant(buffer_attention_split_fp16_sg buffer/attention -DFP16 -DSUBGROUP -DKV_SPLIT)
+# The same pair for a bf16 activation (-DFP16 -DBF16): AttentionBuffer::
+# split_pipeline resolves these when the op runs its _bf16 module.
+vkop_shader_variant(buffer_attention_split_bf16 buffer/attention -DFP16 -DBF16 -DKV_SPLIT)
+vkop_shader_variant(buffer_attention_split_bf16_sg buffer/attention -DFP16 -DBF16 -DSUBGROUP -DKV_SPLIT)
 vkop_shader_variant(buffer_layernorm_sg buffer/layernorm -DSUBGROUP)
 vkop_shader_variant(buffer_layernorm_fp16_sg buffer/layernorm -DFP16 -DSUBGROUP)
 vkop_shader_variant(buffer_rmsnorm_sg buffer/rmsnorm -DSUBGROUP)

@@ -15,6 +15,12 @@
 //   VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
 //   ./build/benchmark/bench_attention [samples]
 // Env: BENCH_SHAPES=dit,llm,small (comma list; default all).
+//      BENCH_ACT_BF16=1: arm 0 is the fp16 op on fp16 tensors, arm 1 the
+//      _bf16 op on the same values as bf16 tensors (--act bf16), both on the
+//      tiled route the op picks (fp16: the coop8 build on Apple, bf16: the
+//      SIMT -DBF16 build). BENCH_ATTN_FP16_COOP8=0 pins arm 0 to the SIMT
+//      tiled kernel too, for the like-for-like kernel A/B. Arm 1's error
+//      column includes the bf16 rounding of its inputs.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -101,6 +107,8 @@ int main(int argc, char **argv) {
     std::string want = "dit,llm,small,few";
     if (const char *e = std::getenv("BENCH_SHAPES")) want = e;
     const bool coop_ab = std::getenv("BENCH_COOP8") != nullptr;
+    const bool act_bf16 = std::getenv("BENCH_ACT_BF16") != nullptr;
+    const char *f16c8 = std::getenv("BENCH_ATTN_FP16_COOP8");
 
     std::vector<Case> cases = {
         // Qwen-Image DiT joint attention: 1024 image + 64 text tokens, the
@@ -187,6 +195,24 @@ int main(int argc, char **argv) {
             M->copyToGPU(cmdpool);
             in.push_back(M);
         }
+        // bf16 copies of every input (same values, bf16-rounded), for the
+        // BENCH_ACT_BF16 arm.
+        std::vector<std::shared_ptr<core::ITensor>> in_bf;
+        if (act_bf16) {
+            for (const auto &t : in) {
+                auto src = std::dynamic_pointer_cast<T16>(t);
+                auto b = std::make_shared<T16>(src->getShape());
+                b->reserveOnCPU();
+                const std::vector<float> &h =
+                    t == Q ? hq : t == K ? hk : t == V ? hv : hm;
+                for (size_t i = 0; i < h.size(); ++i)
+                    b->data()[i] = core::float_to_bf16(h[i]);
+                b->set_elem_kind(core::ElemKind::kBFloat16);
+                b->as_storage_buffer(dev);
+                b->copyToGPU(cmdpool);
+                in_bf.push_back(b);
+            }
+        }
         const float scale = 1.0f / std::sqrt(static_cast<float>(c.D));
         std::unordered_map<std::string, std::string> attrs{
             {"scale", std::to_string(scale)},
@@ -210,26 +236,37 @@ int main(int argc, char **argv) {
             auto at = attrs;
             // BENCH_COOP8=1: arm 0 is the SIMT tiled kernel, arm 1 the
             // coopmat one (MoltenVK). Default: row kernel against tiled.
-            if (coop_ab) {
+            const bool bf_arm = act_bf16 && a == 1;
+            if (act_bf16) {
+                at["flash"] = "1";
+                if (a == 0 && f16c8 != nullptr) at["flash_coop8"] = f16c8;
+            } else if (coop_ab) {
                 at["flash"] = "1";
                 at["flash_coop8"] = a == 0 ? "0" : "1";
             } else {
                 at["flash"] = a == 0 ? "0" : "1";
             }
-            arm.op = ops::create_from_type(ops::OpType::ATTENTION, 1, 0, true);
+            arm.op = ops::create_from_type(ops::OpType::ATTENTION,
+                                           bf_arm ? 2 : 1, 0, true);
             arm.op->set_runtime_device(dev, cmdpool);
             arm.op->setAttribute(at);
             arm.op->enable_replay(true);
             arm.out = std::make_shared<T16>(
                 c.seq_major ? std::vector<int>{c.B, c.S, c.H, c.D}
                             : std::vector<int>{c.B, c.H, c.S, c.D});
+            if (bf_arm) arm.out->set_elem_kind(core::ElemKind::kBFloat16);
             arm.out->as_storage_buffer(dev);
             arm.ts = std::make_unique<VulkanQueryPool>(dev->getLogicalDevice(),
                                                        2);
             arm.op->set_prof_query(arm.ts->get(), 0);
             std::vector<std::shared_ptr<core::ITensor>> out{arm.out};
-            arm.op->onExecute(in, out, 0);
-            arm.op->onExecute(in, out, 0);
+            const auto &ins = bf_arm ? in_bf : in;
+            arm.op->onExecute(ins, out, 0);
+            arm.op->onExecute(ins, out, 0);
+            if (act_bf16) {
+                printf("  arm %d (%s): route %s\n", a, bf_arm ? "bf16" : "fp16",
+                       arm.op->route_tag().c_str());
+            }
             arm.cmd = arm.op->get_record();
             if (!arm.cmd) {
                 printf("%s: no recorded cmd\n", c.name);
@@ -270,7 +307,9 @@ int main(int argc, char **argv) {
             auto &dst = a == 0 ? yo : yn;
             dst.resize(static_cast<size_t>(arms[a].out->num_elements()));
             for (size_t i = 0; i < dst.size(); ++i)
-                dst[i] = core::ITensor::fp16_to_fp32(arms[a].out->data()[i]);
+                dst[i] = (act_bf16 && a == 1)
+                             ? core::bf16_to_float(arms[a].out->data()[i])
+                             : core::ITensor::fp16_to_fp32(arms[a].out->data()[i]);
         }
         double d_on = 0.0;
         for (size_t i = 0; i < yo.size(); ++i)

@@ -427,6 +427,40 @@ size_t npy_count(const std::vector<uint32_t> &shape) {
     return n;
 }
 
+// A bf16 input (--act bf16). numpy has no bf16 dtype, so the .npy carries the
+// raw bf16 words as uint16 ('<u2', what tools/vkop_vs_ort.py writes); an fp32
+// or fp16 array is rounded to bf16 (RNE) instead of being copied as words of
+// the wrong format.
+void fill_bf16_from_npy(const std::shared_ptr<ITensor> &t, const NpyArray &a,
+                        const std::string &name) {
+    const std::string &d = a.descr;
+    const bool f32 = d.find("f4") != std::string::npos;
+    const bool f16 = d.find("f2") != std::string::npos;
+    if (!f32 && !f16) {
+        fill_typed_from_npy<uint16_t>(t, a, name); // '<u2' / '<i2': the bits
+        return;
+    }
+    const size_t n = npy_count(a.shape);
+    if (a.bytes.size() < n * (f32 ? 4 : 2))
+        throw std::runtime_error("npy " + name + " short read");
+    std::vector<uint16_t> bits(n);
+    for (size_t i = 0; i < n; ++i) {
+        float v;
+        if (f32) {
+            std::memcpy(&v, a.bytes.data() + 4 * i, 4);
+        } else {
+            uint16_t h;
+            std::memcpy(&h, a.bytes.data() + 2 * i, 2);
+            v = ITensor::fp16_to_fp32(h);
+        }
+        bits[i] = vkop::core::float_to_bf16(v);
+    }
+    auto typed = as_tensor<uint16_t>(t);
+    typed->resize(a.shape);
+    if (n > 0)
+        typed->fillToCPU(bits.data());
+}
+
 // Resize + fill + upload one input from an .npy if load_inputs_dir has it,
 // else fall through to the deterministic pseudo-random path.
 void prep_input_from_dir_or_random(const std::shared_ptr<Runtime> &rt,
@@ -454,6 +488,8 @@ void prep_input_from_dir_or_random(const std::shared_ptr<Runtime> &rt,
                 fill_typed_from_npy<int8_t>(t, arr, name);
             else if (dt == typeid(float))
                 fill_typed_from_npy<float>(t, arr, name);
+            else if (t->elem_kind() == vkop::core::ElemKind::kBFloat16)
+                fill_bf16_from_npy(t, arr, name);
             else
                 fill_typed_from_npy<uint16_t>(t, arr, name);
             upload_by_dtype(cmdpool, t);
@@ -487,7 +523,15 @@ void upload_by_dtype(const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
 // storage uint8 either way), and the declared kind stays readable from the
 // .vkopbin -- here only the first one can be wrong in a way that decodes to a
 // plausible-looking array.
-const char *bytes_label(const std::type_info &dt) {
+//
+// bf16 (an --act bf16 artifact) shares fp16's uint16_t container, so the
+// container alone would label it float16 and a reader would decode bf16 words
+// as fp16 -- plausible-looking garbage. The elem kind settles it.
+const char *bytes_label(const ITensor &t) {
+    const auto &dt = t.dtype();
+    if (dt == typeid(uint16_t) &&
+        t.elem_kind() == vkop::core::ElemKind::kBFloat16)
+        return "bfloat16";
     if (dt == typeid(float))
         return "float32";
     if (dt == typeid(int64_t))
@@ -587,7 +631,7 @@ void save_outputs(const std::shared_ptr<Runtime> &rt,
             // nbytes is the stream position, i.e. what is actually on disk --
             // so dims x bytes-as x nbytes is a check the consumer can run, not
             // a claim about the tensor.
-            mf << name << '\t' << bytes_label(dt) << '\t'
+            mf << name << '\t' << bytes_label(*t) << '\t'
                << dims_label(t->getShape()) << '\t'
                << static_cast<int64_t>(f.tellp()) << '\n';
         }
@@ -648,6 +692,12 @@ void prep_input(const std::shared_ptr<Runtime> &rt,
         // uint16_t is vkop's fp16 storage; anything else lands here too.
         auto tt = as_tensor<uint16_t>(t);
         auto buf = make_fill<uint16_t>(n, seed);
+        // A bf16 input (--act bf16) shares the container: re-encode the same
+        // values as bf16, or the kernel reads fp16 words as bf16 (|x| ~1e-5
+        // instead of ~0.5).
+        if (t->elem_kind() == vkop::core::ElemKind::kBFloat16)
+            for (auto &h : buf)
+                h = vkop::core::float_to_bf16(ITensor::fp16_to_fp32(h));
         tt->fillToCPU(buf);
         tt->copyToGPU(cmdpool);
     }

@@ -850,25 +850,17 @@ class MatMulBuffer : public BufferFactory {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
         }
-        if (act_bf16) {
-            // Each of these is a separate module or epilogue with no bf16
-            // read: the SwiGLU down fold (matmul_down_act.comp), the gate/up
-            // fold's pack pass (matmul_swiglu_pack.comp), and the attention
-            // QK^T epilogue's mask/bias read. attn_softmax deletes the
-            // Softmax node in the converter and relies on a route that only
-            // takes an fp16 B, so with bf16 there would be no softmax at all.
-            const char *why = down_act_      ? "down_act SwiGLU fold"
-                              : swiglu_      ? "swiglu gate/up fold"
-                              : epi_bias_    ? "QK^T epi_bias mask/bias epilogue"
-                              : attn_softmax_ ? "fused attn_softmax"
-                                             : nullptr;
-            if (why != nullptr) {
-                throw std::runtime_error(
-                    "vkop: no bf16 activation kernel for MatMul '" +
-                    get_name() + "' (" + why +
-                    "); reconvert with --act fp16 or without the "
-                    "fold");
-            }
+        if (act_bf16 && down_act_) {
+            // The SwiGLU down fold is its own module (matmul_down_act.comp)
+            // with fp16-only reads of x, Wg, Wu and Wd, and no _bf16 build.
+            // The gate/up fold (swiglu: coop8 / WIDE epilogues and the
+            // swiglu_pack pass), the QK^T epi_bias epilogue (bf16 mask decode)
+            // and the fused attn_softmax row kernel all read and write bf16
+            // in the _bf16 module (Bf16ActivationTest covers each).
+            throw std::runtime_error(
+                "vkop: no bf16 activation kernel for MatMul '" + get_name() +
+                "' (down_act SwiGLU fold); reconvert with --act fp16 or "
+                "without the fold");
         }
         if (weight_bf16) {
             // v1 scope: bf16 is a constant weight. The SwiGLU down fold reads
@@ -1102,8 +1094,13 @@ class MatMulBuffer : public BufferFactory {
         // ks_store_wide_w8 (four 16-column groups and a per-column scale), a
         // different epilogue that has no swiglu arm, so a byte weight would
         // silently write the plain [M, 2*N] product.
+        // A bf16 B beside a bf16 activation is the --act bf16 fold: every
+        // epilogue that applies it (coop8, the WIDE GEMV, the swiglu_pack
+        // pass) reads and writes bf16 in the _bf16 module.
         const bool swiglu_float =
-            core::is_float_elem(inputs[1]->elem_kind()) &&
+            (core::is_float_elem(inputs[1]->elem_kind()) ||
+             (act_bf16 &&
+              inputs[1]->elem_kind() == core::ElemKind::kBFloat16)) &&
             inputs.size() == 2;
         const bool swiglu_4bit =
             weight_4bit && inputs.size() == (weight_nvfp4 ? 4u : 3u);
@@ -1489,10 +1486,15 @@ class MatMulBuffer : public BufferFactory {
                 break;
             case core::MatmulRoute::kKsplitWide512:
             case core::MatmulRoute::kKsplit512:
-                sel_ks512 = secondary_pipeline(0,
-                                               "buffer_matmul_ksplit512_fp16",
-                                               ksplit512_pipeline_,
-                                               ksplit512_ds_);
+                // A bf16 activation runs the -DBF16 build of the same
+                // 512-lane module (bf16 A/B decode, bf16 store).
+                sel_ks512 = fp16_ == 2
+                                ? secondary_pipeline(
+                                      5, "buffer_matmul_ksplit512_bf16",
+                                      ksplit512_pipeline_, ksplit512_ds_)
+                                : secondary_pipeline(
+                                      0, "buffer_matmul_ksplit512_fp16",
+                                      ksplit512_pipeline_, ksplit512_ds_);
                 if (sel_ks512 == nullptr) {
                     sel_av.ksplit512 = false;
                     retry = true;
@@ -2239,7 +2241,8 @@ class MatMulBuffer : public BufferFactory {
                 int nwords = (total + 1) / 2;
                 MatMulPackPC pack_pc{};
                 pack_pc.total = total;
-                pack_pc.swiglu = swiglu_in_pack_ ? 1 : 0;
+                pack_pc.swiglu = (swiglu_in_pack_ ? 1 : 0) |
+                                 (fp16_ == 2 ? 2 : 0);
                 pack_pc.rows = swiglu_rows_;
                 pack_pc.n_up = swiglu_nup_;
                 fillDescriptorWrites(pack_ds_[m_id_]);
@@ -2824,12 +2827,13 @@ class MatMulBuffer : public BufferFactory {
                 const char *e = std::getenv("VKOP_TILE128");
                 return e == nullptr || std::atoi(e) != 0;
             }();
-            // A bf16 activation stays on the 64x64 SIMT tile: the coop8 GEMM
-            // and the 128x128 tile below stage A as fp16 (no bf16 decode).
-            const bool act_bf16_tile = (para_.bf16 & 2) != 0;
             // Apple: the same plain fp16 shape on 8x8x8 simdgroup matrices
-            // (64x64 workgroup tile, 16-deep K step).
-            if (!act_bf16_tile && coop8_eligible(m, n, k)) {
+            // (64x64 workgroup tile, 16-deep K step). A bf16 activation
+            // (para_.bf16 bit 1) takes it too: the module stages bf16 A/B
+            // into the fp16 fragments under per-row/per-column power-of-two
+            // scales (exact, undone in the fp32 epilogue; see the header of
+            // matmul_coop8.comp) and stores bf16.
+            if (coop8_eligible(m, n, k)) {
                 if (VulkanPipeline *c8 = coop8_pipeline()) {
                     set_route(swiglu_coop8_ ? "coop8_swiglu" : "coop8", batch,
                               m, n, k, rep);
@@ -2853,10 +2857,13 @@ class MatMulBuffer : public BufferFactory {
                                    : (n >= 3072) ? 192
                                    : (n >= 2048) ? 256
                                                  : (1 << 30);
-            if (t128_on && !act_bf16_tile && fp16_ != 0 && para_.transB == 0 &&
+            // The _bf16 module's 128x128 tile stages raw bf16 words and
+            // decodes them to fp32 in the FMA (TILE_UA2/UB2 in matmul.comp).
+            if (t128_on && fp16_ != 0 && para_.transB == 0 &&
                 para_.weight_int8 == 0 && para_.w4 == 0 &&
                 para_.epi_bias == 0 && n % 8 == 0 && k % 16 == 0 &&
                 n >= 128 && m >= t128_min_m) {
+                set_route("tiled128", batch, m, n, k, rep);
                 para_.tile = 2;
                 if (try_submit_bda(UP_DIV(n, 128), UP_DIV(m, 128), batch)) {
                     return;
@@ -3053,6 +3060,8 @@ class MatMulBuffer : public BufferFactory {
             int nwords = (total + 1) / 2;
             MatMulPackPC pack_pc{};
             pack_pc.total = total;
+            // bit 1: a bf16 activation's output is bf16 (odd N lands here).
+            pack_pc.swiglu = fp16_ == 2 ? 2 : 0;
             fillDescriptorWrites(pack_ds_[m_id_]);
             pack_pipeline_->updateDescriptorSets(ds_writes_);
             m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
@@ -3768,10 +3777,13 @@ class MatMulBuffer : public BufferFactory {
                                        std::unique_ptr<VulkanPipeline> &slot,
                                        VkDescriptorSet *ds_slot) {
         // Slots: 0 ksplit512, 1 ksplit512+W8_WIDE, 2 tiled_ks_split,
-        // 3 tiled_ks_fold, 4 ksplit512+W8_WIDE+FP8_HW.
-        static bool no_bytes[5] = {false, false, false, false, false};
-        static bool refused[5] = {false, false, false, false, false};
-        static bool warned_missing[5] = {false, false, false, false, false};
+        // 3 tiled_ks_fold, 4 ksplit512+W8_WIDE+FP8_HW, and the bf16-activation
+        // builds 5 ksplit512_bf16, 6 tiled_ks_split_bf16, 7 tiled_ks_fold_bf16
+        // (their own slots: the static flags below remember a key's absence,
+        // and one module's absence says nothing about its twin's).
+        static bool no_bytes[8] = {};
+        static bool refused[8] = {};
+        static bool warned_missing[8] = {};
         if (slot) {
             return slot.get();
         }
@@ -3857,13 +3869,21 @@ class MatMulBuffer : public BufferFactory {
     // through secondary_pipeline() like the 512-lane pair: a driver refusal or
     // a model archive without the keys leaves ks_n_ at 1, i.e. the unsplit
     // tiled kernel, which is the same kernel without the K cut.
+    // The _bf16 op (a bf16 activation) takes the -DBF16 builds of the pair:
+    // the _fp16 deposit stages A as fp16 and the fold packs half2.
     VulkanPipeline *ks_split_pipeline() {
-        return secondary_pipeline(2, "buffer_matmul_tiled_ks_split_fp16",
-                                  ks_split_pipeline_, ks_split_ds_);
+        return fp16_ == 2
+                   ? secondary_pipeline(6, "buffer_matmul_tiled_ks_split_bf16",
+                                        ks_split_pipeline_, ks_split_ds_)
+                   : secondary_pipeline(2, "buffer_matmul_tiled_ks_split_fp16",
+                                        ks_split_pipeline_, ks_split_ds_);
     }
     VulkanPipeline *ks_fold_pipeline() {
-        return secondary_pipeline(3, "buffer_matmul_tiled_ks_fold_fp16",
-                                  ks_fold_pipeline_, ks_fold_ds_);
+        return fp16_ == 2
+                   ? secondary_pipeline(7, "buffer_matmul_tiled_ks_fold_bf16",
+                                        ks_fold_pipeline_, ks_fold_ds_)
+                   : secondary_pipeline(3, "buffer_matmul_tiled_ks_fold_fp16",
+                                        ks_fold_pipeline_, ks_fold_ds_);
     }
 
     // The SwiGLU down fold's K-split factor. A deposit block walks only its
@@ -3916,10 +3936,12 @@ class MatMulBuffer : public BufferFactory {
     bool coop8_eligible(int m, int n, int k) const {
         // A bf16_wide B would be clamped by the half staging (see
         // core::MatmulFeatures::bf16_wide); the selector already keeps the
-        // tile route away, this keeps the swiglu probe honest too.
+        // tile route away, this keeps the swiglu probe honest too. Only with
+        // an fp16 activation (bf16 == 1): under a bf16 one (bit 1) the module
+        // scales B exactly instead of clamping.
         return fp16_ != 0 && para_.weight_int8 == 0 &&
                para_.epi_bias == 0 && para_.attn_softmax == 0 &&
-               para_.w4 == 0 && !(para_.bf16 != 0 && bf16_wide_) &&
+               para_.w4 == 0 && !(para_.bf16 == 1 && bf16_wide_) &&
                n % 64 == 0 && k % 16 == 0 && m >= 64;
     }
 
@@ -3962,7 +3984,9 @@ class MatMulBuffer : public BufferFactory {
         }
         swiglu_pack_pipe_->updateDescriptorSets(w);
         m_cmd_->bind(*swiglu_pack_pipe_, ds);
-        swiglu_pc_ = {swiglu_rows_, swiglu_nup_, 0, 0};
+        // pad0 is the shader's bf16 flag: a bf16 activation's product (and
+        // so the folded output) is bf16.
+        swiglu_pc_ = {swiglu_rows_, swiglu_nup_, fp16_ == 2 ? 1 : 0, 0};
         m_cmd_->push_constants(*swiglu_pack_pipe_, sizeof(SwigluPackPC),
                                &swiglu_pc_);
         const int groups = swiglu_rows_ * (swiglu_nup_ / 4);
@@ -3988,7 +4012,9 @@ class MatMulBuffer : public BufferFactory {
         }
         std::pair<const uint32_t *, uint32_t> spv;
         try {
-            spv = resolve_spv("buffer_matmul_coop8");
+            // A bf16 activation (fp16_ == 2) runs the -DACT_BF16 build.
+            spv = resolve_spv(fp16_ == 2 ? "buffer_matmul_coop8_bf16"
+                                         : "buffer_matmul_coop8");
         } catch (const std::exception &) {
             return nullptr;
         }
@@ -4455,7 +4481,7 @@ class MatMulBuffer : public BufferFactory {
 
     // Pack pass through direct push-constant addresses (no table needed).
     bool submit_pack_bda(int total) {
-        if (!pack_bda_pipeline_ || !bda_ready()) {
+        if (!pack_bda_pipeline_ || !bda_ready() || fp16_ == 2) {
             return false;
         }
         const VkDeviceAddress out = bda_addr(0);

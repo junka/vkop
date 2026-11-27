@@ -71,7 +71,7 @@ void main() {
     int e1 = 2 * gid + 1;
     float v0 = gap_one(e0);
     float v1 = (e1 < out_total) ? gap_one(e1) : 0.0f;
-    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    uOutput.data[gid] = BUF_PACK2(vec2(v0, v1));
 #else
     if (gid >= out_total) return;
     uOutput.data[gid] = floatBitsToUint(gap_one(gid));

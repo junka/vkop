@@ -270,7 +270,10 @@ Ctx make_ctx(const DeviceTraits &dev, const DeviceProfile &prof,
     // +-65504. Keeping c.tiled off drops the shape onto the split-K GEMV
     // (batch*m <= 8) or the column-parallel fused/reduce kernels, which read
     // bf16 straight to fp32. ks_n and tile128 both hang off c.tiled.
-    const bool bf16_wide = f.weight == WeightKind::kBf16 && f.bf16_wide;
+    // Under a bf16 activation the _bf16 module's tiles decode B as bf16 (no
+    // half stage) and coop8 scales it, so only an fp16-activation tile clamps.
+    const bool bf16_wide =
+        f.weight == WeightKind::kBf16 && f.bf16_wide && !f.act_bf16;
     c.tiled = c.fused && !kn.tile_disabled && w4_tile_ok && !bf16_wide &&
               (s.k % 16 == 0) && (s.m >= c.tiled_min_m) && !f.epi_bias &&
               tiled_ok_n && (!c.weight_byte || (!f.transB && (s.n % 4 == 0)));
@@ -352,9 +355,11 @@ struct MatmulRule {
 bool attn_softmax_applies(const Ctx &c) {
     const MatmulShape &s = *c.s;
     const MatmulFeatures &f = *c.f;
-    return f.attn_softmax && f.fp16 && ((s.n & 1) == 0) &&
-           f.weight == WeightKind::kFp16 && s.n > 0 && s.n <= 16384 &&
-           s.k <= 1024;
+    // B is the K cache (an activation): fp16, or bf16 beside a bf16 Q.
+    const bool b16 = f.weight == WeightKind::kFp16 ||
+                     (f.act_bf16 && f.weight == WeightKind::kBf16);
+    return f.attn_softmax && f.fp16 && ((s.n & 1) == 0) && b16 && s.n > 0 &&
+           s.n <= 16384 && s.k <= 1024;
 }
 
 bool coopmat_i8_applies(const Ctx &c) {
@@ -1346,7 +1351,21 @@ bool matmul_route_takes_bf16_act(MatmulRoute route) {
     case MatmulRoute::kKsplit:
     case MatmulRoute::kKsplitWide:
     case MatmulRoute::kFusedFp16:
-    case MatmulRoute::kTiled: // the 64x64 SIMT tile; the op skips coop8/128
+    // The tile route covers the Apple coop8 GEMM (scaled bf16 staging), the
+    // 128x128 tile and the 64x64 tile; all three decode bf16 in the _bf16
+    // module.
+    case MatmulRoute::kTiled:
+    // Their own -DBF16 builds: buffer_matmul_tiled_ks_{split,fold}_bf16 and
+    // buffer_matmul_ksplit512_bf16.
+    case MatmulRoute::kTiledKs:
+    case MatmulRoute::kKsplit512:
+    case MatmulRoute::kKsplitWide512:
+    // Odd N: the reduce kernel reads A/B through load_a/load_b and the pack
+    // pass encodes bf16 (MatMulPackPC::swiglu bit 1).
+    case MatmulRoute::kReducePack:
+    // The fused QK^T + softmax row kernel: load_a/load_b, the bf16 mask
+    // decode and an -inf-safe row max.
+    case MatmulRoute::kAttnSoftmax:
         return true;
     default:
         return false;

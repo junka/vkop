@@ -10,6 +10,10 @@
 
 #include "../common/buffer_common.comp"
 
-float apply(float x) { return log(exp(x) + 1.0); }
+// max(x, 0) + log(1 + exp(-|x|)): the same function, but exp never sees a
+// positive argument, so x > ~88 no longer overflows exp to Inf (the naive
+// log(exp(x) + 1) returned +Inf there, where softplus(x) == x). bf16 carries
+// fp32's range, so such inputs are ordinary activations, not corner cases.
+float apply(float x) { return max(x, 0.0) + log(1.0 + exp(-abs(x))); }
 
 #include "../common/unary_elementwise_body.comp"

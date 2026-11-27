@@ -7,10 +7,14 @@ here is what Runtime::LoadModel does when a file carries them anyway (an older
 converter, a hand-built graph).
 
   bf16_gate_add.vkopbin     x(bf16) + b(bf16 init) -> y(bf16)    loads and runs
-  bf16_gate_relu.vkopbin    Relu(x bf16) -> y bf16                refused
-  bf16_gate_cast.vkopbin    Cast(x bf16, to=FLOAT) -> y fp32      refused
-  bf16_gate_gather.vkopbin  Gather(table bf16, idx) -> y bf16     refused
+  bf16_gate_relu.vkopbin    Relu(x bf16) -> y bf16                loads and runs
+  bf16_gate_cast.vkopbin    Cast(x bf16, to=FLOAT) -> y fp32      loads and runs
+  bf16_gate_cast16.vkopbin  Cast(x fp32, to=BFLOAT16) -> y bf16   loads and runs
+  bf16_gate_gather.vkopbin  Gather(table bf16, idx) -> y bf16     loads and runs
+  bf16_gate_avgpool.vkopbin AveragePool(x bf16) -> y bf16         refused
   bf16_gate_mixed.vkopbin   x(bf16) + b(fp16 init) -> y(bf16)     refused
+  bf16_gate_movers.vkopbin  x(bf16) -> Reshape -> Slice -> s(bf16) ; s + b -> y
+                                                                 loads and runs
 
 usage: make_bf16_gate_fixture.py <output-dir> <master vkop_shaders.bin>
 """
@@ -76,6 +80,17 @@ def build_all():
     out["bf16_gate_cast"] = model(
         Node("Cast", "cast0", {"to": FP32}, [x], [ref("y", SHAPE, FP32)]),
         [ref("x", SHAPE, "bfloat16")], [ref("y", SHAPE, "float32")], [])
+    out["bf16_gate_cast16"] = model(
+        Node("Cast", "cast16", {"to": BF16}, [ref("x", SHAPE, FP32)], [y]),
+        [ref("x", SHAPE, "float32")], [ref("y", SHAPE, "bfloat16")], [])
+    # AveragePool has no dual (and so no bf16) build: still refused after
+    # the unary and data-movement streams admitted GlobalAveragePool.
+    gx, gy = [1, 2, 2, 4], [1, 2, 1, 2]
+    out["bf16_gate_avgpool"] = model(
+        Node("AveragePool", "pool0",
+             {"kernel_shape": [2, 2], "strides": [2, 2]},
+             [ref("x", gx, BF16)], [ref("y", gy, BF16)]),
+        [ref("x", gx, "bfloat16")], [ref("y", gy, "bfloat16")], [])
     out["bf16_gate_gather"] = model(
         Node("Gather", "gather0", {"axis": 0},
              [ref("table", [4, 8], BF16), ref("idx", [2], INT64)],
@@ -87,6 +102,34 @@ def build_all():
         [ref("x", SHAPE, "bfloat16")], [ref("y", SHAPE, "bfloat16")],
         [helper.make_tensor("b", FP16, SHAPE,
                             bias_values().astype(np.float16).flatten())])
+    # Byte movers: Reshape [2,8] -> [4,4] (an alias), Slice cols 1..3 (the
+    # slice.comp _bf16 word mover: an inner-axis slice is not contiguous, so
+    # it cannot bind a sub-range), then an allow-listed Add reads the result
+    # -- which the gate refuses unless the movers kept the bf16 KIND.
+    def i64(name, values):
+        return numpy_helper.from_array(np.asarray(values, np.int64), name)
+    r = ref("r", [4, 4], BF16)
+    s = ref("s", [4, 2], BF16)
+    dm = DAGBasedModel()
+    for n in (
+            Node("Reshape", "reshape0", {},
+                 [x, ref("shape", [2], INT64)], [r]),
+            Node("Slice", "slice0", {},
+                 [r, ref("starts", [1], INT64), ref("ends", [1], INT64),
+                  ref("axes", [1], INT64)], [s]),
+            Node("Add", "add_movers", {}, [s, ref("bs", [4, 2], BF16)],
+                 [ref("y", [4, 2], BF16)])):
+        dm.nodes[n.name] = n
+    dm.inputs = [ref("x", SHAPE, "bfloat16")]
+    dm.outputs = [ref("s", [4, 2], "bfloat16"), ref("y", [4, 2], "bfloat16")]
+    for t in (i64("shape", [4, 4]), i64("starts", [1]), i64("ends", [3]),
+              i64("axes", [1]),
+              bf16_init("bs", (np.arange(8, dtype=np.float32)
+                               .reshape(4, 2) - 3.0) / 8.0)):
+        dm.initializers[t.name] = t
+    dm.deferred_weights = {}
+    dm.weight_base_dir = "."
+    out["bf16_gate_movers"] = dm
     return out
 
 

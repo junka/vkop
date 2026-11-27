@@ -328,9 +328,18 @@ class FusedElemwise : public BufferFactory {
         // and computes in fp32 registers, so a Cast inside the chain is a
         // register no-op. The build dtype (fp16/fp32 spv) follows the OUTPUT
         // dtype; inputs may differ.
+        //
+        // 2 = bf16: same two-per-word stride as fp16, decoded with the bf16
+        // unpack (fused_elemwise.comp dec16). The code is per INPUT, so a bf16
+        // chain may still read an fp32/fp16 leaf across a fused Cast; the
+        // store format is the build's (the _bf16 module packs bf16).
         for (int k = 0; k < nInputs; ++k) {
-            prog_data_.push_back(inputs[k]->dtype() == typeid(uint16_t) ? 1
-                                                                        : 0);
+            int dt = 0;
+            if (inputs[k]->dtype() == typeid(uint16_t)) {
+                dt = inputs[k]->elem_kind() == core::ElemKind::kBFloat16 ? 2
+                                                                         : 1;
+            }
+            prog_data_.push_back(dt);
         }
         // Ops.
         for (int v : ops_)

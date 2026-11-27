@@ -160,7 +160,10 @@ class ClipBuffer : public BufferFactory {
             auto h = core::as_tensor<uint16_t>(t);
             h->copyToCPU(m_cmdpool_);
             if (h->num_elements() >= 1) {
-                return core::ITensor::fp16_to_fp32((*h)[0]);
+                // uint16_t storage is fp16 unless the tensor says bf16.
+                return t->elem_kind() == core::ElemKind::kBFloat16
+                           ? core::bf16_to_float((*h)[0])
+                           : core::ITensor::fp16_to_fp32((*h)[0]);
             }
         } else if (t->dtype() == typeid(double)) {
             auto d = core::as_tensor<double>(t);

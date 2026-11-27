@@ -94,10 +94,10 @@ void main() {
     float v0 = BUF_LOAD(uInput.data, expand_elem(e0));
     if (e1 >= out_total) {
         // Odd tail element: keep the high half at 0 (no element to write).
-        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, 0.0));
     } else {
         float v1 = BUF_LOAD(uInput.data, expand_elem(e1));
-        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+        uOutput.data[gid] = BUF_PACK2(vec2(v0, v1));
     }
 #else
     if (gid >= out_total) return;
