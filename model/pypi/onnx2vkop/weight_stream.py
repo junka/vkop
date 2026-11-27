@@ -440,6 +440,63 @@ def _fp16_block_to_bf16(block: bytes) -> bytes:
     return np.ascontiguousarray(fp32_to_bf16_bits(f32)).astype("<u2").tobytes()
 
 
+def add_fp16_to_bf16_roundtrip(stats, block: bytes) -> bytes:
+    """Fold one fp16 source band's fp16 -> bf16 rounding into `stats` (a
+    numeric_audit.RoundTrip) and return the bf16 bytes it becomes -- the same
+    bytes write_payload will write for it."""
+    out = _fp16_block_to_bf16(block)
+    src = np.frombuffer(block, dtype="<f2").astype(np.float32)
+    got = (np.frombuffer(out, dtype="<u2").astype(np.uint32)
+           << 16).view(np.float32)
+    stats.add(src, got)
+    return out
+
+
+def bf16_payload_roundtrip(entry: dict, base_dir: str = ""):
+    """What writing a bf16-marked row (mark_bf16_payload) costs its weight, as
+    a numeric_audit.RoundTrip -- the streamed counterpart of the
+    record_roundtrip the in-memory bf16 conversions make.
+
+    The source is read one band at a time (the conversion's own chunk size),
+    so the weight never enters RAM: the statistics are sums and maxima that
+    accumulate band by band. A bf16 source is copied verbatim and costs
+    exactly nothing, so its elements are counted without reading it. A
+    SwiGLU gate/up interleave row is the union of its two sources (the
+    interleave only permutes them).
+    """
+    try:
+        from . import numeric_audit
+    except ImportError:  # flat-module layout
+        import numeric_audit
+    stats = numeric_audit.RoundTrip("bf16")
+    spec = entry.get("interleave")
+    sources = [spec["g"], spec["u"]] if spec is not None else [entry]
+    for src in sources:
+        dtype = src.get("src_dtype", src.get("data_type"))
+        length = int(src["length"]) if spec is None else (
+            int(spec["k"]) * int(spec["n"]) * 2)
+        if dtype == TensorProto.BFLOAT16:
+            stats.elements += length // 2
+            continue
+        if dtype != TensorProto.FLOAT16:
+            raise DeferredWeightError(
+                f"deferred weight '{entry['name']}': a bf16 payload from "
+                f"source dtype {dtype}")
+        path = source_read_path(src, None, base_dir)
+        with open(path, "rb") as f:
+            f.seek(int(src["offset"]))
+            remaining = length
+            while remaining:
+                block = f.read(min(_CHUNK_BYTES, remaining))
+                if not block:
+                    raise DeferredWeightError(
+                        f"deferred weight '{src['name']}' runs out of source "
+                        f"bytes {remaining} byte(s) early in {path}")
+                add_fp16_to_bf16_roundtrip(stats, block)
+                remaining -= len(block)
+    return stats
+
+
 def _int4_layout_ok(init, uses: Dict[str, list], group_size: int,
                     matmul_only: bool = False) -> bool:
     """Can this weight's bytes become a packed 4-bit payload as they stream?

@@ -265,3 +265,339 @@ def test_awq_then_int4_quantizes_the_scaled_weight():
     assert m.initializers["W_scale"].data_type == TensorProto.FLOAT
     # The MatMul now reads [A, W, scale].
     assert [i["name"] for i in m.nodes["mm"].inputs] == ["h", "W", "W_scale"]
+
+
+# --------------------------------------------------------------------------
+# the fold is exact on the graph's own output, for every layout and K != N
+# --------------------------------------------------------------------------
+#
+# Everything above used K = N = 8 and a uniform s, where scaling the weight's
+# rows and scaling its columns are the same thing. The cases below build
+# K != N graphs with an s that varies per channel, evaluate the graph in numpy
+# before and after `awq.apply`, and require the same output: W' = W*diag(s)
+# along the INPUT-channel axis ([K, N] rows for MatMul, [N, K] columns for a
+# transB=1 weight) and A' = A*diag(1/s) cancel exactly, in any layout.
+
+def _arr(init):
+    if init.data_type == TensorProto.BFLOAT16:
+        return awq._bf16_init_to_f32(init)
+    return numpy.asarray(numpy_helper.to_array(init), dtype=numpy.float32)
+
+
+def evaluate(m, feeds):
+    """Every tensor of the DAG, in float64, from a topological sweep."""
+    env = {k: numpy.asarray(v, dtype=numpy.float64) for k, v in feeds.items()}
+    for name, init in m.initializers.items():
+        env[name] = _arr(init).astype(numpy.float64)
+    pending = list(m.nodes.values())
+    while pending:
+        progressed = False
+        for node in list(pending):
+            ins = [i["name"] for i in node.inputs]
+            if not all(i in env for i in ins if i):
+                continue
+            v = [env[i] if i else None for i in ins]
+            a = node.attributes
+            op = node.op_type
+            if op == "RMSNorm":
+                x = v[0]
+                r = x / numpy.sqrt(numpy.mean(x * x, axis=-1, keepdims=True)
+                                   + a.get("eps", 1e-6))
+                out = r * v[1]
+            elif op in ("LayerNormalization", "LayerNorm"):
+                x = v[0]
+                mu = x.mean(axis=-1, keepdims=True)
+                var = ((x - mu) ** 2).mean(axis=-1, keepdims=True)
+                out = (x - mu) / numpy.sqrt(var + a.get("epsilon", 1e-5)) \
+                    * v[1]
+                if len(v) > 2 and v[2] is not None:
+                    out = out + v[2]
+            elif op in ("MatMul", "Gemm"):
+                x, w = v[0], v[1]
+                if int(a.get("transA", 0) or 0):
+                    x = numpy.swapaxes(x, -1, -2)
+                if int(a.get("transB", 0) or 0):
+                    w = w.T
+                # errstate: Accelerate-backed numpy raises spurious
+                # divide/overflow flags from matmul on finite inputs.
+                with numpy.errstate(all="ignore"):
+                    out = float(a.get("alpha", 1.0)) * (x @ w)
+                assert numpy.all(numpy.isfinite(out)), node.name
+                if op == "Gemm" and len(v) > 2 and v[2] is not None:
+                    out = out + float(a.get("beta", 1.0)) * v[2]
+            elif op == "Mul":
+                out = v[0] * v[1]
+            elif op == "Add":
+                out = v[0] + v[1]
+            elif op == "Identity":
+                out = v[0]
+            else:
+                raise NotImplementedError(op)
+            env[node.outputs[0]["name"]] = out
+            pending.remove(node)
+            progressed = True
+        assert progressed, [n.name for n in pending]
+    return env
+
+
+def rel_l2(got, want):
+    return float(numpy.linalg.norm(got - want) / numpy.linalg.norm(want))
+
+
+def _skewed(rng, k, n):
+    """A weight whose input channels differ a lot in magnitude, so s does."""
+    w = rng.standard_normal((k, n)).astype(numpy.float32)
+    return w * numpy.exp(rng.uniform(-2.0, 2.0, size=(k, 1))).astype(
+        numpy.float32)
+
+
+def _store(values, dtype, name):
+    if dtype == "bf16":
+        return awq._f32_to_bf16_init(values, name)
+    return numpy_helper.from_array(
+        numpy.asarray(values, numpy.float16 if dtype == "fp16"
+                      else numpy.float32), name)
+
+
+def norm_mm_graph(k, n, *, norm="LayerNormalization", op="MatMul", transb=0,
+                  w_dtype="fp32", norm_dtype="fp32", bias=True, seed=0):
+    """y = MatMul(norm(x; gamma, beta), W), K != N, every value non-uniform."""
+    rng = numpy.random.RandomState(seed)
+    w_kn = _skewed(rng, k, n)
+    w = w_kn.T.copy() if transb else w_kn
+    m = DAGBasedModel()
+    m.initializers["W"] = _store(w, w_dtype, "W")
+    m.initializers["gamma"] = _store(rng.uniform(0.5, 2.0, k), norm_dtype,
+                                     "gamma")
+    ins = [tref("x", (1, 3, k)), tref("gamma", (k,))]
+    if bias and norm != "RMSNorm":
+        m.initializers["beta"] = _store(rng.uniform(-1.0, 1.0, k), norm_dtype,
+                                        "beta")
+        ins.append(tref("beta", (k,)))
+    m.nodes["norm"] = Node(norm, "norm", {}, ins, [tref("h", (1, 3, k))])
+    attrs = {"transB": 1} if transb else {}
+    m.nodes["mm"] = Node(op, "mm", attrs,
+                         [tref("h", (1, 3, k)), tref("W", list(w.shape))],
+                         [tref("y", (1, 3, n))])
+    m.inputs = [tref("x", (1, 3, k))]
+    m.outputs = [tref("y", (1, 3, n))]
+    return m
+
+
+def _x(k, seed=7):
+    return numpy.random.RandomState(seed).standard_normal((1, 3, k))
+
+
+def check_output_preserved(m, fmt, group_size, tol, stats=None,
+                           expect=frozenset({"W"}), out="y"):
+    k = m.inputs[0]["shape"][-1]
+    feeds = {"x": _x(k)}
+    before = evaluate(m, feeds)[out]
+    scaled, log = run_awq(m, group_size=group_size, fmt=fmt, stats=stats)
+    assert scaled == set(expect), log
+    after = evaluate(m, feeds)[out]
+    assert rel_l2(after, before) < tol, (rel_l2(after, before), log)
+    return log
+
+
+@pytest.mark.parametrize("norm", ["LayerNormalization", "RMSNorm"])
+@pytest.mark.parametrize("k,n", [(128, 64), (64, 128)])
+def test_matmul_kn_fold_preserves_the_output(norm, k, n):
+    """[K, N] MatMul weight: rows scaled by s. Crashed for K != N."""
+    m = norm_mm_graph(k, n, norm=norm)
+    w0 = _arr(m.initializers["W"])
+    check_output_preserved(m, "int4", 64, 1e-5)
+    # s really is per input channel and really varies: rows, not columns.
+    ratio = _arr(m.initializers["W"]) / w0
+    numpy.testing.assert_allclose(ratio, ratio[:, :1].repeat(n, 1),
+                                  rtol=1e-5)
+    assert numpy.ptp(ratio[:, 0]) > 0.5
+
+
+def test_matmul_fold_with_activation_stats_preserves_the_output():
+    """The searched-alpha path scores W*diag(s) too; it crashed for K != N."""
+    k, n = 128, 64
+    m = norm_mm_graph(k, n)
+    act = numpy.exp(numpy.random.RandomState(3).uniform(-2, 2, k))
+    check_output_preserved(m, "int4", 64, 1e-5, stats={"h": act})
+
+
+def test_solve_scales_scores_rows_of_a_wide_weight():
+    """[K, N] with K != N under stats: s has K entries and the search runs."""
+    rng = numpy.random.RandomState(1)
+    w = _skewed(rng, 64, 192)
+    act = numpy.exp(rng.uniform(-2, 2, 64)).astype(numpy.float32)
+    s = awq.solve_scales(w, act, alpha=0.5, n_grid=5, group_size=32,
+                         calib_ratio=0.1)
+    assert s.shape == (64,)
+    assert numpy.all(numpy.isfinite(s)) and numpy.ptp(s) > 0
+
+
+@pytest.mark.parametrize("op", ["Gemm", "MatMul"])
+def test_transb_weight_fold_preserves_the_output(op):
+    """A transB=1 weight is [N, K]: its COLUMNS carry s (byte formats only;
+    the 4-bit gate takes [K, N] alone)."""
+    k, n = 128, 64
+    m = norm_mm_graph(k, n, norm="RMSNorm", op=op, transb=1)
+    assert list(m.initializers["W"].dims) == [n, k]
+    w0 = _arr(m.initializers["W"])
+    check_output_preserved(m, "int8", 64, 1e-5)
+    ratio = _arr(m.initializers["W"]) / w0
+    numpy.testing.assert_allclose(ratio, ratio[:1, :].repeat(n, 0),
+                                  rtol=1e-5)
+
+
+def test_the_gate_reports_k_on_the_input_axis_of_a_transb_weight():
+    m = norm_mm_graph(128, 64, op="Gemm", transb=1)
+    gate = Quantizer._match_weight_only(
+        "W", m.initializers["W"], [m.nodes["mm"]], "int8")
+    assert gate["eligible"] and gate["transb"] == 1
+    assert (gate["k"], gate["n"]) == (128, 64)
+
+
+@pytest.mark.parametrize("w_dtype,norm_dtype,tol", [
+    ("fp16", "fp16", 3e-3),
+    ("fp32", "fp16", 3e-3),
+    ("fp32", "bf16", 1.5e-2),
+    ("fp16", "bf16", 1.5e-2),
+])
+def test_half_storage_fold_preserves_the_output(w_dtype, norm_dtype, tol):
+    """The weight and the norm keep their storage width (rounded once), so
+    the identity holds up to that width's rounding."""
+    k, n = 128, 64
+    m = norm_mm_graph(k, n, w_dtype=w_dtype, norm_dtype=norm_dtype)
+    want = {"fp16": TensorProto.FLOAT16, "fp32": TensorProto.FLOAT,
+            "bf16": TensorProto.BFLOAT16}
+    check_output_preserved(m, "int4", 64, tol)
+    assert m.initializers["W"].data_type == want[w_dtype]
+    assert m.initializers["gamma"].data_type == want[norm_dtype]
+    assert m.initializers["beta"].data_type == want[norm_dtype]
+
+
+def test_layernorm_bias_is_scaled_with_its_gamma():
+    """LN(x) = xhat*gamma + beta: 1/s has to reach beta too, or the bias's
+    share of A meets W*s unscaled."""
+    m = norm_mm_graph(96, 32, bias=True)
+    b0 = _arr(m.initializers["beta"]).copy()
+    g0 = _arr(m.initializers["gamma"]).copy()
+    check_output_preserved(m, "int8", 0, 1e-5)
+    numpy.testing.assert_allclose(_arr(m.initializers["beta"]) / b0,
+                                  _arr(m.initializers["gamma"]) / g0,
+                                  rtol=1e-5)
+
+
+def test_graph_input_fold_preserves_the_output():
+    k, n = 128, 64
+    rng = numpy.random.RandomState(0)
+    m = DAGBasedModel()
+    m.initializers["W"] = numpy_helper.from_array(_skewed(rng, k, n), "W")
+    m.nodes["mm"] = Node("MatMul", "mm", {},
+                         [tref("x", (1, 3, k)), tref("W", (k, n))],
+                         [tref("y", (1, 3, n))])
+    m.inputs = [tref("x", (1, 3, k))]
+    m.outputs = [tref("y", (1, 3, n))]
+    check_output_preserved(m, "int4", 64, 1e-5)
+    assert list(m.initializers["x_awq_inv_scale"].dims) == [1, 1, k]
+
+
+def qkv_graph(k=128, ns=(64, 32, 32), extra_reader=None):
+    """One norm feeding three projections of different widths."""
+    rng = numpy.random.RandomState(0)
+    m = DAGBasedModel()
+    m.initializers["gamma"] = numpy_helper.from_array(
+        rng.uniform(0.5, 2.0, k).astype(numpy.float32), "gamma")
+    m.nodes["norm"] = Node("RMSNorm", "norm", {},
+                           [tref("x", (1, 3, k)), tref("gamma", (k,))],
+                           [tref("h", (1, 3, k))])
+    outs = []
+    for i, n in enumerate(ns):
+        w = f"W{i}"
+        m.initializers[w] = numpy_helper.from_array(_skewed(rng, k, n), w)
+        m.nodes[f"mm{i}"] = Node("MatMul", f"mm{i}", {},
+                                 [tref("h", (1, 3, k)), tref(w, (k, n))],
+                                 [tref(f"y{i}", (1, 3, n))])
+        outs.append(tref(f"y{i}", (1, 3, n)))
+    if extra_reader == "add":
+        m.nodes["res"] = Node("Add", "res", {},
+                              [tref("h", (1, 3, k)), tref("x", (1, 3, k))],
+                              [tref("r", (1, 3, k))])
+        outs.append(tref("r", (1, 3, k)))
+    m.inputs = [tref("x", (1, 3, k))]
+    m.outputs = outs
+    return m
+
+
+def test_projections_sharing_a_norm_share_one_scale():
+    """q/k/v read one norm: one s for all three, folded into gamma once.
+
+    Per-weight solving folded 1/s_q, 1/s_k and 1/s_v all into the same gamma,
+    so each projection came out divided by the other two's scales."""
+    m = qkv_graph()
+    feeds = {"x": _x(128)}
+    before = evaluate(m, feeds)
+    w0 = {w: _arr(m.initializers[w]) for w in ("W0", "W1", "W2")}
+    scaled, log = run_awq(m, group_size=64)
+    assert scaled == {"W0", "W1", "W2"}, log
+    after = evaluate(m, feeds)
+    for y in ("y0", "y1", "y2"):
+        assert rel_l2(after[y], before[y]) < 1e-5, (y, log)
+    s = [(_arr(m.initializers[w]) / w0[w])[:, 0] for w in ("W0", "W1", "W2")]
+    numpy.testing.assert_allclose(s[0], s[1], rtol=1e-5)
+    numpy.testing.assert_allclose(s[0], s[2], rtol=1e-5)
+
+
+def test_a_norm_output_with_another_reader_is_left_alone():
+    """A residual Add reads the norm output too: 1/s would reach it unundone."""
+    m = qkv_graph(extra_reader="add")
+    before = {nm: _arr(t).copy() for nm, t in m.initializers.items()}
+    scaled, log = run_awq(m, group_size=64)
+    assert scaled == set(), log
+    assert "Add 'res'" in log
+    for nm, v in before.items():
+        numpy.testing.assert_array_equal(_arr(m.initializers[nm]), v)
+
+
+def test_an_excluded_projection_keeps_its_siblings_unscaled():
+    """Excluding one of q/k/v leaves its MatMul on the shared norm, so none of
+    the three may move it."""
+    m = qkv_graph()
+    feeds = {"x": _x(128)}
+    before = evaluate(m, feeds)
+    with contextlib.redirect_stdout(io.StringIO()):
+        scaled = awq.apply(m, 64, fmt="int4", exclude={"W1"})
+    assert scaled == set()
+    after = evaluate(m, feeds)
+    for y in ("y0", "y1", "y2"):
+        numpy.testing.assert_array_equal(after[y], before[y])
+
+
+def _dequantized(m, name, consumer, k, n, fmt, group):
+    """The float weight the kernel reads back from -q's encoded payload."""
+    scale = numpy_helper.to_array(
+        m.initializers[consumer.inputs[2]["name"]]).astype(numpy.float64)
+    codes = numpy.asarray(numpy_helper.to_array(m.initializers[name]),
+                          numpy.float64)
+    if fmt == "int8":
+        return codes.reshape(k, n) * scale.reshape(1, n)
+    codes = codes.reshape(-1)[:k * n].reshape(k // group, group, n)
+    return (codes * scale.reshape(k // group, 1, n)).reshape(k, n)
+
+
+@pytest.mark.parametrize("fmt,group,tol", [("int4", 64, 0.2),
+                                           ("int8", 0, 0.02)])
+def test_awq_then_quantize_tracks_the_fp32_graph(fmt, group, tol):
+    """Through the real quantizer: the dequantized AWQ graph stays within the
+    format's error of the fp32 one (a misplaced s is O(1) off)."""
+    k, n = 128, 64
+    m = norm_mm_graph(k, n)
+    feeds = {"x": _x(k)}
+    want = evaluate(m, feeds)["y"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        scaled = Quantizer.quantize_to_awq_weight_only(m, group or 64, fmt)
+    assert scaled == {"W"}
+    node = m.nodes["mm"]
+    w = _dequantized(m, "W", node, k, n, fmt, group)
+    m.initializers["W"] = numpy_helper.from_array(w.astype(numpy.float32), "W")
+    node.inputs = node.inputs[:2]
+    got = evaluate(m, feeds)["y"]
+    assert rel_l2(got, want) < tol, rel_l2(got, want)

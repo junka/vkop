@@ -9378,7 +9378,13 @@ class Quantizer:
         # Byte formats: one scale per output column, whatever transB says.
         out["transb"] = next(iter(transb_flags))
         out["axis"] = 1 if out["transb"] == 1 else 0
-        out["k"], out["n"] = dims
+        # k is the reduction (input-channel) axis: a transB=1 weight is
+        # stored [N, K], so its K is the SECOND dim. AWQ reads k to size the
+        # per-input-channel scale it multiplies into the weight.
+        if out["transb"] == 1:
+            out["n"], out["k"] = dims
+        else:
+            out["k"], out["n"] = dims
         out["eligible"] = True
         return out
 

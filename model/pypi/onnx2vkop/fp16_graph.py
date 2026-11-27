@@ -1166,6 +1166,11 @@ class GraphFp16:
                 if name not in moe and weight_stream.mark_bf16_payload(
                         deferred, name, init, target, dag_model.initializers):
                     summary["converted"] += 1
+                    # The audit row the in-memory branch below records,
+                    # accumulated from the source band by band.
+                    numeric_audit.record(
+                        target, "bf16",
+                        weight_stream.bf16_payload_roundtrip(deferred[target]))
                     if verbose:
                         print(f"{tag} '{target}' is streamed; its bf16 "
                               "payload is written at trailer time")

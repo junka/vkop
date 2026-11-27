@@ -432,6 +432,99 @@ def test_numeric_audit_flags_a_bad_bf16_weight():
     assert [r.tensor for r in audit.flagged()] == ["bad"]
 
 
+def _fp16_matmul(path, external):
+    """y = x @ W with an fp16 W that bf16 can NOT hold exactly, so rounding
+    it to bf16 has a nonzero cost for the audit to report."""
+    rng = np.random.default_rng(5)
+    w = (rng.standard_normal((K, N)) / 8).astype(np.float16)
+    g = h.make_graph([h.make_node("MatMul", ["x", "W"], ["y"])], "g",
+                     [h.make_tensor_value_info("x", T.FLOAT, [1, 4, K])],
+                     [h.make_tensor_value_info("y", T.FLOAT, [1, 4, N])],
+                     [nh.from_array(w, "W")])
+    _save(g, path, external)
+    return w
+
+
+def _audit_rows(log, fmt="bf16"):
+    """tensor -> the per-weight `[numeric-audit]` line for `fmt`."""
+    out = {}
+    for line in log.splitlines():
+        if not line.startswith("[numeric-audit]") or " relL2 " not in line:
+            continue
+        head = line[len("[numeric-audit]"):].replace("WARN", "").split()
+        if head[0] == fmt:
+            out[head[1].rstrip(":")] = line
+    return out
+
+
+@pytest.mark.parametrize("flags", [("--act", "bf16"), ("-q", "bf16")])
+def test_streamed_bf16_rounding_is_in_the_numeric_audit(tmp_path, flags,
+                                                         monkeypatch):
+    """A streamed fp16 weight rounded to bf16 at WRITE time gets the audit row
+    its in-memory twin gets from record_roundtrip -- the same numbers, so the
+    bf16 threshold covers it. It had no row at all."""
+    monkeypatch.setenv("VKOP_NUMERIC_AUDIT", "full")
+    w = _fp16_matmul(tmp_path / "ext.onnx", True)
+    _fp16_matmul(tmp_path / "mem.onnx", False)
+    _, ext = convert(tmp_path / "ext.onnx", tmp_path / "ext.vkopbin", *flags,
+                     *STREAM)
+    assert "streaming 1 initializer" in ext, ext
+    _, mem = convert(tmp_path / "mem.onnx", tmp_path / "mem.vkopbin", *flags,
+                     *NO_STREAM)
+    got, want = _audit_rows(ext), _audit_rows(mem)
+    assert "W" in want, mem
+    assert "W" in got, ext
+    assert got["W"] == want["W"]
+    # And it is the real cost, not a placeholder zero.
+    src = w.astype(np.float32)
+    cost = np.linalg.norm(bf16_bits_to_fp32(fp32_to_bf16_bits(src)) - src) \
+        / np.linalg.norm(src)
+    assert cost > 1e-4
+    assert f"relL2 {cost:.3e}" in got["W"], got["W"]
+
+
+def test_bf16_payload_roundtrip_accumulates_band_by_band(tmp_path,
+                                                         monkeypatch):
+    """The streamed audit reads the source in bands (never the whole weight)
+    and comes out equal to the whole-array round trip, for a plain row and for
+    the SwiGLU gate/up interleave (whose payload is both sources)."""
+    from onnx2vkop import numeric_audit
+    from onnx2vkop import weight_stream as ws
+
+    rng = np.random.default_rng(1)
+    g16 = (rng.standard_normal((K, N)) / 4).astype(np.float16)
+    u16 = (rng.standard_normal((K, N)) * 300).astype(np.float16)
+    (tmp_path / "w.data").write_bytes(g16.tobytes() + u16.tobytes())
+
+    def row(name, offset, dtype=T.FLOAT16):
+        return {"name": name, "location": "w.data",
+                "base_dir": str(tmp_path), "offset": offset,
+                "length": K * N * 2, "src_dtype": dtype,
+                "data_type": T.BFLOAT16, "dims": (K, N), "out_bf16": True}
+
+    def whole(*arrays):
+        src = np.concatenate([a.astype(np.float32).reshape(-1)
+                              for a in arrays])
+        return numeric_audit.pair_stats(
+            src, bf16_bits_to_fp32(fp32_to_bf16_bits(src)), "bf16")
+
+    # 100 bytes: bands that do not divide the row (or even the element count).
+    monkeypatch.setattr(ws, "_CHUNK_BYTES", 100)
+    plain = ws.bf16_payload_roundtrip(row("W", 0))
+    inter = ws.bf16_payload_roundtrip(
+        {"name": "GU", "interleave": {"k": K, "n": N, "g": row("g", 0),
+                                      "u": row("u", K * N * 2)}})
+    for got, want in ((plain, whole(g16)), (inter, whole(g16, u16))):
+        assert got.elements == want.elements
+        assert got.max_abs == want.max_abs
+        assert got.overflow == want.overflow == 0
+        np.testing.assert_allclose(got.rel_l2, want.rel_l2, rtol=1e-12)
+        assert got.rel_l2 > 0
+    # A bf16 source is copied verbatim: counted, not read, and costs zero.
+    kept = ws.bf16_payload_roundtrip(row("B", 0, T.BFLOAT16))
+    assert kept.elements == K * N and kept.rel_l2 == 0.0
+
+
 # ---------------------------------------------------------------------------
 # stream_export's BF16 target
 # ---------------------------------------------------------------------------

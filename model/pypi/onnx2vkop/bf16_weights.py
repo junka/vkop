@@ -517,8 +517,21 @@ def apply(dag_model, *, keep: bool = False, quantize: bool = False,
                     # reads the source bytes here, while the attribute can
                     # still be emitted; write_payload re-checks them as they
                     # pass (weight_stream.py).
-                    scan = _scan_deferred(entry)
+                    #
+                    # An fp16 source is ROUNDED to bf16 at write time, which
+                    # costs what the in-memory `-q bf16` branch below records
+                    # with record_roundtrip; the same pass over the source
+                    # accumulates that row band by band. It goes in first so
+                    # the scan's counts attach to it. A bf16 source is kept
+                    # verbatim (no cost: the scan's own row says so).
+                    stats = None
+                    if entry.get("src_dtype") == _FLOAT16:
+                        stats = _numeric_audit().RoundTrip("bf16")
+                    scan = (_scan_deferred(entry) if stats is None
+                            else _scan_deferred(entry, stats))
                     entry["bf16_tile_overflow"] = scan.overflow
+                    if stats is not None:
+                        _numeric_audit().record(name, "bf16", stats)
                     _record_scan(name, scan, slots, summary)
             continue
         bits = index.match(name, init) if sources else None
@@ -590,7 +603,18 @@ def _ws():
     return weight_stream
 
 
-def _scan_deferred(entry: dict) -> TileScan:
+def _numeric_audit():
+    try:
+        from . import numeric_audit
+    except ImportError:  # flat-module layout (cli run from the dir)
+        import numeric_audit
+    return numeric_audit
+
+
+def _scan_deferred(entry: dict, stats=None) -> TileScan:
+    """TileScan of what a deferred bf16 row will write. With `stats` (a
+    numeric_audit.RoundTrip), an fp16 source's fp16 -> bf16 rounding is
+    accumulated into it from the same bands."""
     path = entry["location"]
     if not os.path.isabs(path):
         path = os.path.join(entry.get("base_dir") or "", path)
@@ -599,7 +623,12 @@ def _scan_deferred(entry: dict) -> TileScan:
     # An fp16 source becomes bf16 only at write time: scan what will be
     # written (the RNE rounding can carry 65504 up to 65536), not the file.
     scan = TileScan()
-    convert = _ws()._fp16_block_to_bf16
+    ws = _ws()
+    if stats is None:
+        convert = ws._fp16_block_to_bf16
+    else:
+        def convert(block):
+            return ws.add_fp16_to_bf16_roundtrip(stats, block)
     with open(path, "rb") as f:
         f.seek(int(entry["offset"]))
         remaining = int(entry["length"])
