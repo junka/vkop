@@ -388,8 +388,10 @@ class MatMulBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
-    void release_completed_bindings() override {
-        BufferFactory::release_completed_bindings();
+    void release_recorded_bindings(
+        std::vector<std::shared_ptr<VulkanResource>> &keep_alive) override {
+        BufferFactory::release_recorded_bindings(keep_alive);
+        // The pool owns the lease, so dropping it here frees nothing.
         if (scratch_is_level_lease_) {
             scratch_.reset();
             scratch_bytes_ = 0;

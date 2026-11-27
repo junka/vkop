@@ -27,7 +27,7 @@ std::string vk_result_label(VkResult r) {
 std::function<void(core::ITensor &)> VulkanCommandBuffer::pre_readback_hook =
     nullptr;
 
-void VulkanCommandBuffer::pipelineBarrier() {
+void VulkanCommandBuffer::pipelineBarrier(bool order_transfer_writes) {
     // Narrow barrier: the graph segment only ever issues compute shader
     // dispatches + vkCmdCopyBuffer/vkCmdUpdateBuffer/image transfer. We do
     // NOT emit graphics, raytrace, host-copy or indirect-dispatch reads
@@ -42,6 +42,10 @@ void VulkanCommandBuffer::pipelineBarrier() {
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
                             VK_ACCESS_SHADER_WRITE_BIT |
                             VK_ACCESS_TRANSFER_READ_BIT;
+    // Activation reuse hands a buffer to a later level's writer, which may be
+    // a vkCmdUpdateBuffer/copy (write-after-write through a transfer).
+    if (order_transfer_writes)
+        barrier.dstAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(
         m_commandBuffer_,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,

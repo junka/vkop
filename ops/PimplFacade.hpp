@@ -69,8 +69,9 @@ class PimplFacade : public Operator {
     std::string get_name() const override { return impl_->get_name(); }
     void enable_trace() override { impl_->enable_trace(); }
     void disable_trace() override { impl_->disable_trace(); }
-    void release_completed_bindings() override {
-        impl_->release_completed_bindings();
+    void release_recorded_bindings(
+        std::vector<std::shared_ptr<VulkanResource>> &keep_alive) override {
+        impl_->release_recorded_bindings(keep_alive);
     }
     void set_required_subgroup_size(uint32_t size) override {
         impl_->set_required_subgroup_size(size);

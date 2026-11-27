@@ -138,6 +138,23 @@ class VulkanBuffer : public VulkanResource {
     }
     void set_view_writer(int32_t node_idx) { view_writer_ = node_idx; }
 
+    // ActivationBufferPool only: a buffer it takes back is owned by nothing
+    // else, so the alias bookkeeping of its previous life no longer describes
+    // any live view and must not follow it to the next owner.
+    void reset_view_tracking() {
+        view_aliased_ = false;
+        view_writer_ = -1;
+    }
+    // ActivationBufferPool only: handed out during the round in which it was
+    // freed, so commands recorded (maybe not yet executed) earlier in that
+    // round can still access it. Commands recorded later are ordered after
+    // them by the level barrier; a host write or a separate queue submit is
+    // not, and must synchronize first (see Tensor::copyToGPUBuffer).
+    bool reuse_pending() const {
+        return parent_ ? parent_->reuse_pending() : reuse_pending_;
+    }
+    void set_reuse_pending(bool pending) { reuse_pending_ = pending; }
+
     void transferBarrier(VkCommandBuffer commandBuffer,
                          VkAccessFlags dstAccessMask,
                          VkDeviceSize size = VK_WHOLE_SIZE,
@@ -279,6 +296,7 @@ class VulkanBuffer : public VulkanResource {
     bool host_visible_ = false;
     VkAccessFlags m_access_ = 0;
     bool view_aliased_ = false;
+    bool reuse_pending_ = false;
     int32_t view_writer_ = -1;
     void *data_ = nullptr;
     // Borrowed sub-range state (null parent_ = this object owns its VkBuffer).

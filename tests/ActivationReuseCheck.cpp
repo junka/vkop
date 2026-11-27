@@ -33,26 +33,67 @@ void check_pool(std::shared_ptr<VulkanDevice> &dev) {
                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
     auto first = pool.acquire(dev, 64, flags, props);
     const auto handle = first->getBuffer();
-    pool.recycle(std::move(first));
-    check(pool.available_count() == 1, "unaliased buffer enters pool");
+    const VulkanBuffer *first_ptr = first.get();
+    first.reset();
+    pool.release(first_ptr);
+    check(pool.available_count() == 1, "unowned buffer enters the free list");
     auto same = pool.acquire(dev, 64, flags, props);
     check(same->getBuffer() == handle && pool.hit_count() == 1,
           "exact-size allocation reuses the buffer");
-    auto pinned = same;
-    pool.recycle(std::move(same));
-    check(pool.available_count() == 0, "external owner prevents reuse");
+    check(same->reuse_pending(),
+          "a buffer freed this round is handed out as reuse-pending");
+    pool.mark_device_idle();
+    check(!same->reuse_pending(), "device idle clears reuse-pending");
+
+    // Another owner (a view tensor, a binding) defers the free until it lets
+    // go; the free list never takes a buffer someone still references.
+    auto other = same;
+    const VulkanBuffer *same_ptr = same.get();
+    same.reset();
+    pool.release(same_ptr);
+    check(pool.available_count() == 0, "a second owner keeps it out");
+    other.reset();
+    pool.collect_held();
+    check(pool.available_count() == 1, "freed once the last owner lets go");
+
     auto aliased = pool.acquire(dev, 64, flags, props);
     aliased->mark_view_aliased();
-    pool.recycle(std::move(aliased));
-    check(pool.available_count() == 0, "view-aliased buffer is not recycled");
-    auto parent = pool.acquire(dev, 64, flags, props);
-    auto range = std::make_shared<VulkanBuffer>(parent, 0, 32);
-    pool.recycle(std::move(range));
-    check(pool.available_count() == 0, "range view is not recycled");
-    pool.recycle(std::move(parent));
-    check(pool.available_count() == 1, "unaliased parent can be recycled");
+    aliased->set_view_writer(7);
+    const VulkanBuffer *aliased_ptr = aliased.get();
+    aliased.reset();
+    pool.release(aliased_ptr);
+    auto fresh = pool.acquire(dev, 64, flags, props);
+    check(fresh.get() == aliased_ptr && !fresh->view_aliased() &&
+              fresh->view_writer() == -1,
+          "alias bookkeeping does not follow a buffer to its next owner");
+
+    // A sub-range view keeps its parent; the parent frees after the view.
+    auto range = std::make_shared<VulkanBuffer>(fresh, 0, 32);
+    const VulkanBuffer *parent_ptr = fresh.get();
+    fresh.reset();
+    pool.release(parent_ptr);
+    check(pool.available_count() == 0, "a live range view keeps its parent");
+    range.reset();
+    pool.collect_held();
+    check(pool.available_count() == 1, "parent frees after its range view");
+
+    // Unused free buffers are trimmed after kTrimRounds rounds.
+    const size_t owned = pool.owned_count();
+    for (uint32_t r = 0; r < ActivationBufferPool::kTrimRounds; ++r)
+        pool.finish_round();
+    check(pool.owned_count() == owned - 1 && pool.available_count() == 0,
+          "idle free buffers are trimmed");
+
+    // A buffer whose owners all vanished without a release() call (e.g. a
+    // resize dropped it) is still found by the round-end sweep.
+    auto orphan = pool.acquire(dev, 128, flags, props);
+    orphan.reset();
+    pool.finish_round();
+    check(pool.available_count() == 1, "round-end sweep frees orphans");
+
     auto scratch1 = pool.acquire_scratch(dev, 128);
     auto scratch2 = pool.acquire_scratch(dev, 128);
     check(scratch1->getBuffer() != scratch2->getBuffer(),
@@ -68,6 +109,7 @@ std::vector<float> run(Runtime &runtime,
                        int rows, int round, int reuse) {
     if (reuse == 2) unsetenv("VKOP_ACTIVATION_REUSE");
     else setenv("VKOP_ACTIVATION_REUSE", reuse ? "1" : "0", 1);
+    // reuse == 2: the default, which is off.
     runtime.ResizeInput("x", {static_cast<uint32_t>(rows), 16});
     auto input = as_tensor<float>(runtime.GetInput("x"));
     std::vector<float> values(static_cast<size_t>(rows) * 16);
@@ -95,13 +137,14 @@ int run_check(const char *fixture) {
     optimized.set_backend_buffer(true);
     reference.LoadModel();
     optimized.LoadModel();
+    // The reference takes the per-op submit path; reuse forces graph mode and
+    // must not depend on any per-level CPU wait.
     setenv("VKOP_GRAPH_SUBMIT", "0", 1);
-    setenv("VKOP_LEVEL_SYNC", "1", 1);
+    unsetenv("VKOP_LEVEL_SYNC");
     const int sizes[] = {1, 2, 4, 2, 1};
     for (int round = 0; round < 5; ++round) {
         auto expected = run(reference, cmdpool, sizes[round], round, false);
-        auto actual = run(optimized, cmdpool, sizes[round], round,
-                          round % 2 == 0 ? 2 : 1);
+        auto actual = run(optimized, cmdpool, sizes[round], round, 1);
         check(actual.size() == static_cast<size_t>(sizes[round] * 16),
               "dynamic output size");
         check(actual == expected, "reuse matches non-reuse bit-for-bit");
@@ -129,12 +172,19 @@ int run_check(const char *fixture) {
         check(actual == expected, "same Runtime works when reuse is toggled");
     }
     const auto expected = run(reference, cmdpool, 2, 8, false);
-    setenv("VKOP_DUMP_NODE", "no_matching_node", 1);
     const auto fallback = run(optimized, cmdpool, 2, 8, 2);
-    check(fallback == expected, "default mode falls back for node dumps");
+    check(fallback == expected, "reuse is off by default");
     auto kept = as_tensor<float>(optimized.GetTensor("b"));
     check(kept && kept->gpu_resource(),
-          "fallback retains intermediate activation");
+          "the default retains intermediate activations");
+    setenv("VKOP_DUMP_NODE", "no_matching_node", 1);
+    bool rejected_dump_node = false;
+    try {
+        run(optimized, cmdpool, 2, 9, 1);
+    } catch (const std::runtime_error &) {
+        rejected_dump_node = true;
+    }
+    check(rejected_dump_node, "node dumps are rejected while reuse is on");
     unsetenv("VKOP_DUMP_NODE");
     setenv("VKOP_ACTIVATION_REUSE", "1", 1);
     setenv("VKOP_SEGMENT_REPLAY", "1", 1);

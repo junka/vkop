@@ -82,31 +82,34 @@ rasterizer proves nothing about the target.
 Knobs: `--steps`, `--text-tokens`, `--latent-frames`, `--latent-h`,
 `--latent-w`, `--audio-latents`, `--no-audio`, `--save DIR`.
 
-### Experimental activation reuse
+### Activation reuse (opt-in)
 
-By default, compatible buffer-backend runs use a conservative, Runtime-local
-activation buffer pool. Set `VKOP_ACTIVATION_REUSE=0` to disable it.
-The buffer backend records, submits and waits for each execution level before retiring
-dead floating-point intermediates. It uses exact-size buffer matches and keeps
-graph inputs, outputs, weights, KV caches, and shared/view buffers out of the
-pool. MatMul scratch uses separate per-level leases. Set
-`VKOP_ACTIVATION_REUSE_STATS=1` to report allocation and reuse counts.
+`VKOP_ACTIVATION_REUSE=1` gives a buffer-backend Runtime a pool for
+floating-point intermediates. After each execution level is recorded, the
+intermediates no later level reads go back to the pool and are handed to
+later levels of the same round (exact size match). There is no per-level CPU
+wait: the barrier between levels orders the old readers before the new
+writer, the pool owns every buffer it allocated so nothing is destroyed while
+recorded commands may still use it, and a host upload into a buffer reused
+earlier in the round first drains the queue. Graph inputs, outputs, weights,
+KV caches and host-computed tensors keep their own memory. Free buffers that
+go unused for two rounds are destroyed. `VKOP_ACTIVATION_REUSE_STATS=1`
+prints allocation, reuse and pool-size counts after each round.
 
-This mode trades throughput for lower peak memory. The default automatically
-falls back to the normal path for non-buffer backends, replay, level hooks,
-level statistics, NaN scans, or intermediate tensor dumps. Explicitly setting
-`VKOP_ACTIVATION_REUSE=1` instead requires compatibility and fails if any of
-those modes are requested. Retired intermediate tensors remain in the graph,
-but reading their old GPU values after `Run()` is an error.
-Free buffers remain cached until the Runtime is destroyed or the switch is
-disabled for a subsequent run; varying shapes can therefore grow the cache.
-The normal graph-submit path remains unchanged when the switch is off.
+It is off by default: it only pays off when the intermediates are large
+(video/image DiT, VAE, a vision tower at high resolution). An LLM decode
+round has well under 1 MiB of them and runs about 6% slower with the pool
+(Qwen3-VL-2B, M5 Max: 13.9 -> 14.8 ms/token, tokens identical). Reuse
+requires graph submit (forced on) and fails if replay, tensor dumps, level
+statistics, the NaN scan or a level hook is requested. Retired intermediates
+remain in the graph, but reading their old values after `Run()` is an error.
 
 The optional `ActivationReuseCheck` build target exercises dynamic shapes,
-branching, aliases and switch transitions. Generate its input with
-`tests/make_activation_reuse_fixture.py` and the build's shader archive.
-On b3, set `VKOP_TEST_SKIP_ATEXIT=1` for this test to bypass the known NVIDIA
-EGL exit-handler crash after the test has already torn down its Runtimes.
+branching, aliases, the pool's ownership rules and switch transitions.
+Generate its input with `tests/make_activation_reuse_fixture.py` and the
+build's shader archive. On b3, set `VKOP_TEST_SKIP_ATEXIT=1` for this test to
+bypass the known NVIDIA EGL exit-handler crash after the test has already torn
+down its Runtimes.
 
 ### Split artifacts: `--prelude`
 

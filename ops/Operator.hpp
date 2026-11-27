@@ -510,8 +510,26 @@ class Operator {
     virtual void enable_trace() { trace_ = true; }
     virtual void disable_trace() { trace_ = false; }
 
-    // Only call after the GPU has completed this operator's commands.
-    virtual void release_completed_bindings() { objs_.clear(); }
+    // Drop the bindings this op recorded, so a buffer it no longer needs can
+    // be reused by later levels of the same round. The commands may still be
+    // pending on the GPU: a resource this op was the last owner of is moved
+    // into `keep_alive` (released by the caller after the round's wait)
+    // instead of being destroyed here.
+    virtual void release_recorded_bindings(
+        std::vector<std::shared_ptr<VulkanResource>> &keep_alive) {
+        for (auto &obj : objs_) {
+            if (!obj || obj.use_count() != 1) continue;
+            // Destroying a borrowed sub-range view frees nothing while its
+            // parent has another owner; parking it would pin the parent (a
+            // pool buffer) for the rest of the round.
+            auto *view = dynamic_cast<VulkanBuffer *>(obj.get());
+            if (view && view->is_view_range() &&
+                view->parent().use_count() > 2) // view + the copy parent() made
+                continue;
+            keep_alive.push_back(std::move(obj));
+        }
+        objs_.clear();
+    }
 
     virtual void set_name(const std::string &name) { name_ = name; }
     virtual std::string get_name() const { return name_; }

@@ -23,6 +23,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -1843,7 +1844,14 @@ template <typename T> class Tensor : public ITensor {
             props |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         }
-        if (auto *pool = ActivationBufferPool::active()) {
+        // Only activations come from the pool: a weight, graph input, KV
+        // cache or host-computed tensor must own (and free) its own memory --
+        // a weight pager evicting a band expects the bytes to go away.
+        auto *pool = ActivationBufferPool::active();
+        if (pool && !read_only_leaf_ && !prealloc_keep_ &&
+            !host_authoritative_ &&
+            (std::is_same<T, float>::value ||
+             std::is_same<T, uint16_t>::value)) {
             vkobj_ = pool->acquire(vd, aligned, flags, props);
         } else {
             vkobj_ = std::make_shared<VulkanBuffer>(vd, aligned, flags, props);
@@ -1935,6 +1943,15 @@ template <typename T> class Tensor : public ITensor {
             auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
             buffer = view->getBuffer();
             offset = view->getOffset();
+        }
+        // A reused activation buffer may still be accessed by commands of this
+        // round that are recorded but not yet executed. Both paths below (host
+        // memcpy, or a copy in a separate submit) bypass the level barrier
+        // that orders GPU reuse, so drain the round first.
+        if (buffer->reuse_pending()) {
+            if (auto *pool = ActivationBufferPool::active()) {
+                pool->sync_for_host();
+            }
         }
         if (buffer->is_host_visible() && upload_in_place_eligible(dev)) {
             // UMA weight (see InitializerUploadScope): write straight into

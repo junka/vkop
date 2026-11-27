@@ -2804,12 +2804,14 @@ int Runtime::compute_live_levels() {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
-    const char *reuse_env = std::getenv("VKOP_ACTIVATION_REUSE");
-    const bool explicit_reuse = reuse_env && reuse_env[0] == '1';
     const auto enabled = [](const char *name) {
         const char *value = std::getenv(name);
         return value && value[0] != '\0' && value[0] != '0';
     };
+    // Opt-in: it saves activation memory, which only matters for models whose
+    // intermediates are large (video/image DiT, VAE); an LLM decode round's
+    // activations are well under 1 MiB.
+    const bool activation_reuse = enabled("VKOP_ACTIVATION_REUSE");
     const char *reuse_level_stat = std::getenv("VKOP_LEVEL_STAT");
     const bool reuse_compatible =
         backend_buffer_ && !replay_mode_ && !enabled("VKOP_REPLAY") &&
@@ -2818,14 +2820,12 @@ double Runtime::Run() {
         !(reuse_level_stat && std::strchr(reuse_level_stat, ',')) &&
         dump_matches_.empty() && !enabled("VKOP_DUMP_NODE") &&
         !std::getenv("VKOP_NODE_DUMP") && !level_hook_;
-    if (explicit_reuse && !reuse_compatible) {
+    if (activation_reuse && !reuse_compatible) {
         throw std::runtime_error(
             "VKOP_ACTIVATION_REUSE requires the buffer backend and "
             "does not support replay, tensor dumps, level statistics, "
             "NaN scan, or a level hook");
     }
-    const bool activation_reuse =
-        reuse_compatible && (!reuse_env || explicit_reuse);
     if (activation_reuse) {
         if (!activation_buffer_pool_) {
             activation_buffer_pool_ = std::make_unique<ActivationBufferPool>();
@@ -3775,7 +3775,7 @@ double Runtime::Run() {
     // for the final level at the end.
     const char *lsync_env = std::getenv("VKOP_LEVEL_SYNC");
     int level_sync = lsync_env ? std::atoi(lsync_env) : 0;
-    bool per_level_wait = activation_reuse || (level_sync == 1);
+    bool per_level_wait = (level_sync == 1);
     // VKOP_NO_ALIAS_BARRIER=1 drops the anti-aliasing prev-level wait (see
     // below), keeping ONLY true data-dependency waits. The barrier was added
     // as a belt-and-suspenders guard against the outshape_tensor_map buffer-
@@ -3867,7 +3867,6 @@ double Runtime::Run() {
         if (batch_levels < 0)
             batch_levels = 0;
     }
-    if (activation_reuse) batch_levels = 0;
     auto flush_batched = [&](std::vector<std::vector<VkSubmitInfo>> &bsis,
                              int nlanes) {
         for (int ci = 0; ci < nlanes; ci++) {
@@ -3973,6 +3972,9 @@ double Runtime::Run() {
     bool graph_no_barrier = false;
     if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
         graph_no_barrier = gnb[0] == '1';
+    // Activation reuse hands a buffer freed at level L to a writer at a later
+    // level of the same recording; the level barrier is what orders the two.
+    if (activation_reuse) graph_no_barrier = false;
 
     // Secondary-command-buffer submit shape (VKOP_SEC_CMD=1).
     //
@@ -4594,9 +4596,17 @@ double Runtime::Run() {
         }
     }
 
+    // Activation reuse, level end (recorded, NOT waited). Dropping this
+    // level's references makes the pool buffers nothing reads any more free
+    // for the following levels, which the level barrier orders after this
+    // one. Nothing is destroyed here: pool buffers are owned by the pool, and
+    // any other resource an op was the last owner of is parked in
+    // reuse_keep_alive until the round's final wait.
+    std::vector<std::shared_ptr<VulkanResource>> reuse_keep_alive;
     auto finish_reuse_level = [&](size_t level_idx) {
+        auto *pool = activation_buffer_pool_.get();
         for (size_t ni : level_node_indices_[level_idx]) {
-            node_ops_[ni]->release_completed_bindings();
+            node_ops_[ni]->release_recorded_bindings(reuse_keep_alive);
         }
         for (const auto &tensor : retire_at_level[level_idx]) {
             if (tensor->get_prealloc_keep() || tensor->has_shape_ssbo() ||
@@ -4605,15 +4615,44 @@ double Runtime::Run() {
                 tensor->get_host_copy_valid() ||
                 tensor->ref_cnt() == std::numeric_limits<uint16_t>::max())
                 continue;
-            auto resource = tensor->gpu_buffer();
-            auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(resource);
-            resource.reset();
+            auto buffer =
+                std::dynamic_pointer_cast<VulkanBuffer>(tensor->gpu_buffer());
             if (!buffer) continue;
+            // A sub-range view (Split/Slice/Gather zero-copy) borrows its
+            // parent's VkBuffer; dropping the view object frees nothing.
+            const VulkanBuffer *root =
+                buffer->is_view_range() ? buffer->parent().get() : buffer.get();
+            // Memory the pool did not allocate (host import, a buffer from
+            // before reuse was enabled) stays with its tensor.
+            if (!pool->owns(root)) continue;
+            buffer.reset();
             tensor->retire_activation_buffer();
-            activation_buffer_pool_->recycle(std::move(buffer));
+            pool->release(root);
         }
-        activation_buffer_pool_->finish_level();
+        pool->collect_held();
+        pool->finish_level();
     };
+    // A host write or separate-submit upload into a buffer freed earlier in
+    // this round (Tensor::copyToGPUBuffer) has to see those earlier levels
+    // executed: submit what is recorded, wait, and continue in a new segment,
+    // exactly as a readback does.
+    struct HostSyncGuard {
+        ActivationBufferPool *pool;
+        ~HostSyncGuard() {
+            if (pool) pool->set_host_sync(nullptr);
+        }
+    } host_sync_guard{activation_reuse ? activation_buffer_pool_.get()
+                                       : nullptr};
+    if (activation_reuse) {
+        activation_buffer_pool_->set_host_sync([&]() {
+            if (graph_seg) graph_submit();
+            flush_seg_batch();
+            dev->wait_all_done();
+            graph_open(graph_cur_level);
+            if (graph_op_idx >= 0)
+                node_ops_[graph_op_idx]->repoint_graph_cmd(graph_seg);
+        });
+    }
 
     for (size_t level_idx = 0; level_idx < n_levels;
          level_idx++) {
@@ -4842,7 +4881,7 @@ double Runtime::Run() {
                 graph_open(level_idx);
             } else if (boundary && !seg_hit) {
                 if (!graph_no_barrier)
-                    graph_seg->pipelineBarrier();
+                    graph_seg->pipelineBarrier(activation_reuse);
             }
             // replay hit 段: 跳过 per-level 所有 op 的 record, 等段尾 graph_submit
             // 自动用 skip_record=true re-submit 上轮 buffer.
@@ -5276,19 +5315,7 @@ double Runtime::Run() {
                 n_readback_levels++;
                 level_readback_[level_idx] = true;
             }
-            if (activation_reuse) {
-                auto completed = graph_seg;
-                graph_submit();
-                flush_seg_batch();
-                completed->wait();
-                completed->clearWaits();
-                graph_prev_sem = VK_NULL_HANDLE;
-                finish_reuse_level(level_idx);
-                // Every segment in this level has completed (a readback waits
-                // its preceding segment). Reuse its command buffers instead
-                // of retaining one timeline semaphore for every graph level.
-                graph_next_seg = 0;
-            }
+            if (activation_reuse) finish_reuse_level(level_idx);
             if (run_profile) {
                 auto sub_t1 = std::chrono::steady_clock::now();
                 prof_submit_ms +=
@@ -5664,8 +5691,12 @@ double Runtime::Run() {
         weight_prof_finish_round();
     }
 
-    if (activation_reuse && std::getenv("VKOP_ACTIVATION_REUSE_STATS")) {
-        activation_buffer_pool_->report();
+    if (activation_reuse) {
+        // The round's final wait above has drained every recorded command.
+        reuse_keep_alive.clear();
+        activation_buffer_pool_->finish_round();
+        if (std::getenv("VKOP_ACTIVATION_REUSE_STATS"))
+            activation_buffer_pool_->report();
     }
 
     auto end = std::chrono::steady_clock::now();

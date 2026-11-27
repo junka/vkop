@@ -124,8 +124,9 @@ class VulkanCommandBuffer {
     // MEMORY_WRITE -> MEMORY_READ|MEMORY_WRITE over ALL_COMMANDS covers every
     // pair the graph can produce (shader, transfer via vkCmdCopyBuffer/
     // vkCmdUpdateBuffer, indirect dispatch reads).
-    void pipelineBarrier();
-    // Full cross-submission memory dependency for synchronous level reuse.
+    void pipelineBarrier(bool order_transfer_writes = false);
+    // Full memory dependency on everything earlier in queue submission
+    // order (earlier segments included); opens each activation-reuse segment.
     void fullMemoryBarrier();
 
     // Append secondary command buffers to this (primary) recording, in array
