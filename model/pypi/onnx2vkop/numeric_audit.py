@@ -88,8 +88,17 @@ _MIN_NORMAL: Dict[str, Optional[float]] = {
 # narrow -- 1.2x from median to worst for fp16 and int8, under 1.1x for the
 # rest -- which is what makes "2x the worst" a usable line rather than a coin
 # flip.
+#
+# bf16 (-q bf16, the --act bf16 domain pass) had no row, so it was never
+# flagged however far off a weight came out, where fp16 was. Its RNE cost is
+# scale-invariant across the normal range (8 significant bits to fp16's 11,
+# so 8x fp16's): 1.66e-03 on N(0, 1) weights, 1.76e-03 on U(-1, 1), measured
+# on [512, 512], [64, 4096] and [576, 64] tensors with the converter's own
+# fp32_to_bf16_bits -- fp16 measures 2.07e-04 on the same draws, matching its
+# resnet18 median above. The line keeps fp16's ratio to that (~2.4x): 4e-3.
 _REL_L2_WARN: Dict[str, float] = {
     "fp16": 5e-4,
+    "bf16": 4e-3,
     "int8": 3e-2,
     "fp8e4m3": 5e-2,
     "fp8e5m2": 1e-1,

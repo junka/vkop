@@ -57,6 +57,9 @@ _CHUNK_BYTES = 1 << 23
 # per-expert checkpoint tensors; hydrating them all to convert would be the
 # OOM this module exists to prevent). prepare() flips the recorded dtype to
 # FLOAT16 at deferral time so _downcast_bfloat16 leaves the file bytes alone.
+# Where the payload is bf16 after all (--act bf16's domain pass, -q bf16,
+# --keep-bf16) the row is re-marked later and written as bf16 instead -- see
+# mark_bf16_payload.
 _PASS_THROUGH_DATA_TYPES = frozenset(
     {TensorProto.FLOAT16, TensorProto.BFLOAT16})
 _PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2, TensorProto.BFLOAT16: 2,
@@ -212,7 +215,11 @@ def deferral_refusal(quant: Optional[str], unify: bool,
     """
     if not _env_flag(_ENV_ENABLE, True):
         return f"{_ENV_ENABLE}=0"
-    if quant is not None and quant not in ("fp16",) + _VALUE_FREE_FORMATS:
+    # -q bf16 streams like -q fp16: its payload is the source's bits (a bf16
+    # source) or each fp16 value rounded once, both element for element, so
+    # write_payload converts a band at a time (mark_bf16_payload). It used to
+    # hydrate the whole model for that.
+    if quant is not None and quant not in ("fp16", "bf16") + _VALUE_FREE_FORMATS:
         return f"-q {quant} rewrites weight payloads and needs their bytes"
     if unify:
         return "--unify concatenates weight payloads and needs their bytes"
@@ -360,6 +367,77 @@ def _stream_entry(tensor, base_dir, location, offset, length,
         entry["data_type"] = TensorProto.FLOAT16
         tensor.data_type = TensorProto.FLOAT16
     return entry
+
+
+def mark_bf16_payload(deferred: Dict[str, dict], name: str, init,
+                      target: Optional[str] = None,
+                      initializers: Optional[dict] = None) -> bool:
+    """Make a deferred 16-bit float row write a bfloat16 payload.
+
+    The streamed counterpart of a bf16 payload built in memory: a bf16 source
+    is copied verbatim (its bits ARE the value), an fp16 one is rounded once,
+    fp16 -> fp32 (exact) -> bf16 RNE, which is what fp16_graph's
+    `_bf16_payload` / bf16_weights' `-q bf16` do to the same values in memory.
+    `write_payload` does the conversion band by band, so the weight still never
+    enters RAM.
+
+    Only rows the writer copies element for element qualify: a plain
+    pass-through or the SwiGLU gate/up interleave. A row that encodes (`quant`)
+    or re-lays (`lane_major`, `transpose_payload`) its payload is refused, and
+    so is any source dtype other than fp16/bf16. Returns whether it was marked.
+
+    `target` other than `name` is a second, bf16 copy of a shared weight (the
+    bf16 domain pass gives the bf16 readers their own tensor while an island
+    keeps the export's): it gets its own row over the same source bytes and an
+    external-data twin of `init` in `initializers`, so neither tensor is ever
+    hydrated.
+    """
+    entry = deferred.get(name)
+    if entry is None:
+        return False
+    for key in ("quant", "lane_major", "transpose_payload", "src_dims"):
+        if entry.get(key) is not None:
+            return False
+    src = entry.get("src_dtype", entry.get("data_type"))
+    if src not in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+        return False
+    if entry.get("interleave") is not None:
+        spec = entry["interleave"]
+        if any(spec[k].get("src_dtype", spec[k].get("data_type"))
+               not in (TensorProto.FLOAT16, TensorProto.BFLOAT16)
+               for k in ("g", "u")):
+            return False
+    if target is not None and target != name:
+        if initializers is None:
+            return False
+        twin = TensorProto()
+        twin.CopyFrom(init)
+        twin.name = target
+        twin.data_type = TensorProto.BFLOAT16
+        new = dict(entry)
+        new["name"] = target
+        new["src_dtype"] = src
+        new["data_type"] = TensorProto.BFLOAT16
+        new["out_bf16"] = True
+        new["consumers"] = 1
+        deferred[target] = new
+        initializers[target] = twin
+        return True
+    entry["src_dtype"] = src
+    entry["data_type"] = TensorProto.BFLOAT16
+    entry["out_bf16"] = True
+    init.data_type = TensorProto.BFLOAT16
+    return True
+
+
+def _fp16_block_to_bf16(block: bytes) -> bytes:
+    """fp16 bytes -> bf16 bytes: widened exactly, rounded once (RNE)."""
+    try:
+        from .bf16_weights import fp32_to_bf16_bits
+    except ImportError:  # flat-module layout
+        from bf16_weights import fp32_to_bf16_bits
+    f32 = np.frombuffer(block, dtype="<f2").astype(np.float32)
+    return np.ascontiguousarray(fp32_to_bf16_bits(f32)).astype("<u2").tobytes()
 
 
 def _int4_layout_ok(init, uses: Dict[str, list], group_size: int,
@@ -1043,16 +1121,21 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
     path = source_read_path(entry, out_f, base_dir)
     remaining = entry["length"]
     # A row bf16_weights flipped (--keep-bf16: the weight lands in a slot the
-    # runtime reads bf16 from) copies the source bits verbatim instead.
+    # runtime reads bf16 from) copies the source bits verbatim instead, and
+    # so does a bf16 source whose payload is bf16 (`out_bf16`, see
+    # mark_bf16_payload). An fp16 source with a bf16 payload is rounded.
+    out_bf16 = bool(entry.get("out_bf16") or entry.get("keep_bf16"))
     to_fp16 = (entry.get("src_dtype") == TensorProto.BFLOAT16
-               and not entry.get("keep_bf16"))
+               and not out_bf16)
+    fp16_to_bf16 = (out_bf16
+                    and entry.get("src_dtype") == TensorProto.FLOAT16)
     # A kept bf16 row was range-scanned from this same source when the graph
     # was built (bf16_weights.apply), because its bf16_wide attribute had to be
     # decided before the payload is written. The bytes pass through here
     # anyway, so the scan is repeated on them: a source that changed in
     # between would otherwise ship a weight the attribute misdescribes.
     tile_scan = None
-    if entry.get("keep_bf16") and "bf16_tile_overflow" in entry:
+    if out_bf16 and "bf16_tile_overflow" in entry:
         try:
             from .bf16_weights import TileScan
         except ImportError:  # flat-module layout
@@ -1076,7 +1159,10 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
                     # bf16 normalization.
                     block = np.ascontiguousarray(
                         f32.astype(np.float16)).tobytes()
-            elif tile_scan is not None:
+            elif fp16_to_bf16:
+                # Same byte count out as in (2 -> 2), so `length` holds.
+                block = _fp16_block_to_bf16(block)
+            if tile_scan is not None:
                 tile_scan.add_bytes(block)
             out_f.write(block)
             remaining -= len(block)
@@ -1092,8 +1178,10 @@ def write_payload(entry: dict, out_f, base_dir: str, dag_model=None) -> int:
 
 
 def _read_rows(src_entry: dict, base_dir: str, row0: int, rows: int,
-               n_dim: int, out_f=None) -> np.ndarray:
-    """Rows [row0, row0+rows) of a [K, N] 16-bit deferred source, as fp16 bits.
+               n_dim: int, out_f=None, out_bf16: bool = False) -> np.ndarray:
+    """Rows [row0, row0+rows) of a [K, N] 16-bit deferred source, as fp16 bits
+    (bf16 bits with `out_bf16`: a bf16 source verbatim, an fp16 one rounded
+    once -- see mark_bf16_payload).
 
     `out_f` is the file being written; when the source and that file are the
     same file (an in-place reconversion) it is what redirects this read to the
@@ -1109,7 +1197,11 @@ def _read_rows(src_entry: dict, base_dir: str, row0: int, rows: int,
             f"deferred weight '{src_entry['name']}' runs out of source bytes "
             f"while interleaving for the SwiGLU gate/up fold")
     u16 = np.frombuffer(block, dtype=np.uint16)
-    if src_entry.get("src_dtype") == TensorProto.BFLOAT16:
+    src_bf16 = src_entry.get("src_dtype") == TensorProto.BFLOAT16
+    if out_bf16:
+        if not src_bf16:
+            u16 = np.frombuffer(_fp16_block_to_bf16(block), dtype=np.uint16)
+    elif src_bf16:
         f32 = (u16.astype(np.uint32) << 16).view(np.float32)
         with np.errstate(over="ignore"):
             u16 = f32.astype(np.float16).view(np.uint16)
@@ -1128,8 +1220,9 @@ def _write_interleave(entry: dict, out_f, base_dir: str) -> int:
     row = 0
     while row < k_dim:
         take = min(band, k_dim - row)
-        g = _read_rows(spec["g"], base_dir, row, take, n_dim, out_f)
-        u = _read_rows(spec["u"], base_dir, row, take, n_dim, out_f)
+        out_bf16 = bool(entry.get("out_bf16"))
+        g = _read_rows(spec["g"], base_dir, row, take, n_dim, out_f, out_bf16)
+        u = _read_rows(spec["u"], base_dir, row, take, n_dim, out_f, out_bf16)
         gu = np.concatenate([g.reshape(take, n_dim // 4, 4),
                              u.reshape(take, n_dim // 4, 4)], axis=2)
         out_f.write(np.ascontiguousarray(gu).tobytes())

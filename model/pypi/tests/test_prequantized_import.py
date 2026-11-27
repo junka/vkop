@@ -303,6 +303,54 @@ def test_fp16_scale_is_widened_exactly():
                                      arr(scale16).astype(numpy.float32))
 
 
+def bf16_init(values, name):
+    """A BFLOAT16 initializer from raw bf16 bits (the values must be exact in
+    bf16; truncation of the fp32 pattern is then the bf16 encoding)."""
+    f32 = numpy.ascontiguousarray(values, dtype=numpy.float32)
+    bits = (f32.view(numpy.uint32) >> 16).astype(numpy.uint16)
+    assert numpy.array_equal(
+        (bits.astype(numpy.uint32) << 16).view(numpy.float32), f32)
+    return helper.make_tensor(name, TensorProto.BFLOAT16, list(f32.shape),
+                              bits.tobytes(), raw=True)
+
+
+def test_bf16_scale_is_widened_exactly():
+    """bf16 -> fp32 is exact (bf16 is fp32's high half), so a bf16 scale table
+    imports like an fp16 one: the same numbers as the fp32 table the kernel
+    binds. The int8 payload is untouched."""
+    w = randn(8, 16, 4)
+    twin = quantize_int8(float_weight_graph(
+        w, [("MatMul", "mm", {"transB": 0}, ["x", "W"])]))
+    s = arr(twin.initializers["W_scale"]).astype(numpy.float32)
+    s_bf16 = (s.view(numpy.uint32) & numpy.uint32(0xFFFF0000)).view(
+        numpy.float32)  # values on bf16's grid
+
+    m = fold(dq_graph(twin.initializers["W"], bf16_init(s_bf16, "W_scale"),
+                      matmul_consumer(), attrs={"axis": 1}))
+
+    imported = m.initializers["W_scale"]
+    assert imported.data_type == TensorProto.FLOAT
+    numpy.testing.assert_array_equal(arr(imported), s_bf16)
+    assert _init_bytes(m.initializers["W"]) == _init_bytes(twin.initializers["W"])
+
+
+@pytest.mark.parametrize("half", [TensorProto.FLOAT16, TensorProto.BFLOAT16],
+                         ids=["fp16", "bf16"])
+def test_half_output_dtype_folds_like_the_undeclared_weight(half):
+    """output_dtype only rounds the dequantized weight, which the fp32 kernel
+    multiply does not reproduce for fp16 and need not for bf16 either: both
+    fold onto the -q int8 twin's exact bytes."""
+    w = randn(8, 16, 6)
+    twin = quantize_int8(float_weight_graph(
+        w, [("MatMul", "mm", {"transB": 0}, ["x", "W"])]))
+    payload, scale = twin.initializers["W"], twin.initializers["W_scale"]
+    m = fold(dq_graph(payload, scale, matmul_consumer(),
+                      attrs={"axis": 1, "output_dtype": half}))
+    assert [i["name"] for i in m.nodes["mm"].inputs] == ["x", "W", "W_scale"]
+    assert _init_bytes(m.initializers["W"]) == _init_bytes(payload)
+    numpy.testing.assert_array_equal(arr(m.initializers["W_scale"]), arr(scale))
+
+
 def test_zero_zero_point_is_dropped():
     """A zero point of all-zeros is the identity the formula claims, so the fold
     takes it and the payload's own offset stays 0 — and the now-unread
@@ -624,6 +672,39 @@ def test_int32_conv_bias_dequantizes_on_the_host():
         assert dead not in m.initializers, f"{dead} only ever fed this node"
 
 
+@pytest.mark.parametrize("scale_half", [False, True], ids=["fp32-scale",
+                                                            "fp16-scale"])
+def test_int32_constant_with_bf16_output_dtype_keeps_the_bf16_value(scale_half):
+    """output_dtype=BFLOAT16 on a host-evaluated constant: the value is ONNX's
+    (q * s rounded to bf16), stored in the width the scale was normalized to
+    -- no bf16 tensor enters the graph, and bf16 -> fp16/fp32 is exact."""
+    q = numpy.array([257, -385, 3, 1000], dtype=numpy.int32)
+    s = numpy.array([1.0, 1.0, 0.5, 0.25], dtype=numpy.float32)
+    s_init = numpy_helper.from_array(
+        s.astype(numpy.float16) if scale_half else s, "b_scale")
+    m = fold(dq_graph(numpy_helper.from_array(q, "b_q"), s_init,
+                      [("Conv", "c", {}, ["x", "W", DQ_OUT])],
+                      attrs={"axis": 0, "output_dtype": TensorProto.BFLOAT16}))
+    out = m.initializers["b_q_dequant"]
+    want_dtype = TensorProto.FLOAT16 if scale_half else TensorProto.FLOAT
+    assert out.data_type == want_dtype
+    assert m.nodes["c"].inputs[2]["dtype"] == want_dtype
+    # 257 and -385 need 9 significant bits: bf16 (8 bits) rounds them to
+    # 256 and -384 (ties to even); the rest are exact.
+    numpy.testing.assert_array_equal(arr(out).astype(numpy.float32),
+                                     [256.0, -384.0, 1.5, 250.0])
+
+
+def test_int32_constant_with_a_bf16_scale_dequantizes_exactly():
+    q = numpy.array([100, -200, 50], dtype=numpy.int32)
+    s = numpy.array([0.5, 0.015625, 3.0], dtype=numpy.float32)  # exact in bf16
+    m = fold(dq_graph(numpy_helper.from_array(q, "b_q"), bf16_init(s, "b_scale"),
+                      [("Conv", "c", {}, ["x", "W", DQ_OUT])],
+                      attrs={"axis": 0, "output_dtype": TensorProto.FLOAT}))
+    numpy.testing.assert_array_equal(arr(m.initializers["b_q_dequant"]),
+                                     q.astype(numpy.float32) * s)
+
+
 def test_int32_constant_subtracts_its_zero_point_before_scaling():
     """(q - zero_point) * scale, each table broadcast along the `axis` attribute
     -- which ONNX defaults to 1 and is not given here. Scaling first would put
@@ -811,7 +892,7 @@ BYTE_GATES = [
     pytest.param(lambda px: byte_graph(px, consumers=[]),
                  "nothing reads", id="no-consumers"),
     pytest.param(lambda px: byte_graph(
-        px, attrs={"axis": 1, "output_dtype": TensorProto.BFLOAT16}),
+        px, attrs={"axis": 1, "output_dtype": TensorProto.INT32}),
         "output_dtype", id="output-dtype-the-kernels-cannot-reproduce"),
     pytest.param(lambda px: byte_graph(px, p=px.u8),
                  "no vkop dequantization kernel", id="uint8-payload-is-asymmetric"),

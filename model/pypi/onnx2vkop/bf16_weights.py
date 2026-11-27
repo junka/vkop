@@ -501,7 +501,16 @@ def apply(dag_model, *, keep: bool = False, quantize: bool = False,
         if name in deferred:
             if keep or quantize:
                 entry = deferred[name]
-                if _flip_deferred(entry, init):
+                flipped = _flip_deferred(entry, init)
+                if (not flipped and quantize
+                        and not (exclude and name in exclude)
+                        and entry.get("src_dtype", entry.get("data_type"))
+                        == _FLOAT16
+                        and entry.get("interleave") is None):
+                    # -q bf16 on a streamed fp16 source: rounded once at
+                    # write time, as `quantize` does to an in-memory one.
+                    flipped = _ws().mark_bf16_payload(deferred, name, init)
+                if flipped:
                     _retag(slots)
                     summary["deferred"].append(name)
                     # The payload is written after the graph, so the scan
@@ -573,8 +582,33 @@ def tile_scan_line(summary: dict) -> str:
     return line
 
 
+def _ws():
+    try:
+        from . import weight_stream
+    except ImportError:  # flat-module layout (cli run from the dir)
+        import weight_stream
+    return weight_stream
+
+
 def _scan_deferred(entry: dict) -> TileScan:
     path = entry["location"]
     if not os.path.isabs(path):
         path = os.path.join(entry.get("base_dir") or "", path)
-    return scan_file(path, int(entry["offset"]), int(entry["length"]))
+    if entry.get("src_dtype") != _FLOAT16:
+        return scan_file(path, int(entry["offset"]), int(entry["length"]))
+    # An fp16 source becomes bf16 only at write time: scan what will be
+    # written (the RNE rounding can carry 65504 up to 65536), not the file.
+    scan = TileScan()
+    convert = _ws()._fp16_block_to_bf16
+    with open(path, "rb") as f:
+        f.seek(int(entry["offset"]))
+        remaining = int(entry["length"])
+        while remaining:
+            block = f.read(min(_SCAN_CHUNK * 2, remaining))
+            if not block:
+                raise ValueError(
+                    f"bf16 scan: {path} ends {remaining} byte(s) before the "
+                    f"{entry['length']} at offset {entry['offset']}")
+            scan.add_bytes(convert(block))
+            remaining -= len(block)
+    return scan

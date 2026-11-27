@@ -428,9 +428,13 @@ def _convert_tensor(entry: dict, target: str,
     if target == "F32":
         return np.ascontiguousarray(arr.astype(np.float32)).tobytes()
     if target == "BF16":
-        f32 = arr.astype(np.float32)
-        u32 = f32.view(np.uint32)
-        return ((u32 >> 16).astype(np.uint16)).tobytes()
+        # Round to nearest even, like the F16 branch above (numpy's cast) and
+        # every bf16 encode in the converter. `u32 >> 16` truncated instead:
+        # a biased, up-to-1-ulp error on every fp32/fp16 -> bf16 conversion.
+        # A bf16 source is unaffected (its low half is zero, so RNE is exact).
+        from .bf16_weights import fp32_to_bf16_bits
+        return np.ascontiguousarray(
+            fp32_to_bf16_bits(arr.astype(np.float32))).astype("<u2").tobytes()
     raise ValueError(f"no conversion to {target}")
 
 

@@ -193,6 +193,11 @@ NK_ROUTES = [
                  id="modelopt-transpose-then-cast"),
     pytest.param((("Cast", {"to": TensorProto.FLOAT16}),
                   ("Transpose", {})), 0, id="cast-then-default-perm"),
+    # A bf16 ModelOpt export casts the dequantized weight to BFLOAT16 instead:
+    # the same rounding-only view, which the kernel's fp32 multiply beats.
+    pytest.param((("Transpose", {"perm": [1, 0]}),
+                  ("Cast", {"to": TensorProto.BFLOAT16})), 0,
+                 id="bf16-modelopt-transpose-then-cast"),
 ]
 
 
@@ -322,6 +327,44 @@ def test_an_evaluated_first_level_splits_back_exactly():
 
 
 # --------------------------------------------------------------------------
+# bf16 where fp16 is accepted: the same rounding-only declarations
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dq", ["dq1", "dq2"])
+@pytest.mark.parametrize("half", [TensorProto.FLOAT16, TensorProto.BFLOAT16],
+                         ids=["fp16", "bf16"])
+def test_half_output_dtype_folds_onto_the_twin(dq, half):
+    """output_dtype=BFLOAT16 on either DQ folds to the same bytes as the
+    undeclared chain, exactly as FLOAT16 does (DQ2: the weight's rounding is
+    not reproduced for either; DQ1: with a power-of-two global every
+    e4m3 * global product is exact in both half types)."""
+    codes, sb, _ = good()
+    g = numpy.float32(2.0 ** -10)
+    ref = fold(chain_graph(codes, sb, g, axis=0))
+    attrs = {"output_dtype": half}
+    m = fold(chain_graph(codes, sb, g, axis=0,
+                         dq1_attrs=attrs if dq == "dq1" else None,
+                         dq2_attrs=attrs if dq == "dq2" else None))
+    assert_matches_twin(m, ref)
+
+
+def test_bf16_global_scale_is_widened_exactly():
+    """A BFLOAT16 global (raw bf16 bits) folds to the fp32 global of the same
+    value, as an fp16 one does."""
+    c, s, _ = good()
+    g = numpy.float32(0.0078125)  # 2**-7: exact in bf16
+    m = chain_graph(c, s, g, axis=0)
+    bits = (numpy.array([g], numpy.float32).view(numpy.uint32)
+            >> 16).astype(numpy.uint16)
+    m.initializers["W_f8_scale_f32_scale"] = helper.make_tensor(
+        "W_f8_scale_f32_scale", TensorProto.BFLOAT16, [1], bits.tobytes(),
+        raw=True)
+    fold(m)
+    got = numpy_helper.to_array(m.initializers["W_scale_global"])
+    assert got.dtype == numpy.float32 and got.reshape(-1)[0] == g
+
+
+# --------------------------------------------------------------------------
 # gates: everything the kernel cannot read raises
 # --------------------------------------------------------------------------
 
@@ -375,10 +418,10 @@ def g_gemm():
     return m
 
 
-def g_bf16_cast():
+def g_int_cast():
     c, s, g = good()
     return chain_graph(c, s, g, axis=0,
-                       views=(("Cast", {"to": TensorProto.BFLOAT16}),))
+                       views=(("Cast", {"to": TensorProto.INT32}),))
 
 
 def g_n12():
@@ -455,10 +498,18 @@ def g_runtime_scale():
     return m
 
 
-def g_bf16_output():
+def g_int_output():
     c, s, g = good()
     return chain_graph(c, s, g, axis=0,
-                       dq2_attrs={"output_dtype": TensorProto.BFLOAT16})
+                       dq2_attrs={"output_dtype": TensorProto.INT32})
+
+
+def g_bf16_first_level_rounds():
+    """The block scales DQ1 rounds to bf16 are not what the kernel's fp32
+    e4m3 * global gives: a global with more than 8 significant bits."""
+    c, s, _ = good()
+    return chain_graph(c, s, numpy.float32(1.0 + 2.0 ** -12), axis=0,
+                       dq1_attrs={"output_dtype": TensorProto.BFLOAT16})
 
 
 GATES = [
@@ -468,7 +519,7 @@ GATES = [
     pytest.param(g_nonzero_zp, "non-zero zero_point", id="nonzero-zero-point"),
     pytest.param(g_scale_read_elsewhere, "also reads", id="block-scale-shared"),
     pytest.param(g_gemm, "MatMul only", id="gemm-consumer"),
-    pytest.param(g_bf16_cast, "cannot reproduce", id="bf16-cast-view"),
+    pytest.param(g_int_cast, "cannot reproduce", id="int-cast-view"),
     pytest.param(g_n12, "multiple of 8", id="n-not-multiple-of-8"),
     pytest.param(g_unsplittable_single_dq, "two-level form",
                  id="single-dq-table-not-e4m3-times-g"),
@@ -481,7 +532,9 @@ GATES = [
     pytest.param(g_a_operand, "single B operand", id="a-operand"),
     pytest.param(g_layouts_disagree, "both layouts", id="layouts-disagree"),
     pytest.param(g_runtime_scale, "computed at run time", id="runtime-scale"),
-    pytest.param(g_bf16_output, "output_dtype", id="bf16-output-dtype"),
+    pytest.param(g_int_output, "output_dtype", id="int-output-dtype"),
+    pytest.param(g_bf16_first_level_rounds, "rounds e4m3 * global to bf16",
+                 id="bf16-first-level-rounding"),
 ]
 
 

@@ -18,6 +18,7 @@ except ImportError:  # onnxsim 可选；缺失则退回 ConstantFolder
 
 from .dag import Node, _init_byte_len
 from . import numeric_audit
+from .bf16_weights import bf16_bits_to_fp32, fp32_to_bf16_bits
 
 
 def _env_int(name: str, default: int) -> int:
@@ -43,6 +44,32 @@ _NP_DTYPE = {
     TensorProto.INT8: np.int8, TensorProto.BOOL: np.bool_,
     TensorProto.UINT32: np.uint32, TensorProto.UINT64: np.uint64,
 }
+
+
+def _round_through_bf16(arr) -> np.ndarray:
+    """`arr` rounded to bfloat16 (RNE, as ONNX's Cast(to=BFLOAT16) does) and
+    held as float32, which carries every bf16 value exactly.
+
+    numpy has no native bf16, and a BFLOAT16 constant is not something the
+    normalized graph may hold (converter._downcast_bfloat16 has already
+    rewritten every bf16 tensor to fp16 -- or fp32 under --act bf16 -- before
+    any pass runs). float32 is the one form both targets take without a second
+    rounding: bf16 -> fp16 is exact in fp16's range, bf16 -> fp32 always is."""
+    return bf16_bits_to_fp32(fp32_to_bf16_bits(
+        np.asarray(arr, dtype=np.float32))).reshape(np.shape(arr))
+
+
+def _float_init_to_f32(init) -> np.ndarray:
+    """A FLOAT / FLOAT16 / BFLOAT16 initializer's values as float32 (exact for
+    all three: bf16 is fp32's high half). Decoded from the bits, so it does not
+    depend on what numpy_helper.to_array returns for bf16 on this onnx."""
+    if init.data_type == TensorProto.BFLOAT16:
+        if init.raw_data:
+            bits = np.frombuffer(init.raw_data, dtype=np.uint16)
+        else:
+            bits = np.asarray(init.int32_data, dtype=np.uint16)
+        return bf16_bits_to_fp32(bits).reshape([int(d) for d in init.dims])
+    return numpy_helper.to_array(init).astype(np.float32)
 
 
 def _concat_axis_ok(node, out_rank: int, u_ax: int) -> bool:
@@ -225,6 +252,11 @@ class ConstantFolder:
                                axis=tuple(axes) if axes else None)]
         if op == "Cast":
             to = node.attribute[0].i
+            if to == TensorProto.BFLOAT16:
+                # Folded to its bf16 VALUE, held as float32 (see
+                # _round_through_bf16): the plain `.get(to, float32)` dropped
+                # the rounding the Cast exists to apply.
+                return [_round_through_bf16(const[node.input[0]])]
             return [const[node.input[0]].astype(_NP_DTYPE.get(to, np.float32))]
         if op == "Slice":
             x = const[node.input[0]]
@@ -11976,22 +12008,25 @@ class PreQuantizedWeights:
     @staticmethod
     def _check_output_dtype(node):
         """The dequantized product's type. The fold leaves the multiply to the
-        shader, which does it in fp32 and hands the consumer fp16/fp32, so those
-        targets are equal-or-better precision; anything else (bf16, an int
-        output) says the exporter rounded the weight through a layout the kernel
-        does not reproduce."""
+        shader, which does it in fp32, so a float target is equal-or-better
+        precision: fp16 and bf16 alike only round the dequantized weight, and
+        neither rounding is reproduced (bf16 is the coarser of the two, which
+        makes the kernel's fp32 product the closer to the exact q * s). Anything
+        else (an int output) says the exporter rounded the weight through a
+        layout the kernel does not reproduce."""
         out_dtype = int(node.attributes.get("output_dtype", 0) or 0)
         if out_dtype not in (
             0,
             TensorProto.FLOAT,
             TensorProto.FLOAT16,
+            TensorProto.BFLOAT16,
             TensorProto.DOUBLE,
         ):
             raise ValueError(
                 f"DequantizeLinear '{node.name}' declares output_dtype "
                 f"{PreQuantizedWeights._dt_name(out_dtype)}; the weight-only "
-                f"kernels produce float32/fp16 and cannot reproduce that "
-                f"rounding."
+                f"kernels produce a float (fp32/fp16/bf16) and cannot "
+                f"reproduce that rounding."
             )
 
     @staticmethod
@@ -12016,7 +12051,11 @@ class PreQuantizedWeights:
     # of DequantizeLinear(e2m1 payload, ., block_size=16), read by MatMul.
     # ------------------------------------------------------------------
 
-    _NVFP4_VIEW_CASTS = (TensorProto.FLOAT, TensorProto.FLOAT16)
+    # bf16 is a view like fp16: it only rounds the dequantized weight, which
+    # the kernel's fp32 multiply does at least as precisely. A bf16 ModelOpt
+    # export writes exactly this Cast(to=BFLOAT16) between DQ and MatMul.
+    _NVFP4_VIEW_CASTS = (TensorProto.FLOAT, TensorProto.FLOAT16,
+                         TensorProto.BFLOAT16)
 
     @staticmethod
     def _nvfp4_scale_dqs(dag_model, dq_nodes, pair_names, producers, consumers):
@@ -12108,7 +12147,10 @@ class PreQuantizedWeights:
             if c is None or c.op_type != "Cast":
                 continue
             to = next((a.i for a in c.attribute if a.name == "to"), None)
-            if to != TensorProto.FLOAT16 or elem.get(c.input[0]) != TensorProto.FLOAT:
+            # A bf16 operand Cast is the same exporter artifact as the fp16
+            # one: the GEMM is declared FLOAT either way (checked below).
+            if (to not in (TensorProto.FLOAT16, TensorProto.BFLOAT16)
+                    or elem.get(c.input[0]) != TensorProto.FLOAT):
                 continue
             # Only where the GEMM itself is declared FLOAT (an fp32 model): a
             # half-typed GEMM inside fp32 I/O is a coherent fp16 island and its
@@ -12143,8 +12185,8 @@ class PreQuantizedWeights:
 
         Returns ([(matmul, tb)], [view nodes]) where tb is 1 when the MatMul's
         effective B is the TRANSPOSE of the payload as stored: an odd number of
-        Transposes on the way, XOR the MatMul's own transB. A Cast to fp16/fp32
-        only rounds the dequantized weight, which the kernel's fp32 multiply
+        Transposes on the way, XOR the MatMul's own transB. A Cast to
+        fp16/bf16/fp32 only rounds the dequantized weight, which the kernel's fp32 multiply
         does at least as precisely (the same rule as output_dtype); a Cast to
         anything else is a rounding the kernel does not reproduce."""
         out_names = {o["name"] for o in dag_model.outputs}
@@ -12246,12 +12288,13 @@ class PreQuantizedWeights:
                 f"'{x_name}': NVFP4 block scale '{b_name}' is "
                 f"{list(b_init.dims)}, expected {list(want)} (one e4m3 byte per "
                 f"(16-value K block, output column))")
-        if g_init.data_type not in (TensorProto.FLOAT, TensorProto.FLOAT16):
+        if g_init.data_type not in (TensorProto.FLOAT, TensorProto.FLOAT16,
+                                    TensorProto.BFLOAT16):
             raise ValueError(
                 f"'{x_name}': NVFP4 global scale '{g_name}' is "
                 f"{PreQuantizedWeights._dt_name(g_init.data_type)}; the kernel "
-                f"binds one fp32 (fp16 is widened exactly).")
-        g = numpy_helper.to_array(g_init)
+                f"binds one fp32 (fp16/bf16 are widened exactly).")
+        g = _float_init_to_f32(g_init)
         if g.size != 1:
             raise ValueError(
                 f"'{x_name}': NVFP4 global scale '{g_name}' has {g.size} entries "
@@ -12262,7 +12305,8 @@ class PreQuantizedWeights:
             raise ValueError(
                 f"'{x_name}': NVFP4 global scale '{g_name}' is {float(g32)}")
         out_dt = int(dq1.attributes.get("output_dtype", 0) or 0) or g_init.data_type
-        if out_dt not in (TensorProto.FLOAT, TensorProto.FLOAT16):
+        if out_dt not in (TensorProto.FLOAT, TensorProto.FLOAT16,
+                          TensorProto.BFLOAT16):
             raise ValueError(
                 f"DequantizeLinear '{dq1.name}' produces "
                 f"{PreQuantizedWeights._dt_name(out_dt)} block scales; the kernel "
@@ -12273,15 +12317,21 @@ class PreQuantizedWeights:
                 f"'{x_name}': NVFP4 block scale '{b_name}' carries {codes.size} "
                 f"bytes for a {list(want)} table")
         PreQuantizedWeights._check_e4m3_finite(codes, b_name, x_name)
-        if out_dt == TensorProto.FLOAT16:
-            # ONNX rounds the first DQ's product to fp16; the kernel keeps it in
-            # fp32. Equal only when no product needs the rounding.
+        if out_dt in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+            # ONNX rounds the first DQ's product to the half type; the kernel
+            # keeps it in fp32. Equal only when no product needs the rounding.
             prod = PreQuantizedWeights._e4m3_decode(codes) * g32
-            if not np.array_equal(prod.astype(np.float16).astype(np.float32),
-                                  prod):
+            if out_dt == TensorProto.FLOAT16:
+                with np.errstate(over="ignore"):
+                    rounded = prod.astype(np.float16).astype(np.float32)
+                half = "fp16"
+            else:
+                rounded = _round_through_bf16(prod)
+                half = "bf16"
+            if not np.array_equal(rounded, prod):
                 raise ValueError(
                     f"DequantizeLinear '{dq1.name}' rounds e4m3 * global to "
-                    f"fp16 and that rounding changes some block scales; the "
+                    f"{half} and that rounding changes some block scales; the "
                     f"kernel's fp32 product would not match the graph.")
         return codes.reshape(want), g32
 
@@ -12560,17 +12610,29 @@ class PreQuantizedWeights:
             if table_init is None:
                 continue
             if label == "scale" and table_init.data_type not in (
-                    TensorProto.FLOAT, TensorProto.FLOAT16):
+                    TensorProto.FLOAT, TensorProto.FLOAT16,
+                    TensorProto.BFLOAT16):
                 raise ValueError(
                     f"'{payload.name}': the constant's scale '{table_init.name}' "
                     f"is {PreQuantizedWeights._dt_name(table_init.data_type)}; a "
-                    f"DequantizeLinear scale is float or half."
+                    f"DequantizeLinear scale is float or half (fp16/bf16)."
                 )
+            table = (_float_init_to_f32(table_init) if label == "scale"
+                     else numpy_helper.to_array(table_init).astype(np.float32))
             view = PreQuantizedWeights._broadcast_view(
-                numpy_helper.to_array(table_init).astype(np.float32), q.shape,
-                axis, label, payload.name)
+                table, q.shape, axis, label, payload.name)
             deq = deq - view if label == "zero_point" else deq * view
 
+        if out_dtype == TensorProto.BFLOAT16:
+            # ONNX rounds the product to bf16. The graph holds no bf16 tensor
+            # (converter._downcast_bfloat16 normalized them all away before the
+            # passes), so the constant keeps that VALUE in the width its scale
+            # was normalized to -- the same bf16 -> fp16/fp32 rewrite the
+            # downcast applies to a bf16 initializer, and exact for both.
+            deq = _round_through_bf16(deq)
+            out_dtype = (scale_init.data_type
+                         if scale_init.data_type == TensorProto.FLOAT16
+                         else TensorProto.FLOAT)
         name = f"{payload.name}_dequant"
         dag_model.initializers[name] = numpy_helper.from_array(
             deq.astype(np.float32 if out_dtype == TensorProto.FLOAT
@@ -12611,14 +12673,17 @@ class PreQuantizedWeights:
     @staticmethod
     def _constant_output_type(node, scale_init):
         """What the dequantized constant is declared to be: ONNX says the output
-        type is the scale's, unless `output_dtype` overrides it."""
+        type is the scale's, unless `output_dtype` overrides it. BFLOAT16 is
+        returned as such; the caller rounds through it and stores the value in
+        the scale's normalized width."""
         out = int(node.attributes.get("output_dtype", 0) or 0)
-        if out in (0, TensorProto.FLOAT, TensorProto.FLOAT16):
+        if out in (0, TensorProto.FLOAT, TensorProto.FLOAT16,
+                   TensorProto.BFLOAT16):
             return out or scale_init.data_type
         raise ValueError(
             f"DequantizeLinear '{node.name}' declares output_dtype "
             f"{PreQuantizedWeights._dt_name(out)}; a host-evaluated constant is "
-            f"float or half."
+            f"float or half (fp16/bf16)."
         )
 
     @staticmethod
@@ -12784,20 +12849,24 @@ class PreQuantizedWeights:
     def _scale_array(scale_init, payload_name, label):
         """The scale table as an ndarray, in whatever rank the graph declared.
 
-        Only fp32 and fp16 get through: the kernels bind a float32 table, fp16 ->
-        fp32 is exact, and anything narrower (bf16) or wider (double) would have
-        to be re-rounded by the converter to reach the shader's precision, which
-        is a numerical claim this pass has no business making."""
+        Only fp32, fp16 and bf16 get through: the kernels bind a float32 table,
+        and fp16 -> fp32 and bf16 -> fp32 are both exact (bf16 IS fp32's high
+        half). A wider table (double) would have to be re-rounded by the
+        converter to reach the shader's precision, which is a numerical claim
+        this pass has no business making."""
         if scale_init.data_type not in (
             TensorProto.FLOAT,
             TensorProto.FLOAT16,
+            TensorProto.BFLOAT16,
         ):
             raise ValueError(
                 f"'{payload_name}': {label} dequant scale is "
                 f"{PreQuantizedWeights._dt_name(scale_init.data_type)}; the "
-                f"weight-only kernels bind a float32 table (fp16 is accepted and "
-                f"widened exactly)."
+                f"weight-only kernels bind a float32 table (fp16/bf16 are "
+                f"accepted and widened exactly)."
             )
+        if scale_init.data_type == TensorProto.BFLOAT16:
+            return _float_init_to_f32(scale_init)
         return numpy_helper.to_array(scale_init)
 
     @staticmethod

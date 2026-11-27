@@ -89,7 +89,7 @@ def weight_chain(prefix, n, k, rng, nodes, inits):
 
 
 def modelopt_mlp(path, m_rows=4, k=64, h=128, seed=3, value_info=True,
-                 act_cast=True):
+                 act_cast=True, act_to=TensorProto.FLOAT16):
     """What ModelOpt 0.48's NVFP4 W4A16 export of an fp32 Linear-SiLU-Linear
     looks like (out/w4a16_fp32.onnx of the investigation, scaled down):
     Cast(to=fp16) on BOTH GEMM operands, FLOAT GEMM outputs and bias."""
@@ -102,7 +102,7 @@ def modelopt_mlp(path, m_rows=4, k=64, h=128, seed=3, value_info=True,
     a_up = "x"
     if act_cast:
         nodes.append(helper.make_node("Cast", ["x"], ["x_f16"],
-                                      to=TensorProto.FLOAT16))
+                                      to=act_to))
         a_up = "x_f16"
     nodes += [
         helper.make_node("Cast", [up], [up + "_f16"], to=TensorProto.FLOAT16),
@@ -115,7 +115,7 @@ def modelopt_mlp(path, m_rows=4, k=64, h=128, seed=3, value_info=True,
     a_down = "a"
     if act_cast:
         nodes.append(helper.make_node("Cast", ["a"], ["a_f16"],
-                                      to=TensorProto.FLOAT16))
+                                      to=act_to))
         a_down = "a_f16"
     nodes += [
         helper.make_node("Cast", ["down_t"], ["down_t_f16"],
@@ -157,6 +157,18 @@ def test_activation_casts_are_bypassed_weight_casts_kept():
     # The weight-side Casts are views the nvfp4 fold absorbs: untouched.
     assert prod["h"].input[1] == "up_deq_f16"
     assert prod["out"].input[1] == "down_t_f16"
+
+
+def test_bf16_activation_casts_are_bypassed_like_fp16_ones():
+    """Cast(to=BFLOAT16) in front of an fp4 GEMM of an fp32 model is the same
+    exporter artifact as the fp16 one (left in place, it hands a bf16 A to a
+    GEMM with a quantized operand, which the runtime refuses)."""
+    model, *_ = modelopt_mlp(None, act_to=TensorProto.BFLOAT16)
+    assert quiet(PreQuantizedWeights.strip_fp4_operand_casts, model) == 2
+    prod = by_output(model)
+    assert prod["h"].input[0] == "x"
+    assert prod["out"].input[0] == "a"
+    assert "x_f16" not in prod and "a_f16" not in prod
 
 
 def test_without_value_info_the_gemm_bias_decides():

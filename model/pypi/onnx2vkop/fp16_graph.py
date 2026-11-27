@@ -57,11 +57,13 @@ try:
     from . import shader_map
     from . import numeric_audit
     from . import bf16_weights
+    from . import weight_stream
     from .dag import Node
 except ImportError:  # run as a flat script from inside onnx2vkop/, as converter.py supports
     import shader_map
     import numeric_audit
     import bf16_weights
+    import weight_stream
     from dag import Node
 
 _FLOAT = onnx.TensorProto.FLOAT
@@ -1154,9 +1156,30 @@ class GraphFp16:
                 summary.setdefault("deferred_to_quantizer", []).append(name)
                 continue
             if name in deferred:
-                if verbose:
-                    print(f"{tag} '{name}' is streamed; its payload dtype is "
-                          "decided at write time")
+                # The bytes stay in the source file, so the bf16 payload is
+                # produced at write time (weight_stream.write_payload): a bf16
+                # source verbatim, an fp16 one rounded once. Left as it was,
+                # the row wrote float16 under the bf16 declaration -- a node
+                # binding bf16 activations to an fp16 weight, which the
+                # runtime refuses, where the in-memory twin got real bf16.
+                moe = set(getattr(dag_model, "moe_keep_alive", ()) or ())
+                if name not in moe and weight_stream.mark_bf16_payload(
+                        deferred, name, init, target, dag_model.initializers):
+                    summary["converted"] += 1
+                    if verbose:
+                        print(f"{tag} '{target}' is streamed; its bf16 "
+                              "payload is written at trailer time")
+                else:
+                    # A row that encodes or reorders its payload (a byte
+                    # format, the down_act lane-major fold) or a MoE paging
+                    # slot keeps its width: the write-time conversion only
+                    # covers a plain copy and the gate/up interleave. The
+                    # runtime's bf16 gate refuses the mixed node at load;
+                    # mixed_half_kinds exempts weight slots, so say it here.
+                    if verbose:
+                        print(f"{tag} WARNING: streamed '{name}' cannot be "
+                              "rewritten to bf16 at write time; its payload "
+                              "keeps the source width")
                 continue
             if int(init.data_type) not in (_FLOAT, _FLOAT16):
                 continue

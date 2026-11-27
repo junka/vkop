@@ -405,6 +405,42 @@ def _bf16_bytes_to_fp32(raw: bytes) -> bytes:
 _downcast_stats = {"widened": 0}
 
 
+def _bf16_tensors(model):
+    """Every bf16 TensorProto the normalization rewrites: initializers and
+    tensor-valued node attributes (Constant's `value`, ConstantOfShape's)."""
+    for init in model.graph.initializer:
+        if init.data_type == _BFLOAT16:
+            yield init
+    for node in model.graph.node:
+        for attr in node.attribute:
+            if (attr.type == onnx.AttributeProto.TENSOR
+                    and attr.t.data_type == _BFLOAT16):
+                yield attr.t
+
+
+def _bf16_storage_to_raw(model) -> int:
+    """Move bf16 payloads stored in `int32_data` into `raw_data`, in place.
+
+    ONNX allows a 16-bit float tensor either way: `raw_data` bytes, or one
+    uint16 bit pattern per `int32_data` element (what
+    `helper.make_tensor(..., raw=False)` writes). The normalization below
+    reads `raw_data` only; an fp16 tensor in `int32_data` was never affected
+    because numpy_helper decodes it wherever it reads it, while a bf16 one
+    became an EMPTY payload ("cannot reshape array of size 0") -- or, with the
+    widen/downcast labelling it FLOAT16, bf16 bit patterns read as fp16. The
+    bits are moved, not converted, so the result is exact. Returns how many.
+    """
+    moved = 0
+    for t in _bf16_tensors(model):
+        if t.raw_data or not len(t.int32_data):
+            continue
+        bits = np.asarray(t.int32_data, dtype=np.uint32).astype(np.uint16)
+        t.raw_data = np.ascontiguousarray(bits).astype("<u2").tobytes()
+        t.ClearField("int32_data")
+        moved += 1
+    return moved
+
+
 def _downcast_bfloat16(model, act: str = "fp16") -> int:
     """Rewrite every bfloat16 tensor in the model to float16, in place.
 
@@ -430,6 +466,7 @@ def _downcast_bfloat16(model, act: str = "fp16") -> int:
     a table whose own magnitudes are ~50.
     """
     count = 0
+    _bf16_storage_to_raw(model)
     init_names = {init.name for init in model.graph.initializer}
     forced_fp32 = _consumer_runs_fp32(model.graph, init_names)
     # A bf16 MatMulBnb4 absmax becomes the fp32 nf4 scale table
@@ -437,6 +474,13 @@ def _downcast_bfloat16(model, act: str = "fp16") -> int:
     # make the import lossy, while bf16 -> fp32 is exact.
     forced_fp32 |= {node.input[2] for node in model.graph.node
                     if node.op_type == "MatMulBnb4" and len(node.input) > 2}
+    # Same for a DequantizeLinear scale: per-column int8 scales sit well
+    # below fp16's smallest normal (6.1e-5), where an fp16 scale keeps only a
+    # few significant bits (or flushes to 0). bf16 -> fp32 keeps it exact, and
+    # the pre-quantized import takes an fp32 (or bf16) scale.
+    forced_fp32 |= {node.input[1] for node in model.graph.node
+                    if node.op_type == "DequantizeLinear"
+                    and len(node.input) > 1}
     widened = 0
     to_fp32 = act == "bf16"
     for init in model.graph.initializer:
@@ -466,6 +510,26 @@ def _downcast_bfloat16(model, act: str = "fp16") -> int:
                 else:
                     attr.t.raw_data = _bf16_bytes_to_fp16(attr.t.raw_data)
                     attr.t.data_type = _FLOAT16
+                count += 1
+            elif (not to_fp32 and node.op_type == "Cast"
+                    and attr.name == "to" and attr.i == _BFLOAT16):
+                # The fourth place a dtype is spelled. The value_info loop
+                # above already declared this Cast's output FLOAT16, so a `to`
+                # left at BFLOAT16 contradicted its own declaration: the
+                # usual bf16 export (fp32 I/O, Cast(to=bf16) in, Cast(to=fp32)
+                # out) then reached the FP16 domain pass as a bf16 island, the
+                # pass refused it, and the artifact bound bf16 activations to
+                # fp16 weights -- where the same graph exported in fp16
+                # converts cleanly. Under --act bf16 (`to_fp32`) the Cast is
+                # left alone: the bf16 domain pass owns it.
+                attr.i = _FLOAT16
+                count += 1
+            elif (node.op_type == "DequantizeLinear"
+                    and attr.name == "output_dtype"
+                    and attr.i == _BFLOAT16):
+                # opset 21's explicit output type: follows the value_info
+                # loop above, which declared the output at the target width.
+                attr.i = _FLOAT32 if to_fp32 else _FLOAT16
                 count += 1
     return count
 
@@ -566,6 +630,8 @@ class ModelConverter:
         # 16-bit operand there is read at half density instead of rounded.
         # _downcast_bfloat16 widens those to fp32 (see its docstring).
         bf16_sources = {}
+        # Before the stash, which (like the normalization) reads raw_data.
+        _bf16_storage_to_raw(model)
         if keep_bf16 or quant == "bf16":
             bf16_sources = bf16_weights.stash_sources(model)
             if bf16_sources:

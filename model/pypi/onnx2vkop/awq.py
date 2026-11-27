@@ -250,6 +250,27 @@ def _find_fold(dag_model, mm_node, s):
     return _Fold(reason="view chain too long")
 
 
+def _bf16_init_to_f32(init) -> np.ndarray:
+    """A BFLOAT16 initializer's values as float32 -- exact (bf16 is fp32's
+    high half), from raw_data or int32_data, whatever numpy_helper's bf16
+    support on the installed onnx."""
+    from .bf16_weights import bf16_bits_to_fp32
+    if init.raw_data:
+        bits = np.frombuffer(init.raw_data, dtype="<u2")
+    else:
+        bits = np.asarray(init.int32_data, dtype=np.uint32).astype(np.uint16)
+    return bf16_bits_to_fp32(bits).reshape(tuple(int(d) for d in init.dims))
+
+
+def _f32_to_bf16_init(values, name):
+    from onnx import helper
+    from .bf16_weights import fp32_to_bf16_bits
+    bits = fp32_to_bf16_bits(np.asarray(values, dtype=np.float32))
+    return helper.make_tensor(name, TensorProto.BFLOAT16, list(bits.shape),
+                              np.ascontiguousarray(bits).astype("<u2")
+                              .tobytes(), raw=True)
+
+
 def _fold_into_norm(dag_model, norm, s):
     """1/s into the norm's scale initializer.
 
@@ -264,9 +285,14 @@ def _fold_into_norm(dag_model, norm, s):
     w_init = dag_model.initializers.get(w_name)
     if w_init is None:
         return _Fold(reason=f"{norm.op_type} scale '{w_name}' is not constant")
-    if w_init.data_type not in (1, 10):  # FLOAT, FLOAT16
+    if w_init.data_type not in (1, 10, 16):  # FLOAT, FLOAT16, BFLOAT16
         return _Fold(reason=f"{norm.op_type} scale '{w_name}' is not float")
-    wk = np.asarray(numpy_helper.to_array(w_init), dtype=np.float32)
+    # BFLOAT16 is what the --act bf16 domain pass (which runs before AWQ)
+    # makes of a norm scale, as the fp16 pass makes FLOAT16 of it; refusing
+    # it left every AWQ weight of a --act bf16 conversion on the plain grid.
+    is_bf16 = w_init.data_type == TensorProto.BFLOAT16
+    wk = (_bf16_init_to_f32(w_init) if is_bf16 else
+          np.asarray(numpy_helper.to_array(w_init), dtype=np.float32))
     if wk.ndim != 1:
         return _Fold(reason=f"{norm.op_type} scale '{w_name}' is not 1-D")
     if wk.size != s.size:
@@ -277,9 +303,14 @@ def _fold_into_norm(dag_model, norm, s):
 
     def _apply():
         new = wk * inv
-        out = numpy_helper.from_array(
-            new.astype(np.float16 if w_init.data_type == 10 else np.float32),
-            w_name)
+        if is_bf16:
+            # Stays bf16, rounded once (RNE) like the fp16 case below.
+            out = _f32_to_bf16_init(new, w_name)
+        else:
+            out = numpy_helper.from_array(
+                new.astype(np.float16 if w_init.data_type == 10
+                           else np.float32),
+                w_name)
         dag_model.initializers[w_name] = out
 
     return _Fold(apply_fn=_apply, consumed=f"norm '{norm.name}'")
