@@ -15,10 +15,9 @@
 //   * run the graph N times as a sampler would, with an Euler step in between,
 //   * build the VAE decoder's rotary position grid,
 //
-// and then report what came back. It is a *smoke/soak* driver: it proves the
-// converted graphs load on this device and produce finite values at the shape
-// contract the exporter documented. It does not claim the output looks like a
-// video -- with no text encoder wired in here the conditioning is synthetic.
+// and then report what came back. Without --prompt, conditioning is synthetic
+// and the run is only a graph smoke/soak test. With --prompt, the tokenizer and
+// text tower provide encoder_hidden_states before the denoiser is loaded.
 //
 // Usage:
 //   minimax_h3 --transformer TF.vkopbin [options]
@@ -32,7 +31,7 @@
 //   --latent-w N         latent width,  patch 2 -> rows = w/2 (default 4)
 //   --audio-latents N    audio latents; rows = N * 2 channels (default 4)
 //   --no-audio           drive the video-only graph variant
-//   --save DIR           write `sample.f32`, `audio_sample.f32`, `video.f16`
+//   --save DIR           write samples plus `video.f16`, `.bf16`, or `.f32`
 //
 // Build: cmake -DENABLE_EXAMPLE=ON .. && make minimax_h3
 //
@@ -43,6 +42,7 @@
 // are the ROW counts.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -110,6 +110,13 @@ struct Options {
     std::string prompt;
     std::string tokenizer_path;
     std::string checkpoint_dir;
+    // The adaln "prelude" graph. When the denoiser was sliced by
+    // `h3_split_adaln.py`, its 50 `adaln_proj.linear` weights (6.5 GB, 35% of
+    // the artifact) are gone from the body and each block reads a precomputed
+    // `adaln_table_<b>` input instead. This graph is `temb -> adaln_table_b`
+    // for all b, so the tables are built once for every distinct timestep the
+    // sampler will visit, before the body is loaded.
+    std::string prelude_path;
     // The VAE's `config.json`, for `latents_mean`/`latents_std`.
     std::string vae_config;
     int steps = 2;
@@ -127,10 +134,16 @@ void usage(const char *argv0) {
         stderr,
         "Usage: %s [--transformer TF.vkopbin] [--vae VAE.vkopbin]\n"
         "          [--text-encoder TE.vkopbin] [options]\n"
-        "  --prompt TEXT      real prompt (needs --tokenizer and --text-encoder)\n"
+        "  --prompt TEXT      prompt to tokenize as-is (needs --tokenizer and\n"
+        "                     --text-encoder); no chat template is added\n"
         "  --tokenizer BIN    tokenizer .bin (qwen3_vl.bin works: H3's is the\n"
         "                     same Qwen2 tokenizer, byte-identical)\n"
         "  --checkpoint DIR   H3 checkpoint dir (supplies the timestep MLP)\n"
+        "  --prelude PRE.vkopbin\n"
+        "                     adaln prelude graph, for a denoiser sliced by\n"
+        "                     h3_split_adaln.py: builds every adaln table once\n"
+        "                     instead of keeping 6.5 GB of adaln weights\n"
+        "                     resident during denoising\n"
         "  --vae-config JSON  the VAE's config.json (latents_mean/std); with it\n"
         "                     the decoder receives de-normalized latents\n"
         "  --steps N          denoising steps (default 2)\n"
@@ -169,6 +182,8 @@ bool parse_args(int argc, char **argv, Options &o) {
             o.tokenizer_path = argv[++i];
         } else if (a == "--checkpoint" && i + 1 < argc) {
             o.checkpoint_dir = argv[++i];
+        } else if (a == "--prelude" && i + 1 < argc) {
+            o.prelude_path = argv[++i];
         } else if (a == "--vae-config" && i + 1 < argc) {
             o.vae_config = argv[++i];
         } else if (a == "--steps" && next_int(argc, argv, i, o.steps)) {
@@ -262,6 +277,37 @@ void upload_float(const std::shared_ptr<Runtime> &rt,
     } else {
         upload<uint16_t>(rt, pool, name, f32_to_f16(host), dims);
     }
+}
+
+std::vector<float> tensor_to_float(
+    const std::shared_ptr<ITensor> &tensor,
+    const std::shared_ptr<VulkanCommandPool> &pool = {}) {
+    if (!tensor) {
+        throw std::runtime_error("cannot decode a null tensor");
+    }
+    if (tensor->dtype() == typeid(float)) {
+        auto typed = as_tensor<float>(tensor);
+        if (pool) typed->copyToCPU(pool);
+        return {typed->data().begin(), typed->data().end()};
+    }
+    if (tensor->dtype() == typeid(uint16_t)) {
+        auto typed = as_tensor<uint16_t>(tensor);
+        if (pool) typed->copyToCPU(pool);
+        std::vector<float> out(typed->num_elements());
+        const auto kind = tensor->elem_kind();
+        if (kind != vkop::core::ElemKind::kBFloat16 &&
+            kind != vkop::core::ElemKind::kFloat16) {
+            throw std::runtime_error(
+                "16-bit tensor is neither fp16 nor bfloat16");
+        }
+        const bool bf16 = kind == vkop::core::ElemKind::kBFloat16;
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i] = bf16 ? vkop::core::bf16_to_float((*typed)[i])
+                          : ITensor::fp16_to_fp32((*typed)[i]);
+        }
+        return out;
+    }
+    throw std::runtime_error("unsupported floating tensor storage type");
 }
 
 void upload_i64(const std::shared_ptr<Runtime> &rt,
@@ -545,31 +591,18 @@ struct Stats {
     double mean = 0.0;
 };
 
-// Read one output back and summarize it. `fp16` picks the decoder for the
-// stored bytes; a converted fp16 graph writes halfs even for an fp32-typed
-// accessor, so the caller passes the graph's dtype.
+// Read one output back and summarize it using the tensor's declared element
+// kind, since fp16 and bf16 share the same uint16_t host container.
 Stats summarize(const std::shared_ptr<Runtime> &rt,
                 const std::shared_ptr<VulkanCommandPool> &pool,
-                const std::string &name, bool fp16) {
+                const std::string &name) {
     Stats s;
     auto t = rt->GetOutput(name);
     if (!t) {
         std::printf("  %-16s <no such graph output>\n", name.c_str());
         return s;
     }
-    std::vector<float> host;
-    if (fp16) {
-        auto typed = as_tensor<uint16_t>(t);
-        typed->copyToCPU(pool);
-        host.resize(typed->num_elements());
-        for (size_t i = 0; i < host.size(); ++i) {
-            host[i] = vkop::core::ITensor::fp16_to_fp32((*typed)[i]);
-        }
-    } else {
-        auto typed = as_tensor<float>(t);
-        typed->copyToCPU(pool);
-        host.assign(typed->data().begin(), typed->data().end());
-    }
+    const std::vector<float> host = tensor_to_float(t, pool);
     s.n = host.size();
     if (host.empty()) {
         std::printf("  %-16s empty\n", name.c_str());
@@ -712,6 +745,9 @@ int main(int argc, char **argv) {
         qwen::Tokenizer tok;
         tok.load(opt.tokenizer_path);
         const std::vector<uint32_t> ids = tok.encode(opt.prompt);
+        if (ids.empty()) {
+            throw std::runtime_error("--prompt produced no input tokens");
+        }
         n_text_tokens = static_cast<int>(ids.size());
         std::printf("\n[text] prompt -> %d token(s)\n", n_text_tokens);
 
@@ -744,15 +780,25 @@ int main(int argc, char **argv) {
         rt_te->ReadResult();
         auto pe = rt_te->GetOutput("prompt_embeds");
         if (!pe) throw std::runtime_error("text encoder produced no prompt_embeds");
-        const bool pe_fp16 = pe->dtype() == typeid(uint16_t);
-        prompt_embeds.resize(static_cast<size_t>(n_text_tokens) * kTextFeatureDim);
-        if (pe_fp16) {
-            auto t = as_tensor<uint16_t>(pe);
-            for (size_t i = 0; i < prompt_embeds.size(); ++i)
-                prompt_embeds[i] = vkop::core::ITensor::fp16_to_fp32((*t)[i]);
-        } else {
-            auto t = as_tensor<float>(pe);
-            prompt_embeds.assign(t->data().begin(), t->data().end());
+        const std::vector<int> pe_shape = pe->getShape();
+        if (pe_shape.size() != 3 || pe_shape[0] != 1 ||
+            pe_shape[1] != n_text_tokens ||
+            pe_shape[2] != kTextFeatureDim) {
+            throw std::runtime_error(
+                "text encoder prompt_embeds shape must be [1, seq, 5120]");
+        }
+        prompt_embeds = tensor_to_float(pe);
+        // Diagnostic: `VKOP_H3_TEXT_SCALE=<f>` multiplies prompt_embeds before
+        // it reaches the denoiser. Qwen3-VL's `hidden_states[50]` is
+        // pre-final-norm and carries outlier channels (absmax ~1.5e4 against a
+        // mean near 0.4), so this isolates "the conditioner's scale" from "the
+        // denoiser's math" when a run goes non-finite.
+        if (const char *ts = std::getenv("VKOP_H3_TEXT_SCALE")) {
+            const float f = std::strtof(ts, nullptr);
+            if (f != 1.0F && std::isfinite(f) && f != 0.0F) {
+                for (float &x : prompt_embeds) x *= f;
+                std::printf("[text] prompt_embeds scaled by %.6g\n", f);
+            }
         }
         double sum = 0.0F, amax = 0.0F;
         size_t nonfinite = 0;
@@ -823,6 +869,92 @@ int main(int argc, char **argv) {
                     temb_times.front(), temb_times.back(),
                     *std::max_element(step_row_count.begin(),
                                       step_row_count.end()));
+    }
+
+    // -----------------------------------------------------------------
+    // adaln prelude: build every timestep's modulation table up front
+    // -----------------------------------------------------------------
+    //
+    // A denoiser sliced by `h3_split_adaln.py` carries no `adaln_proj.linear`
+    // weights; each block reads a graph input `adaln_table_<b>` of shape
+    // `[T, 6, 5376]` instead. Those are a pure function of the timestep
+    // (`linear(silu(temb))`), and `temb_times` already enumerates every
+    // distinct timestep the whole sampler will visit, so ONE prelude pass
+    // computes them for all steps.
+    //
+    // The phase swap is what makes a 20 GB card hold the released canvas: the
+    // adaln weights are 6.5 GB (35% of the artifact), so peak is
+    // max(prelude, body) instead of their sum. The prelude Runtime is
+    // destroyed before the body is loaded, and the tables travel through host
+    // memory like `prompt_embeds` does.
+    //
+    // Row order is `temb_times`, i.e. the same order `real_temb` is packed in,
+    // so a step's rows are `step_row_offset[step] .. +step_row_count[step]` --
+    // exactly the slice the per-step `temb` upload already uses.
+    std::vector<std::vector<float>> adaln_tables;  // [block][T * 6 * 5376]
+    int adaln_rows = 0;
+    if (!opt.prelude_path.empty()) {
+        try {
+            if (real_temb.empty()) {
+                throw std::runtime_error(
+                    "--prelude needs --checkpoint: the tables are a function\n"
+                    "of temb, which the checkpoint's timestep MLP produces");
+            }
+            auto rt_pre = std::make_shared<Runtime>(pool, opt.prelude_path,
+                                                    /*precision=*/0);
+            rt_pre->set_backend_buffer(true);
+            rt_pre->LoadModel();
+            upload_float(rt_pre, pool, "temb", real_temb,
+                         {static_cast<uint32_t>(real_temb.size() / kTembDim),
+                          static_cast<uint32_t>(kTembDim)});
+            const auto t0 = std::chrono::steady_clock::now();
+            rt_pre->Run();
+            rt_pre->ReadResult();
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count();
+
+            // The prelude declares `adaln_table_<b>` for b = 0..N-1 and
+            // nothing else; its count must match the body's inputs or a block
+            // would read a table nobody built.
+            for (int b = 0;; ++b) {
+                auto t = rt_pre->GetOutput("adaln_table_" + std::to_string(b));
+                if (!t) break;
+                std::vector<float> host = tensor_to_float(t);
+                // One row is `6 * hidden` -- six modulation chunks (shift,
+                // scale, gate for msa and mlp). Derived from the tensor rather
+                // than hardcoded so a model with a different hidden width
+                // reports a shape error instead of silently mis-slicing.
+                const auto shape = t->getShape();
+                const size_t row =
+                    shape.empty() ? 0 : static_cast<size_t>(shape.back());
+                if (row == 0 || host.size() % row != 0) {
+                    throw std::runtime_error(
+                        "adaln_table_" + std::to_string(b) + " has " +
+                        std::to_string(host.size()) +
+                        " elements, not a multiple of its last dim");
+                }
+                if (adaln_rows == 0) {
+                    adaln_rows = static_cast<int>(host.size() / row);
+                } else if (static_cast<int>(host.size() / row) != adaln_rows) {
+                    throw std::runtime_error(
+                        "adaln_table_" + std::to_string(b) +
+                        " has a different row count than adaln_table_0");
+                }
+                adaln_tables.push_back(std::move(host));
+            }
+            if (adaln_tables.empty()) {
+                throw std::runtime_error("prelude produced no adaln_table_*");
+            }
+            std::printf(
+                "[prelude] %s\n  %zu block table(s) x [%d, %d] in %.0f ms\n",
+                opt.prelude_path.c_str(), adaln_tables.size(), adaln_rows,
+                6 * 5376, ms);
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "prelude: %s\n", e.what());
+            return 1;
+        }
+        // The prelude Runtime dies here, taking its 6.5 GB with it.
     }
 
     // -----------------------------------------------------------------
@@ -920,6 +1052,69 @@ int main(int argc, char **argv) {
             upload_i64(rt, pool, "text_indices", l.text_indices,
                        {static_cast<uint32_t>(l.n_text)});
 
+            // The sliced denoiser's adaln tables. Uploaded ONCE: the tables
+            // span every timestep the sampler visits, and `timestep_indices`
+            // (uploaded per step below) is what selects rows out of them.
+            //
+            // A body that expects a table the prelude did not build reads
+            // whatever the runtime left in the buffer -- measured all zeros,
+            // which zeroes AdaLN's shift/scale/gate and silently removes both
+            // the timestep and the conditioning from every block. That is not
+            // a crash, so it has to be checked here.
+            if (!adaln_tables.empty()) {
+                if (adaln_rows != step_row_offset[static_cast<size_t>(steps)]) {
+                    throw std::runtime_error(
+                        "prelude built " + std::to_string(adaln_rows) +
+                        " adaln row(s) but the sampler visits " +
+                        std::to_string(
+                            step_row_offset[static_cast<size_t>(steps)]) +
+                        "; the two disagree on the timestep grid");
+                }
+                for (size_t b = 0; b < adaln_tables.size(); ++b) {
+                    const std::string name = "adaln_table_" + std::to_string(b);
+                    auto probe = rt->GetInput(name);
+                    if (!probe) {
+                        throw std::runtime_error(
+                            "prelude built " + std::to_string(adaln_tables.size()) +
+                            " table(s) but this denoiser has no graph input `" +
+                            name +
+                            "`; the prelude and the body come from different "
+                            "splits");
+                    }
+                    // Shape the upload like the body declares it ([T, 6, h]),
+                    // not like the prelude emits it ([T, 6*h]): the element
+                    // count is identical and the body's own dims are what its
+                    // `Shape(adaln_table_b)` slice arithmetic reads.
+                    std::vector<uint32_t> dims;
+                    dims.push_back(static_cast<uint32_t>(adaln_rows));
+                    const auto in_shape = probe->getShape();
+                    for (size_t d = 1; d < in_shape.size(); ++d) {
+                        dims.push_back(static_cast<uint32_t>(in_shape[d]));
+                    }
+                    upload_float(rt, pool, name, adaln_tables[b], dims);
+                }
+                std::printf("  adaln: %zu table(s) x %d row(s) uploaded\n",
+                            adaln_tables.size(), adaln_rows);
+            } else if (rt->GetInput("adaln_table_0")) {
+                // The body was sliced but no prelude was given. Every block's
+                // modulation would be whatever the buffer happened to hold.
+                throw std::runtime_error(
+                    "this denoiser takes `adaln_table_*` inputs (it was sliced "
+                    "by h3_split_adaln.py) but --prelude was not given; its\n"
+                    "AdaLN modulation would be uninitialized");
+            }
+
+            // `pack_order` is NOT audio-only. The body's row-to-source mapping
+            // gathers through it whether or not audio rows exist: with
+            // `n_audio == 0` it is still a `[seq]` permutation (text then
+            // video), and leaving it unuploaded made the graph gather through
+            // whatever the buffer happened to hold -- measured as a 5376-wide
+            // adaln operand at +-3.4e10 and a scalar at 2.2e17 in a run that
+            // otherwise produced finite output. Uploading it unconditionally
+            // is what `build_packed_layout` already computes.
+            upload_i64(rt, pool, "pack_order", l.pack_order,
+                       {static_cast<uint32_t>(l.seq)});
+
             const bool joint = l.n_audio > 0;
             if (joint) {
                 upload_float(rt, pool, "audio_hidden_states", audio,
@@ -927,8 +1122,6 @@ int main(int argc, char **argv) {
                               kAudioFeatureDim});
                 upload_i64(rt, pool, "audio_indices", l.audio_indices,
                            {static_cast<uint32_t>(l.n_audio)});
-                upload_i64(rt, pool, "pack_order", l.pack_order,
-                           {static_cast<uint32_t>(l.seq)});
             }
 
             // `sigmas` was built before the timestep MLP: it doubles as the
@@ -974,15 +1167,14 @@ int main(int argc, char **argv) {
                     ++failures;
                     break;
                 }
-                const bool fp16 = s->dtype() == typeid(uint16_t);
                 rt->ReadResult();
                 // Feed the velocity back through one Euler step, then upload
                 // the next x_t. Readback is a host->device round trip, which is
                 // exactly what a sampler does between steps.
-                Stats st = summarize(rt, pool, "sample", fp16);
+                Stats st = summarize(rt, pool, "sample");
                 if (st.nonfinite != 0) ++failures;
                 if (joint) {
-                    Stats at = summarize(rt, pool, "audio_sample", fp16);
+                    Stats at = summarize(rt, pool, "audio_sample");
                     if (at.nonfinite != 0) ++failures;
                 }
                 if (st.n == 0) break;
@@ -990,16 +1182,7 @@ int main(int argc, char **argv) {
                 // Reuse the last step's velocity rather than re-reading it: a
                 // real sampler reads `sample` and applies the scheduler, which
                 // is the same shape the graph wrote.
-                std::vector<float> vel;
-                if (fp16) {
-                    auto typed = as_tensor<uint16_t>(s);
-                    vel.resize(typed->num_elements());
-                    for (size_t i = 0; i < vel.size(); ++i)
-                        vel[i] = vkop::core::ITensor::fp16_to_fp32((*typed)[i]);
-                } else {
-                    auto typed = as_tensor<float>(s);
-                    vel.assign(typed->data().begin(), typed->data().end());
-                }
+                const std::vector<float> vel = tensor_to_float(s);
                 euler_step(video, vel, sigmas[step], sigmas[step + 1]);
                 upload_float(rt, pool, "hidden_states", video,
                              {1, static_cast<uint32_t>(l.n_video),
@@ -1007,16 +1190,7 @@ int main(int argc, char **argv) {
                 if (joint && !audio.empty()) {
                     auto a = rt->GetOutput("audio_sample");
                     if (a) {
-                        std::vector<float> avel;
-                        if (fp16) {
-                            auto typed = as_tensor<uint16_t>(a);
-                            avel.resize(typed->num_elements());
-                            for (size_t i = 0; i < avel.size(); ++i)
-                                avel[i] = vkop::core::ITensor::fp16_to_fp32((*typed)[i]);
-                        } else {
-                            auto typed = as_tensor<float>(a);
-                            avel.assign(typed->data().begin(), typed->data().end());
-                        }
+                        const std::vector<float> avel = tensor_to_float(a);
                         // The audio rows step down their OWN schedule
                         // (`audio_scheduler/`, shift 3), not the video one.
                         euler_step(audio, avel, audio_sigmas[step],
@@ -1107,8 +1281,7 @@ int main(int argc, char **argv) {
             rt->ReadResult();
 
             auto pe = rt->GetOutput("prompt_embeds");
-            const bool fp16 = pe && pe->dtype() == typeid(uint16_t);
-            Stats st = summarize(rt, pool, "prompt_embeds", fp16);
+            Stats st = summarize(rt, pool, "prompt_embeds");
             if (st.nonfinite != 0) ++failures;
         } catch (const std::exception &e) {
             std::fprintf(stderr, "text_encoder: %s\n", e.what());
@@ -1198,20 +1371,24 @@ int main(int argc, char **argv) {
             rt->ReadResult();
 
             auto v = rt->GetOutput("video");
-            const bool fp16 = v && v->dtype() == typeid(uint16_t);
-            Stats st = summarize(rt, pool, "video", fp16);
+            Stats st = summarize(rt, pool, "video");
             if (st.nonfinite != 0) ++failures;
 
             if (!opt.save_dir.empty() && v) {
-                std::string path = opt.save_dir + "/video.f16";
+                const bool packed16 = v->dtype() == typeid(uint16_t);
+                const bool bf16 =
+                    v->elem_kind() == vkop::core::ElemKind::kBFloat16;
+                const std::string suffix =
+                    packed16 ? (bf16 ? ".bf16" : ".f16") : ".f32";
+                std::string path = opt.save_dir + "/video" + suffix;
                 std::FILE *f = std::fopen(path.c_str(), "wb");
                 if (f) {
-                    if (fp16) {
+                    if (packed16) {
                         auto typed = as_tensor<uint16_t>(v);
                         std::fwrite(&(*typed)[0], sizeof(uint16_t),
                                     typed->num_elements(), f);
-                        std::printf("  saved %s (%d halfs)\n", path.c_str(),
-                                    typed->num_elements());
+                        std::printf("  saved %s (%d 16-bit values)\n",
+                                    path.c_str(), typed->num_elements());
                     } else {
                         auto typed = as_tensor<float>(v);
                         std::fwrite(&(*typed)[0], sizeof(float),
@@ -1229,17 +1406,23 @@ int main(int argc, char **argv) {
                 const int pw_px = width * kVaePatch;
                 const size_t need =
                     static_cast<size_t>(3) * pw_frames * ph_px * pw_px;
-                std::vector<float> f32;
-                if (fp16) {
-                    auto typed = as_tensor<uint16_t>(v);
-                    f32.resize(typed->num_elements());
-                    for (size_t i = 0; i < f32.size(); ++i)
-                        f32[i] = ITensor::fp16_to_fp32((*typed)[i]);
-                } else {
-                    auto typed = as_tensor<float>(v);
-                    f32.assign(typed->data().begin(), typed->data().end());
-                }
+                const std::vector<float> f32 = tensor_to_float(v);
                 if (f32.size() == need) {
+                    // Count non-finite pixels once: the clamp below turns NaN
+                    // into 0.0 and Inf into 1.0, so a fully broken decode still
+                    // writes a plausible-looking image. Say so instead.
+                    size_t bad = 0;
+                    for (float x : f32) {
+                        if (!std::isfinite(x)) ++bad;
+                    }
+                    if (bad != 0) {
+                        std::fprintf(stderr,
+                                     "  vae: %zu/%zu decoded values are not "
+                                     "finite -- the PNGs below are clamped, not "
+                                     "the model's output\n",
+                                     bad, f32.size());
+                        ++failures;
+                    }
                     const float im_mean[3] = {0.485F, 0.456F, 0.406F};
                     const float im_std[3] = {0.229F, 0.224F, 0.225F};
                     const size_t plane =

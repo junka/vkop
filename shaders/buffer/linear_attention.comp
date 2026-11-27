@@ -46,6 +46,19 @@
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
+// bf16 shares this kernel's geometry with fp16 (16-bit storage, two per uint
+// word); -DBF16 swaps only the word-to-float step. Routing the decode/pack
+// sites through these names is what keeps a bf16 graph from being read with
+// fp16's 5-bit exponent -- a silent numeric corruption, not a crash.
+#ifdef BF16
+#include "../common/bf16.comp"
+#define OPS_DEC2(w) unpackBF16x2(w)
+#define OPS_ENC2(v) packBF16x2(v)
+#else
+#define OPS_DEC2(w) unpackHalf2x16(w)
+#define OPS_ENC2(v) packHalf2x16(v)
+#endif
+
 #define MAX_HEAD_DIM 128
 
 // Reading q/k/v/g/beta: identical in both fp16 layouts (BUF_LOAD handles the
@@ -288,7 +301,7 @@ void main() {
             const int c0 = 2 * lane;
             const int c1 = c0 + 1;
             vec2 p = vec2(s_out[c0], c1 < dv ? s_out[c1] : 0.0);
-            uOut.data[obase / 2u + uint(lane)] = packHalf2x16(p);
+            uOut.data[obase / 2u + uint(lane)] = OPS_ENC2(p);
         }
 #else
         if (col_ok) {

@@ -1304,6 +1304,19 @@ class InferenceServer {
         // is what the client waits for before the first token, last_run_ms is
         // the per-dispatch cost at the end of the context.
         const auto prefill_t0 = std::chrono::steady_clock::now();
+        // Snapshot the paging counters HERE, not after the prefill. The hook
+        // fires on every Run(), and a request's DECODE is a Run() per token, so
+        // whatever the previous request's decode accumulated is still in these
+        // counters when this prefill starts. Printing the raw values labelled
+        // "this prefill" therefore over-reported by the previous request's
+        // decode on every request after the first (measured: 113, 904, 1582,
+        // 7232 page-ins for a 113-band model -- exactly 8x, 6x and 64x, the
+        // previous answers' token counts). Subtracting the snapshot makes the
+        // line mean what it says.
+        const size_t page_calls_at_start = page_calls_;
+        const size_t page_bytes_at_start = page_bytes_;
+        const double page_host_ms_at_start = page_host_ms_;
+        const double page_device_ms_at_start = page_device_ms_;
         for (int blk = 0; blk < n_chunks; ++blk) {
             const int A = P + blk * C_max;                     // absolute start
             const int C = std::min(C_max, P + S - A);
@@ -1435,13 +1448,16 @@ class InferenceServer {
                     L, P, n_chunks, prefill_ms, last_run_ms, next_id);
         if (pager_) {
             // Paging cost is the other half of the trade: the arena freed the
-            // VRAM, and this is what it charged per prefill.
+            // VRAM, and this is what it charged for THIS prefill. The counters
+            // are left running (the decode that follows pages too, and its cost
+            // is worth knowing) -- see the snapshot above for why the deltas,
+            // not the raw totals, are printed.
             std::printf("[serve] paging: %zu page-in(s), %.1f MiB moved "
                         "(host %.0f ms + device %.0f ms)\n",
-                        page_calls_, page_bytes_ / 1048576.0, page_host_ms_,
-                        page_device_ms_);
-            page_calls_ = page_bytes_ = 0;
-            page_host_ms_ = page_device_ms_ = 0.0;
+                        page_calls_ - page_calls_at_start,
+                        (page_bytes_ - page_bytes_at_start) / 1048576.0,
+                        page_host_ms_ - page_host_ms_at_start,
+                        page_device_ms_ - page_device_ms_at_start);
         }
         std::fflush(stdout);
 
@@ -1673,8 +1689,12 @@ const char *kUsage =
     "\n"
     "  --page-weights  stream the single-consuming-level weights from the\n"
     "                  artifact through one shared VRAM arena instead of\n"
-    "                  keeping them all resident (needs the disk read to be\n"
-    "                  fast: every token re-reads every paged band).\n"
+    "                  keeping them all resident. It buys VRAM with speed:\n"
+    "                  every paged band is re-read on every token, and a\n"
+    "                  shared slot settles the device before each page-in\n"
+    "                  (measured on 2B: 5174 -> 2494 MiB resident, prefill\n"
+    "                  103 -> 2733 ms). Prefer float:MiB with a budget that\n"
+    "                  keeps most of the model resident over `all`.\n"
     "                  all        page every pageable weight (smallest VRAM)\n"
     "                  float:MiB  keep the largest bands resident up to this\n"
     "                             budget, page the rest\n"

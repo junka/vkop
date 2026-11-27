@@ -41,6 +41,19 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+// bf16 shares this kernel's geometry with fp16 (16-bit storage, two per uint
+// word); -DBF16 swaps only the word-to-float step. Routing the decode/pack
+// sites through these names is what keeps a bf16 graph from being read with
+// fp16's 5-bit exponent -- a silent numeric corruption, not a crash.
+#ifdef BF16
+#include "../common/bf16.comp"
+#define OPS_DEC2(w) unpackBF16x2(w)
+#define OPS_ENC2(v) packBF16x2(v)
+#else
+#define OPS_DEC2(w) unpackHalf2x16(w)
+#define OPS_ENC2(v) packHalf2x16(v)
+#endif
+
 // The state tail is at most this long; Qwen3.5 uses K=4 (state_len 3).
 #define MAX_STATE 32
 
@@ -165,7 +178,7 @@ void conv_mode(const int gid) {
     vec2 p;
     p.x = conv_element(2 * gid);
     p.y = (2 * gid + 1 < uConv1d.total) ? conv_element(2 * gid + 1) : 0.0;
-    uOutput.data[gid] = packHalf2x16(p);
+    uOutput.data[gid] = OPS_ENC2(p);
 #else
     uOutput.data[gid] = floatBitsToUint(conv_element(gid));
 #endif

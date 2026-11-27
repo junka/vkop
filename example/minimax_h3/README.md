@@ -19,13 +19,17 @@ is the authority on that split — read it first.
 | `text_encoder` | Qwen3-VL tower → `prompt_embeds` | ✅ full |
 | `audio_vae_decoder` | BigVGAN waveform | ❌ not converted (missing ops) |
 
-`text_encoder` converts and runs. The driver feeds in-vocabulary ids and a
-causal mask (it has no tokenizer), runs the tower, and reports the
-`prompt_embeds` statistics — a smoke test of the graph contract, not a real
-prompt. Wiring it to the denoiser (tokenize → embed → pack → denoise) is the
-production driver's job, so the denoiser here still gets synthetic
-`encoder_hidden_states`; the output is a **finiteness/shape smoke test**, not a
-claim that the video looks right.
+`text_encoder` converts and runs. With `--prompt`, the driver tokenizes the
+provided text, builds the causal mask, runs the tower, and passes
+`prompt_embeds` into the denoiser before loading the denoiser Runtime. Without
+`--prompt`, the denoiser uses synthetic `encoder_hidden_states`; a standalone
+`--text-encoder` run uses in-vocabulary ids only as a graph smoke test.
+
+Prompt preprocessing is not yet verified against a known-good MiniMax-H3
+reference: the driver currently calls `Tokenizer::encode` on the supplied text
+as-is, with no automatic chat template or BOS/EOS insertion. Do not treat a
+finite output as proof of semantic prompt correctness until that input contract
+is confirmed.
 
 ### The text encoder's dtype (a real bug this fixed)
 
@@ -78,7 +82,50 @@ rasterizer proves nothing about the target.
 Knobs: `--steps`, `--text-tokens`, `--latent-frames`, `--latent-h`,
 `--latent-w`, `--audio-latents`, `--no-audio`, `--save DIR`.
 
-### Real conditioning: prompt in, PNG frames out
+### Split artifacts: `--prelude`
+
+The released canvas does not fit beside the denoiser's full resident set: the
+int4 denoiser is 18.6 GB, leaving ~1.8 GiB of a 20 GB card, so the packed
+sequence dies around 180 rows while the real canvas needs 2016.
+`model/exporter/minimax_h3/h3_split_adaln.py` splits the problem in two, because
+`adaln_proj.linear` — 6.5 GB, 35% of the artifact — is a **pure function of the
+timestep**:
+
+* `<stem>_prelude.onnx` — `temb` → `adaln_table_<b>` for every block.
+* `<stem>_body.onnx` — the same graph with each block's adaln `Gemm` replaced by
+  a graph input `adaln_table_<b>` of shape `[T, 6, 5376]`.
+
+Peak is then `max(prelude, body)` instead of their sum: body is 10.7 GB, leaving
+9.6 GiB for activations. `temb_times` already enumerates every distinct
+timestep the sampler visits, so **one** prelude pass builds the tables for all
+steps and the per-step `timestep_indices` selects rows:
+
+```bash
+./minimax_h3 \
+  --prompt "a cat walking on the beach at sunset, cinematic" \
+  --tokenizer    h3_qwen2.bin \
+  --text-encoder text_encoder_fixed.vkopbin \
+  --checkpoint   /data2/wjjdata/minimax-h3/transformer \
+  --prelude      prelude_fix.vkopbin \
+  --transformer  split/body_bf16r.vkopbin \
+  --vae          vae_bf16c.vkopbin \
+  --vae-config   /data2/wjjdata/minimax-h3/vae/config.json \
+  --steps 50 --latent-frames 1 --latent-h 16 --latent-w 16 --save out/
+```
+
+The prelude Runtime is destroyed before the body loads, and the tables travel
+through host memory like `prompt_embeds`.
+
+**A sliced body without `--prelude` is refused, by design.** An unfilled
+`adaln_table_*` buffer reads back as **all zeros**, which zeroes AdaLN's
+shift/scale/gate and silently removes both the timestep and the conditioning
+from every block — no crash, no NaN, just a picture that ignores the prompt and
+barely moves with `--steps`. That was the state that made 4-step and 50-step
+output look identical. The driver checks both directions: it throws if a sliced
+body is given without `--prelude`, and it throws if the prelude's table count or
+row count disagrees with what the body/sampler expects.
+
+### Prompt execution path: prompt in, PNG frames out
 
 Without `--prompt` the driver feeds noise and the frames are noise. The full
 path takes five inputs and produces `frame_NNN.png`:
@@ -155,16 +202,53 @@ prints `OK` has proven: the artifact loads on this device, every graph input's
 recorded dtype and shape line up, the plan executes, and no intermediate
 produced NaN/Inf.
 
-With the five real-conditioning inputs it also proves the host-side contract
-end to end: tokenizer → tower → packed layout → per-step `temb`/indices →
-sampler → un-patchify → de-normalize → decoder → PNG. That is every piece of
-the reference pipeline that lives outside the graphs. It is still not a
-numerical agreement test — for that, compare `prompt_embeds` and `sample`
-against a torch run on the same ids.
+With the five conditioning inputs, the driver executes the host-side path:
+tokenizer → tower → packed layout → per-step `temb`/indices → sampler →
+un-patchify → de-normalize → decoder → PNG. Prompt tokenization/wrapping still
+needs comparison with the reference pipeline, and this is not a numerical
+agreement test — compare `prompt_embeds` and `sample` against a torch run on the
+same ids after confirming the prompt input contract.
 
 Note `prompt_embeds` can show a large `absmax` (~1.5e4): Qwen3-VL's
 `hidden_states[50]` is pre-final-norm and carries outlier channels. That is
 expected and is why the conditioner width is 5120.
+
+### bf16 artifacts: shader changes need a reconversion
+
+`.vkopbin` carries **its own** SPIR-V archive (`model.shader_archive_size`), and
+the runtime reads shaders only from there — `libvkop` links no SPIR-V of its
+own. So editing a shader and rebuilding `vkop_shaders.bin` changes nothing for
+an artifact that is already on disk: the model must be **reconverted**.
+
+While auditing a bf16 build, `cmp`-ing the `-DFP16` and `-DFP16 -DBF16` SPIR-V
+is the right first move, but the verdict depends on how the shader dispatches:
+
+| how the shader picks its width | identical SPIR-V means |
+|---|---|
+| runtime push-constant bit (`uPC.bf16`, as in `matmul.comp`) | **correct** |
+| pure word mover, no decode (`slice`, `concat`, `reshape`) | **correct** |
+| `#ifdef BF16` at compile time (`rotary`, `fused_elemwise`) | **the bf16 path is missing** |
+
+`grep -c BF16 <shader>` returning 0 is not proof of a defect — check which row
+the shader is in. Two real defects found this way:
+
+* `fused_elemwise.comp` — 49 unpack + 51 pack sites hardcoded to fp16, so its
+  `_bf16` module was byte-identical to the fp16 one. 363 nodes in the body.
+* `rotary.comp` — the output pack and the cos/sin decode were both hardcoded to
+  fp16, so bf16 cos/sin were decoded as fp16 and the rotation output landed at
+  1e5…3e6 instead of ~1e1, overflowing the next MatMul to inf. These two are
+  why any `seq` except a lucky few produced NaN.
+
+When a bf16 run goes non-finite, `VKOP_NAN_SCAN=1` only works on a **small**
+geometry (`--latent-h 4 --latent-w 4`): a full-size graph has too many levels
+and dies in `vkCreateSemaphore`. Then `VKOP_DUMP_NODE=<op>` on the reported
+node, and walk the ONNX graph backwards from there.
+
+One caution on that walk: before `rotary` was fixed, only some `seq` values
+produced NaN and the passing ones clustered on `seq % 8 == 0`, which read like an
+alignment or shared-memory race. It was not — different `seq` simply made the
+already-wrong rotation overflow to inf with different probability. A statistical
+pattern in a numeric failure is not evidence about the mechanism.
 
 ### Measured on b3 (RTX 4000 Ada, 2026-11-23/24)
 

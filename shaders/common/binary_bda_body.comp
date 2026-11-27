@@ -22,6 +22,22 @@
 // they leave it undefined).
 
 #include "activation.comp"
+#ifdef BF16
+#include "bf16.comp"
+#endif
+
+// Both 16-bit formats pack two per word; -DBF16 swaps only the word-to-float
+// step. Without this the BDA build decoded bf16 bytes as fp16 -- plausible
+// wrong numbers, not NaNs -- which is the same defect the SSBO body had.
+#ifdef FP16
+#ifdef BF16
+#define BDA_DEC2(w) unpackBF16x2(w)
+#define BDA_ENC2(v) packBF16x2(v)
+#else
+#define BDA_DEC2(w) unpackHalf2x16(w)
+#define BDA_ENC2(v) packHalf2x16(v)
+#endif
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -61,14 +77,14 @@ float bda_activation(float v) {
 float load_elem(int linear, IArr8 out_d, IArr8 in0_d) {
     if (uPC.broadcast == 0) {
 #ifdef FP16
-        return unpackHalf2x16(uInputA.data[linear >> 1])[linear & 1];
+        return BDA_DEC2(uInputA.data[linear >> 1])[linear & 1];
 #else
         return uintBitsToFloat(uInputA.data[linear]);
 #endif
     }
     int ia = broadcast_index(linear, out_d, in0_d, uPC.rank);
 #ifdef FP16
-    return unpackHalf2x16(uInputA.data[ia >> 1])[ia & 1];
+    return BDA_DEC2(uInputA.data[ia >> 1])[ia & 1];
 #else
     return uintBitsToFloat(uInputA.data[ia]);
 #endif
@@ -79,7 +95,7 @@ float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
                  ? linear
                  : broadcast_index(linear, out_d, in1_d, uPC.rank);
 #ifdef FP16
-    return unpackHalf2x16(uInputB.data[ib >> 1])[ib & 1];
+    return BDA_DEC2(uInputB.data[ib >> 1])[ib & 1];
 #else
     return uintBitsToFloat(uInputB.data[ib]);
 #endif
@@ -88,9 +104,9 @@ float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
 void store_elem(int linear, float v) {
 #ifdef FP16
     uint w = uint(linear) >> 1;
-    vec2 p = unpackHalf2x16(uOutput.data[w]);
+    vec2 p = BDA_DEC2(uOutput.data[w]);
     p[uint(linear) & 1u] = v;
-    uOutput.data[w] = packHalf2x16(p);
+    uOutput.data[w] = BDA_ENC2(p);
 #else
     uOutput.data[linear] = floatBitsToUint(v);
 #endif

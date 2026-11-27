@@ -1375,6 +1375,19 @@ if(ENABLE_ASAN)
 endif()
 
 if (ENABLE_EXAMPLE)
+# The Qwen tokenizer ships its own CMake project under llm/tokenizer/. It is
+# added HERE, before example/, because example/minimax_h3 links it for the
+# --prompt path and a target added later in the file is not visible there.
+# Adding it a second time under the ENABLE_LLM_CHAT block below is not an
+# option: llm/tokenizer/tests/CMakeLists.txt declares a `copy_test_data`
+# custom target, and CMake refuses the duplicate.
+#
+# Pulled in as a subdirectory its project() is locally scoped and
+# enable_testing() is a no-op (the top level already called it), so its
+# tokenizer_test joins the top-level ctest cleanly either way.
+if (ENABLE_LLM_CHAT AND EXISTS ${CMAKE_SOURCE_DIR}/llm/tokenizer/CMakeLists.txt)
+    add_subdirectory(llm/tokenizer llm_tokenizer)
+endif ()
 add_subdirectory(example)
 endif ()
 
@@ -1428,7 +1441,10 @@ endforeach()
 # no -lvulkan link is needed here.
 option(ENABLE_LLM_CHAT "Build the LLM conversational driver (llm_chat)" ON)
 if (ENABLE_LLM_CHAT)
-    add_subdirectory(llm/tokenizer llm_tokenizer)
+    # llm/tokenizer was already added above, before example/, because
+    # example/minimax_h3 links it -- see the comment there. Adding it again
+    # here would run llm/tokenizer/tests/CMakeLists.txt twice and CMake
+    # rejects the duplicate `copy_test_data` target.
     add_executable(llm_chat llm/exporter/driver/llm_chat.cpp llm/exporter/driver/conversation.cc)
     target_link_libraries(llm_chat PRIVATE vkop vload tokenizer)
     target_include_directories(llm_chat PRIVATE
@@ -1522,10 +1538,12 @@ endif()
 option(ENABLE_IMAGE_GEN "Build the image generation driver (image_gen)" ON)
 if (ENABLE_IMAGE_GEN)
     # image_gen tokenizes the prompt itself (raw ChatML template -> ids -> text
-    # tower), so it needs the same tokenizer library llm_chat uses. The llm
-    # block normally adds the subdirectory already; only add it a second time
-    # when that option is off (CMake rejects a repeated add_subdirectory).
-    if (NOT ENABLE_LLM_CHAT)
+    # tower), so it needs the same tokenizer library llm_chat uses. The
+    # tokenizer subdirectory is added once, above example/ -- so by here the
+    # target either exists or the option that would add it is off. Guard on the
+    # target, not on ENABLE_LLM_CHAT: CMake rejects a repeated
+    # add_subdirectory of the same source tree.
+    if (NOT TARGET tokenizer AND EXISTS ${CMAKE_SOURCE_DIR}/llm/tokenizer/CMakeLists.txt)
         add_subdirectory(llm/tokenizer llm_tokenizer)
     endif()
     add_executable(image_gen image/exporter/image_gen.cpp)
