@@ -441,7 +441,7 @@ def _bf16_storage_to_raw(model) -> int:
     return moved
 
 
-def _downcast_bfloat16(model, act: str = "fp16") -> int:
+def _downcast_bfloat16(model, act: str = "fp16", slots=()) -> int:
     """Rewrite every bfloat16 tensor in the model to float16, in place.
 
     Under `act == "bf16"` the target is float32 instead, for every tensor: the
@@ -464,7 +464,17 @@ def _downcast_bfloat16(model, act: str = "fp16") -> int:
     them to fp16 produced an artifact that computed garbage -- the entire
     +96808-wide adaln bias read at half density, worth a 5144 absolute error on
     a table whose own magnitudes are ~50.
+
+    `slots` names MoE paging slots to leave alone (initializer and value_info).
+    Their bytes are not here -- `prepare` kept them in the checkpoint, so the
+    tensor is external with an empty raw_data -- and `restore_paging_slots`
+    performs the same bf16 transition `prepare` applies to a streamed weight:
+    FLOAT16 tensor, `src_dtype` BFLOAT16 on the row. Widening one to FLOAT here
+    (--act bf16 widens every tensor) made the slot's dtype describe 4-byte
+    elements of a 2-byte slice, which restore_paging_slots refuses, and made
+    slot_sources record FLOAT as the checkpoint's dtype.
     """
+    slots = set(slots)
     count = 0
     _bf16_storage_to_raw(model)
     init_names = {init.name for init in model.graph.initializer}
@@ -486,6 +496,17 @@ def _downcast_bfloat16(model, act: str = "fp16") -> int:
     for init in model.graph.initializer:
         if init.data_type != _BFLOAT16:
             continue
+        if init.name in slots:
+            # A paging slot's bytes stay in the checkpoint (raw_data is
+            # empty) and keep their 2-byte width: widening one to FLOAT for
+            # an fp32 consumer would describe 4-byte elements of a 2-byte
+            # slice. Under --act fp16 it is declared FLOAT16 and the pager
+            # rounds bf16 -> fp16 on the way in (moe_source_dtype says
+            # bfloat16); under --act bf16 it stays bf16.
+            if not to_fp32:
+                init.data_type = _FLOAT16
+                count += 1
+            continue
         if to_fp32 or init.name in forced_fp32:
             init.raw_data = _bf16_bytes_to_fp32(init.raw_data)
             init.data_type = _FLOAT32
@@ -498,7 +519,10 @@ def _downcast_bfloat16(model, act: str = "fp16") -> int:
     for vi in (list(model.graph.input) + list(model.graph.output)
                + list(model.graph.value_info)):
         if vi.type.tensor_type.elem_type == _BFLOAT16:
-            vi.type.tensor_type.elem_type = _FLOAT32 if to_fp32 else _FLOAT16
+            # A slot's declaration follows the FLOAT16 its tensor becomes in
+            # restore_paging_slots; the bf16 domain pass re-declares it.
+            vi.type.tensor_type.elem_type = (
+                _FLOAT16 if vi.name in slots or not to_fp32 else _FLOAT32)
             count += 1
     for node in model.graph.node:
         for attr in node.attribute:
@@ -640,7 +664,19 @@ class ModelConverter:
         # `act` (--act) picks the normalization target: under --act bf16 a
         # bf16 source goes to float32, which the bf16 domain pass turns back
         # into bf16 exactly (see _downcast_bfloat16).
-        bf16_count = _downcast_bfloat16(model, act)
+        # Paging slots are never widened: under --act bf16 they stay bf16,
+        # under --act fp16 they are declared FLOAT16 (see _downcast_bfloat16).
+        # What each slot's checkpoint bytes really are, taken before the retag
+        # below: under --act fp16 a bf16 slot is declared FLOAT16, and if
+        # slot_sources read that, moe_source_dtype would say float16 and the
+        # pager would copy bf16 bits into the fp16 slot verbatim. Recorded as
+        # the checkpoint dtype, the pager rounds bf16 -> fp16 on the way in.
+        slot_file_dtypes = {}
+        if moe_slots:
+            slot_file_dtypes = {t.name: t.data_type
+                                for t in weight_stream._all_tensors(model)
+                                if t.name in moe_slots}
+        bf16_count = _downcast_bfloat16(model, act, slots=moe_slots)
         if bf16_count or _downcast_stats["widened"]:
             target = "float32" if act == "bf16" else "float16"
             print(f"[bf16] {bf16_count} bfloat16 tensor(s) -> {target}, "
@@ -675,6 +711,9 @@ class ModelConverter:
         moe_sources = {}
         if moe_slots:
             moe_sources = weight_stream.slot_sources(model, base_dir, moe_slots)
+            for n, (loc, off, length, dt) in list(moe_sources.items()):
+                moe_sources[n] = (loc, off, length,
+                                  slot_file_dtypes.get(n, dt))
             restore_paging_slots(model, base_dir, deferred_weights, moe_slots)
         PreQuantizedWeights.strip_fp4_operand_casts(model)
         print("Optimizing ONNX model...")

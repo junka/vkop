@@ -1162,23 +1162,45 @@ class GraphFp16:
                 # the row wrote float16 under the bf16 declaration -- a node
                 # binding bf16 activations to an fp16 weight, which the
                 # runtime refuses, where the in-memory twin got real bf16.
+                #
+                # A MoE paging slot is retagged the same way: its row becomes
+                # a bfloat16 declaration while its bytes stay in the checkpoint
+                # (the writer lays none down for a slot), and the row's
+                # moe_source_dtype keeps naming what the checkpoint holds. A
+                # bf16 checkpoint -- every MoE export -- is then paged in
+                # verbatim, the same bits a streamed bf16 weight gets in the
+                # trailer; an fp16 one is rounded by the pager on the way in
+                # (core/WeightPager.hpp). What a slot cannot get is a `__bf16`
+                # twin: that would be a second, non-slot tensor with no
+                # checkpoint slice of its own, so a slot shared with an island
+                # keeps its width and the warning below.
                 moe = set(getattr(dag_model, "moe_keep_alive", ()) or ())
-                if name not in moe and weight_stream.mark_bf16_payload(
-                        deferred, name, init, target, dag_model.initializers):
+                if ((name not in moe or target == name)
+                        and weight_stream.mark_bf16_payload(
+                            deferred, name, init, target,
+                            dag_model.initializers)):
                     summary["converted"] += 1
-                    # The audit row the in-memory branch below records,
-                    # accumulated from the source band by band.
-                    numeric_audit.record(
-                        target, "bf16",
-                        weight_stream.bf16_payload_roundtrip(deferred[target]))
-                    if verbose:
+                    if name not in moe:
+                        # The audit row the in-memory branch below records,
+                        # accumulated from the source band by band. (A slot
+                        # is converted by the pager at load, not here.)
+                        numeric_audit.record(
+                            target, "bf16",
+                            weight_stream.bf16_payload_roundtrip(
+                                deferred[target]))
+                    if verbose and name in moe:
+                        print(f"{tag} MoE paging slot '{name}' is declared "
+                              "bf16; the runtime pages it from the "
+                              "checkpoint")
+                    elif verbose:
                         print(f"{tag} '{target}' is streamed; its bf16 "
                               "payload is written at trailer time")
                 else:
                     # A row that encodes or reorders its payload (a byte
                     # format, the down_act lane-major fold) or a MoE paging
-                    # slot keeps its width: the write-time conversion only
-                    # covers a plain copy and the gate/up interleave. The
+                    # slot that would need a twin keeps its width: the
+                    # write-time conversion only covers a plain copy and the
+                    # gate/up interleave. The
                     # runtime's bf16 gate refuses the mixed node at load;
                     # mixed_half_kinds exempts weight slots, so say it here.
                     if verbose:

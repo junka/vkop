@@ -60,6 +60,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/DType.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
 #include "model/load.hpp"
@@ -78,6 +79,13 @@ struct PagedSource {
     uint64_t offset = 0;     // byte offset into `path`
     uint64_t size = 0;       // payload bytes; must equal the resident payload
     std::string group;       // band this weight belongs to ("3", "layer:7", ...)
+    // Element format of the bytes at `path` when it differs from the resident
+    // tensor's (InitializerEntry.moe_source_dtype, an ONNX dtype name). Empty
+    // means "same as the buffer": the bytes are copied verbatim. A MoE slot
+    // pages from a bf16 checkpoint, so a bf16 slot (--act bf16) is copied
+    // verbatim and an fp16 one is rounded on the way in; see
+    // convert_half_payload().
+    std::string src_dtype;
 };
 
 // A band is the unit a schedule pages: every weight whose `group` matches is
@@ -170,6 +178,7 @@ class WeightPager {
             // orders by. Falling back to the name keeps a slot pageable even
             // when the exporter left the group empty.
             s.group = in.moe_group;
+            s.src_dtype = in.moe_source_dtype;
             add(std::move(s));
             ++added;
         }
@@ -178,6 +187,43 @@ class WeightPager {
 
     size_t size() const { return by_name_.size(); }
     bool empty() const { return by_name_.empty(); }
+
+    // What a page-in does to bytes of format `src` landing in a buffer of
+    // format `dst`. Only the 2-byte float pair converts, because only it keeps
+    // the byte count (resolve_() checks the source slice against the buffer).
+    // Any other disagreement is refused rather than copied: bf16 bits read as
+    // fp16 (or the reverse) are plausible numbers, not an error, so a verbatim
+    // copy there is a silently wrong model.
+    enum class Convert { kNone, kFp16ToBf16, kBf16ToFp16 };
+    static Convert conversion_for(ElemKind src, ElemKind dst) {
+        if (src == ElemKind::kInvalid || src == dst) return Convert::kNone;
+        if (src == ElemKind::kFloat16 && dst == ElemKind::kBFloat16)
+            return Convert::kFp16ToBf16;
+        if (src == ElemKind::kBFloat16 && dst == ElemKind::kFloat16)
+            return Convert::kBf16ToFp16;
+        throw std::runtime_error(
+            std::string("WeightPager: cannot page ") + elem_name(src) +
+            " bytes into a " + elem_name(dst) +
+            " buffer (only float16 <-> bfloat16 converts on the way in)");
+    }
+
+    // Convert `bytes` of little-endian 16-bit floats in place, with the
+    // converter's rounding so a paged slot holds the bits a trailer copy of it
+    // would: fp16 -> fp32 (exact) -> bf16 round-to-nearest-even
+    // (core::float_to_bf16, as weight_stream.mark_bf16_payload writes), and
+    // bf16 -> fp32 (exact) -> fp16 (ITensor::fp32_to_fp16).
+    static void convert_half_payload(void *data, size_t bytes, Convert how) {
+        if (how == Convert::kNone) return;
+        auto *p = static_cast<unsigned char *>(data);
+        for (size_t i = 0; i + 1 < bytes; i += 2) {
+            uint16_t v;
+            std::memcpy(&v, p + i, sizeof(v));
+            v = how == Convert::kFp16ToBf16
+                    ? float_to_bf16(ITensor::fp16_to_fp32(v))
+                    : ITensor::fp32_to_fp16(bf16_to_float(v));
+            std::memcpy(p + i, &v, sizeof(v));
+        }
+    }
 
     // Derive bands from the graph instead of from converter declarations.
     //
@@ -419,6 +465,7 @@ class WeightPager {
     struct Destination {
         const PagedSource *src = nullptr;
         std::shared_ptr<VulkanBuffer> buf;
+        Convert convert = Convert::kNone;
     };
 
     // Resolve every source to its live destination and check the payload fits.
@@ -448,7 +495,19 @@ class WeightPager {
                     std::to_string(s->size) + " bytes but its buffer holds " +
                     std::to_string(vb->getSize()));
             }
-            out.push_back({s, std::move(vb)});
+            // A declared source format the runtime does not know is refused
+            // here, before any byte moves: kInvalid would read as "same as the
+            // buffer" and copy verbatim.
+            const ElemKind src_kind = s->src_dtype.empty()
+                                          ? ElemKind::kInvalid
+                                          : elem_kind_from_name(s->src_dtype);
+            if (!s->src_dtype.empty() && src_kind == ElemKind::kInvalid) {
+                throw std::runtime_error("WeightPager: '" + s->name +
+                                         "' source dtype '" + s->src_dtype +
+                                         "' is not an element format");
+            }
+            out.push_back(
+                {s, std::move(vb), conversion_for(src_kind, t->elem_kind())});
         }
         return out;
     }
@@ -513,6 +572,8 @@ class WeightPager {
             }
             fm->read_at(base + off, static_cast<size_t>(d.src->size),
                         static_cast<size_t>(d.src->offset));
+            convert_half_payload(base + off, static_cast<size_t>(d.src->size),
+                                 d.convert);
             copies.push_back({off, d.src});
             off += static_cast<size_t>(d.src->size);
         }

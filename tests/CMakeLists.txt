@@ -94,6 +94,7 @@ set(TEST_SOURCES
     Bf16ActivationTest.cpp
     Bf16ElementwiseTest.cpp
     Bf16DataMoveTest.cpp
+    WeightPagerBf16Test.cpp
 )
 
 # Test sources are compiled one TU per file. That used to be a bad deal: every
