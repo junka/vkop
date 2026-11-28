@@ -572,7 +572,8 @@ class ModelConverter:
                          rgba: bool = False,
                          group_size: int = 0,
                          keep_bf16: bool = False,
-                         act: str = "fp16") -> DAGBasedModel:
+                         act: str = "fp16",
+                         exclude=None) -> DAGBasedModel:
         """Parse and convert ONNX model to DAG format.
 
         `group_size` is the 4-bit K group (`-q int4`'s knob). It is needed
@@ -631,9 +632,26 @@ class ModelConverter:
             print(f"[moe] {len(moe_slots)} paging slot(s) declared "
                   f"({len({g for g, _ in moe_slots.values()})} group(s))")
 
+        # --exclude-* (node_patterns, scopes, downstream_of): those weights
+        # are read into memory so the quantizer can skip them by name.
+        # Unnamed nodes get their names only after optimize_model, so a
+        # pattern written against those cannot be matched here; then nothing
+        # streams (the old, whole-model behaviour) rather than letting the
+        # trailer-time quantizer ignore the exclusion.
+        held = set()
+        if exclude and any(exclude):
+            try:
+                held = exclusion.resolve_proto(model, *exclude)
+                print(f"[exclude] {len(held)} weight(s) read into memory, "
+                      f"the rest streams")
+            except exclusion.ExclusionError:
+                held = None
+                print("[exclude] patterns not resolvable on the raw graph "
+                      "(unnamed nodes?): weights not streamed",
+                      file=sys.stderr)
         deferred_weights = weight_stream.prepare(
             model, base_dir, quant=quant, unify=unify, rgba=rgba,
-            group_size=group_size, keep_in_file=moe_slots)
+            group_size=group_size, keep_in_file=moe_slots, hold=held)
 
         # A float32 weight left in its file under a byte format is quantized on
         # the way into the trailer, so its scale has to exist in the graph: this

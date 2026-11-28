@@ -505,3 +505,43 @@ def test_int4_refuses_a_group_that_does_not_divide_k():
         row, _ = _int4_row_and_bytes(out, "W")
         assert row["dtype"] == "float16", (
             "an ungroupable K must leave the weight wide, not ship nibbles")
+
+
+@pytest.mark.parametrize("quant", ["int8", "int4"])
+def test_exclusion_keeps_streaming_the_other_weights(quant):
+    """--exclude-node used to force --stream-weights off (the trailer-time
+    quantizer cannot see an exclusion), which loaded the whole model: a 40 GB
+    DiT was OOM-killed for excluding one 2 MB head. Now the excluded weight
+    alone is read into memory and stays float; every other one still streams
+    and quantizes."""
+    rng = np.random.RandomState(3)
+    wq = (rng.randn(K, N) * 0.05).astype(np.float16)
+    wk = (rng.randn(K, N) * 0.05).astype(np.float16)
+    with tempfile.TemporaryDirectory() as tmp:
+        g = helper.make_graph(
+            [helper.make_node("MatMul", ["X", "Wq"], ["Yq"], name="quantized"),
+             helper.make_node("MatMul", ["X", "Wk"], ["Yk"], name="kept")],
+            "g",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT16, [1, K])],
+            [helper.make_tensor_value_info("Yq", TensorProto.FLOAT16, [1, N]),
+             helper.make_tensor_value_info("Yk", TensorProto.FLOAT16, [1, N])],
+            [numpy_helper.from_array(wq, "Wq"), numpy_helper.from_array(wk, "Wk")])
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+        m.ir_version = 8
+        mp = os.path.join(tmp, "m.onnx")
+        onnx.save_model(m, mp, save_as_external_data=True,
+                        all_tensors_to_one_file=True, location="w.bin",
+                        size_threshold=0)
+        out = os.path.join(tmp, "o.vkopbin")
+        p = subprocess.run(
+            [sys.executable, "-m", "onnx2vkop.cli", "-i", mp, "-o", out,
+             "-q", quant, "--group-size", "64", "--target-backend", "buffer",
+             "--external-blob-mb", "1", "--stream-weights", "on",
+             "--exclude-node", "kept"],
+            capture_output=True, text=True, cwd=PYPI)
+        assert p.returncode == 0, p.stderr[-800:]
+        assert "[stream] streaming 1 initializer(s)" in p.stdout, p.stdout[-1500:]
+        dt = {e["name"]: e.get("dtype")
+              for e in _section(out, "initializers")["initializers"]}
+        assert dt["Wk"] == "float16", dt
+        assert dt["Wq"] == quant, dt

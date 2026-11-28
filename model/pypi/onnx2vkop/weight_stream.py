@@ -550,7 +550,7 @@ def _int4_layout_ok(init, uses: Dict[str, list], group_size: int,
 def prepare(model, base_dir: str, *, quant: Optional[str] = None,
             unify: bool = False, rgba: bool = False, group_size: int = 0,
             keep_in_file=(), transcribe_slots: bool = False,
-            verbose: bool = True) -> Dict[str, dict]:
+            hold=(), verbose: bool = True) -> Dict[str, dict]:
     """Hydrate what the pipeline may read; return the deferred-weight table.
 
     Called right after `onnx.load(..., load_external_data=False)`: the whole
@@ -581,6 +581,13 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
     what a model whose checkpoint has been deleted needs.
     """
     declared = {name for name in keep_in_file}
+    # `hold`: weights an --exclude-* flag keeps at source precision. The
+    # trailer-time quantizer has no notion of an exclusion, so they are not
+    # deferred: they hydrate like any small tensor and the in-memory quantizer
+    # skips them by name, while every other weight still streams.
+    # hold=None: the exclusion could not be resolved yet, so nothing defers.
+    hold_all = hold is None
+    hold = set(hold or ())
     graph = model.graph
     consumers: Dict[str, Counter] = {}
     # name -> [(node, operand_index)] for _reachable_as_weight. Built once: the
@@ -593,6 +600,8 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
             uses.setdefault(name, []).append((node, i))
 
     refusal = deferral_refusal(quant, unify, rgba)
+    if refusal is None and hold_all:
+        refusal = "--exclude-* not resolvable before load"
     cap = stream_min_bytes() if refusal is None else 0
 
     deferred: Dict[str, dict] = {}
@@ -619,7 +628,8 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
             continue
         keep_in_file_gates = (refusal is None
                               and seen_names[init.name] == 1
-                              and length >= cap)
+                              and length >= cap
+                              and init.name not in hold)
         # A value-free format quantizes every float weight it can see, whatever
         # float the source file holds. The fp16 case used to fall through as a
         # plain pass-through, which was wrong twice over: the payload shipped as

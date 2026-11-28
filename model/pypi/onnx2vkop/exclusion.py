@@ -188,7 +188,40 @@ def _weight_inputs(dag_model, node, producers):
     return found
 
 
-def resolve(dag_model, node_patterns=None, scopes=None, downstream_of=None):
+class _ProtoNode:
+    def __init__(self, node):
+        self.name = node.name
+        self.op_type = node.op_type
+        self.inputs = [{"name": n} for n in node.input]
+        self.outputs = [{"name": n} for n in node.output]
+
+
+class _ProtoView:
+    """Just enough of a DAGBasedModel for `resolve` over a raw ONNX proto."""
+
+    def __init__(self, model):
+        self.nodes = {}
+        for i, node in enumerate(model.graph.node):
+            v = _ProtoNode(node)
+            v.name = v.name or f"__unnamed_{i}"
+            self.nodes[v.name] = v
+        self.initializers = {t.name: t for t in model.graph.initializer}
+
+
+def resolve_proto(model, node_patterns=None, scopes=None, downstream_of=None):
+    """`resolve` on the ONNX proto as loaded, before any DAG exists.
+
+    The streaming loader (weight_stream.prepare) uses it to keep the excluded
+    weights out of the trailer-time quantizer: they are read into memory like
+    any small tensor, so the DAG-level exclusion has a value to leave alone
+    while every other weight still streams. Silent: the DAG pass reports.
+    """
+    return resolve(_ProtoView(model), node_patterns, scopes, downstream_of,
+                   quiet=True)
+
+
+def resolve(dag_model, node_patterns=None, scopes=None, downstream_of=None,
+            quiet=False):
     """Turn the CLI patterns into the initializer names the quantizers skip.
 
     Returns the set of names, empty when no flag was given. Every pattern that
@@ -242,6 +275,8 @@ def resolve(dag_model, node_patterns=None, scopes=None, downstream_of=None):
     weights = set()
     for name in sorted(excluded_nodes):
         weights |= _weight_inputs(dag_model, nodes[name], producers)
+    if quiet:
+        return weights
 
     for label, pattern, selected in hits:
         print(f"[exclude] {label} {pattern!r}: {len(selected)} node(s)")

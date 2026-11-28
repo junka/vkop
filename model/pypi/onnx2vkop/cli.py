@@ -633,47 +633,6 @@ def _apply_build_knobs(args) -> None:
             print(f"[config] {env_name}={val}")
 
 
-def _any_exclusion(args) -> bool:
-    return bool(args.exclude_nodes or args.exclude_scopes
-                or args.exclude_downstream_of)
-
-
-def _force_payloads_for_exclusion(args) -> None:
-    """Make --stream-weights and the exclusion flags agree, or refuse.
-
-    A weight left in its ONNX data file under a value-free format (int8, fp8,
-    int4, nf4) is quantized on the way into the trailer (weight_stream/quant_payload),
-    and that code has no notion of a node exclusion -- it would produce the
-    quantized weight this run is asking not to produce, and report a clean
-    conversion doing it. The payloads have to be in memory for the exclusion to
-    have anything to skip.
-
-    Only the value-free formats (nvfp4 among them) reach that path: AWQ still
-    refuses deferral, so for it this changes nothing. It is still the memory of the
-    whole model, so the switch is announced rather than silent, and an explicit
-    --stream-weights on is an error rather than a contradiction the run resolves
-    on its own.
-    """
-    if not _any_exclusion(args):
-        return
-    value_free = tuple(weight_stream._VALUE_FREE_FORMATS)
-    if args.stream_weights == "on":
-        sys.exit(
-            "Error: --stream-weights on cannot be combined with --exclude-*: "
-            f"a streamed weight under -q {'/'.join(value_free)} is quantized at "
-            "trailer time, where the exclusion has no say, so the flag would be "
-            "ignored. Drop --stream-weights (the exclusion forces it off) or "
-            "drop the exclusion.")
-    if args.quant in value_free:
-        args.stream_weights = "off"
-        print(
-            "[exclude] --stream-weights off: the excluded payloads must be in "
-            "memory for -q "
-            f"{args.quant} to skip them (a streamed weight is quantized at "
-            "trailer time, which ignores the exclusion). This conversion holds "
-            "the weights in RAM.", file=sys.stderr)
-
-
 def _hf_checkpoint_to_onnx(args):
     """--hf-checkpoint: write the graph-only ONNX and return (onnx, output).
 
@@ -724,7 +683,6 @@ def main():
                  "--unify or --rgba (both repack weight payloads; the bf16 "
                  "weight contract covers plain MatMul/Gemm B and Gather table "
                  "initializers only).")
-    _force_payloads_for_exclusion(args)
     if args.emit_ort_onnx and args.stream_weights != "off":
         # The lowered graph needs every weight's bytes; a streamed one never
         # enters RAM.
@@ -764,7 +722,9 @@ def main():
             str(input_path), args.batch, quant=args.quant,
             unify=args.unify, rgba=args.rgba,
             group_size=getattr(args, "group_size", 0),
-            keep_bf16=args.keep_bf16, act=args.act)
+            keep_bf16=args.keep_bf16, act=args.act,
+            exclude=(args.exclude_nodes, args.exclude_scopes,
+                     args.exclude_downstream_of))
 
         # Create a simple args object for apply_optimizations
         class Args:
