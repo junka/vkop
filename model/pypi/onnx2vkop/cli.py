@@ -276,6 +276,10 @@ Examples:
   # With all optimizations
   onnx2vkop -i model.onnx -u -r -b 4
 
+  # Straight from a Hugging Face safetensors checkpoint (no ONNX export step;
+  # weights are streamed from the shards)
+  onnx2vkop --hf-checkpoint ~/models/Qwen3-4B -o qwen3_4b.vkopbin -q int4
+
   # Mixed precision: hold one layer's weights wide to localize an accuracy loss
   onnx2vkop -i model.onnx -q int4 --exclude-scope model.layers.0
   onnx2vkop -i model.onnx -q awq --awq-format nf4 \\
@@ -283,9 +287,47 @@ Examples:
         """,
     )
 
-    parser.add_argument("-i", "--input", required=True, help="Input ONNX model file path")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("-i", "--input", help="Input ONNX model file path")
+    src.add_argument(
+        "--hf-checkpoint", metavar="DIR",
+        help="Convert a Hugging Face checkpoint directory (config.json + "
+             "*.safetensors) instead of an ONNX file. The architecture is "
+             "traced on the meta device into a graph-only ONNX whose "
+             "initializers point straight into the safetensors shards "
+             "(external_data location/offset/length), so no weight byte is "
+             "copied before the normal conversion streams them into the "
+             ".vkopbin. Needs torch + transformers. See onnx2vkop/hf_import.py.",
+    )
     parser.add_argument(
-        "-o", "--output", help="Output VKOP binary file path (default: input_name.vkopbin)"
+        "-o", "--output", help="Output VKOP binary file path (default: input_name.vkopbin; "
+                               "with --hf-checkpoint, <checkpoint dir name>.vkopbin in "
+                               "the current directory)"
+    )
+    parser.add_argument(
+        "--hf-builder", metavar="MODULE:FN", default=None,
+        help="--hf-checkpoint: the function that turns the config into a "
+             "traceable graph (pkg.module:fn or path/to/file.py:fn), called as "
+             "fn(config, torch_dtype, index) -> onnx2vkop.hf_import.GraphSpec. "
+             "Default: a Llama-family decoder (llama/qwen2/qwen3/mistral) with "
+             "the in-tree llm I/O contract -- inputs_embeds, position_ids, "
+             "attention_bias, past_key_values_i -> logits, present_key_values_i.",
+    )
+    parser.add_argument(
+        "--hf-trace-dtype", choices=["auto", "fp16", "fp32"], default="auto",
+        help="--hf-checkpoint: width the graph is traced at. auto (default): "
+             "fp32 under --act bf16/fp32 or for an fp32 checkpoint, else fp16. "
+             "A weight stored at that width, or stored as bf16, is referenced "
+             "in its shard; any other one is converted into a side file.",
+    )
+    parser.add_argument(
+        "--hf-onnx", metavar="PATH", default=None,
+        help="--hf-checkpoint: where to keep the intermediate graph-only ONNX "
+             "(default: next to the output, <output stem>.graph.onnx). Its "
+             "shard references are relative paths; ONNX Runtime and "
+             "onnx.checker refuse a path that leaves the model's directory, so "
+             "put it inside the checkpoint directory if you want to run it "
+             "there too.",
     )
     parser.add_argument(
         "-q", "--quant", choices=["fp32", "fp16", "bf16", "int8", "fp8e4m3",
@@ -632,6 +674,37 @@ def _force_payloads_for_exclusion(args) -> None:
             "the weights in RAM.", file=sys.stderr)
 
 
+def _hf_checkpoint_to_onnx(args):
+    """--hf-checkpoint: write the graph-only ONNX and return (onnx, output).
+
+    The ONNX references the checkpoint's shards in place (hf_import.py); from
+    here on the conversion is the ordinary -i path, so every pass, quantizer
+    and audit applies unchanged.
+    """
+    ckpt = Path(args.hf_checkpoint)
+    if not ckpt.is_dir():
+        sys.exit(f"Error: --hf-checkpoint '{ckpt}' is not a directory")
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = Path.cwd() / (ckpt.resolve().name + ".vkopbin")
+    onnx_path = (Path(args.hf_onnx) if args.hf_onnx
+                 else output_path.with_suffix(".graph.onnx"))
+    try:
+        from . import hf_import
+    except ImportError:
+        import hf_import
+    try:
+        hf_import.export_graph_onnx(
+            str(ckpt), str(onnx_path), builder=args.hf_builder,
+            trace_dtype=args.hf_trace_dtype, act=args.act)
+    except ImportError as e:
+        sys.exit(f"Error: --hf-checkpoint needs torch and transformers ({e})")
+    except hf_import.HFImportError as e:
+        sys.exit(f"Error: {e}")
+    return onnx_path, output_path
+
+
 def main():
     """Main entry point for the CLI."""
     args = parse_args()
@@ -659,21 +732,24 @@ def main():
         print("[ort] --emit-ort-onnx: --stream-weights off", file=sys.stderr)
     _apply_build_knobs(args)
 
-    # Validate input file
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Error: Input file '{args.input}' does not exist")
-        sys.exit(1)
-
-    if not input_path.suffix.lower() in [".onnx"]:
-        print("Error: Input file must be an ONNX model (.onnx)")
-        sys.exit(1)
-
-    # Determine output path
-    if args.output:
-        output_path = Path(args.output)
+    if args.hf_checkpoint:
+        input_path, output_path = _hf_checkpoint_to_onnx(args)
     else:
-        output_path = input_path.with_suffix(".vkopbin")
+        # Validate input file
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"Error: Input file '{args.input}' does not exist")
+            sys.exit(1)
+
+        if not input_path.suffix.lower() in [".onnx"]:
+            print("Error: Input file must be an ONNX model (.onnx)")
+            sys.exit(1)
+
+        # Determine output path
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = input_path.with_suffix(".vkopbin")
 
     print(f"Converting model: {input_path}")
     print(f"Output will be saved to: {output_path}")
