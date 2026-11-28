@@ -1434,6 +1434,13 @@ endforeach()
 add_executable(ActivationReuseCheck EXCLUDE_FROM_ALL tests/ActivationReuseCheck.cpp)
 target_link_libraries(ActivationReuseCheck PRIVATE vkop vload)
 
+# MiniMax-H3 FL2VA/Ref2VA denoiser loop (ComfyUI checkpoint, see
+# model/exporter/minimax_h3/h3_export_fl2va.py). Independent of ENABLE_EXAMPLE:
+# it needs no tokenizer and no image codecs.
+add_executable(minimax_h3_fl2va EXCLUDE_FROM_ALL example/minimax_h3/fl2va.cpp)
+target_link_libraries(minimax_h3_fl2va PRIVATE vkop vload)
+target_compile_features(minimax_h3_fl2va PRIVATE cxx_std_20)
+
 # LLM conversational driver (Qwen3-VL, buffer backend). Text in → text out.
 # Links vkop + vload (graph runtime + model loader) and the standalone Qwen
 # tokenizer (BBPE encode/decode + chat template). The tokenizer ships its own

@@ -559,7 +559,8 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
                           dynamic_axes, *, model_dir: str, component: str,
                           out_path: str, weights_file: str | None = None,
                           ckpt_prefix: str = "", ckpt_rename: str | None = None,
-                          rope_theta: float | None = None
+                          rope_theta: float | None = None,
+                          target_dtype: str | None = None
                           ) -> str:
     """Export one component with its REAL weights, holding no more than a chunk.
 
@@ -569,6 +570,10 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
       2. splice            -- each parameter becomes an external initializer
                               pointing at a checkpoint shard (headers only)
       3. copy              -- append bytes 8 MiB at a time
+
+    `target_dtype` ("F32", "F16", ...) converts every payload while it is
+    copied, one tensor at a time -- for a graph traced wider than the
+    checkpoint stores (the FL2VA fp32 export of a bf16 checkpoint).
 
     `ckpt_prefix` is the module prefix the wrapper added that the checkpoint
     does not carry (`model.` for the denoiser); `ckpt_rename` translates it to a
@@ -631,7 +636,7 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
     shapes_ck = {hits[n]: list(shapes[n]) for n in hits}
     resolved = SE.splice_initializers(proto, shapes_ck, index,
                                       weights_file=weights_file,
-                                      target_dtype=None)
+                                      target_dtype=target_dtype)
     for init in proto.graph.initializer:
         if init.name in back:
             init.name = back[init.name]
@@ -643,7 +648,8 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
         raise SystemExit(f"[stream] spliced {len(resolved)} of {len(hits)}")
 
     wpath = os.path.join(out_dir, weights_file)
-    nbytes, offsets = SE.copy_weights(resolved, wpath)
+    nbytes, offsets = SE.copy_weights(resolved, wpath,
+                                      target_dtype=target_dtype)
     # `copy_weights` keys offsets by the names it was handed (checkpoint
     # names); the initializers carry the wrapper names again, so translate.
     SE.patch_offsets(proto, {back.get(k, k): v for k, v in offsets.items()})

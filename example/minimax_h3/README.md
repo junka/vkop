@@ -82,6 +82,36 @@ rasterizer proves nothing about the target.
 Knobs: `--steps`, `--text-tokens`, `--latent-frames`, `--latent-h`,
 `--latent-w`, `--audio-latents`, `--no-audio`, `--save DIR`.
 
+### FL2VA / Ref2VA from the ComfyUI repack
+
+`Comfy-Org/MiniMax-H3` ships the FL2VA and Ref2VA denoisers as single-file
+checkpoints (`diffusion_models/minimax_h3_{fl2va,ref2va}[_pruned]_*.safetensors`).
+They use the older single-stream DiT (`blocks.N.attn.qkv_proj`, a token
+refiner, curve-form adaLN) that ComfyUI implements in
+`comfy/ldm/minimax/model.py`; `model/exporter/minimax_h3/h3_export_fl2va.py`
+ports that forward and exports one denoising step, and `minimax_h3_fl2va`
+(this directory's `fl2va.cpp`, a top-level target) runs the t2va sampler
+around it. Text tower and VAEs are not wired yet: the driver's conditioning
+is synthetic unless `--text-states` is given.
+
+```bash
+python h3_export_fl2va.py --ckpt .../minimax_h3_fl2va_pruned_bf16.safetensors \
+    --out out/dit.onnx --dtype bf16          # streams 37 GiB, ~1 min
+python -m onnx2vkop.cli -i out/dit.onnx -o out/dit_int8.vkopbin \
+    -q int8 --act bf16 --target-backend buffer --master-archive build/vkop_shaders.bin
+make minimax_h3_fl2va
+VKOP_ACTIVATION_REUSE=1 ./minimax_h3_fl2va --dit out/dit_int8.vkopbin \
+    --width 256 --height 256 --length 22 --steps 8 --save run/
+```
+
+`--act bf16` is required (H3's hidden states overflow fp16). int8 weights run
+beside bf16 activations on every MatMul route, and on Apple the large GEMMs
+take the coop8 kernel's int8 stage. Activation reuse matters here: the graph's
+shapes are dynamic, so without it every intermediate keeps its own buffer.
+Measured on an M5 Max (pruned FL2VA, 554 packed rows): 2.3 s/step, 21.4 GiB
+peak; the fp32-activation artifact (`--dtype fp32`, `--act fp32`) runs the
+same model at 46.8 s/step because no tiled kernel takes fp32 A with int8 B.
+
 ### Activation reuse (opt-in)
 
 `VKOP_ACTIVATION_REUSE=1` gives a buffer-backend Runtime a pool for
