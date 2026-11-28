@@ -613,7 +613,7 @@ $CONV -i $M/h3_fl2va_te_a/te.onnx -o $M/h3_fl2va_te_a/te.vkopbin -q int8   # sam
 $PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
     --out $M/h3_fl2va_cr_v2/dit.onnx --dtype bf16 --convrot 256
 $CONV -i $M/h3_fl2va_cr_v2/dit.onnx -o $M/h3_fl2va_cr_v2/dit_int4.vkopbin -q int4 --group-size 128 \
-    --exclude-node Gemm_26143,Gemm_6339
+    --exclude-node Gemm_6027,Gemm_25207
 
 # turbo DiTs: same export with the LoRA merged, same conversion (the exclusion
 # node names come out identical; turbo_build.sh in ~/models/tools greps them)
@@ -621,7 +621,7 @@ $PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_fl2va_pruned_bf16.s
     --out $M/h3_fl2va_turbo8/dit.onnx --dtype bf16 --convrot 256 \
     --lora $C/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
 $CONV -i $M/h3_fl2va_turbo8/dit.onnx -o $M/h3_fl2va_turbo8/dit_int4.vkopbin -q int4 --group-size 128 \
-    --exclude-node Gemm_26143,Gemm_6339
+    --exclude-node Gemm_6027,Gemm_25207
 # (4-step: loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16 -> h3_fl2va_turbo4)
 
 # DiT without rotation (int8 reference, 20 GB; does not fit at 2687 rows)
