@@ -336,6 +336,84 @@ bf16 reaches only cos 0.99969 (max |d| 0.57), and int8 weights cos 0.99987 at
 | same, 256×192 (one non-square tile) | cos 1.0000000, max \|d\| 3e-5 |
 | GPU time per 256² tile (N = 1) | 68 ms, peak 0.7 GB; 20 tiles batched: 1.07 s but 6.4 GB peak, so run tiles one at a time |
 
+### 3g. Pre-quantized text tower (`qwen3vl_32b_minimax_h3_int8_convrot`)
+
+`h3_export_fl2va_te.py` recognizes this file (27.1 GB) from its
+`comfy_quant` entries and imports it as-is; the logic is in
+`h3_comfy_quant.py` (`Int8ConvRot`), which the VAE exporter could share.
+Checked per tensor:
+
+- All 350 LM linears (q/k/v/o, gate/up/down × 50) are
+  `{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}`,
+  the same format as the video VAE (§3c): I8 `[N, K]` codes of `W·H`, one fp32
+  `weight_scale [N, 1]` per output row = absmax/127 (to 1e-7), every row
+  reaching |q| = 127. Every K is a multiple of 256 (5120, o_proj 8192, down
+  25600), and every linear is rotated.
+- Against the bf16 file rotated by H: rel 0.0088 (q/k/v/gate/up) and 0.010
+  (o/down); unrotated rel 1.37. Plain per-row int8 of the unrotated bf16
+  weights (vkop's int8 tower) is 0.011–0.014.
+- No AWQ, no `pre_quant_scale`, no norm folding: the norms, the embedding
+  table and the vision tower are bf16 and bit-identical to the bf16 file. The
+  host keeps reading `h3_fl2va_te/embed_tokens.bf16`.
+
+The graph gets `reshape(x, [-1, 256]) @ H` in front of every quantized linear,
+as forward pre-hooks (q/k/v and gate/up share one rotation, so 4 per layer),
+with H one bf16 initializer. The weights stream as bf16 `q·s̃`, where
+`s̃ = bf16(127·s)/127`. That is the scale `-q int8` measures on the stream,
+and every streamed value then sits within 0.496 of a code, so the converter
+gets back exactly the repack's codes. Streaming `q·s` directly would flip
+about 1e-4 of the codes by one in bf16. The cost is a per-row scale change of
+at most 2⁻⁸ (mean 1.5e-3). Checked on all 350 tensors of both halves: 0 code
+mismatches. H converts to int8 without error.
+
+```bash
+I8CR=$C/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
+$PY h3_export_fl2va_te.py --ckpt $I8CR --embed $M/h3_fl2va_te/embed_tokens.bf16 \
+    --out $M/h3_fl2va_te_i8cr_a/te.onnx --layers 0,25      # same with _b, 25,50
+$CONV -i $M/h3_fl2va_te_i8cr_a/te.onnx -o $M/h3_fl2va_te_i8cr_a/te.vkopbin -q int8   # same for _b
+build/minimax_h3_fl2va --te $M/h3_fl2va_te_i8cr_a/te.vkopbin,$M/h3_fl2va_te_i8cr_b/te.vkopbin ...
+```
+
+Per half: 22.7 GiB of `weights.bin`, exported in ~25 s (peak 2.6 GB), and
+converted in ~60 s (peak 4.2 GB) to a 12.2 GB `te.vkopbin`. The `weights.bin`
+was deleted afterwards. 2-layer slice against an fp32 torch run of the same
+dequantized weights (with the rotations): cos 0.999992, rel 0.0047.
+
+Accuracy on the dog prompt (53 tokens), against a layer-streamed fp32 torch
+run of the **bf16** weights. Token 0 is the attention sink (norm 15k against
+~300 for the others) and dominates the whole-tensor cos, so the `tok 1+`
+columns are what tell the variants apart:
+
+| text tower | cos | rel | rel, tok 1+ | per-token cos, tok 1+ (mean / min) |
+|---|---|---|---|---|
+| int8_convrot as-is (vkop) | 0.999977 | 0.015 | **0.016** | 0.99986 / 0.9989 |
+| int8 from bf16 (vkop) | 0.999944 | 0.017 | 0.052 | 0.99835 / 0.952 |
+| NVFP4 + AWQ (vkop, default) | 0.999717 | 0.027 | 0.163 | 0.98442 / **0.489** |
+| int8_convrot weights, fp32 torch | 0.999992 | 0.005 | 0.020 | 0.99977 / 0.994 |
+
+The vkop int8_convrot tower against the fp32 torch run of its own weights
+gives cos 0.999983, rel 0.014 (tok 1+). The earlier "NVFP4 vs int8 cos 0.9998"
+only measured token 0. Off the sink, the NVFP4 tower is 10× further from bf16
+than int8_convrot, and token 35 comes out at cos 0.49.
+
+| text tower | artifact | load+run (run) | peak |
+|---|---|---|---|
+| int8_convrot, two halves | 2 × 12.2 GB | 5.0–5.3 s (0.88–0.90 s) | 11.7 GB |
+| int8 from bf16, two halves | 2 × 12.2 GB | 4.9 s (0.68 s) | 11.7 GB |
+| NVFP4, one graph | 13.7 GB | 2.7 s (0.70 s) | 13.2 GB |
+
+The 200 online rotations add ~0.2 s of GPU time; the tower runs once per
+video.
+
+**Recommendation:** make int8_convrot the default text tower. It is the most
+accurate of the three by a wide margin (3× closer to bf16 than vkop's own
+int8, 10× closer than NVFP4), and it peaks lower than NVFP4 because it runs
+as two halves. It costs ~2.5 s more per prompt and 10.7 GB more disk. Keep
+NVFP4 as the option for the smaller download (15.7 GB) and single-graph
+simplicity. vkop's int8-from-bf16 path has no remaining advantage, except
+that it needs only the bf16 file. Whether the token-level gap changes the
+video was not checked: no end-to-end run with the int8_convrot conditioning.
+
 ## 4. Commands
 
 ```bash

@@ -375,6 +375,11 @@ def main(argv=None):
                         if k.startswith("model.layers.0.") and
                         k.endswith(".pre_quant_scale")}
         print(f"[nvfp4] pre_quant_scale on {sorted(NVFP4['pqs'])}")
+    # The repack's int8_convrot file, auto-detected from its comfy_quant
+    # entries and imported as-is (h3_comfy_quant; FL2VA.md §3g).
+    import h3_comfy_quant
+    i8cr = None if args.nvfp4 else h3_comfy_quant.Int8ConvRot.detect(
+        args.ckpt, "model.layers.")
     if args.embed:
         # An existing bf16 table (the nvfp4 file stores embed_tokens as int8;
         # the bf16 checkpoint's table is the same weights unquantized -- AWQ
@@ -407,11 +412,16 @@ def main(argv=None):
         from safetensors import safe_open
         model = TextTower(c, dtype=torch.float32, device="cpu",
                           layer_ids=layer_ids).eval()
+        if i8cr:
+            i8cr.attach(model, torch.float32, "cpu")
         sd = {}
         if args.nvfp4:
             header, base = st_header(args.ckpt)
         with safe_open(args.ckpt, "pt") as f:
             for name in model.state_dict():
+                if i8cr and i8cr.owns(name):
+                    sd[name] = i8cr.reference(name)
+                    continue
                 if args.nvfp4 and name.endswith("_proj.weight"):
                     sd[name] = torch.from_numpy(nvfp4_dequant(*nvfp4_parts(
                         args.ckpt, header, base, name[: -len(".weight")])))
@@ -443,11 +453,12 @@ def main(argv=None):
         os.symlink(os.path.abspath(args.ckpt), link)
     wrapper = TextTower(c, device="meta", layer_ids=layer_ids).eval()
     dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
+    kw = i8cr.attach(wrapper, torch.bfloat16, "meta") if i8cr else {}
     with torch.no_grad():
         common.export_streaming_real(
             wrapper, dummies, INPUT_NAMES, OUTPUT_NAMES, DYNAMIC_AXES,
             model_dir=os.path.join(out_dir, "ckpt"), component="te",
-            out_path=args.out)
+            out_path=args.out, **kw)
     return 0
 
 
