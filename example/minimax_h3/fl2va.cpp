@@ -2,12 +2,15 @@
 //
 // Runs the text-to-audio-video sampling loop around the one-step DiT graph
 // that model/exporter/minimax_h3/h3_export_fl2va.py exports. The host side
-// mirrors ComfyUI (comfy/ldm/minimax/model.py, plain t2va: no keyframes, no
-// references):
+// mirrors ComfyUI (comfy/ldm/minimax/model.py; t2va, and ref2va with
+// reference images; no keyframes):
 //
-//   * packed layout [text | audio (stereo, channel-major) | video (2x2 patches)]
-//     and its (t, h, w) RoPE positions; the graph gets cos/sin of the 48
-//     split-half angles,
+//   * packed layout [text | ref images | audio (stereo, channel-major) |
+//     video (2x2 patches)] and its (t, h, w) RoPE positions; the graph gets
+//     cos/sin of the 48 split-half angles. A reference image is one latent
+//     frame at its own size, placed at t = text_len + i ahead of the targets,
+//     re-injected every step at timestep max(t_v, 0.999) (never denoised),
+//   * per-text-token adaLN tags (--text-tags: 1 text, 0 vision pads),
 //   * per-stream timesteps t = 1 - sigma, the audio stream on its own shift
 //     (video 12, audio 3); adaLN reads the curve table at each distinct t,
 //   * Euler on each stream's own sigma grid: the head predicts x0 - noise,
@@ -74,6 +77,12 @@ struct Options {
     // audio VAE decoder (h3_export_fl2va_audio_vae.py) -> stereo 32 kHz wav;
     // --audio-latent decodes a saved [32, 2, T] audio latent with only it loaded
     std::string audio_vae, wav, audio_latent;
+    // ref2va: normalized reference-image latents [24, 1, HL, WL] ("PATH:HL:WL",
+    // in presentation order) and the text tower's per-token adaLN tags (int64,
+    // 1 text / 0 vision pad; default all 1)
+    std::vector<std::string> ref_latents;
+    std::string text_tags, dump_layout;
+    double cond_aug = 0.999;  // comfy VISUAL_COND_TIMESTEP / noise aug
     int width = 256, height = 256, length = 22, steps = 8, text_len = 32;
     uint32_t seed = 42;
 };
@@ -95,7 +104,12 @@ void usage(const char *argv0) {
                  "  --vae vae.vkopbin --frames DIR   decode to DIR/frame_%%04d.ppm\n"
                  "  --audio-vae avae.vkopbin --wav OUT.wav   decode the audio latent\n"
                  "               (float32 stereo, 32 kHz)\n"
-                 "  --audio-latent F.f32  decode a saved [32, 2, T] audio latent only\n",
+                 "  --audio-latent F.f32  decode a saved [32, 2, T] audio latent only\n"
+                 "  --ref-latent F.f32:HL:WL  ref2va reference image latent "
+                 "[24, 1, HL, WL] (repeatable)\n"
+                 "  --text-tags F.i64  per-token adaLN tags (1 text, 0 vision pad)\n"
+                 "  --cond-aug 0.999   reference timestep / noise augmentation\n"
+                 "  --dump-layout DIR  write position/pack/mod of step 1 and exit\n",
                  argv0);
 }
 
@@ -124,6 +138,10 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--audio-vae" && (v = next("--audio-vae"))) o.audio_vae = v;
         else if (a == "--wav" && (v = next("--wav"))) o.wav = v;
         else if (a == "--audio-latent" && (v = next("--audio-latent"))) o.audio_latent = v;
+        else if (a == "--ref-latent" && (v = next("--ref-latent"))) o.ref_latents.push_back(v);
+        else if (a == "--text-tags" && (v = next("--text-tags"))) o.text_tags = v;
+        else if (a == "--dump-layout" && (v = next("--dump-layout"))) o.dump_layout = v;
+        else if (a == "--cond-aug" && (v = next("--cond-aug"))) o.cond_aug = std::atof(v);
         else if (a == "--width" && (v = next("--width"))) o.width = std::atoi(v);
         else if (a == "--height" && (v = next("--height"))) o.height = std::atoi(v);
         else if (a == "--length" && (v = next("--length"))) o.length = std::atoi(v);
@@ -238,16 +256,18 @@ std::vector<double> axis_from_sqrt_area(int dim, int patch, double sqrt_area) {
     return out;
 }
 
-// The step-independent part of comfy's PackedLayout for plain t2va.
+// The step-independent part of comfy's PackedLayout: t2va, plus ref2va
+// reference images (refs = their latent (h, w), one latent frame each).
 struct Layout {
     int text_len, latent_t, lat_h, lat_w, audio_t;
-    int hh, ww, n_text, n_audio, n_video, seq;
+    int hh, ww, n_text, n_ref, n_audio, n_video, seq;
     std::vector<double> position;  // [seq, 3] (t, h, w)
-    std::vector<int64_t> pack;     // concat([text, video, audio]) -> packed
+    std::vector<int64_t> pack;     // concat([text, refs+video, audio]) -> packed
 };
 
 Layout build_layout(int text_len, int latent_t, int lat_h, int lat_w,
-                    int audio_t) {
+                    int audio_t,
+                    const std::vector<std::pair<int, int>> &refs = {}) {
     Layout l{};
     l.text_len = text_len;
     l.latent_t = latent_t;
@@ -259,7 +279,9 @@ Layout build_layout(int text_len, int latent_t, int lat_h, int lat_w,
     l.n_text = text_len;
     l.n_audio = audio_t * 2;
     l.n_video = latent_t * l.hh * l.ww;
-    l.seq = l.n_text + l.n_audio + l.n_video;
+    l.n_ref = 0;
+    for (const auto &r : refs) l.n_ref += (r.first / 2) * (r.second / 2);
+    l.seq = l.n_text + l.n_ref + l.n_audio + l.n_video;
     const double area = std::sqrt(static_cast<double>(lat_h) * lat_w);
     const auto ah = axis_from_sqrt_area(lat_h, 2, area);
     const auto aw = axis_from_sqrt_area(lat_w, 2, area);
@@ -271,7 +293,17 @@ Layout build_layout(int text_len, int latent_t, int lat_h, int lat_w,
     };
     int row = 0;
     for (int i = 0; i < text_len; ++i) put(row++, i, 0.0, 0.0);
-    const double cursor = text_len;
+    // reference images: one frame each at t = text_len + i, on their own
+    // area-normalized grid; the targets' timeline starts after them
+    double cursor = text_len;
+    for (const auto &r : refs) {
+        const double ra = std::sqrt(static_cast<double>(r.first) * r.second);
+        const auto rh = axis_from_sqrt_area(r.first, 2, ra);
+        const auto rw = axis_from_sqrt_area(r.second, 2, ra);
+        for (double y : rh)
+            for (double x : rw) put(row++, cursor, y, x);
+        cursor += 1.0;
+    }
     for (int ch = 0; ch < 2; ++ch)
         for (int t = 0; t < audio_t; ++t)
             put(row++, cursor + t, 0.0, ch == 0 ? aw.front() : aw.back());
@@ -281,13 +313,31 @@ Layout build_layout(int text_len, int latent_t, int lat_h, int lat_w,
             for (int x = 0; x < l.ww; ++x) put(row++, tpos, ah[y], aw[x]);
         tpos += kFrameRescale * kFramePerToken[t % 5];
     }
-    // graph concat order is [text, video, audio]; packed is [text, audio, video]
+    // graph concat order is [text, refs + video, audio];
+    // packed is [text, refs, audio, video]
     l.pack.resize(l.seq);
     int p = 0;
+    const int nv_all = l.n_ref + l.n_video;
     for (int i = 0; i < l.n_text; ++i) l.pack[p++] = i;
-    for (int i = 0; i < l.n_audio; ++i) l.pack[p++] = l.n_text + l.n_video + i;
-    for (int i = 0; i < l.n_video; ++i) l.pack[p++] = l.n_text + i;
+    for (int i = 0; i < l.n_ref; ++i) l.pack[p++] = l.n_text + i;
+    for (int i = 0; i < l.n_audio; ++i) l.pack[p++] = l.n_text + nv_all + i;
+    for (int i = 0; i < l.n_video; ++i) l.pack[p++] = l.n_text + l.n_ref + i;
     return l;
+}
+
+// [C, T, H, W] -> [T*(H/2)*(W/2), C*2*2] for any latent (reference images)
+std::vector<float> patchify_thw(const std::vector<float> &x, int T, int H, int W) {
+    std::vector<float> rows(static_cast<size_t>(T) * (H / 2) * (W / 2) * kVideoC * 4);
+    size_t o = 0;
+    for (int t = 0; t < T; ++t)
+        for (int y = 0; y < H / 2; ++y)
+            for (int xw = 0; xw < W / 2; ++xw)
+                for (int c = 0; c < kVideoC; ++c)
+                    for (int p = 0; p < 2; ++p)
+                        for (int q = 0; q < 2; ++q)
+                            rows[o++] = x[((static_cast<size_t>(c) * T + t) * H +
+                                           (2 * y + p)) * W + (2 * xw + q)];
+    return rows;
 }
 
 // [C, T, H, W] -> [T*hh*ww, C*2*2] (comfy patchify_video, patch 1x2x2)
@@ -902,14 +952,53 @@ int main(int argc, char **argv) {
         for (auto &v : text) v = nd(rng);
     }
 
-    const Layout l = build_layout(text_len, latent_t, lat_h, lat_w, audio_t);
+    // ref2va reference images: normalized latents [24, 1, HL, WL] -> rows,
+    // condition-noise-augmented once (comfy _cond_video_rows: aug * r +
+    // (1 - aug) * noise with one fixed seed for the whole run; our RNG, not
+    // torch's -- the noise is 0.1% of the row)
+    std::vector<std::pair<int, int>> ref_hw;
+    std::vector<float> ref_rows;
+    for (const auto &spec : o.ref_latents) {
+        const size_t c2 = spec.rfind(':'), c1 = spec.rfind(':', c2 - 1);
+        if (c1 == std::string::npos || c2 == std::string::npos || c1 == 0) {
+            std::fprintf(stderr, "--ref-latent wants PATH:HL:WL, got %s\n", spec.c_str());
+            return 2;
+        }
+        const int rh = std::atoi(spec.c_str() + c1 + 1), rw = std::atoi(spec.c_str() + c2 + 1);
+        const auto z = read_f32(spec.substr(0, c1));
+        if (rh % 2 || rw % 2 || z.size() != static_cast<size_t>(kVideoC) * rh * rw) {
+            std::fprintf(stderr, "%s: %zu floats, want [24, 1, %d, %d] with even HL/WL\n",
+                         spec.c_str(), z.size(), rh, rw);
+            return 2;
+        }
+        auto r = patchify_thw(z, 1, rh, rw);
+        ref_rows.insert(ref_rows.end(), r.begin(), r.end());
+        ref_hw.emplace_back(rh, rw);
+    }
+    if (o.cond_aug < 1.0 && !ref_rows.empty()) {
+        std::mt19937 arng(o.seed ^ 0xa11ceU);
+        std::normal_distribution<float> an(0.f, 1.f);
+        const float a = static_cast<float>(o.cond_aug);
+        for (auto &v : ref_rows) v = a * v + (1.f - a) * an(arng);
+    }
+    std::vector<int64_t> text_tags(text_len, 1);
+    if (!o.text_tags.empty()) {
+        text_tags = read_i64(o.text_tags);
+        if (static_cast<int>(text_tags.size()) != text_len) {
+            std::fprintf(stderr, "--text-tags has %zu entries, text has %d tokens\n",
+                         text_tags.size(), text_len);
+            return 2;
+        }
+    }
+
+    const Layout l = build_layout(text_len, latent_t, lat_h, lat_w, audio_t, ref_hw);
     std::printf("[fl2va] %dx%d, %d frames -> latent %dx%dx%d, audio_t %d, "
-                "text %d%s; seq %d (text %d, audio %d, video %d)\n",
+                "text %d%s; seq %d (text %d, refs %d in %zu, audio %d, video %d)\n",
                 o.width, o.height, frames, latent_t, lat_h, lat_w, audio_t,
                 text_len,
                 !o.te.empty() ? " (prompt)"
                 : o.text_states.empty() ? " (synthetic)" : "", l.seq,
-                l.n_text, l.n_audio, l.n_video);
+                l.n_text, l.n_ref, ref_hw.size(), l.n_audio, l.n_video);
 
     // rope cos/sin are step-independent
     std::vector<float> rope_cos(static_cast<size_t>(l.seq) * n_ang);
@@ -922,6 +1011,40 @@ int main(int argc, char **argv) {
                 rope_cos[static_cast<size_t>(s) * n_ang + a * n_freq + f] = std::cos(ang);
                 rope_sin[static_cast<size_t>(s) * n_ang + a * n_freq + f] = std::sin(ang);
             }
+
+    // per-step adaLN tables: distinct timesteps -> curve rows, per-row mod index
+    // (row * 3 + modality tag: video 0, text 1, audio 2)
+    const auto step_tables = [&](double t_v, double t_a, std::vector<float> &t_emb,
+                                 std::vector<int64_t> &mod, int64_t &row_v,
+                                 int64_t &row_a) {
+        const double t_ref = std::max(t_v, o.cond_aug);
+        std::set<double> uniq{t_v, t_a};
+        if (l.n_ref) uniq.insert(t_ref);
+        std::vector<double> unique_t(uniq.begin(), uniq.end());
+        auto t_row = [&](double t) {
+            return static_cast<int64_t>(
+                std::find(unique_t.begin(), unique_t.end(), t) - unique_t.begin());
+        };
+        t_emb.assign(unique_t.size() * t_dim, 0.f);
+        for (size_t u = 0; u < unique_t.size(); ++u) {
+            const float pos = std::clamp(static_cast<float>(unique_t[u]), 0.f, 1.f) *
+                              static_cast<float>(t_rows - 1);
+            const int i0 = std::min(static_cast<int>(std::floor(pos)), t_rows - 2);
+            const float fr = pos - static_cast<float>(i0);
+            for (int d = 0; d < t_dim; ++d) {
+                const float a = t_table[i0 * t_dim + d], b = t_table[(i0 + 1) * t_dim + d];
+                t_emb[u * t_dim + d] = a + (b - a) * fr;
+            }
+        }
+        mod.assign(l.seq, 0);
+        int r = 0;
+        for (int i = 0; i < l.n_text; ++i) mod[r++] = t_row(t_v) * 3 + text_tags[i];
+        for (int i = 0; i < l.n_ref; ++i) mod[r++] = t_row(t_ref) * 3 + 0;
+        for (int i = 0; i < l.n_audio; ++i) mod[r++] = t_row(t_a) * 3 + 2;
+        for (int i = 0; i < l.n_video; ++i) mod[r++] = t_row(t_v) * 3 + 0;
+        row_v = t_row(t_v);
+        row_a = t_row(t_a);
+    };
 
     // initial noise: video [24, T, H, W] then audio [32, 2, Ta]
     std::mt19937 rng(o.seed);
@@ -937,6 +1060,29 @@ int main(int argc, char **argv) {
     for (int k = 0; k <= steps; ++k) {
         sv[k] = time_shift_sigma(1.0 - static_cast<double>(k) / steps, 1.0, kShiftVideo);
         sa[k] = time_shift_sigma(sv[k], kShiftVideo, kShiftAudio);
+    }
+
+    if (!o.dump_layout.empty()) {
+        // step-1 tables, for checking the layout against comfy's PackedLayout
+        std::filesystem::create_directories(o.dump_layout);
+        const double t_v = 1.0 - std::max(sv[0], 1e-6);
+        const double t_a = 1.0 - time_shift_sigma(std::max(sv[0], 1e-6), kShiftVideo, kShiftAudio);
+        std::vector<float> t_emb;
+        std::vector<int64_t> mod;
+        int64_t rv, ra;
+        step_tables(t_v, t_a, t_emb, mod, rv, ra);
+        auto dump = [&](const std::string &n, const void *p, size_t bytes) {
+            std::ofstream f(o.dump_layout + "/" + n, std::ios::binary);
+            f.write(static_cast<const char *>(p), static_cast<std::streamsize>(bytes));
+        };
+        dump("position.f64", l.position.data(), l.position.size() * 8);
+        dump("pack.i64", l.pack.data(), l.pack.size() * 8);
+        dump("mod.i64", mod.data(), mod.size() * 8);
+        dump("t_emb.f32", t_emb.data(), t_emb.size() * 4);
+        dump("ref_rows.f32", ref_rows.data(), ref_rows.size() * 4);
+        std::printf("[dump] %s: seq %d, %zu distinct t\n", o.dump_layout.c_str(), l.seq,
+                    t_emb.size() / t_dim);
+        return 0;
     }
 
     std::shared_ptr<VulkanDevice> dev;
@@ -979,39 +1125,27 @@ int main(int argc, char **argv) {
     for (int k = 0; k < steps; ++k) {
         const double sig_v = std::max(sv[k], 1e-6), sig_a = sa[k];
         const double t_v = 1.0 - sig_v, t_a = 1.0 - time_shift_sigma(sig_v, kShiftVideo, kShiftAudio);
-        std::set<double> uniq{t_v, t_a};
-        std::vector<double> unique_t(uniq.begin(), uniq.end());
-        auto t_row = [&](double t) {
-            return static_cast<int64_t>(
-                std::find(unique_t.begin(), unique_t.end(), t) - unique_t.begin());
-        };
-        // adaLN curve table, lerped at each distinct t
-        std::vector<float> t_emb(unique_t.size() * t_dim);
-        for (size_t u = 0; u < unique_t.size(); ++u) {
-            const float pos = std::clamp(static_cast<float>(unique_t[u]), 0.f, 1.f) *
-                              static_cast<float>(t_rows - 1);
-            const int i0 = std::min(static_cast<int>(std::floor(pos)), t_rows - 2);
-            const float fr = pos - static_cast<float>(i0);
-            for (int d = 0; d < t_dim; ++d) {
-                const float a = t_table[i0 * t_dim + d], b = t_table[(i0 + 1) * t_dim + d];
-                t_emb[u * t_dim + d] = a + (b - a) * fr;
-            }
-        }
-        std::vector<int64_t> mod(l.seq);
-        int r = 0;
-        for (int i = 0; i < l.n_text; ++i) mod[r++] = t_row(t_v) * 3 + 1;
-        for (int i = 0; i < l.n_audio; ++i) mod[r++] = t_row(t_a) * 3 + 2;
-        for (int i = 0; i < l.n_video; ++i) mod[r++] = t_row(t_v) * 3 + 0;
-        std::vector<int64_t> vidx(l.n_video), vt(l.n_video, t_row(t_v));
-        std::vector<int64_t> aidx(l.n_audio), at(l.n_audio, t_row(t_a));
-        for (int i = 0; i < l.n_video; ++i) vidx[i] = l.n_text + l.n_audio + i;
-        for (int i = 0; i < l.n_audio; ++i) aidx[i] = l.n_text + i;
+        std::vector<float> t_emb;
+        std::vector<int64_t> mod;
+        int64_t row_v, row_a;
+        step_tables(t_v, t_a, t_emb, mod, row_v, row_a);
+        const size_t n_t = t_emb.size() / t_dim;
+        std::vector<int64_t> vidx(l.n_video), vt(l.n_video, row_v);
+        std::vector<int64_t> aidx(l.n_audio), at(l.n_audio, row_a);
+        for (int i = 0; i < l.n_video; ++i) vidx[i] = l.n_text + l.n_ref + l.n_audio + i;
+        for (int i = 0; i < l.n_audio; ++i) aidx[i] = l.n_text + l.n_ref + i;
 
-        upload_float(rt, pool, "video_rows", patchify(xv, l), {u32(l.n_video), 96});
+        // refs ride ahead of the target video rows in the same projection
+        std::vector<float> vrows = ref_rows;
+        {
+            const auto tr = patchify(xv, l);
+            vrows.insert(vrows.end(), tr.begin(), tr.end());
+        }
+        upload_float(rt, pool, "video_rows", vrows, {u32(l.n_ref + l.n_video), 96});
         upload_float(rt, pool, "audio_rows", pack_audio(xa, audio_t), {u32(l.n_audio), 32});
         upload_float(rt, pool, "text_states", text, {u32(text_len), kTextDim});
         upload<int64_t>(rt, pool, "pack_index", l.pack, {u32(l.seq)});
-        upload_float(rt, pool, "t_emb", t_emb, {u32(unique_t.size()), u32(t_dim)});
+        upload_float(rt, pool, "t_emb", t_emb, {u32(n_t), u32(t_dim)});
         upload<int64_t>(rt, pool, "mod_index", mod, {u32(l.seq)});
         upload_float(rt, pool, "rope_cos", rope_cos, {u32(l.seq), u32(n_ang)});
         upload_float(rt, pool, "rope_sin", rope_sin, {u32(l.seq), u32(n_ang)});
