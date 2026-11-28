@@ -801,6 +801,121 @@ TEST(Bf16ActivationTest, MatMulInt4WeightMatchesFp32) {
     }
 }
 
+// The SwiGLU fold on an int4 [K, 2*N_up] weight (group scale) beside a bf16
+// activation: the MiniMax-H3 fc1 form (its weight rows pre-interleaved by the
+// exporter). coop8's int4 B stage feeds the same epilogue as a float B.
+TEST(Bf16ActivationTest, MatMulInt4SwigluMatchesFp32) {
+    Env e;
+    struct Case {
+        int m, k, nup;
+        const char *why;
+    } cases[] = {{256, 512, 512, "coop8 epilogue"},
+                 {1, 1024, 2048, "decode WIDE GEMV epilogue"},
+                 {20, 256, 48, "tile + swiglu_pack"}};
+    const int group = 128;
+    for (const Case &c : cases) {
+        const int n = 2 * c.nup, ng = c.k / group;
+        auto av = bf16_values(static_cast<size_t>(c.m) * c.k, 191 + c.m);
+        std::vector<int> code(static_cast<size_t>(c.k) * n);
+        uint32_t st = 4321u + static_cast<uint32_t>(n);
+        for (auto &v : code) {
+            st = st * 1664525u + 1013904223u;
+            v = static_cast<int>(st >> 24) % 15 - 7;
+        }
+        std::vector<float> sc(static_cast<size_t>(ng) * n);
+        for (size_t i = 0; i < sc.size(); ++i)
+            sc[i] = 2e-3F * std::pow(10.0F, float(i % 11) / 10.0F);
+        std::vector<float> bv(code.size());
+        for (int kk = 0; kk < c.k; ++kk)
+            for (int j = 0; j < n; ++j)
+                bv[static_cast<size_t>(kk) * n + j] =
+                    float(code[static_cast<size_t>(kk) * n + j]) *
+                    sc[static_cast<size_t>(kk / group) * n + j];
+        std::vector<int8_t> bytes(code.size() / 2);
+        for (size_t i = 0; i < code.size(); i += 2)
+            bytes[i / 2] = static_cast<int8_t>((code[i] & 0xF) | ((code[i + 1] & 0xF) << 4));
+        auto a = half_in(e, true, {c.m, c.k}, av);
+        auto w = std::make_shared<Tensor<int8_t>>(std::vector<int>{c.k, n});
+        w->set_elem_kind(ElemKind::kInt4);
+        w->set_payload_bytes(static_cast<int>(bytes.size()));
+        w->fillToCPU(bytes);
+        w->as_storage_buffer(e.dev);
+        w->copyToGPU(e.cmdpool);
+        auto s = std::make_shared<Tensor<float>>(std::vector<int>{ng * n});
+        s->fillToCPU(sc);
+        s->as_storage_buffer(e.dev);
+        s->copyToGPU(e.cmdpool);
+        auto y = out<uint16_t>(e, {c.m, c.nup}, ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::MATMUL, 2, {{"transB", "0"}, {"swiglu", "1"}});
+        op->onExecute({a, w, s}, {y}, 0);
+        submit(e, op.get());
+        const auto got = read_half(e, true, y);
+        std::vector<double> ref, mag;
+        mm_ref(1, 1, c.m, c.k, n, false, av, bv, &ref, &mag);
+        std::vector<double> h(static_cast<size_t>(c.m) * c.nup);
+        for (int i = 0; i < c.m; ++i)
+            for (int j = 0; j < c.nup; ++j) {
+                const int oct = j / 4, q = j % 4;
+                const double g = ref[static_cast<size_t>(i) * n + oct * 8 + q];
+                const double u = ref[static_cast<size_t>(i) * n + oct * 8 + 4 + q];
+                h[static_cast<size_t>(i) * c.nup + j] = g / (1.0 + std::exp(-g)) * u;
+            }
+        double worst = 0;
+        EXPECT_EQ(count_bad(got, h, 2.5e-2, 0.05, &worst), 0)
+            << c.why << " (route " << op->route_tag() << ") worst " << worst;
+        LOG_INFO("bf16 x int4 SwiGLU %s: route %s, worst %g", c.why,
+                 op->route_tag().c_str(), worst);
+    }
+}
+
+// MatMul(x [rows, 256], H) with hadamard=256 (the converter's tag for a B
+// that IS the normalized regular Hadamard, MiniMax-H3 ConvRot) runs the fast
+// transform hadamard256.comp; it must equal the GEMM it replaces.
+TEST(Bf16ActivationTest, MatMulHadamard256MatchesGemm) {
+    Env e;
+    const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
+    std::vector<float> H(256 * 256);
+    for (int i = 0; i < 256; ++i)
+        for (int j = 0; j < 256; ++j) {
+            float v = 1.0F / 16.0F;
+            for (int d = 0; d < 4; ++d)
+                v *= h4[(i >> (2 * d)) & 3][(j >> (2 * d)) & 3];
+            H[static_cast<size_t>(i) * 256 + j] = v;
+        }
+    for (int rows : {1, 3, 1000}) {
+        auto av = bf16_values(static_cast<size_t>(rows) * 256, 301 + rows);
+        for (size_t i = 5; i < av.size(); i += 97)
+            av[i] = bf16_to_float(float_to_bf16(av[i] * 3.0e4F));
+        std::vector<double> ref(static_cast<size_t>(rows) * 256, 0.0);
+        for (int r = 0; r < rows; ++r)
+            for (int i = 0; i < 256; ++i) {
+                const double x = av[static_cast<size_t>(r) * 256 + i];
+                for (int j = 0; j < 256; ++j)
+                    ref[static_cast<size_t>(r) * 256 + j] += x * H[static_cast<size_t>(i) * 256 + j];
+            }
+        auto run = [&](bool tag) {
+            auto a = half_in(e, true, {rows, 256}, av);
+            auto b = half_in(e, true, {256, 256}, H);
+            auto y = out<uint16_t>(e, {rows, 256}, ElemKind::kBFloat16);
+            Attrs at{{"transB", "0"}};
+            if (tag) at["hadamard"] = "256";
+            auto op = make_op(e, OpType::MATMUL, 2, at);
+            op->onExecute({a, b}, {y}, 0);
+            submit(e, op.get());
+            return std::make_pair(read_half(e, true, y), op->route_tag());
+        };
+        const auto fast = run(true);
+        const auto gemm = run(false);
+        EXPECT_EQ(fast.second, "hadamard") << rows;
+        double worst = 0;
+        EXPECT_EQ(count_bad(fast.first, ref, 1e-2, 1e-2, &worst), 0)
+            << "rows " << rows << " worst " << worst;
+        std::vector<double> g(gemm.first.begin(), gemm.first.end());
+        EXPECT_EQ(count_bad(fast.first, g, 1.6e-2, 1e-2, &worst), 0)
+            << "rows " << rows << " vs GEMM (" << gemm.second << ") worst " << worst;
+    }
+}
+
 // NVFP4 weight-only MatMul under a bf16 activation: [A bf16, W e2m1 [K, N]
 // (low nibble first), s e4m3 [K/16, N], g fp32 [1]] -- the form
 // PreQuantizedWeights folds a ModelOpt/ComfyUI NVFP4 Linear into.

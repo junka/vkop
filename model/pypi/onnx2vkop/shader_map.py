@@ -135,6 +135,9 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # Keyed by (op, backend). Buffer and image paths never share a shader,
     # so listing them under the wrong backend just ships dead bytes.
     ("MatMul", "buffer"): [
+        # MatMul hadamard=256 (tag_hadamard_matmul): the fast transform that
+        # replaces a GEMM against the normalized regular Hadamard of order 256.
+        "buffer_hadamard256",
         "buffer_matmul_coop",
         # Apple 8x8x8 coopmat GEMM; only the MoltenVK driver builds it.
         "buffer_matmul_coop8",
@@ -522,8 +525,9 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_attention_split_fp16_sg",
         # The bf16-activation (--act bf16) builds of the tiled and split-KV
         # kernels; the _bf16 Attention resolves these in place of the _fp16
-        # keys (the coop8 flash build has no bf16 form).
+        # keys, and the coop8 flash build's -DACT_BF16 form on MoltenVK.
         "buffer_attention_flash_bf16",
+        "buffer_attention_flash_coop8_bf16",
         "buffer_attention_split_bf16",
         "buffer_attention_split_bf16_sg",
     ],

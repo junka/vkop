@@ -1998,6 +1998,34 @@ class FusionOptimizer:
             )
         )
 
+        # MatMul(x[.., 256], H) with H the normalized regular Hadamard of
+        # order 256 (MiniMax-H3 --convrot): tag it hadamard=256 so the runtime
+        # runs the fast transform (hadamard256.comp) instead of a GEMM. Only a
+        # tag -- B stays, and a runtime without the key runs the GEMM.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "tag_hadamard_matmul",
+                FusionOptimizer.match_hadamard_matmul,
+                FusionOptimizer.fold_hadamard_matmul,
+                priority=64,
+            )
+        )
+
+        # SwiGLU over a pre-interleaved fc1 (MiniMax-H3 --swiglu-interleave):
+        # ONE MatMul whose [K, 2F] weight the exporter already stored gate/up
+        # four columns at a time, followed by Reshape[-1, F/4, 2, 4] ->
+        # Gather(axis 2, 0 | 1) -> silu(g) * u -> Reshape[-1, F]. That is the
+        # swiglu=1 epilogue's own layout, so the tail folds into the MatMul
+        # with the weight (and any streamed 4-bit payload) untouched.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_swiglu_interleaved",
+                FusionOptimizer.match_swiglu_interleaved,
+                FusionOptimizer.fold_swiglu_interleaved,
+                priority=64,
+            )
+        )
+
         # Elemwise chain fusion (kernel-fusion engine): collapse single-
         # consumer pointwise chains (Add/Sub/Mul/Div/Pow/Sqrt/Sigmoid/Neg/
         # Exp/Tanh) into one FusedElemwise dispatch. Runs late (after all
@@ -6496,6 +6524,159 @@ class FusionOptimizer:
                             "wu": wu["name"], "k": k_dim, "n": n_dim,
                             "quant": quant_pair is not None})
         return matches
+
+    _HADAMARD256 = None
+
+    @staticmethod
+    def _hadamard256():
+        if FusionOptimizer._HADAMARD256 is None:
+            h4 = np.array([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1],
+                           [-1, 1, 1, 1]], np.float32)
+            h = h4
+            while h.shape[0] < 256:
+                h = np.kron(h, h4)
+            FusionOptimizer._HADAMARD256 = h / np.float32(16.0)
+        return FusionOptimizer._HADAMARD256
+
+    @staticmethod
+    def match_hadamard_matmul(dag_model):
+        matches = []
+        for mm in dag_model.nodes.values():
+            if mm.op_type != "MatMul" or len(mm.inputs) != 2:
+                continue
+            if "hadamard" in mm.attributes or any(
+                    k != "transB" for k in mm.attributes) or \
+                    mm.attributes.get("transB", 0):
+                continue
+            ad = list(mm.inputs[0].get("shape") or [])
+            if not ad or ad[-1] != 256:
+                continue
+            t = dag_model.initializers.get(mm.inputs[1]["name"])
+            if t is None or list(t.dims) != [256, 256]:
+                continue
+            try:
+                if t.data_type == TensorProto.BFLOAT16:
+                    from .bf16_weights import bf16_bits_to_fp32
+                    raw = np.frombuffer(t.raw_data, "<u2") if t.raw_data else \
+                        np.array(t.int32_data, np.uint32).astype("<u2")
+                    w = bf16_bits_to_fp32(raw).reshape(256, 256)
+                else:
+                    w = numpy_helper.to_array(t).astype(np.float32)
+            except Exception:
+                continue
+            if w.shape != (256, 256) or not np.array_equal(
+                    w, FusionOptimizer._hadamard256()):
+                continue
+            matches.append({"mm": mm})
+        return matches
+
+    @staticmethod
+    def fold_hadamard_matmul(dag_model, match) -> bool:
+        match["mm"].attributes["hadamard"] = [256]
+        return True
+
+    @staticmethod
+    def match_swiglu_interleaved(dag_model):
+        producer = {}
+        consumers = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+            for i in n.inputs:
+                consumers[i["name"]].append(n)
+
+        def only(name):
+            cs = consumers.get(name, [])
+            return cs[0] if len(cs) == 1 else None
+
+        def dims(entry):
+            return list(entry.get("shape") or [])
+
+        matches = []
+        for mm in dag_model.nodes.values():
+            if mm.op_type != "MatMul" or len(mm.inputs) not in (2, 3):
+                continue
+            # transB is allowed: a streamed [N, K] weight is relaid as [K, N]
+            # by a later pass, which keeps the node's other attributes.
+            if any(k != "transB" for k in mm.attributes):
+                continue
+            # The weight may still sit behind its Transpose here (folded at a
+            # lower priority); N comes from the product's shape, and
+            # _validate_folded_weights checks the final B.
+            od = list(mm.outputs[0].get("shape") or [])
+            if len(od) != 2 or not isinstance(od[-1], int) or od[-1] <= 0:
+                continue
+            n2 = int(od[-1])
+            if n2 % 16 != 0:
+                continue
+            r1 = only(mm.outputs[0]["name"])
+            if r1 is None or r1.op_type != "Reshape":
+                continue
+            d1 = dims(r1.outputs[0])
+            if len(d1) != 4 or d1[2:] != [2, 4] or d1[1] * 8 != n2:
+                continue
+            gs = consumers.get(r1.outputs[0]["name"], [])
+            if len(gs) != 2 or any(g.op_type != "Gather" for g in gs):
+                continue
+            sel = {}
+            for g in gs:
+                ax = int(g.attributes.get("axis", 0))
+                if ax not in (2, -2):
+                    break
+                v = FusionOptimizer._const_scalar_ints(
+                    dag_model, producer, g, [1])
+                arr = FusionOptimizer._guard_const_array(
+                    g.inputs[1]["name"], dag_model, producer)
+                if v is None or arr is None or arr.ndim != 0:
+                    break
+                sel[v[0]] = g
+            if set(sel) != {0, 1}:
+                continue
+            gate, up = sel[0], sel[1]
+            greaders = consumers.get(gate.outputs[0]["name"], [])
+            sig = next((c for c in greaders if c.op_type == "Sigmoid"), None)
+            m1 = next((c for c in greaders if c.op_type == "Mul"), None)
+            if sig is None or m1 is None or len(greaders) != 2:
+                continue
+            gname, sname = gate.outputs[0]["name"], sig.outputs[0]["name"]
+            if sorted(i["name"] for i in m1.inputs) != sorted([gname, sname]):
+                continue
+            if only(sname) is not m1:
+                continue
+            m2 = only(m1.outputs[0]["name"])
+            if m2 is None or m2.op_type != "Mul" or len(m2.inputs) != 2:
+                continue
+            if sorted(i["name"] for i in m2.inputs) != sorted(
+                    [m1.outputs[0]["name"], up.outputs[0]["name"]]):
+                continue
+            if only(up.outputs[0]["name"]) is not m2:
+                continue
+            r2 = only(m2.outputs[0]["name"])
+            if r2 is None or r2.op_type != "Reshape":
+                continue
+            d2 = dims(r2.outputs[0])
+            if len(d2) != 2 or d2[1] * 2 != n2:
+                continue
+            matches.append({"mm": mm, "r1": r1, "gate": gate, "up": up,
+                            "sig": sig, "m1": m1, "m2": m2, "r2": r2})
+        return matches
+
+    @staticmethod
+    def fold_swiglu_interleaved(dag_model, match) -> bool:
+        mm = match["mm"]
+        fused = Node(
+            op_type="MatMul",
+            name=mm.name + "_swiglu",
+            attributes=dict(mm.attributes, swiglu=[1]),
+            inputs=mm.inputs[:],
+            outputs=match["r2"].outputs[:],
+        )
+        for key in ("mm", "r1", "gate", "up", "sig", "m1", "m2", "r2"):
+            n = match[key]
+            if n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
 
     @staticmethod
     def fold_swiglu_gate_up(dag_model, match) -> bool:

@@ -734,6 +734,8 @@ checkout:
 | same + turbo 8-step LoRA, 8 steps | 13.7 (110 s total) | 19.9 GB |
 | same + turbo 4-step LoRA, 4 steps, shift 6 | 13.8 (55 s total) | 19.9 GB |
 | VAE, 56 frames 512×288 (3 clips × 6 tiles) | 29 s total | – |
+| VAE, auto tile 288 (3 clips × 2 tiles), -O2 driver, coop8 attention | 9.3 s total | 3.4 GB |
+| turbo 4-step DiT after §6a (bf16 coop8 attention, gather row path, SwiGLU fold, FWHT) | 12.4 (50 s total) | 19.7 GB |
 | DiT int8, bf16, 2687 rows | – | 26.3 GB, killed: does not fit beside the other processes on 36 GB |
 | text tower int8, 53 tokens, two halves | 4.3 s total (run 0.7 s) | ~12 GB per half |
 | text tower NVFP4, 53 tokens, one graph | 2.5 s total (run 0.7 s) | 13.2 GB |
@@ -748,6 +750,53 @@ where an in-distribution latent is ≈ 1 (the test tone encodes to 0.65), so
 the quiet output most likely comes from the DiT/sampler, not from the
 decoder. The decoder itself matches comfy exactly.
 
+### 6a. Profile and the optimizations it led to
+
+Per-op GPU timestamps need the per-level submit path
+(`VKOP_SUBMIT_PROF=1 VKOP_GRAPH_SUBMIT=0`), which a 50-layer graph cannot use
+(it needs activation reuse, i.e. graph mode). So one DiT block was exported
+at the real geometry (`--num-layers 1 --geometry 53,17,18,32,93`, 2687 rows)
+and profiled with vkop-bench. One block, before → after:
+
+| op | before | after | change |
+|---|---|---|---|
+| qkv / out / fc1 / fc2 int4 GEMMs | 61.4 / 20.5 / 81.8 / 40.8 ms | same | coop8 at ~10.1 TFLOP/s (fp16 B 10.8, int8 11.1) |
+| attention, 56 heads × 2687 | 29.6 ms (SIMT, bf16) | 22.1 ms | `attention_flash_coop8 -DACT_BF16` |
+| 4 ConvRot rotations | 4.4 ms (GEMM vs H) | 0.8 ms | `tag_hadamard_matmul` → `hadamard256.comp` FWHT |
+| fc1 gate/up Slices + silu·mul | ~4 ms | 0 | fc1 rows interleaved by the exporter, `fuse_swiglu_interleaved` → MatMul swiglu=1 |
+| 6 adaLN modulation Gathers | 4.3 ms | 0.4 ms | gather.comp row fast path (16-byte chunks) |
+| whole block | 284 ms | 263 ms | |
+
+- **Attention.** The coop8 build stages bf16 Q/K/V as fp16 after a
+  power-of-two range scale per Q block and per K/V tile, so bf16 values past
+  65504 stay exact to fp16 precision (`AttentionRoutesMatchFp32` puts Q, K and
+  V past it).
+- **Rotations.** H = kron(h4)^4/16, so x·H is four radix-4 butterfly stages
+  instead of 256 MACs per element. The converter tags only a B equal to that
+  matrix, and a runtime without the key runs the GEMM.
+- **SwiGLU.** `--swiglu-interleave 1` (default) stores fc1 rows gate/up four
+  at a time and writes the tail as `reshape [-1, F/4, 2, 4] → select 0/1 →
+  silu·mul`. That is exactly the layout the swiglu epilogue already reads, so
+  the int4 payload is untouched.
+- **Not done: int4 dequant.** coop8's int4 B stage is ~7 % slower than fp16 B.
+  Two attempts changed nothing measurable, so neither shipped:
+  - an fp16 magic-number nibble decode with half2 scaling;
+  - group scales cached in registers instead of reloaded every K step.
+
+  The cost is not decode ALU or scale traffic.
+- **Recording is not a bottleneck.** Only the first step records (2.4 s);
+  later steps take 36 ms. The GPU is busy for the whole step, and step time
+  creeps up over a run (13.3 → 14.1 s), which looks like thermal throttling.
+- **VAE.** The ViT3D decoder only holds up near its 256-px tile: a whole
+  512×288 frame (32 latents wide) decodes to blocks. It is fine up to ~320 px.
+  `--vae-tile 0` (default) picks the size in [256, 320] with the least decoded
+  area: 18 → 6 decoder calls at 512×288. The driver is also built at -O2, which
+  removes 6.6 s of host-side RoPE/unpack/blend from each decode.
+
+What is left per step at 512×288 is ~80 % int4 GEMM at the coop8 ceiling.
+The next large step would be the M5 GPU's neural accelerators, which only
+Metal 4's tensor API reaches, not MoltenVK.
+
 `VKOP_ACTIVATION_REUSE=1` is required. The DiT graph has dynamic shapes, so
 the load-time shape pool does not apply, and without reuse every intermediate
 keeps its own buffer, which fills memory on the first run. With reuse on, the
@@ -761,7 +810,8 @@ peak is weights plus a few GB.
 | `h3_fl2va_te_a/te.vkopbin`, `h3_fl2va_te_b/te.vkopbin` | alternative | int8 text tower layers 0–24 / 25–49 |
 | `h3_fl2va_te/embed_tokens.bf16`, `h3_fl2va_te/tokenizer/` | yes | |
 | `h3_fl2va_cr/dit_int4.vkopbin` (+ its host tables) | yes | DiT, int4 + ConvRot, 50 steps |
-| `h3_fl2va_turbo8/dit_int4.vkopbin`, `h3_fl2va_turbo4/dit_int4.vkopbin` | yes | same with the 8-step / 4-step turbo LoRA merged (10.8 GB each) |
+| `h3_fl2va_turbo4v2/dit_int4.vkopbin` | yes | 4-step turbo LoRA, interleaved fc1 + FWHT rotations (§6a) |
+| `h3_fl2va_turbo8/dit_int4.vkopbin`, `h3_fl2va_turbo4/dit_int4.vkopbin` | older | 8-step / 4-step turbo before the SwiGLU/FWHT folds (10.8 GB each; re-export for them) |
 | `h3_fl2va_bf16/dit_int4.vkopbin`, `dit_int4h.vkopbin`, `dit_int8.vkopbin` | comparison | DiT without rotation (all int4 / head wide / int8) |
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |
 | `h3_fl2va_vae/vae.vkopbin` | yes | |
@@ -776,8 +826,9 @@ deleted on 2026-11-28. The exporters rebuild any of them.
 
 - The 4-step LoRA is trained for 768p; try it at 1344×768 (needs the
   activation budget at ~3× the rows).
-- The out_proj rotation could be folded into the V projection (per-head,
-  group 64 or 128) instead of running online.
+- Re-export the 50-step and 8-step DiTs with `--swiglu-interleave` (and
+  reconvert for the FWHT tag); only turbo4v2 carries §6a's graph changes.
+- The int4 coop8 B stage's remaining ~7 % against fp16 B (§6a).
 - Audio VAE speed: ~60 % of its GPU time goes to the 127 alias-free
   activations (6 ops each). One fused `pad → up → snake → down` kernel would
   remove ~760 dispatches. The audio VAE is < 1 s of a multi-minute run, so

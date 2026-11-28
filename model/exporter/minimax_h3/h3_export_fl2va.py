@@ -143,6 +143,18 @@ def _ident(x):
     return x
 
 
+def swiglu_perm(two_f: int) -> np.ndarray:
+    """fc1 row order for vkop's SwiGLU GEMM epilogue (MatMul swiglu=1): gate
+    and up output columns interleaved four at a time (g0..g3 u0..u3 g4 ..)."""
+    f = two_f // 2
+    j = np.arange(f // 4)[:, None] * 4 + np.arange(4)[None, :]
+    return np.concatenate([j, j + f], axis=1).reshape(-1)
+
+
+def interleave_rows(w: np.ndarray) -> np.ndarray:
+    return w[swiglu_perm(w.shape[0])]
+
+
 def linear(dim_in, dim_out, bias, dtype, device):
     m = nn.Linear(dim_in, dim_out, bias=bias, dtype=dtype, device=device)
     m.requires_grad_(False)
@@ -196,9 +208,16 @@ class MLP(nn.Module):
         self.fc1 = linear(c["hidden"], c["ffn"] * 2, False, dtype, device)
         self.fc2 = linear(c["ffn"], c["hidden"], False, dtype, device)
         self.rot = _ident
+        # fc1 rows interleaved (swiglu_perm): the converter folds the
+        # reshape/select/silu/mul below into the GEMM's SwiGLU epilogue.
+        self.interleaved = bool(c.get("swiglu_interleave", 0))
 
     def forward(self, x):
         h = self.fc1(self.rot(x))
+        if self.interleaved:
+            h4 = h.reshape(-1, self.ffn // 4, 2, 4)
+            y = (F.silu(h4[:, :, 0]) * h4[:, :, 1]).reshape(-1, self.ffn)
+            return self.fc2(self.rot(y))
         gate, up = h[:, :self.ffn], h[:, self.ffn:]
         return self.fc2(self.rot(F.silu(gate) * up))
 
@@ -474,6 +493,8 @@ def load_real(model, ckpt):
             t = f.get_tensor(name)
             if name in rot:
                 t = torch.from_numpy(rotate_in(t.float().numpy(), hadamard(g)))
+            if model.c.get("swiglu_interleave") and name.endswith("mlp.fc1.weight"):
+                t = torch.from_numpy(interleave_rows(t.float().numpy()))
             sd[name] = t.to(p.dtype)
     model.load_state_dict(sd, assign=True)
     return model
@@ -503,6 +524,10 @@ def main(argv=None):
                          "attention/MLP linear's input by a block Hadamard, in "
                          "the graph for x and while streaming for W, so a "
                          "later -q int4 quantizes outlier-free weights")
+    ap.add_argument("--swiglu-interleave", type=int, default=1,
+                    help="store fc1 with gate/up rows interleaved four at a "
+                         "time so the converter folds SwiGLU into the fc1 "
+                         "GEMM (MatMul swiglu=1); 0 keeps the plain layout")
     ap.add_argument("--lora", default=None,
                     help="ComfyUI LoRA (e.g. loras/minimax_h3_fl2v_turbo_8step_*) "
                          "merged into the weights while they stream, before "
@@ -510,7 +535,8 @@ def main(argv=None):
     ap.add_argument("--lora-strength", type=float, default=1.0)
     args = ap.parse_args(argv)
 
-    c = dict(CFG, num_layers=args.num_layers, convrot=args.convrot)
+    c = dict(CFG, num_layers=args.num_layers, convrot=args.convrot,
+             swiglu_interleave=args.swiglu_interleave)
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
@@ -577,6 +603,14 @@ def main(argv=None):
             then = transforms.get(n, lambda w: w)
             transforms[n] = (lambda w, t=t, then=then:
                              then(w + lora.delta(t)))
+    if args.swiglu_interleave:
+        # last: a row permutation commutes with the K-side rotation
+        for name, m in wrapper.named_modules():
+            if isinstance(m, MLP):
+                n = f"{name}.fc1.weight"
+                first = transforms.get(n, lambda w: w)
+                transforms[n] = (lambda w, first=first:
+                                 interleave_rows(first(w)))
     with torch.no_grad():
         common.export_streaming_real(
             wrapper, dummies, INPUT_NAMES, OUTPUT_NAMES, DYNAMIC_AXES,

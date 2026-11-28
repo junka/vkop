@@ -1,0 +1,77 @@
+#version 450 core
+#extension GL_EXT_control_flow_attributes : enable
+
+// y = x . H for every 256-element row x, H the normalized REGULAR Hadamard of
+// order 256 (comfy-kitchen ConvRot: kron(h4, h4, h4, h4) / 16 with
+// h4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]], symmetric). It replaces
+// the GEMM a MatMul(x [rows, 256], H) would run (MatMul attribute hadamard=256,
+// set by the converter only when B holds exactly that matrix): as a GEMM it is
+// 256 MACs per element and compute-bound; as a fast transform it is four
+// radix-4 butterfly stages (one per base-4 digit of the column index, since
+// every kron factor is the same h4) and bound by its one read and one write.
+//
+// Workgroup: 256 lanes = 4 rows x 64 lanes; a lane owns 4 consecutive
+// elements on load/store and one 4-point butterfly per stage. fp32 math, the
+// result rounded once on the store. Activations are 16-bit (bf16 or fp16,
+// push constant), two per uint word, element 0 in the low half.
+
+#include "../common/bf16.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output { uint data[]; } uOut;
+layout(set = 0, binding = 1) readonly buffer Input { uint data[]; } uIn;
+
+layout(push_constant) uniform PC {
+    int rows;  // number of 256-element rows
+    int bf16;  // 1: bf16 words, 0: fp16 words
+    int pad0;
+    int pad1;
+} uPC;
+
+shared float sh[4][256];
+
+vec2 dec(uint w) { return uPC.bf16 != 0 ? unpackBF16x2(w) : unpackHalf2x16(w); }
+uint enc(vec2 v) { return uPC.bf16 != 0 ? packBF16x2(v) : packHalf2x16(v); }
+
+void main() {
+    const int lid = int(gl_LocalInvocationID.x);
+    const int v = lid >> 6;
+    const int t = lid & 63;
+    const int row = int(gl_WorkGroupID.x) * 4 + v;
+    const bool ok = row < uPC.rows;
+    const int w0 = row * 128 + t * 2;  // 4 elements = 2 words
+
+    vec4 x = vec4(0.0);
+    if (ok) {
+        x = vec4(dec(uIn.data[w0]), dec(uIn.data[w0 + 1]));
+    }
+    sh[v][t * 4 + 0] = x.x;
+    sh[v][t * 4 + 1] = x.y;
+    sh[v][t * 4 + 2] = x.z;
+    sh[v][t * 4 + 3] = x.w;
+    barrier();
+
+    [[unroll]] for (int s = 0; s < 4; ++s) {
+        const int sh2 = 2 * s;
+        const int stride = 1 << sh2;
+        const int lo = t & (stride - 1);
+        const int base = ((t >> sh2) << (sh2 + 2)) | lo;
+        const float x0 = sh[v][base];
+        const float x1 = sh[v][base + stride];
+        const float x2 = sh[v][base + 2 * stride];
+        const float x3 = sh[v][base + 3 * stride];
+        // h4 rows (h4 is symmetric, so x . h4 == h4 . x)
+        sh[v][base] = x0 + x1 + x2 - x3;
+        sh[v][base + stride] = x0 + x1 - x2 + x3;
+        sh[v][base + 2 * stride] = x0 - x1 + x2 + x3;
+        sh[v][base + 3 * stride] = -x0 + x1 + x2 + x3;
+        barrier();
+    }
+
+    if (ok) {
+        const float n = 1.0 / 16.0;
+        uOut.data[w0] = enc(vec2(sh[v][t * 4 + 0], sh[v][t * 4 + 1]) * n);
+        uOut.data[w0 + 1] = enc(vec2(sh[v][t * 4 + 2], sh[v][t * 4 + 3]) * n);
+    }
+}

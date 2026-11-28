@@ -704,6 +704,15 @@ class MatMulBuffer : public BufferFactory {
         // fp16-staging tile routes away (core::MatmulFeatures::bf16_wide and
         // coop8_eligible). Same bare-int spelling as down_act; inert unless B
         // is actually bf16.
+        // B is the normalized regular Hadamard of order 256 (the converter's
+        // fuse_hadamard_matmul checks the values): run hadamard256.comp's fast
+        // transform on A instead of the GEMM. A model without that key keeps
+        // the GEMM, which computes the same product.
+        auto hd = attributes.find("hadamard");
+        if (hd != attributes.end() && !hd->second.empty()) {
+            auto list = parse_attr_list<int>(hd->second);
+            hadamard_ = !list.empty() ? list[0] : std::stoi(hd->second);
+        }
         auto bw = attributes.find("bf16_wide");
         if (bw != attributes.end() && !bw->second.empty()) {
             auto list = parse_attr_list<int>(bw->second);
@@ -735,6 +744,9 @@ class MatMulBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         swiglu_pack_ = false;
+        if (hadamard_ == 256 && try_hadamard(inputs, outputs)) {
+            return;
+        }
         execute_core(inputs, outputs);
         // A swiglu op whose route has no swiglu epilogue wrote the plain
         // interleaved product to swiglu_scratch_; finish it here.
@@ -3982,6 +3994,85 @@ class MatMulBuffer : public BufferFactory {
         int pad0;
         int pad1;
     };
+    struct HadamardPC {
+        int rows;
+        int bf16;
+        int pad0;
+        int pad1;
+    };
+
+    // y = A . H256 by the fast transform (hadamard256.comp). False when the
+    // shapes or dtypes are not its form, or the key is missing: the caller
+    // then runs the ordinary GEMM.
+    bool try_hadamard(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        if (hadamard_unavailable_ || inputs.empty() || outputs.empty()) {
+            return false;
+        }
+        const auto ak = inputs[0]->elem_kind();
+        const bool a_bf16 = ak == core::ElemKind::kBFloat16;
+        if (!(a_bf16 || ak == core::ElemKind::kFloat16) ||
+            outputs[0]->elem_kind() != ak) {
+            return false;
+        }
+        const auto ashape = inputs[0]->getShape();
+        if (ashape.empty() || ashape.back() != 256) {
+            return false;
+        }
+        int64_t total = 1;
+        for (int d : ashape) total *= d;
+        if (!hadamard_pipe_) {
+            if (!archive_has_spv("buffer_hadamard256")) {
+                hadamard_unavailable_ = true;
+                return false;
+            }
+            auto spv = resolve_spv("buffer_hadamard256");
+            hadamard_pipe_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE,
+                                              DESCRIPTOR_TYPE_STORAGE},
+                sizeof(HadamardPC), spv.first, static_cast<int>(spv.second),
+                false, 0, nullptr);
+            for (auto &ds : hadamard_ds_) {
+                ds = hadamard_pipe_->allocDescriptorSets();
+            }
+        }
+        auto out = core::as_tensor<uint16_t>(outputs[0]);
+        if (out->num_elements() == total) {
+            out->reshape_view(ashape);
+        } else {
+            out->resize(ashape);
+        }
+        auto in = core::as_tensor<uint16_t>(inputs[0]);
+        auto out_buf = out->as_storage_buffer(m_dev_, m_cmd_);
+        auto in_buf = in->as_storage_buffer(m_dev_, m_cmd_);
+        objs_.clear();
+        objs_.emplace_back(out_buf);
+        objs_.emplace_back(in_buf);
+        VkDescriptorSet ds = hadamard_ds_[m_id_];
+        std::vector<VkWriteDescriptorSet> w(2);
+        for (int i = 0; i < 2; ++i) {
+            w[i] = {};
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = ds;
+            w[i].dstBinding = static_cast<uint32_t>(i);
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = DESCRIPTOR_TYPE_STORAGE;
+            w[i].pBufferInfo = std::get<VkDescriptorBufferInfo *>(
+                objs_[i]->getDescriptorInfo());
+        }
+        hadamard_pipe_->updateDescriptorSets(w);
+        m_cmd_->bind(*hadamard_pipe_, ds);
+        hadamard_pc_ = {static_cast<int>(total / 256), a_bf16 ? 1 : 0, 0, 0};
+        m_cmd_->push_constants(*hadamard_pipe_, sizeof(HadamardPC),
+                               &hadamard_pc_);
+        dispatch_and_record(UP_DIV(hadamard_pc_.rows, 4), 1, 1, &hadamard_pc_,
+                            sizeof(HadamardPC));
+        route_tag_ = "hadamard";
+        return true;
+    }
+
     void submit_swiglu_pack() {
         if (!swiglu_pack_pipe_) {
             auto spv = resolve_spv("buffer_matmul_swiglu_pack");
@@ -4167,6 +4258,11 @@ class MatMulBuffer : public BufferFactory {
     VkDeviceSize swiglu_scratch_bytes_ = 0;
     std::shared_ptr<VulkanResource> swiglu_out_;
     std::unique_ptr<VulkanPipeline> swiglu_pack_pipe_;
+    int hadamard_ = 0;
+    bool hadamard_unavailable_ = false;
+    std::unique_ptr<VulkanPipeline> hadamard_pipe_;
+    VkDescriptorSet hadamard_ds_[vkop::kInflight] = {nullptr};
+    HadamardPC hadamard_pc_{};
     VkDescriptorSet swiglu_pack_ds_[vkop::kInflight] = {nullptr};
     SwigluPackPC swiglu_pc_{};
     VkDescriptorSet coop8_ds_[vkop::kInflight] = {nullptr};

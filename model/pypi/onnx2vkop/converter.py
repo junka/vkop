@@ -227,7 +227,8 @@ def _fusions_the_target_cannot_run(args) -> dict:
                 "only (the gate/up fold still runs)"}
     else:
         return {}
-    return {"fuse_swiglu_gate_up": why, "fuse_swiglu_down_proj": why}
+    return {"fuse_swiglu_gate_up": why, "fuse_swiglu_down_proj": why,
+            "fuse_swiglu_interleaved": why}
 
 class UnsupportedOpError(RuntimeError):
     """A graph contains an op_type the runtime cannot execute.
