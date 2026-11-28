@@ -96,6 +96,9 @@ struct Options {
     std::string qwen_dir, vision;
     std::string text_tags, dump_layout;
     double cond_aug = 0.999;  // comfy VISUAL_COND_TIMESTEP / noise aug
+    // euler (lightx2v / the FL2VA workflow) or res_multistep (comfy's
+    // eta-0 second-order multistep; the Ref2VA workflow's sampler)
+    std::string sampler = "euler";
     int width = 256, height = 256, length = 22, steps = 8, text_len = 32;
     uint32_t seed = 42;
 };
@@ -127,6 +130,7 @@ void usage(const char *argv0) {
                  "  --text-tags F.i64  per-token adaLN tags (1 text, 0 vision pad)\n"
                  "  --cond-aug 0.999   reference timestep / noise augmentation\n"
                  "  --steps 0          stop after the text tower / reference encoding\n"
+                 "  --sampler euler|res_multistep  (default euler)\n"
                  "  --dump-layout DIR  write position/pack/mod of step 1 and exit\n",
                  argv0);
 }
@@ -164,6 +168,7 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--vision" && (v = next("--vision"))) o.vision = v;
         else if (a == "--dump-layout" && (v = next("--dump-layout"))) o.dump_layout = v;
         else if (a == "--cond-aug" && (v = next("--cond-aug"))) o.cond_aug = std::atof(v);
+        else if (a == "--sampler" && (v = next("--sampler"))) o.sampler = v;
         else if (a == "--width" && (v = next("--width"))) o.width = std::atoi(v);
         else if (a == "--height" && (v = next("--height"))) o.height = std::atoi(v);
         else if (a == "--length" && (v = next("--length"))) o.length = std::atoi(v);
@@ -1460,6 +1465,34 @@ int main(int argc, char **argv) {
     const auto u32 = [](size_t v) { return static_cast<uint32_t>(v); };
     // step-independent inputs, uploaded once per round anyway: Run() may have
     // retired them if activation reuse is on, and they are small.
+    if (o.sampler != "euler" && o.sampler != "res_multistep") {
+        std::fprintf(stderr, "--sampler: euler or res_multistep\n");
+        return 2;
+    }
+    // res_multistep (comfy k_diffusion, eta 0): Euler on the first and the
+    // last step, otherwise x <- e^-h x + h (b1 x0 + b2 x0_prev) on t = -log sigma.
+    // x0 = x + sigma * out (the head predicts x0 - noise). Applied per stream on
+    // its own sigma grid: exact for video (the sampler's sigma); for audio comfy
+    // steps the carried (sigma_v / sigma_a)-scaled latent instead, so audio is
+    // an approximation of the workflow's trajectory.
+    std::vector<float> x0v_prev, x0a_prev;
+    const auto res_step = [](std::vector<float> &x, const std::vector<float> &x0,
+                             std::vector<float> &x0_prev, const std::vector<double> &sg,
+                             int k) {
+        const double s = sg[k], sn = sg[k + 1];
+        if (k == 0 || sn <= 0.0 || x0_prev.empty()) {
+            for (size_t i = 0; i < x.size(); ++i)  // Euler: x + (sn - s) (x - x0) / s
+                x[i] = static_cast<float>(x[i] + (sn - s) * (x[i] - x0[i]) / s);
+        } else {
+            const double t = -std::log(s), tn = -std::log(sn), tp = -std::log(sg[k - 1]);
+            const double h = tn - t, c2 = (tp - t) / h;
+            const double phi1 = std::expm1(-h) / -h, phi2 = (phi1 - 1.0) / -h;
+            const double b1 = phi1 - phi2 / c2, b2 = phi2 / c2, eh = std::exp(-h);
+            for (size_t i = 0; i < x.size(); ++i)
+                x[i] = static_cast<float>(eh * x[i] + h * (b1 * x0[i] + b2 * x0_prev[i]));
+        }
+        x0_prev = x0;
+    };
     double total_ms = 0;
     for (int k = 0; k < steps; ++k) {
         const double sig_v = std::max(sv[k], 1e-6), sig_a = sa[k];
@@ -1508,8 +1541,16 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "non-finite denoiser output; stopping\n");
             return 3;
         }
-        add_unpatchified(xv, ov, l, static_cast<float>(sv[k] - sv[k + 1]));
-        add_unpacked_audio(xa, oa, audio_t, static_cast<float>(sa[k] - sa[k + 1]));
+        if (o.sampler == "euler") {
+            add_unpatchified(xv, ov, l, static_cast<float>(sv[k] - sv[k + 1]));
+            add_unpacked_audio(xa, oa, audio_t, static_cast<float>(sa[k] - sa[k + 1]));
+        } else {
+            std::vector<float> x0v = xv, x0a = xa;  // x0 = x + sigma * out
+            add_unpatchified(x0v, ov, l, static_cast<float>(sv[k]));
+            add_unpacked_audio(x0a, oa, audio_t, static_cast<float>(sa[k]));
+            res_step(xv, x0v, x0v_prev, sv, k);
+            res_step(xa, x0a, x0a_prev, sa, k);
+        }
     }
     const Stats fv = stats(xv), fa = stats(xa);
     std::printf("[done] %d steps, %.2f s/step; video latent rms %.3f absmax %.2f, "

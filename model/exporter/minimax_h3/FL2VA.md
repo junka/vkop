@@ -520,6 +520,63 @@ Open items: video blocks (`process_video_block`) are ported and checked against 
 no video ref was run through the towers. The fp16 vision graph runs 3× slower than
 bf16 (not investigated). The full 50-layer `--deepstack` towers are not built yet.
 
+### 3i. Ref2VA end to end, and its turbo LoRA
+
+The Ref2VA DiT (`minimax_h3_ref2va_pruned_bf16`) has the FL2VA architecture,
+so `h3_export_fl2va.py` exports it unchanged (`--convrot 256`, int4, head
+excluded); everything ref2va-specific is host-side in the driver
+(`--ref-image/--vae-enc`, `--qwen/--vision`, `--text-tags`). ComfyUI's
+Reference-to-Video template runs it with
+`minimax_h3_ref2v_turbo_4step_v0.1` at strength 1, `simple` 20 steps and the
+`res_multistep` sampler, default shifts (12 / 3). The LoRA's metadata names
+the fl2va checkpoint as `base_model`; the template applies it to the ref2va
+DiT, and so do we. `--lora` merges it before the rotation (rank 128,
+alpha 8 → scale 0.0625; ΔW/W 4.3e-4; merged+rotated spot check rel 0.0017).
+
+`--sampler res_multistep` is comfy's eta-0 second-order multistep (Euler on
+the first and last step, else `x ← e^−h x + h(b1·x0 + b2·x0_prev)` on
+t = −log σ, x0 = x + σ·out); a toy-denoiser check against comfy's loop
+agrees to 4e-16. It is exact for the video stream; audio is stepped on its
+own σ grid with the same formula, while comfy steps the carried
+(σ_v/σ_a)-scaled latent, so audio approximates the workflow's trajectory.
+
+Red-car reference (448×320 `match`), "<Picture 1> drives slowly along the
+beach at sunset…", 512×288×56f, seed 42, int8_convrot text tower with
+DeepStack:
+
+| DiT | sampler, steps | s/step | denoise | audio rms | result |
+|---|---|---|---|---|---|
+| base ref2va | Euler, 50 | 20.6 | 17 min | 0.036 | the car is kept; almost static |
+| + turbo4 | Euler, 4 | 15.4 | 62 s | 0.057 | the car is kept and fully in frame; camera pushes in; sharp |
+| + turbo4 | Euler, 8 | 15.9 | 127 s | 0.081 | the car is kept; drives toward the left edge |
+| + turbo4 | res_multistep, 20 (template) | 19.0 | 380 s | 0.114 | the car is kept; most motion, leaves the frame |
+
+Every run peaked at 21.0 GB (DiT; text tower 11.8 GB in its own process).
+All turbo runs show a faint mark in the bottom-right corner (from the LoRA's
+training data). Turbo4 with 4 Euler steps is the cheapest good setting;
+res_multistep 20 matches the template.
+
+```bash
+# DiT + turbo LoRA (37 GiB streamed; export peak 5.7 GB, convert 2.6 GB)
+$PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors \
+    --out $M/h3_ref2va/dit_turbo4/dit.onnx --dtype bf16 --convrot 256 \
+    --lora $C/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
+$CONV -i $M/h3_ref2va/dit_turbo4/dit.onnx -o $M/h3_ref2va/dit_turbo4/dit_int4.vkopbin \
+    -q int4 --group-size 128 --exclude-node <Gemms of final_layer.video_out / condition_proj>
+# prep (no weights), then text side and the rest in two processes
+$PY h3_ref2va_prep.py qwen --prompt "<Picture 1> ..." --image car.png --width 512 --height 288 --out run/q
+$PY h3_ref2va_prep.py vae car.png --width 512 --height 288 --length 56 --out run/ref0
+build/minimax_h3_fl2va --dit $M/h3_ref2va/dit_turbo4/dit_int4.vkopbin \
+    --te $M/h3_ref2va/te_i8cr_ds_a/te.vkopbin,$M/h3_fl2va_te_i8cr_b/te.vkopbin \
+    --embed $M/h3_fl2va_te/embed_tokens.bf16 --qwen run/q --vision $M/h3_ref2va/vision/vision_fp16.vkopbin \
+    --text-out run/text_states.f32
+build/minimax_h3_fl2va --dit $M/h3_ref2va/dit_turbo4/dit_int4.vkopbin --text-states run/text_states.f32 \
+    --text-tags run/q/tags.i64 --ref-image run/ref0.f32:320:448 --vae-enc $M/h3_ref2va/vae_enc/vae_enc_fp32.vkopbin \
+    --width 512 --height 288 --length 56 --steps 4 [--sampler res_multistep --steps 20] \
+    --audio-vae $M/h3_fl2va_avae/avae_fp32.vkopbin --wav run/audio.wav \
+    --vae $M/h3_fl2va_vae/vae.vkopbin --frames run/frames
+```
+
 ## 4. Commands
 
 ```bash
