@@ -703,6 +703,45 @@ TEST(Bf16ElementwiseTest, GatherBf16OutputFromEveryTable) {
     }
 }
 
+// bf16 table -> bf16 output along axis 0 with rows of 16-byte chunks takes
+// gather.comp's row fast path (one thread per chunk): bit-exact rows, a
+// negative index wraps once, an out-of-range index gives a zero row.
+TEST(Bf16ElementwiseTest, GatherBf16RowFastPath) {
+    Env e;
+    const int rows = 6, cols = 40;
+    auto tv = with_specials(values(rows * cols, 67, 1e5F));
+    auto table = bf16_in(e, {rows, cols}, tv);
+    const std::vector<int64_t> iv{5, 0, -4, 6, -7, 3, 3};
+    auto idx = std::make_shared<Tensor<int64_t>>(
+        std::vector<int>{static_cast<int>(iv.size())});
+    idx->fillToCPU(iv);
+    auto keep = idx->data();
+    idx->as_storage_buffer(e.dev);
+    idx->copyToGPU(e.cmdpool, keep.data());
+    const int n = static_cast<int>(iv.size());
+    auto y = out<uint16_t>(e, {n, cols}, ElemKind::kBFloat16);
+    auto op = make_op(e, OpType::GATHER, 2, {{"axis", "0"}});
+    op->onExecute({table, idx}, {y}, 0);
+    submit(e, op.get());
+    const auto bits = read_bits(e, y);
+    for (int r = 0; r < n; ++r) {
+        int64_t src = iv[r] < 0 ? iv[r] + rows : iv[r];
+        for (int c = 0; c < cols; ++c) {
+            const uint16_t got = bits[r * cols + c];
+            if (src < 0 || src >= rows) {
+                EXPECT_EQ(got, 0) << "row " << r << " col " << c;
+                continue;
+            }
+            const float v = tv[src * cols + c];
+            if (std::isnan(v)) {
+                EXPECT_TRUE(std::isnan(bf16_to_float(got)));
+                continue;
+            }
+            EXPECT_EQ(got, float_to_bf16(v)) << "row " << r << " col " << c;
+        }
+    }
+}
+
 // The WEIGHT role is unchanged: a bf16 table with an fp16/fp32 output still
 // takes the -DBF16_TABLE modules and is not a bf16 activation.
 TEST(Bf16ElementwiseTest, GatherBf16WeightTableUnchanged) {

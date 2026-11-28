@@ -24,6 +24,7 @@ struct GpuGatherParam {
     int idims;
     int odims;
     int nindex;
+    int row_vec; // gather.comp's row fast path, 0 = off
 };
 } // namespace gather
 static_assert(sizeof(gather::GpuGatherParam) <= 128,
@@ -697,6 +698,24 @@ class Gather : public Operator {
         param_.odims = out_shape.size();
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());
+        // Row fast path (only the bf16 -> bf16 build has it): axis 0 and rows
+        // of 16-byte chunks, one thread per chunk instead of per element.
+        param_.row_vec = 0;
+        if (bf16_pipe_ != nullptr && out_bf16 && table_bf16 &&
+            param_.axis == 0 && rank >= 2) {
+            int64_t inner = 1;
+            for (size_t d = 1; d < inshape.size(); ++d) inner *= inshape[d];
+            if (inner > 0 && (inner % 8) == 0) {
+                param_.row_vec = static_cast<int>(inner / 8);
+                const int64_t nidx = std::accumulate(
+                    indshape.begin(), indshape.end(), int64_t{1},
+                    std::multiplies<>());
+                submit(&param_,
+                       static_cast<int>(UP_DIV(nidx * param_.row_vec, 256)), 1,
+                       1);
+                return;
+            }
+        }
         submit(&param_, UP_DIV(total_size, 256), 1, 1);
     }
 

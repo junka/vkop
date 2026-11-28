@@ -71,6 +71,11 @@ layout(set=0, binding=1) readonly buffer inputBuffer { DTYPE data[]; } uInput;
 // 32 bits (.x) are read — correct for the model's small non-negative index
 // values (reading as int[] would stride by 4 bytes and misread every element).
 layout(set=0, binding=2) readonly buffer indexBuffer { ivec2 data[]; } uIndex;
+#if defined(BF16_OUT) && defined(BF16_TABLE)
+layout(set=0, binding=0) writeonly buffer outputVec { uvec4 data[]; } uOutputV;
+layout(set=0, binding=1) readonly buffer inputVec { uvec4 data[]; } uInputV;
+#define GATHER_ROW_FAST 1
+#endif
 #endif
 
 // 8-int struct for shapes/coords (matches buffer_common.comp's IArr8 layout).
@@ -89,6 +94,10 @@ layout(push_constant) uniform gatherBuffer {
     int idims;
     int odims;
     int nindex; // rank of the indices tensor (NOT element count)
+    // > 0: row fast path (axis 0, same 16-bit format in and out, row bytes a
+    // multiple of 16): one thread per 16-byte chunk, row_vec chunks per row,
+    // grid = indices count * row_vec. 0: the general per-element path.
+    int row_vec;
 } uGatherPara;
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -124,6 +133,26 @@ IArr8 gather_linear_to_nd(int linear, IArr8 dims, int rank) {
 
 void main()
 {
+#ifdef GATHER_ROW_FAST
+    // Row copy (the adaLN modulation gathers of a DiT: [rows, C] tables
+    // indexed per token): ~10x the per-element path's bandwidth.
+    if (uGatherPara.row_vec > 0) {
+        const int rv = uGatherPara.row_vec;
+        const int g = int(gl_GlobalInvocationID.x);
+        const int nidx = gather_total_size(uGatherPara.indicesShape,
+                                           uGatherPara.nindex);
+        if (g >= nidx * rv) return;
+        const int r = g / rv;
+        const int c = g - r * rv;
+        const int axis_size = uGatherPara.inShape.v[0];
+        int gi = uIndex.data[r].x;
+        if (gi < 0) gi += axis_size;
+        uOutputV.data[g] = (gi < 0 || gi >= axis_size)
+                               ? uvec4(0u)
+                               : uInputV.data[gi * rv + c];
+        return;
+    }
+#endif
     int odims = uGatherPara.odims;
     int total_output_size = gather_total_size(uGatherPara.outShape, odims);
     int gid = int(gl_GlobalInvocationID.x);
