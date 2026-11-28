@@ -611,8 +611,8 @@ $CONV -i $M/h3_fl2va_te_a/te.onnx -o $M/h3_fl2va_te_a/te.vkopbin -q int8   # sam
 # excluded nodes are the video output head and condition_proj (look the names
 # up in dit.onnx: the Gemm reading final_layer.video_out.weight / condition_proj.weight).
 $PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
-    --out $M/h3_fl2va_cr/dit.onnx --dtype bf16 --convrot 256
-$CONV -i $M/h3_fl2va_cr/dit.onnx -o $M/h3_fl2va_cr/dit_int4.vkopbin -q int4 --group-size 128 \
+    --out $M/h3_fl2va_cr_v2/dit.onnx --dtype bf16 --convrot 256
+$CONV -i $M/h3_fl2va_cr/dit.onnx -o $M/h3_fl2va_cr_v2/dit_int4.vkopbin -q int4 --group-size 128 \
     --exclude-node Gemm_26143,Gemm_6339
 
 # turbo DiTs: same export with the LoRA merged, same conversion (the exclusion
@@ -662,9 +662,9 @@ $HOME/.venvs/h3/bin/python -c "from transformers import Qwen2Tokenizer; import n
 export VKOP_ACTIVATION_REUSE=1     # required: dynamic shapes, see §6
 build/minimax_h3_fl2va --te $M/h3_fl2va_te4/te.vkopbin \
     --embed $M/h3_fl2va_te/embed_tokens.bf16 --prompt-ids ids.i64 --text-out text_states.f32 \
-    --dit $M/h3_fl2va_cr/dit_int4.vkopbin --width 512 --height 288 --length 56
+    --dit $M/h3_fl2va_cr_v2/dit_int4.vkopbin --width 512 --height 288 --length 56
 build/minimax_h3_fl2va --text-states text_states.f32 \
-    --dit $M/h3_fl2va_cr/dit_int4.vkopbin \
+    --dit $M/h3_fl2va_cr_v2/dit_int4.vkopbin \
     --width 512 --height 288 --length 56 --steps 50 --seed 42 --save run/ \
     --vae $M/h3_fl2va_vae/vae.vkopbin --frames run/frames \
     --audio-vae $M/h3_fl2va_avae/avae_fp32.vkopbin --wav run/audio.wav
@@ -809,9 +809,8 @@ peak is weights plus a few GB.
 | `h3_fl2va_te4/te.vkopbin` | yes | NVFP4 text tower |
 | `h3_fl2va_te_a/te.vkopbin`, `h3_fl2va_te_b/te.vkopbin` | alternative | int8 text tower layers 0–24 / 25–49 |
 | `h3_fl2va_te/embed_tokens.bf16`, `h3_fl2va_te/tokenizer/` | yes | |
-| `h3_fl2va_cr/dit_int4.vkopbin` (+ its host tables) | yes | DiT, int4 + ConvRot, 50 steps |
-| `h3_fl2va_turbo4v2/dit_int4.vkopbin` | yes | 4-step turbo LoRA, interleaved fc1 + FWHT rotations (§6a) |
-| `h3_fl2va_turbo8/dit_int4.vkopbin`, `h3_fl2va_turbo4/dit_int4.vkopbin` | older | 8-step / 4-step turbo before the SwiGLU/FWHT folds (10.8 GB each; re-export for them) |
+| `h3_fl2va_cr_v2`, `h3_fl2va_turbo8v2`, `h3_fl2va_turbo4v2` `/dit_int4.vkopbin` (+ host tables) | yes | DiT int4 + ConvRot with §6a's graph (interleaved fc1, FWHT): 50 steps / 8-step LoRA / 4-step LoRA |
+| `h3_fl2va_cr`, `h3_fl2va_turbo8`, `h3_fl2va_turbo4` `/dit_int4.vkopbin` | older | the same three before the SwiGLU/FWHT folds (their export intermediates deleted) |
 | `h3_fl2va_bf16/dit_int4.vkopbin`, `dit_int4h.vkopbin`, `dit_int8.vkopbin` | comparison | DiT without rotation (all int4 / head wide / int8) |
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |
 | `h3_fl2va_vae/vae.vkopbin` | yes | |
@@ -826,8 +825,6 @@ deleted on 2026-11-28. The exporters rebuild any of them.
 
 - The 4-step LoRA is trained for 768p; try it at 1344×768 (needs the
   activation budget at ~3× the rows).
-- Re-export the 50-step and 8-step DiTs with `--swiglu-interleave` (and
-  reconvert for the FWHT tag); only turbo4v2 carries §6a's graph changes.
 - The int4 coop8 B stage's remaining ~7 % against fp16 B (§6a).
 - Audio VAE speed: ~60 % of its GPU time goes to the 127 alias-free
   activations (6 ops each). One fused `pad → up → snake → down` kernel would
