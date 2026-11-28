@@ -99,6 +99,32 @@ def rotate_in(w: np.ndarray, h: np.ndarray) -> np.ndarray:
     return (w.reshape(n, k // g, g) @ h).reshape(n, k)
 
 
+class LoraMerge:
+    """ComfyUI generic LoRA (`diffusion_model.<module>.lora_{A,B}.weight`,
+    scalar `.alpha`) merged into the base weight while it streams:
+    W += strength * alpha / rank * B @ A (rank = A.shape[0]; the repack's
+    fused qkv carries a concatenated A and 3x alpha, so the ratio holds)."""
+
+    def __init__(self, path: str, strength: float = 1.0):
+        from safetensors import safe_open
+        self.f = safe_open(path, "pt")
+        self.strength = strength
+        keys = set(self.f.keys())
+        self.targets = sorted(k[len("diffusion_model."):-len(".lora_A.weight")]
+                              for k in keys if k.endswith(".lora_A.weight"))
+        self.has_alpha = all(f"diffusion_model.{t}.alpha" in keys
+                             for t in self.targets)
+
+    def delta(self, module: str) -> np.ndarray:
+        pre = f"diffusion_model.{module}"
+        a = self.f.get_tensor(pre + ".lora_A.weight").float()
+        b = self.f.get_tensor(pre + ".lora_B.weight").float()
+        # no alpha: already folded into B (the Pika adapters)
+        scale = (self.f.get_tensor(pre + ".alpha").item() / a.shape[0]
+                 if self.has_alpha else 1.0)
+        return (b @ a).numpy() * np.float32(self.strength * scale)
+
+
 class _Rot:
     """Online activation rotation x -> x @ blockdiag(H), H shared by the whole
     model (`FL2VADiT.convrot_h`). A plain object, so assigning it to a module
@@ -477,6 +503,11 @@ def main(argv=None):
                          "attention/MLP linear's input by a block Hadamard, in "
                          "the graph for x and while streaming for W, so a "
                          "later -q int4 quantizes outlier-free weights")
+    ap.add_argument("--lora", default=None,
+                    help="ComfyUI LoRA (e.g. loras/minimax_h3_fl2v_turbo_8step_*) "
+                         "merged into the weights while they stream, before "
+                         "--convrot and before the converter quantizes them")
+    ap.add_argument("--lora-strength", type=float, default=1.0)
     args = ap.parse_args(argv)
 
     c = dict(CFG, num_layers=args.num_layers, convrot=args.convrot)
@@ -521,6 +552,10 @@ def main(argv=None):
     # every tensor of a weightless trace lives on meta, inputs included
     dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
     transforms, computed = {}, {}
+    lora = LoraMerge(args.lora, args.lora_strength) if args.lora else None
+    if lora:
+        print(f"[lora] {os.path.basename(args.lora)}: {len(lora.targets)} "
+              f"linears, strength {args.lora_strength}")
     if args.convrot:
         import onnx
         h = hadamard(args.convrot)
@@ -535,6 +570,13 @@ def main(argv=None):
                                          h.shape, bits.tobytes(), raw=True)
         computed = {"convrot_h": hp}
         print(f"[convrot] group {args.convrot}: {len(transforms)} weights rotated")
+    if lora:
+        # merge first, then rotate: the LoRA delta lives in the original basis
+        for t in lora.targets:
+            n = t + ".weight"
+            then = transforms.get(n, lambda w: w)
+            transforms[n] = (lambda w, t=t, then=then:
+                             then(w + lora.delta(t)))
     with torch.no_grad():
         common.export_streaming_real(
             wrapper, dummies, INPUT_NAMES, OUTPUT_NAMES, DYNAMIC_AXES,

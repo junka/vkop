@@ -51,8 +51,9 @@ constexpr int kVideoC = 24;
 constexpr int kAudioC = 32;
 constexpr int kTextDim = 5120;
 constexpr int kRopeAxes = 3;
-constexpr double kShiftVideo = 12.0;
-constexpr double kShiftAudio = 3.0;
+// Base-model shifts; the 4-step turbo LoRA wants video 6 (--shift-video).
+double kShiftVideo = 12.0;
+double kShiftAudio = 3.0;
 constexpr double kFrameRescale = 5.0 / 3.0;
 constexpr int kFramePerToken[5] = {1, 4, 4, 4, 4};
 constexpr int kFps = 24;
@@ -82,6 +83,7 @@ void usage(const char *argv0) {
                  "usage: %s --dit dit.vkopbin [--host-dir DIR] [--width W] "
                  "[--height H]\n"
                  "          [--length FRAMES] [--steps N] [--seed S] "
+                 "[--shift-video 12] [--shift-audio 3] "
                  "[--text-len L | --text-states F.f32]\n"
                  "          [--save DIR]\n"
                  "  --host-dir   rope_inv_freq.f32 + adaln_t_table.f32 "
@@ -128,6 +130,8 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--steps" && (v = next("--steps"))) o.steps = std::atoi(v);
         else if (a == "--text-len" && (v = next("--text-len"))) o.text_len = std::atoi(v);
         else if (a == "--seed" && (v = next("--seed"))) o.seed = static_cast<uint32_t>(std::atoll(v));
+        else if (a == "--shift-video" && (v = next("--shift-video"))) kShiftVideo = std::atof(v);
+        else if (a == "--shift-audio" && (v = next("--shift-audio"))) kShiftAudio = std::atof(v);
         else return false;
         if (v == nullptr) return false;
     }

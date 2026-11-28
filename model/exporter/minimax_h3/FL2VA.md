@@ -154,6 +154,17 @@ the int8 DiT (rms of the `out` difference; `out` rms ≈ 3.0 video, 1.0 audio):
 So the head exclusion is what helps video, and the rotation is what helps
 audio, for +2–3 % time. Both are in the default recipe.
 
+Keeping the head wide uses `--exclude-node`. That flag used to switch weight
+streaming off for the whole conversion: the trailer-time quantizer cannot see
+an exclusion, so the converter loaded every weight into memory, and excluding
+the 2 MB head made the 40 GB DiT conversion run out of memory. Now the
+exclusion is resolved on the raw graph first (`exclusion.resolve_proto`):
+only the excluded weights are read into memory and skipped by the in-memory
+quantizer, and everything else still streams (`weight_stream.prepare(hold=)`).
+A pattern that only matches names given after optimization (unnamed nodes)
+falls back to the old whole-model load rather than being ignored. Test:
+`test_streamed_byte_quant.py::test_exclusion_keeps_streaming_the_other_weights`.
+
 Environment: venv `~/.venvs/h3`, Python 3.12, with torch, onnx 1.19.1,
 onnxoptimizer, flatbuffers, safetensors, transformers and pytest. Put this
 checkout's `model/pypi` on `PYTHONPATH`.
@@ -235,6 +246,31 @@ The activations stay fp32. Against fp32 torch on the dog latent, fp16
 reaches only cos 0.9987 and bf16 0.9937, while fp32 is exact, and fp16 saves
 only ~25 % of the GPU time.
 
+### 3e. Turbo LoRAs (`h3_export_fl2va.py --lora`)
+
+The repack ships lightx2v's step-distilled LoRAs (ComfyUI generic format:
+`diffusion_model.<module>.lora_{A,B}.weight` plus a scalar `.alpha`, on
+qkv/out/fc1/fc2 of all 50 blocks and the token refiner). `--lora FILE
+[--lora-strength 1]` merges `W += strength·alpha/rank·B·A` while the weight
+streams, before the ConvRot rotation, so the converter quantizes the merged
+weight. The rest of the pipeline is unchanged. lightx2v samples them exactly as
+the base driver does: Euler, no CFG, `q = (N−i)/N` grid shifted per stream
+(audio shift 3).
+
+| LoRA | steps | video shift | ΔW/W | bf16 values changed by the merge |
+|---|---|---|---|---|
+| `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16` | 8 | 12 (6 looks the same) | 0.5–2e-4 | 1–4 % |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16` | 4 | 6 (`--shift-video 6`) | ~1e-3 | 20–26 % |
+
+The 8-step delta is far below bf16 and int4 rounding, but it survives
+anyway. It is low-rank and structured, and rounding of weights spread
+randomly over the grid keeps it on average. The result is clearly visible:
+8 steps of the base model give a flat, washed-out frame, while 8 turbo steps
+look like the 50-step run. Spot check of a merged, rotated weight against
+numpy: rel 0.0017, which is bf16 rounding. One step costs the same as the
+base DiT (13.7–13.9 s at 512×288×56f), so the denoising loop takes
+110 s (8 steps) or 55 s (4 steps) instead of 705 s.
+
 ## 4. Commands
 
 ```bash
@@ -265,6 +301,15 @@ $PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_fl2va_pruned_bf16.s
     --out $M/h3_fl2va_cr/dit.onnx --dtype bf16 --convrot 256
 $CONV -i $M/h3_fl2va_cr/dit.onnx -o $M/h3_fl2va_cr/dit_int4.vkopbin -q int4 --group-size 128 \
     --exclude-node Gemm_26143,Gemm_6339
+
+# turbo DiTs: same export with the LoRA merged, same conversion (the exclusion
+# node names come out identical; turbo_build.sh in ~/models/tools greps them)
+$PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
+    --out $M/h3_fl2va_turbo8/dit.onnx --dtype bf16 --convrot 256 \
+    --lora $C/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
+$CONV -i $M/h3_fl2va_turbo8/dit.onnx -o $M/h3_fl2va_turbo8/dit_int4.vkopbin -q int4 --group-size 128 \
+    --exclude-node Gemm_26143,Gemm_6339
+# (4-step: loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16 -> h3_fl2va_turbo4)
 
 # DiT without rotation (int8 reference, 20 GB; does not fit at 2687 rows)
 $PY h3_export_fl2va.py --ckpt ... --out $M/h3_fl2va_bf16/dit.onnx --dtype bf16
@@ -303,6 +348,8 @@ build/minimax_h3_fl2va --text-states text_states.f32 \
     --width 512 --height 288 --length 56 --steps 50 --seed 42 --save run/ \
     --vae $M/h3_fl2va_vae/vae.vkopbin --frames run/frames \
     --audio-vae $M/h3_fl2va_avae/avae_fp32.vkopbin --wav run/audio.wav
+# turbo: --dit $M/h3_fl2va_turbo8/dit_int4.vkopbin --steps 8
+#    or  --dit $M/h3_fl2va_turbo4/dit_int4.vkopbin --steps 4 --shift-video 6
 ffmpeg -framerate 24 -i run/frames/frame_%04d.ppm -i run/audio.wav \
     -c:v libx264 -pix_fmt yuv420p -c:a aac -b:a 192k out.mp4
 ```
@@ -363,6 +410,8 @@ checkout:
 | DiT int4, bf16, 512×288×56f = 2687 rows (SIMT tile) | 23.1 | 19.8 GB |
 | DiT int4, bf16, 2687 rows (coop8 int4 stage) | 12.8 | 19.8 GB |
 | DiT int4 + ConvRot 256, head wide, 2687 rows (coop8) | 14.1 | 19.9 GB |
+| same + turbo 8-step LoRA, 8 steps | 13.7 (110 s total) | 19.9 GB |
+| same + turbo 4-step LoRA, 4 steps, shift 6 | 13.8 (55 s total) | 19.9 GB |
 | VAE, 56 frames 512×288 (3 clips × 6 tiles) | 29 s total | – |
 | DiT int8, bf16, 2687 rows | – | 26.3 GB, killed: does not fit beside the other processes on 36 GB |
 | text tower int8, 53 tokens, two halves | 4.3 s total (run 0.7 s) | ~12 GB per half |
@@ -390,7 +439,8 @@ peak is weights plus a few GB.
 | `h3_fl2va_te4/te.vkopbin` | yes | NVFP4 text tower |
 | `h3_fl2va_te_a/te.vkopbin`, `h3_fl2va_te_b/te.vkopbin` | alternative | int8 text tower layers 0–24 / 25–49 |
 | `h3_fl2va_te/embed_tokens.bf16`, `h3_fl2va_te/tokenizer/` | yes | |
-| `h3_fl2va_cr/dit_int4.vkopbin` (+ its host tables) | yes | DiT, int4 + ConvRot |
+| `h3_fl2va_cr/dit_int4.vkopbin` (+ its host tables) | yes | DiT, int4 + ConvRot, 50 steps |
+| `h3_fl2va_turbo8/dit_int4.vkopbin`, `h3_fl2va_turbo4/dit_int4.vkopbin` | yes | same with the 8-step / 4-step turbo LoRA merged (10.8 GB each) |
 | `h3_fl2va_bf16/dit_int4.vkopbin`, `dit_int4h.vkopbin`, `dit_int8.vkopbin` | comparison | DiT without rotation (all int4 / head wide / int8) |
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |
 | `h3_fl2va_vae/vae.vkopbin` | yes | |
@@ -402,9 +452,8 @@ deleted on 2026-11-28. The exporters rebuild any of them.
 
 ## 8. Open items
 
-- The repack ships turbo LoRAs (`loras/minimax_h3_fl2v_turbo_{4,8}step_*`):
-  merging one into the bf16 weights before quantizing would cut 50 steps to
-  4–8.
+- The 4-step LoRA is trained for 768p; try it at 1344×768 (needs the
+  activation budget at ~3× the rows).
 - The out_proj rotation could be folded into the V projection (per-head,
   group 64 or 128) instead of running online.
 - Audio VAE speed: ~60 % of its GPU time goes to the 127 alias-free
