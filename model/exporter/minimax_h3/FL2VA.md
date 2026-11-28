@@ -94,6 +94,7 @@ every graph below was verified, at 1–2 layers.
 | `h3_export_fl2va.py` | one DiT step | `video_rows, audio_rows, text_states, pack_index, t_emb, mod_index, rope_cos/sin, video/audio_index, video/audio_t` → `video_v, audio_v` | writes `rope_inv_freq.f32` and `adaln_t_table.f32` for the host; `--dtype bf16` (default `fp32` only for the legacy fp32-activation artifact) |
 | `h3_export_fl2va_audio_vae.py` | audio decode, whole clip in one call | `z [2,32,1,Ta]` (normalized; one row per stereo channel) → `wave [2,1,1,Ta·800]` | see §3d; builds on CPU (decoder 250 MB fp32), no streaming |
 | `h3_export_fl2va_vae.py` | one decoder call (one clip/tile) | `z [N,24]` (denormalized), `rope_cos/sin [N+5,24]` → `pixels [N,3072]` | the zero suffix token is `h[:1]*0`, because `zeros_like` traces to ConstantOfShape, which has no kernel |
+| `h3_export_fl2va_vae_encoder.py` | video VAE encoder, one 256-px tile of one image (Ref2VA refs) | `pixels [N,3,h,w]` RGB in [0,1] → `latent [N,24,h/16,w/16]` (normalized posterior mean) | see §3f; host prep and tiling in `h3_ref2va_prep.py`; builds on CPU (60 M params), no streaming |
 
 ### 3a. NVFP4 text tower (`h3_export_fl2va_te.py --nvfp4`)
 
@@ -271,6 +272,70 @@ numpy: rel 0.0017, which is bf16 rounding. One step costs the same as the
 base DiT (13.7–13.9 s at 512×288×56f), so the denoising loop takes
 110 s (8 steps) or 55 s (4 steps) instead of 705 s.
 
+### 3f. Video VAE encoder for Ref2VA reference images (`h3_export_fl2va_vae_encoder.py`)
+
+Ref2VA (`MiniMaxH3ReferenceToVideo`) encodes every reference image with the
+video VAE's causal CNN encoder (`EncoderFCN3D`, ch 128, mult 1/2/2/4/4/8, 2
+res blocks per level) and puts the latent into the DiT's ref rows
+(`latent_h = th/16`, `latent_w = tw/16`, one latent frame). What comfy does
+for one image (`VAE.encode` → `MiniMaxH3VideoVAE.encode`, T = 1):
+
+1. Resize (node): aspect kept, `match` = down only to the generation's pixel
+   area, `max` = short edge ≤ 2048 (never up); each side rounded to a multiple
+   of 32; `comfy.utils.lanczos` (PIL LANCZOS through uint8).
+2. `process_input` x·2−1, then `_normalize_pixels` ((x+1)/2 − imagenet mean) /
+   imagenet std: net, imagenet normalization of the [0, 1] pixels.
+3. `tiled_encode`: 256-px tiles with ≥ 64-px overlap (`split_tiles`), each
+   encoded alone (GroupNorm statistics are per tile), blended linearly in
+   latent space against the unblended neighbour above, then to the left.
+4. `moments[:, :, -1:]`, the posterior **mean** (first 24 of 48 channels; no
+   sampling; only the H3 *image* VAEs sample), then `(mean − latents_mean) /
+   latents_std` with the checkpoint's fp16-stored buffers. That normalized
+   latent is what the DiT gets, the same space as its own video latent.
+
+With one frame every `CausalConv3d` takes comfy's `autopad="causal_zero"`
+path (no temporal padding, only the kernel's last temporal tap) and the
+time-stride-2 downsamplers keep T = 1, so the encoder is exactly a 2-D CNN:
+reflect-padded 3×3 convs on `weight[:, :, -1]`, 2-D GroupNorm(32, eps 1e-6) +
+SiLU, the downsamplers as reflect pad right/bottom 1 + stride-2 conv. The
+graph is that 2-D CNN for one tile, with exact folds: imagenet normalization
+into `conv_in` (reflect padding commutes with a per-channel affine), and
+`quant_conv`'s mean half plus the latent normalization into `conv_out`.
+It needs no new runtime op (33 Conv, 30 Pad reflect, 25 InstanceNorm via the
+GroupNorm reshape chain, SiLU fused into FusedElemwise); H, W and the batch
+are dynamic.
+
+Host contract (`h3_ref2va_prep.py vae IMAGE --width W --height H [--length F]
+[--ref-image-size match|max] --out PREFIX`):
+
+- `PREFIX.f32` holds `[3, th, tw]` float32 planar RGB in [0, 1], the resized
+  ref; `PREFIX.json` holds `th`, `tw`, `latent_h/w` and the tile plan
+  (`vae_tiles`: `y`, `x` tile starts, `y_overlap`, `x_overlap` in pixels;
+  tiles are 256 px, or the whole side when it is ≤ 256).
+- Per tile, run the graph on `pixels[:, y:y+h, x:x+w]` as `[1, 3, h, w]`;
+  it gives `latent [1, 24, h/16, w/16]`, already normalized.
+- Blend as `tiled_encode` in the prep script does: latent overlap = pixel
+  overlap/16 = e; tile (i, j) first blends its top e rows with the
+  *unblended* tile (i−1, j)'s bottom e rows using weights `k/e` for itself
+  and `1 − k/e` for the neighbour (k = 0..e−1), then its left e columns with
+  the unblended tile (i, j−1) the same way, and then drops its last e
+  rows/cols unless it is the last row/column. Concatenate. Normalizing
+  before blending is exact (the weights sum to 1).
+- Result: `[24, th/16, tw/16]`, the DiT's ref-image latent, row-major
+  (c, h, w).
+
+Activations stay fp32. On a 256² tile against fp32 torch, fp16 gives NaN,
+bf16 reaches only cos 0.99969 (max |d| 0.57), and int8 weights cos 0.99987 at
+2.5× the time, while bf16 is no faster than fp32 (68 vs 69 ms).
+
+| check (fp32 graph, red_car_beach 1024×768) | result |
+|---|---|
+| graph module vs literal 5-D port of comfy's encode, one 256² tile | cos 1.0000000, max \|d\| 4e-5 |
+| ComfyUI's own `MiniMaxH3VideoVAE.encode` (vae.py, stubbed `comfy.*`, CPU fp32) vs vkop tiles + host blend, `match` 448×320 (4 tiles) | cos 1.0000000, max \|d\| 1.6e-4 (latent std 1.03) |
+| same, `max` 1024×768 (20 tiles) | cos 1.0000000, max \|d\| 5.1e-4 |
+| same, 256×192 (one non-square tile) | cos 1.0000000, max \|d\| 3e-5 |
+| GPU time per 256² tile (N = 1) | 68 ms, peak 0.7 GB; 20 tiles batched: 1.07 s but 6.4 GB peak, so run tiles one at a time |
+
 ## 4. Commands
 
 ```bash
@@ -326,6 +391,13 @@ $PY h3_export_fl2va_audio_vae.py --ckpt $C/vae/minimax_h3_audio_vae_fp32.safeten
     --out $M/h3_fl2va_avae/avae.onnx [--reference ref.npz --frames 16]
 $CONV --act fp32 -q fp32 -i $M/h3_fl2va_avae/avae.onnx -o $M/h3_fl2va_avae/avae_fp32.vkopbin
 
+# video VAE encoder for Ref2VA refs (fp32, 248 MB; seconds). --reference
+# checks the graph against a literal 5-D port of comfy's encode.
+$PY h3_export_fl2va_vae_encoder.py --ckpt $C/vae/minimax_h3_video_vae_fp16.safetensors \
+    --out $M/h3_ref2va/vae_enc/vae_enc.onnx [--reference ref.npz]
+$CONV --act fp32 -q fp32 -i $M/h3_ref2va/vae_enc/vae_enc.onnx -o $M/h3_ref2va/vae_enc/vae_enc_fp32.vkopbin
+python3 h3_ref2va_prep.py vae ref.png --width 512 --height 288 --out ref0   # ref0.f32 + ref0.json
+
 # driver
 make -C build -j16 minimax_h3_fl2va
 ```
@@ -371,6 +443,7 @@ for 6 s, and records the peak footprint.
 | DiT | int4 group 128 on ConvRot-rotated weights; video head and condition_proj bf16 (int8: 20.2 GB) | bf16 | 10.8 GB (after a `.comp` change: `tools/patch_model_shaders.py`) |
 | VAE decoder | int8 | bf16 | 2.45 GB |
 | audio VAE decoder | fp32 | fp32 | 268 MB |
+| video VAE encoder (Ref2VA) | fp32 | fp32 | 248 MB |
 
 Norms and biases stay bf16. The sampler state lives on the host in fp32.
 
@@ -445,6 +518,7 @@ peak is weights plus a few GB.
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |
 | `h3_fl2va_vae/vae.vkopbin` | yes | |
 | `h3_fl2va_avae/avae_fp32.vkopbin` | yes | audio VAE decoder (`avae_fp16`/`avae_bf16.vkopbin`: less accurate comparisons) |
+| `h3_ref2va/vae_enc/vae_enc_fp32.vkopbin` | Ref2VA | video VAE encoder, one tile (§3f) |
 | `*/…weights.bin` | no | export intermediates, only needed to reconvert |
 
 The fp32-activation DiT, the unsplit tower and the 1–2-layer test models were
