@@ -414,6 +414,111 @@ simplicity. vkop's int8-from-bf16 path has no remaining advantage, except
 that it needs only the bf16 file. Whether the token-level gap changes the
 video was not checked: no end-to-end run with the int8_convrot conditioning.
 
+### 3h. Ref2VA: reference images in the text tower (`h3_export_ref2va_vision.py`, `--deepstack`)
+
+ComfyUI's Ref2VA lets Qwen see each reference image (`comfy/text_encoders/minimax.py`,
+`qwen3vl.py`, `qwen_vl.py`, `llama.py`). Three pieces cover it: the vision tower, a text
+tower variant, and the host prep.
+
+**Presentation.** There is no chat template. Per reference, in comfy's order (images, then
+videos, then standalone audio; ordinals are 1-based per kind), each text piece is tokenized
+on its own, and the prompt comes last:
+
+- image: `"<Picture i>: "` `<|vision_start|>` *n vision rows* `<|vision_end|>`
+- audio: `"<Audio j>: "` only (audio never enters Qwen)
+- video: `"<Video k>: "`, then per 2-frame block `"<T.T seconds>"` + a vision block
+
+The tokenizer adds `MINIMAX_EXTRA_TOKENS` (151669–151675). The Qwen copy of a ref image
+is comfy's `resized` picture, the same one the VAE encodes (§3f). It is a multiple of
+32, so `smart_resize` and the bilinear resize are the identity. Then
+`(x − 0.5)/0.5`, the frame repeated to fill the temporal patch, and patchified to
+`[gh·gw, 1536]`, `grid = [1, gh, gw]`, `n = gh·gw/4` rows.
+
+**Vision tower** (`visual.*`, in both the NVFP4 and the bf16 file, 595M bf16): 27 ViT
+blocks (hidden 1152, 16 heads, MLP 4304 gelu-tanh), a 48×48 learned position grid,
+2-D RoPE, a 2×2 merger to 5120, and three DeepStack mergers after blocks 8/16/24. The
+graph is `qwen3vl_visual_dynamic.VisualDynamic` around transformers'
+`Qwen3VLVisionModel`. Everything derived from the size is computed in-graph from
+`grid_thw`, so one graph takes any grid (even sides ≤ 256 patches). Attention covers one
+block (comfy's `cu_seqlens`), so the graph runs once per image or video block:
+`pixel_values [S,1536] fp32, grid_thw [1,3] i64 → image_features, deepstack_features_0..2
+[S/4, 5120]` (rows in merge-block order = token order).
+
+**Text tower** `--deepstack` adds `deepstack_0..2 [L, 5120]` (only those of layers 0–2
+inside a `--layers` slice). The graph adds `deepstack_i` to the hidden state *after* text
+layer i, as comfy's `Llama2_.forward` and HF's `_deepstack_process` do. They are zero except at
+the vision rows, so all-zero inputs give the plain t2va graph (adding 0 is exact), and
+one graph serves both. It works for `--nvfp4`, the bf16→int8 path and the int8_convrot
+file. RoPE stays on the host: the 3-D MRoPE positions go through Qwen3-VL's
+*interleaved* section [24, 20, 20] (of the 64 frequencies, T by default, H on
+1, 4, …, 58, W on 2, 5, …, 59), and then `cos/sin(cat(f, f))` gives the same
+`rope_cos/sin [L, 128]` inputs as before.
+
+**Host contract** (`h3_ref2va_prep.py qwen`, files in `--out DIR`):
+
+| file | content |
+|---|---|
+| `ids.i64 [L]` | token ids; vision rows hold 151655 (`<\|image_pad\|>`, row replaced) |
+| `vision_<b>.f32 [S_b, 1536]` + `ref2va_qwen.json` | patches of block b; json: `L`, `blocks[b] = {kind, ref, grid [1,gh,gw], start, rows, file}` |
+| `rope_cos.f32`, `rope_sin.f32 [L, 128]` | MRoPE tables (`pos3.i64 [3, L]` = the positions) |
+| `tags.i64 [L]` | DiT adaLN token tag: 0 on each vision block **including** its `<\|vision_start\|>`/`<\|vision_end\|>`, 1 elsewhere |
+
+Driver: run the vision graph per block. Take `inputs_embeds` = `embed_tokens.bf16` rows of
+`ids`, with rows `[start, start+rows)` overwritten by `image_features`.
+`deepstack_i` = zeros `[L, 5120]` with the same rows set to `deepstack_features_i`, and
+`attention_bias` causal as before. MRoPE positions (comfy `qwen2vl_mrope_position_ids`):
+text runs on sequentially. A block of merged size (mh, mw) = (gh/2, gw/2) starting at
+sequence index s, with running offset o, gets t = s+o, h = s+o+row, w = s+o+col. The
+text after it resumes at s+o+max(mh, mw), and o += max(mh, mw) − rows. With no image all
+three axes are equal, which is the existing 1-D RoPE.
+
+**Verification** (two refs, 384×384 + 512×288 → grids 24×24 and 18×32, 144 rows each,
+L = 322; and one 512×512 ref, grid 32×32):
+
+| check | result |
+|---|---|
+| prep vs comfy's own functions (exec'd from source) | patches, positions, tags identical; rope 1e-7 |
+| prep rope vs HF `Qwen3VLTextRotaryEmbedding` (mrope interleaved) | 1.2e-7 |
+| VisualDynamic fp32 vs HF `Qwen3VLVisionModel` fp32 | cos 1.0000000 (max diff ≤ 5e-4) |
+| vision graph on GPU, **fp16** act (`vision_fp16.vkopbin`) vs HF fp32 | cos ≥ 0.99990 image features, ≥ 0.99994 deepstack; 0.33 s / 576 patches, 0.64 s / 1024 |
+| vision graph, bf16 act (`vision_bf16.vkopbin`) | image 0.9991, deepstack_2 0.9986–0.9993; 0.11 s / 576 patches |
+| 3-layer text tower with deepstack + MRoPE vs fp32 torch port (same image features), NVFP4 / int8 from bf16 / int8_convrot | cos 0.999993 / 0.999991 / 0.999993 |
+| same, fed with the vkop fp16 vision outputs (chained) | cos 0.99993 (all three) |
+| same NVFP4 graph with deepstack zeroed | vision rows cos 0.853 (text rows 0.99994): the injection matters |
+
+The ViT's residual stream reaches |x| ≈ 10.6k in the last block (fp16 max 65504), so fp16
+has about 6× headroom. Exporting the vision tower peaks at 3.7 GB, the fp16 conversion
+at 4.9 GB (a 1.6 GB vkopbin), and a vision run at 1.9 GB. The truncated-tower
+`--reference` now loads one layer at a time (≤ 5.5 GB at 3 layers).
+
+```bash
+C=~/.cache/modelscope/hub/models/Comfy-Org/MiniMax-H3/text_encoders
+V=$M/h3_ref2va/vision
+# vision tower: fp32 graph (bf16 trace widened, 2.2 GB external weights) -> fp16 artifact
+$PY h3_export_ref2va_vision.py --ckpt $C/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+    --out $V/fp32/vision.onnx --dtype fp32
+$CONV -i $V/fp32/vision.onnx -o $V/vision_fp16.vkopbin --act fp16 -q fp16 --stream-min-mib 8
+#   (--stream-min-mib 8: the patch-conv fold must read the 3 MiB patch_embed weight)
+# bf16 alternative: --dtype bf16 --out $V/vision_bf16.onnx; $CONV ... --act bf16 -q bf16
+# text tower with deepstack: the §3a / §3g commands plus --deepstack, e.g. NVFP4:
+$PY h3_export_fl2va_te.py --nvfp4 --deepstack --ckpt $C/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+    --embed $M/h3_fl2va_te/embed_tokens.bf16 --out $M/h3_ref2va/te4/te.onnx
+$CONV -i $M/h3_ref2va/te4/te.onnx -o $M/h3_ref2va/te4/te.vkopbin -q bf16
+#   int8_convrot halves: add --deepstack to both; only the first half (0,25) gets
+#   deepstack_0..2 inputs, the second half's graph is unchanged
+# host prep, and a truncated check (fp32 HF vision reference -> 3-layer tower)
+$PY h3_ref2va_prep.py qwen --prompt "..." --image ref1.png --width 512 --height 288 --out run/q
+$PY h3_export_ref2va_vision.py --ckpt ... --reference run/vref.npz --inputs run/q
+$PY h3_export_fl2va_te.py --nvfp4 --deepstack --num-layers 3 --ckpt ... --embed ... \
+    --ref2va-inputs run/q --vision-ref run/vref.npz --reference run/te_ref.npz --out run/te3/te.onnx
+```
+
+Test artifacts: `$V/test/` (prep dirs, the HF references), `$V/te_test/nvfp4_3/`
+(a 3-layer NVFP4 deepstack graph with its `ref.npz` and its `inA`/`inB` .npy inputs).
+Open items: video blocks (`process_video_block`) are ported and checked against comfy, but
+no video ref was run through the towers. The fp16 vision graph runs 3× slower than
+bf16 (not investigated). The full 50-layer `--deepstack` towers are not built yet.
+
 ## 4. Commands
 
 ```bash

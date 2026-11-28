@@ -19,11 +19,21 @@ reduces to plain rotate-half RoPE (theta 5e6, head_dim 128).
     attention_bias  [L, L]  fp32   causal additive mask (0 / large negative)
     rope_cos        [L, 128] fp32  cos(cat(f, f)), f = pos * inv_freq
     rope_sin        [L, 128] fp32
+    deepstack_i     [L, 5120] fp32 (--deepstack only; i = 0, 1, 2, for each of
+                                   text layers 0..2 inside the exported slice)
+                                   Qwen3-VL DeepStack: added to the hidden
+                                   state AFTER text layer i. Zero except the
+                                   vision rows (Ref2VA); all zero = t2va.
   graph output
     hidden          [L, 5120]      layer-50 hidden state
 
+With reference images (Ref2VA, FL2VA.md §3f) the host also replaces the
+vision rows of inputs_embeds by the vision tower's image_features and builds
+rope_cos/sin from the 3-D MRoPE positions (h3_ref2va_prep.py).
+
 Usage: python h3_export_fl2va_te.py --ckpt .../qwen3vl_32b_minimax_h3_bf16.safetensors \
            --out ~/models/h3_fl2va_te/te.onnx [--num-layers 2 --reference ref.npz]
+           [--deepstack [--ref2va-inputs DIR --vision-ref vref.npz]]
 """
 from __future__ import annotations
 
@@ -160,23 +170,32 @@ class Tower(nn.Module):
                                      for i in layer_ids})
 
 
+# Qwen3-VL DeepStack: the vision tower's 3 extra feature sets are added to the
+# hidden state after text layers 0, 1, 2 (comfy llama.py Llama2_.forward,
+# HF Qwen3VLTextModel._deepstack_process), at the vision rows only.
+DEEPSTACK_LAYERS = (0, 1, 2)
+
+
 class TextTower(nn.Module):
     def __init__(self, c=CFG, dtype=torch.bfloat16, device="meta",
-                 layer_ids=None):
+                 layer_ids=None, deepstack=False):
         super().__init__()
         self.dtype = dtype
-        self.model = Tower(c, dtype, device,
-                           layer_ids if layer_ids is not None
-                           else range(c["layers"]))
+        layer_ids = list(layer_ids if layer_ids is not None else range(c["layers"]))
+        self.model = Tower(c, dtype, device, layer_ids)
+        # the deepstack inputs this slice takes, by text layer index
+        self.ds_layers = [i for i in DEEPSTACK_LAYERS if i in layer_ids] if deepstack else []
 
-    def forward(self, inputs_embeds, attention_bias, rope_cos, rope_sin):
+    def forward(self, inputs_embeds, attention_bias, rope_cos, rope_sin, *deepstack):
         dt = self.dtype
         x = inputs_embeds.to(dt)
         bias = attention_bias.to(dt).unsqueeze(0).unsqueeze(0)       # [1,1,L,L]
         cos = rope_cos.to(dt).unsqueeze(1)                          # [L,1,D]
         sin = rope_sin.to(dt).unsqueeze(1)
-        for layer in self.model.layers.values():
+        for idx, layer in self.model.layers.items():
             x = layer(x, bias, cos, sin)
+            if int(idx) in self.ds_layers:
+                x = x + deepstack[self.ds_layers.index(int(idx))].to(dt)
         return x
 
 
@@ -184,6 +203,12 @@ INPUT_NAMES = ["inputs_embeds", "attention_bias", "rope_cos", "rope_sin"]
 OUTPUT_NAMES = ["hidden"]
 DYNAMIC_AXES = {"inputs_embeds": {0: "L"}, "attention_bias": {0: "L", 1: "L2"},
                 "rope_cos": {0: "L"}, "rope_sin": {0: "L"}, "hidden": {0: "L"}}
+
+
+def io_spec(tower):
+    """(input names, dynamic axes) of a TextTower's graph."""
+    ds = ["deepstack_%d" % i for i in tower.ds_layers]
+    return INPUT_NAMES + ds, dict(DYNAMIC_AXES, **{n: {0: "L"} for n in ds})
 
 
 def host_inputs(ids, table, c=CFG):
@@ -306,8 +331,9 @@ def export_nvfp4(wrapper, dummies, ckpt, out_path):
     import h3_export_common as common
     from onnx2vkop import stream_export as SE
     out_dir = os.path.dirname(os.path.abspath(out_path))
-    proto, shapes = common.trace_weightless(wrapper, dummies, INPUT_NAMES,
-                                            OUTPUT_NAMES, DYNAMIC_AXES)
+    input_names, dynamic_axes = io_spec(wrapper)
+    proto, shapes = common.trace_weightless(wrapper, dummies, input_names,
+                                            OUTPUT_NAMES, dynamic_axes)
     qnames = [n for n in shapes if n.endswith("_proj.weight")]
     plain = {n: v for n, v in shapes.items() if n not in qnames}
     ck_dir = os.path.join(out_dir, "ckpt", "te_nvfp4")
@@ -324,7 +350,7 @@ def export_nvfp4(wrapper, dummies, ckpt, out_path):
     nbytes, offsets = SE.copy_weights(resolved, wpath)
     SE.patch_offsets(proto, offsets)
     nvfp4_splice(proto, ckpt, qnames, wpath, weights_file)
-    SE.resolve_shape_dims(proto, DYNAMIC_AXES)
+    SE.resolve_shape_dims(proto, dynamic_axes)
     onnx.save(proto, out_path)
     print(f"[nvfp4] wrote {out_path}: {len(qnames)} NVFP4 Linear(s), "
           f"{len(resolved)} plain tensor(s); {os.path.getsize(wpath) / 2**30:.2f} GiB")
@@ -352,6 +378,16 @@ def main(argv=None):
     ap.add_argument("--embed", default=None,
                     help="bf16 embed_tokens.bf16 to look rows up in (default: "
                          "written from --ckpt, which needs a bf16 table)")
+    ap.add_argument("--deepstack", action="store_true",
+                    help="add the deepstack_i inputs (Ref2VA reference images, "
+                         "FL2VA.md 3f); all-zero deepstack = the plain graph")
+    ap.add_argument("--ref2va-inputs", default=None,
+                    help="with --deepstack: an h3_ref2va_prep.py qwen dir; its "
+                         "token list, MRoPE tables and vision rows replace "
+                         "--text (needs --vision-ref)")
+    ap.add_argument("--vision-ref", default=None,
+                    help="h3_export_ref2va_vision.py --reference npz for "
+                         "--ref2va-inputs: image_features / deepstack rows")
     args = ap.parse_args(argv)
     c = dict(CFG, layers=args.num_layers)
     layer_ids = range(c["layers"])
@@ -361,12 +397,19 @@ def main(argv=None):
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
 
-    from transformers import Qwen2Tokenizer
-    tok_dir = os.path.join(out_dir, "tokenizer")
-    if not os.path.isdir(tok_dir):
-        tok_dir = os.path.join(os.path.dirname(out_dir), "h3_fl2va_te", "tokenizer")
-    tok = Qwen2Tokenizer.from_pretrained(tok_dir)
-    ids = tok(args.text, add_special_tokens=False)["input_ids"]
+    if args.ref2va_inputs:
+        import h3_ref2va_prep as prep
+        if not (args.deepstack and args.vision_ref):
+            raise SystemExit("--ref2va-inputs needs --deepstack and --vision-ref")
+        r2v = prep.read_qwen_inputs(args.ref2va_inputs)
+        ids = r2v["ids"]
+    else:
+        from transformers import Qwen2Tokenizer
+        tok_dir = os.path.join(out_dir, "tokenizer")
+        if not os.path.isdir(tok_dir):
+            tok_dir = os.path.join(os.path.dirname(out_dir), "h3_fl2va_te", "tokenizer")
+        tok = Qwen2Tokenizer.from_pretrained(tok_dir)
+        ids = tok(args.text, add_special_tokens=False)["input_ids"]
 
     if args.nvfp4:
         header, _ = st_header(args.ckpt)
@@ -407,37 +450,57 @@ def main(argv=None):
         print(f"[embed] wrote {emb_path} ({table.nbytes / 2**30:.2f} GiB)")
     if table is not None:
         inputs = host_inputs(ids, table, c)
+    if args.ref2va_inputs:
+        z = np.load(args.vision_ref)
+        feats = [(z[f"b{i}_image_features"],
+                  [z[f"b{i}_deepstack_features_{k}"] for k in range(3)])
+                 for i in range(len(r2v["meta"]["blocks"]))]
+        rows = table if table is not None else np.memmap(
+            args.embed, np.uint16, "r", shape=(c["vocab"], c["hidden"]))
+        inputs = prep.assemble_text_inputs(r2v, rows, feats)
+    elif args.deepstack:
+        for i in DEEPSTACK_LAYERS:
+            inputs["deepstack_%d" % i] = np.zeros_like(inputs["inputs_embeds"])
 
     if args.reference:
+        # fp32 on CPU, ONE layer resident at a time (a 32B layer is 1.8 GB fp32)
         from safetensors import safe_open
-        model = TextTower(c, dtype=torch.float32, device="cpu",
-                          layer_ids=layer_ids).eval()
-        if i8cr:
-            i8cr.attach(model, torch.float32, "cpu")
-        sd = {}
         if args.nvfp4:
             header, base = st_header(args.ckpt)
+        h = torch.from_numpy(inputs["inputs_embeds"])
+        rest = [torch.from_numpy(inputs[n]) for n in INPUT_NAMES[1:]]
         with safe_open(args.ckpt, "pt") as f:
-            for name in model.state_dict():
-                if i8cr and i8cr.owns(name):
-                    sd[name] = i8cr.reference(name)
-                    continue
-                if args.nvfp4 and name.endswith("_proj.weight"):
-                    sd[name] = torch.from_numpy(nvfp4_dequant(*nvfp4_parts(
-                        args.ckpt, header, base, name[: -len(".weight")])))
-                else:
-                    sd[name] = f.get_tensor(name).float()
-        model.load_state_dict(sd, assign=True)
-        with torch.no_grad():
-            h = model(*[torch.from_numpy(inputs[n]) for n in INPUT_NAMES])
+            for li in layer_ids:
+                # built on meta: load_state_dict(assign=True) supplies every
+                # tensor, so no empty fp32 copy is allocated first
+                model = TextTower(c, dtype=torch.float32, device="meta",
+                                  layer_ids=[li], deepstack=args.deepstack).eval()
+                if i8cr:
+                    i8cr.attach(model, torch.float32, "cpu")
+                sd = {}
+                for name in model.state_dict():
+                    if i8cr and i8cr.owns(name):
+                        sd[name] = i8cr.reference(name)
+                        continue
+                    if args.nvfp4 and name.endswith("_proj.weight"):
+                        sd[name] = torch.from_numpy(nvfp4_dequant(*nvfp4_parts(
+                            args.ckpt, header, base, name[: -len(".weight")])))
+                    else:
+                        sd[name] = f.get_tensor(name).float()
+                model.load_state_dict(sd, assign=True)
+                ds = [torch.from_numpy(inputs["deepstack_%d" % i]) for i in model.ds_layers]
+                with torch.no_grad():
+                    h = model(h, *rest, *ds)
+                del model, sd
         np.savez(args.reference, **inputs, hidden=h.numpy())
         print(f"[ref] {args.reference}: L={len(ids)} hidden absmax "
               f"{h.abs().max():.1f} rms {h.pow(2).mean().sqrt():.3f}")
-        del model, sd
 
     if args.nvfp4:
-        wrapper = TextTower(c, device="meta", layer_ids=layer_ids).eval()
-        dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
+        wrapper = TextTower(c, device="meta", layer_ids=layer_ids,
+                            deepstack=args.deepstack).eval()
+        input_names, _ = io_spec(wrapper)
+        dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in input_names)
         with torch.no_grad():
             export_nvfp4(wrapper, dummies, args.ckpt, args.out)
         return 0
@@ -451,12 +514,14 @@ def main(argv=None):
             os.unlink(os.path.join(ck_dir, f))
     if not os.path.lexists(link):
         os.symlink(os.path.abspath(args.ckpt), link)
-    wrapper = TextTower(c, device="meta", layer_ids=layer_ids).eval()
-    dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
+    wrapper = TextTower(c, device="meta", layer_ids=layer_ids,
+                        deepstack=args.deepstack).eval()
+    input_names, dynamic_axes = io_spec(wrapper)
+    dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in input_names)
     kw = i8cr.attach(wrapper, torch.bfloat16, "meta") if i8cr else {}
     with torch.no_grad():
         common.export_streaming_real(
-            wrapper, dummies, INPUT_NAMES, OUTPUT_NAMES, DYNAMIC_AXES,
+            wrapper, dummies, input_names, OUTPUT_NAMES, dynamic_axes,
             model_dir=os.path.join(out_dir, "ckpt"), component="te",
             out_path=args.out, **kw)
     return 0
