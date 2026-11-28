@@ -70,7 +70,8 @@ DiT and VAE are quantized from their full-precision files by vkop's streaming
 quantizer. The DiT takes the `int8_convrot` recipe (§3b) without the file
 itself: rotating the bf16 weights and requantizing gives the same int4 as
 requantizing the rotated int8 file (weight error 0.1172 vs 0.1176). The other
-pre-quantized files (`*_fp8_scaled`, `*_w6a8`) are not used: fp8 weights save
+pre-quantized files (`*_fp8_scaled`, `*_w6a8`) are not used (the video
+VAE's `int8_convrot` can be imported as-is, §3c, but is not the default): fp8 weights save
 nothing over int8, Apple GPUs have no fp8 matmul (activations cannot go fp8),
 and w6a8 has no kernel.
 
@@ -154,6 +155,48 @@ audio, for +2–3 % time. Both are in the default recipe.
 Environment: venv `~/.venvs/h3`, Python 3.12, with torch, onnx 1.19.1,
 onnxoptimizer, flatbuffers, safetensors, transformers and pytest. Put this
 checkout's `model/pypi` on `PYTHONPATH`.
+
+### 3c. Pre-quantized video VAE (`minimax_h3_video_vae_int8_convrot`)
+
+`h3_export_fl2va_vae.py` recognizes this file from its `comfy_quant` entries
+and imports it as-is. The format of its 144 decoder linears (to_qkv, to_out,
+w1, w2 × 36):
+
+- `{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}`.
+- I8 codes `[N, K]` of `W·H`, where H is the DiT's group-256 Hadamard
+  (matches the fp16 weights rotated with it at rel 0.008).
+- One fp32 `weight_scale [N, 1]` per output row, absmax/127: every row
+  reaches |q| = 127.
+- `x_embedder`, `proj_out`, the norms and the biases are fp32.
+
+The exporter streams `q·scale` as fp16 and puts `x @ H` before each of these
+linears. `-q int8` in the converter is the same per-output-channel absmax/127
+scheme, so it gets the repack's codes back exactly. H itself is quantized to
+int8 without error, because ±1/16 is exact. `--convrot 256` on the fp16 file
+applies the same recipe with round-to-nearest. At 2 layers it matches the
+unrotated graph at rel 1e-6.
+
+Measured on the dog latent (512×288×56f, 18 decoder calls), against a
+bf16-weight VAE, with no other GPU load:
+
+| VAE | GPU time | total | peak | PSNR vs bf16 |
+|---|---|---|---|---|
+| bf16 weights | 27.9 s | 43.0 s | 5.6 GB | – |
+| int8 from fp16 (default) | 26.2 s | 36.2 s | 3.4 GB | 46.31 dB (min 45.08) |
+| int8_convrot as-is | 29.2 s | 39.2 s | 3.4 GB | 46.38 dB (min 45.18) |
+
+The weight error per linear is 0.0095 → 0.0083, but that is invisible next to
+the bf16 activations. The 144 online rotations cost +11 % GPU time. ConvRot
+pays off in ComfyUI because it also quantizes activations to int8 (W8A8);
+here they stay bf16. So the fp16 → int8 path stays the default, and the
+int8_convrot file is the option when only the 2.8 GB download is wanted
+(`~/models/h3_fl2va_vae_i8cr/vae.vkopbin`):
+
+```bash
+$PY h3_export_fl2va_vae.py --ckpt $C/vae/minimax_h3_video_vae_int8_convrot.safetensors \
+    --out $M/h3_fl2va_vae_i8cr/vae.onnx
+$CONV -i $M/h3_fl2va_vae_i8cr/vae.onnx -o $M/h3_fl2va_vae_i8cr/vae.vkopbin -q int8 --external-blob-mb 1
+```
 
 ## 4. Commands
 

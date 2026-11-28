@@ -21,6 +21,16 @@ tiles (64-px overlap), blending in pixel space; that bookkeeping is the host's
 
 Usage: python h3_export_fl2va_vae.py --ckpt .../minimax_h3_video_vae_fp16.safetensors \
            --out ~/models/h3_fl2va_vae/vae.onnx [--num-layers 2 --reference ref.npz]
+
+Pre-quantized checkpoint: `minimax_h3_video_vae_int8_convrot.safetensors` is
+read as-is. Its 144 decoder linears (to_qkv/to_out/w1/w2) are comfy-kitchen
+`int8_tensorwise` with ConvRot: I8 codes [N, K] with one fp32 scale per output
+row, absmax/127 (every row reaches |q| = 127), of the weight rotated as W @ H
+(block Hadamard, group 256, the same H as the DiT's `--convrot`). The export
+streams q * scale as fp16 and puts `x @ H` before each of those linears; the
+converter's `-q int8` is the same per-output-channel absmax/127, so it
+recovers the repack's codes exactly. `--convrot G` applies the same recipe to
+the fp16 checkpoint (rotate, let the converter round).
 """
 from __future__ import annotations
 
@@ -34,11 +44,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from h3_export_fl2va import hadamard, rotate_in
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 CFG = dict(dim=2048, heads=32, dim_head=64, layers=36, z=24, eps=1e-5,
-           n_reg=4, rope_pairs=24, out=3 * 4 * 16 * 16)
+           n_reg=4, rope_pairs=24, out=3 * 4 * 16 * 16, convrot=0)
+ROT_LINEARS = ("attn.to_qkv", "attn.to_out", "ff.w1", "ff.w2")
 
 
 def rms(x, w, eps):
@@ -90,10 +103,10 @@ class Block(nn.Module):
         self.ff = FF(c, dtype, device)
         self.scale2 = P(c["dim"], dtype, device)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, rot):
         c = self.c
         L, H, D, R = x.shape[0], c["heads"], c["dim_head"], c["rope_pairs"]
-        qkv = self.attn.to_qkv(rms(x, self.norm1.weight, c["eps"]))
+        qkv = self.attn.to_qkv(rot(rms(x, self.norm1.weight, c["eps"])))
         qkv = qkv.reshape(L, H, 3 * D)                 # per head: [q | k | v]
         q, k, v = qkv[..., :D], qkv[..., D:2 * D], qkv[..., 2 * D:]
         q, k = rms(q, None, c["eps"]), rms(k, None, c["eps"])
@@ -106,10 +119,10 @@ class Block(nn.Module):
         q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
         s = torch.matmul(q, k.transpose(-1, -2)) * (1.0 / math.sqrt(D))
         o = torch.matmul(torch.softmax(s, -1), v).squeeze(0).transpose(0, 1)
-        x = x + self.attn.to_out(o.reshape(L, H * D)) * self.scale1.to(x.dtype)
-        h = self.ff.w1(rms(x, self.norm2.weight, c["eps"]))
+        x = x + self.attn.to_out(rot(o.reshape(L, H * D))) * self.scale1.to(x.dtype)
+        h = self.ff.w1(rot(rms(x, self.norm2.weight, c["eps"])))
         g, u = h[:, :4 * c["dim"]], h[:, 4 * c["dim"]:]
-        return x + self.ff.w2(F.silu(g) * u) * self.scale2.to(x.dtype)
+        return x + self.ff.w2(rot(F.silu(g) * u)) * self.scale2.to(x.dtype)
 
 
 class Decoder(nn.Module):
@@ -138,6 +151,24 @@ class VAEDecoder(nn.Module):
         self.c, self.dtype = c, dtype
         self.post_quant_conv = PostQuantConv(c, dtype, device)
         self.decoder = Decoder(c, dtype, device)
+        g = c["convrot"]
+        if g:
+            # ConvRot: every block linear sees x @ blockdiag(H) and its weight
+            # is W @ H (+-1/sqrt(g) is exact in fp16 and bf16)
+            self.register_buffer("convrot_h", torch.empty(g, g, dtype=dtype,
+                                                          device=device))
+
+    def rot(self, x):
+        g = self.c["convrot"]
+        if not g:
+            return x
+        return torch.matmul(x.reshape(-1, g), self.convrot_h).reshape(x.shape)
+
+    def convrot_names(self):
+        if not self.c["convrot"]:
+            return []
+        return [f"decoder.transformer_blocks.{i}.{m}.weight"
+                for i in range(self.c["layers"]) for m in ROT_LINEARS]
 
     def forward(self, z, rope_cos, rope_sin):
         dt, c = self.dtype, self.c
@@ -152,7 +183,7 @@ class VAEDecoder(nn.Module):
         # comfy builds the rotation table in the model dtype
         cos, sin = rope_cos.to(dt).unsqueeze(1), rope_sin.to(dt).unsqueeze(1)
         for blk in self.decoder.transformer_blocks:
-            h = blk(h, cos, sin)
+            h = blk(h, cos, sin, self.rot)
         out = self.decoder.proj_out(self.decoder.norm_out(h))
         return out[:n].float()
 
@@ -173,6 +204,38 @@ def host_rope(T, H, W, c=CFG):
     return np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
 
 
+def ckpt_quant(path):
+    """{weight name: comfy_quant dict} for the decoder's pre-quantized linears
+    (empty for the fp16 checkpoint)."""
+    import json
+    from safetensors import safe_open
+    out = {}
+    with safe_open(path, "np") as f:
+        for k in f.keys():
+            if k.startswith("decoder.") and k.endswith(".comfy_quant"):
+                out[k[:-len("comfy_quant")] + "weight"] = json.loads(
+                    bytes(f.get_tensor(k)).decode())
+    return out
+
+
+def weight_transforms(path, quant, names, g):
+    """Checkpoint name -> fp32 rewrite: q * scale for the int8_convrot file
+    (already in the rotated basis), W @ H for a plain one."""
+    if quant:
+        from safetensors import safe_open
+        f = safe_open(path, "np")
+        bad = [n for n, q in quant.items()
+               if q.get("format") != "int8_tensorwise" or
+               not q.get("convrot") or q.get("convrot_groupsize") != g]
+        if bad or not set(names) <= set(quant):
+            raise SystemExit(f"[int8_convrot] unexpected layout: {bad[:3]}, "
+                             f"{len(quant)} quantized vs {len(names)} rotated")
+        return {n: (lambda w, n=n: w * f.get_tensor(n + "_scale").astype(np.float32))
+                for n in names}
+    h = hadamard(g)
+    return {n: (lambda w, h=h: rotate_in(w, h)) for n in names}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -181,8 +244,18 @@ def main(argv=None):
     ap.add_argument("--num-layers", type=int, default=CFG["layers"])
     ap.add_argument("--reference", default=None)
     ap.add_argument("--clip", default="7,8,8", help="T,H,W of the trace/reference clip")
+    ap.add_argument("--convrot", type=int, default=0,
+                    help="ConvRot group for a plain checkpoint (256 = the "
+                         "repack's recipe); set from the file for int8_convrot")
     args = ap.parse_args(argv)
-    c = dict(CFG, layers=args.num_layers)
+    quant = ckpt_quant(args.ckpt)
+    g = args.convrot
+    if quant:
+        g = next(iter(quant.values()))["convrot_groupsize"]
+        if args.convrot and args.convrot != g:
+            raise SystemExit(f"--convrot {args.convrot} but the checkpoint uses {g}")
+        print(f"[int8_convrot] {len(quant)} pre-quantized linears, group {g}")
+    c = dict(CFG, layers=args.num_layers, convrot=g)
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -195,10 +268,17 @@ def main(argv=None):
     if args.reference:
         from safetensors import safe_open
         model = VAEDecoder(c, dtype=torch.float32, device="cpu").eval()
+        tf = weight_transforms(args.ckpt, quant, model.convrot_names(), g) if g else {}
         sd = {}
         with safe_open(args.ckpt, "pt") as f:
             for name in model.state_dict():
-                sd[name] = f.get_tensor(name).float()
+                if name == "convrot_h":
+                    sd[name] = torch.from_numpy(hadamard(g))
+                    continue
+                t = f.get_tensor(name).float()
+                if name in tf:
+                    t = torch.from_numpy(np.asarray(tf[name](t.numpy()), np.float32))
+                sd[name] = t
         model.load_state_dict(sd, assign=True)
         with torch.no_grad():
             px = model(*[torch.from_numpy(inputs[n]) for n in INPUT_NAMES])
@@ -218,11 +298,20 @@ def main(argv=None):
         os.symlink(os.path.abspath(args.ckpt), link)
     wrapper = VAEDecoder(c, device="meta").eval()
     dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
+    transforms, computed = {}, {}
+    if g:
+        import onnx
+        transforms = weight_transforms(args.ckpt, quant, wrapper.convrot_names(), g)
+        computed = {"convrot_h": onnx.numpy_helper.from_array(
+            hadamard(g).astype(np.float16), "convrot_h")}
     with torch.no_grad():
         common.export_streaming_real(
             wrapper, dummies, INPUT_NAMES, OUTPUT_NAMES, DYNAMIC_AXES,
             model_dir=os.path.join(out_dir, "ckpt"), component="vae",
-            out_path=args.out)
+            out_path=args.out,
+            # the int8 file keeps everything else fp32; the graph is fp16
+            target_dtype="F16" if (g or quant) else None,
+            transforms=transforms, computed=computed)
     return 0
 
 
