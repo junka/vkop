@@ -59,14 +59,17 @@ Everything comes from `~/.cache/modelscope/hub/models/Comfy-Org/MiniMax-H3/`.
 
 | model | file | size | dtype |
 |---|---|---|---|
-| text tower | `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors` | 51.5 GB | bf16 (it also carries the vision tower, which t2va does not use) |
+| text tower | `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (default) | 15.7 GB | NVFP4 + AWQ, imported as-is |
+| text tower (alternative, and the embedding table) | `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors` | 51.5 GB | bf16 (it also carries the vision tower, which t2va does not use) |
 | DiT | `diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors` | 40.2 GB | bf16 (adaLN fp16, patch projections and heads fp32) |
 | video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` | 5.2 GB | fp16 (encoder + decoder; only the decoder is used) |
 | tokenizer | ComfyUI's `comfy/text_encoders/qwen25_tokenizer/` (vocab.json, merges.txt) | – | – |
 
-The repack's pre-quantized files (`*_int8_convrot`, `*_fp8_scaled`,
-`*_w6a8`, `*_nvfp4_awq`) are not used. Every model is quantized from its
-full-precision file by vkop's own streaming quantizer. Importing
+The text tower is imported from the repack's NVFP4 file as-is (§3a); the
+DiT and VAE are quantized from their full-precision files by vkop's streaming
+quantizer. The other pre-quantized files (`*_int8_convrot`, `*_fp8_scaled`,
+`*_w6a8`) are not used: fp8 weights save nothing over int8, and w6a8 has no
+kernel. Importing
 `int8_convrot` directly is still open: it needs a grouped Hadamard rotation of
 the activations and streaming of int8 DequantizeLinear payloads.
 
@@ -88,6 +91,41 @@ every graph below was verified, at 1–2 layers.
 | `h3_export_fl2va.py` | one DiT step | `video_rows, audio_rows, text_states, pack_index, t_emb, mod_index, rope_cos/sin, video/audio_index, video/audio_t` → `video_v, audio_v` | writes `rope_inv_freq.f32` and `adaln_t_table.f32` for the host; `--dtype bf16` (default `fp32` only for the legacy fp32-activation artifact) |
 | `h3_export_fl2va_vae.py` | one decoder call (one clip/tile) | `z [N,24]` (denormalized), `rope_cos/sin [N+5,24]` → `pixels [N,3072]` | the zero suffix token is `h[:1]*0`, because `zeros_like` traces to ConstantOfShape, which has no kernel |
 
+### 3a. NVFP4 text tower (`h3_export_fl2va_te.py --nvfp4`)
+
+How the comfy-kitchen layout of `qwen3vl_32b_minimax_h3_nvfp4_awq` is
+stored:
+
+- **Weights:** U8 `[N, K/2]` with the *even* element in the high nibble
+  (`hi_first`).
+- **Block scales:** e4m3 `[N, K/16]` in cuBLAS's blocked tile order.
+- **Global scale:** `weight_scale_2`, one fp32 value.
+- **Dequant:** `value = E2M1 × block × global`.
+- **AWQ:** `pre_quant_scale`, present only on `o_proj` and `down_proj`,
+  multiplies the input. For q/k/v and gate/up the smoothing is folded into
+  the norm weights, so the norms must come from this file.
+- **Embeddings:** stored as int8 here; the host reads rows from the bf16
+  file's table instead (same weights, unquantized).
+
+The exporter traces each Linear as `[x·pre_quant_scale] @ Wᵀ`, then replaces
+the W input with ModelOpt's chain:
+`DQ(W e2m1 [N,K], DQ(s e4m3 [N,K/16], g), axis=1, block_size=16)`. Each
+weight's nibbles are swapped to ONNX's low-first order and its scales are
+un-swizzled (`from_blocked`), one tensor at a time.
+`PreQuantizedWeights` folds the chain into vkop's NVFP4 MatMul, which
+runs beside bf16 activations (`Bf16ActivationTest.MatMulNvfp4WeightMatchesFp32`).
+
+Checked against the bf16 checkpoint (layer 3): o_proj comes out at rel 0.096
+of the bf16 weights and down_proj at 0.117, which is the normal FP4 level.
+The other nibble order gives > 1.3. The graph matches an fp32 run of the same
+dequantized weights at cos 0.99999. For the real prompt, the conditioning
+agrees with the int8 tower at cos 0.9998. The NVFP4 payload is hydrated during
+conversion, which peaks at 26.4 GB for the whole tower.
+
+End to end, with the same prompt, seed 42, 50 steps and the int4 coop8 DiT, the
+video looks the same as the int8-tower run (`h3_fl2va_run_dog/v2/dog_nvfp4.mp4`
+next to `dog.mp4`). That run took 13.7 s/step.
+
 Environment: venv `~/.venvs/h3`, Python 3.12, with torch, onnx 1.19.1,
 onnxoptimizer, flatbuffers, safetensors, transformers and pytest. Put this
 checkout's `model/pypi` on `PYTHONPATH`.
@@ -101,7 +139,14 @@ PY="env PYTHONPATH=$PWD/model/pypi $HOME/.venvs/h3/bin/python"
 CONV="$HOME/.venvs/h3/bin/python -m onnx2vkop.cli --act bf16 --target-backend buffer \
       --master-archive $PWD/build/vkop_shaders.bin"   # run from model/pypi
 
-# text tower: two halves of ~12 GB each (the 24 GB whole does not load on 36 GB)
+# text tower, NVFP4 (default): one 13.7 GB graph. The bf16 table and the
+# tokenizer come from the bf16 export below (or any earlier one).
+$PY h3_export_fl2va_te.py --nvfp4 --ckpt $C/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+    --embed $M/h3_fl2va_te/embed_tokens.bf16 --out $M/h3_fl2va_te4/te.onnx
+$CONV -i $M/h3_fl2va_te4/te.onnx -o $M/h3_fl2va_te4/te.vkopbin -q bf16
+
+# text tower, int8 from bf16 (alternative): two halves of ~12 GB each (the
+# 24 GB whole does not load on 36 GB); also writes embed_tokens.bf16
 mkdir -p $M/h3_fl2va_te/tokenizer && cp <ComfyUI>/comfy/text_encoders/qwen25_tokenizer/* $M/h3_fl2va_te/tokenizer/
 $PY h3_export_fl2va_te.py --ckpt $C/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
     --out $M/h3_fl2va_te_a/te.onnx --layers 0,25
@@ -133,7 +178,7 @@ $HOME/.venvs/h3/bin/python -c "from transformers import Qwen2Tokenizer; import n
   np.asarray(t('<prompt>', add_special_tokens=False)['input_ids'], np.int64).tofile('ids.i64')"
 
 export VKOP_ACTIVATION_REUSE=1     # required: dynamic shapes, see §6
-build/minimax_h3_fl2va --te $M/h3_fl2va_te_a/te.vkopbin,$M/h3_fl2va_te_b/te.vkopbin \
+build/minimax_h3_fl2va --te $M/h3_fl2va_te4/te.vkopbin \
     --embed $M/h3_fl2va_te/embed_tokens.bf16 --prompt-ids ids.i64 --text-out text_states.f32 \
     --dit $M/h3_fl2va_bf16/dit_int4.vkopbin --width 512 --height 288 --length 56
 build/minimax_h3_fl2va --text-states text_states.f32 \
@@ -152,7 +197,7 @@ for 6 s, and records the peak footprint.
 
 | model | weights | activations | artifact |
 |---|---|---|---|
-| text tower | int8, per output channel | bf16 | 2 × 12.2 GB, plus a 1.56 GB host embedding table |
+| text tower | NVFP4 + AWQ, imported (int8 alternative: 2 × 12.2 GB) | bf16 | 13.7 GB, plus a 1.56 GB host embedding table |
 | DiT | int4, group 128 (int8: 20.2 GB) | bf16 | 10.8 GB (after a `.comp` change: `tools/patch_model_shaders.py`) |
 | VAE decoder | int8 | bf16 | 2.45 GB |
 
@@ -193,7 +238,8 @@ checkout:
 | DiT int4, bf16, 2687 rows (coop8 int4 stage) | 12.8 | 19.8 GB |
 | VAE, 56 frames 512×288 (3 clips × 6 tiles) | 29 s total | – |
 | DiT int8, bf16, 2687 rows | – | 26.3 GB, killed: does not fit beside the other processes on 36 GB |
-| text tower, 53 tokens, two halves | 4.3 s total (run 0.7 s) | ~12 GB per half |
+| text tower int8, 53 tokens, two halves | 4.3 s total (run 0.7 s) | ~12 GB per half |
+| text tower NVFP4, 53 tokens, one graph | 2.5 s total (run 0.7 s) | 13.2 GB |
 
 `VKOP_ACTIVATION_REUSE=1` is required. The DiT graph has dynamic shapes, so
 the load-time shape pool does not apply, and without reuse every intermediate
@@ -204,7 +250,8 @@ peak is weights plus a few GB.
 
 | path | used | note |
 |---|---|---|
-| `h3_fl2va_te_a/te.vkopbin`, `h3_fl2va_te_b/te.vkopbin` | yes | text tower layers 0–24 / 25–49 |
+| `h3_fl2va_te4/te.vkopbin` | yes | NVFP4 text tower |
+| `h3_fl2va_te_a/te.vkopbin`, `h3_fl2va_te_b/te.vkopbin` | alternative | int8 text tower layers 0–24 / 25–49 |
 | `h3_fl2va_te/embed_tokens.bf16`, `h3_fl2va_te/tokenizer/` | yes | |
 | `h3_fl2va_bf16/dit_int4.vkopbin` (`dit_int8.vkopbin`) | yes | DiT |
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |

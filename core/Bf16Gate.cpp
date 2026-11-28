@@ -156,9 +156,22 @@ bool bf16_int8_weight_slot(ops::OpType type,
                            size_t index) {
     // int4 (signed nibbles, fp32 [K/group, N] scale table) decodes through
     // the same _bf16 module paths: Bf16ActivationTest.MatMulInt4WeightMatchesFp32.
-    if (type != ops::OpType::MATMUL || inputs.size() != 3 || !inputs[1] ||
-        (inputs[1]->elem_kind() != ElemKind::kInt8 &&
-         inputs[1]->elem_kind() != ElemKind::kInt4)) {
+    if (type != ops::OpType::MATMUL || inputs.size() < 3 || !inputs[1]) {
+        return false;
+    }
+    const ElemKind w = inputs[1]->elem_kind();
+    // NVFP4: [A, W e2m1, block scale e4m3, global fp32], the two scale levels
+    // decoded in fp32 by the same module paths:
+    // Bf16ActivationTest.MatMulNvfp4WeightMatchesFp32.
+    if (w == ElemKind::kFloat4E2M1) {
+        if (inputs.size() != 4) return false;
+        if (index == 1) return true;
+        if (index == 2)
+            return inputs[2] && inputs[2]->elem_kind() == ElemKind::kFloat8E4M3FN;
+        return index == 3 && inputs[3] &&
+               inputs[3]->elem_kind() == ElemKind::kFloat32;
+    }
+    if (inputs.size() != 3 || (w != ElemKind::kInt8 && w != ElemKind::kInt4)) {
         return false;
     }
     if (index == 1) {

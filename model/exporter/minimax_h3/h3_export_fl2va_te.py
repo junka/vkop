@@ -61,7 +61,33 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.weight, self.eps)
 
 
-def lin(i, o, dtype, device):
+# --nvfp4: the projections whose AWQ smoothing was not folded into a norm and
+# so carry `pre_quant_scale` (multiplies the input). Filled from the checkpoint.
+NVFP4 = {"on": False, "pqs": set()}
+
+
+class QLinear(nn.Module):
+    """An NVFP4 Linear as traced: [x * pre_quant_scale] @ W^T. After the trace
+    the W input is replaced by the two-level DequantizeLinear chain
+    (nvfp4_splice), which onnx2vkop's PreQuantizedWeights imports."""
+
+    def __init__(self, i, o, dtype, device, pqs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(o, i, dtype=dtype, device=device),
+                                   requires_grad=False)
+        if pqs:
+            self.pre_quant_scale = nn.Parameter(
+                torch.empty(i, dtype=dtype, device=device), requires_grad=False)
+
+    def forward(self, x):
+        if hasattr(self, "pre_quant_scale"):
+            x = x * self.pre_quant_scale.to(x.dtype)
+        return torch.matmul(x, self.weight.to(x.dtype).t())
+
+
+def lin(i, o, dtype, device, name=""):
+    if NVFP4["on"]:
+        return QLinear(i, o, dtype, device, name in NVFP4["pqs"])
     m = nn.Linear(i, o, bias=False, dtype=dtype, device=device)
     m.requires_grad_(False)
     return m
@@ -76,10 +102,10 @@ class Attention(nn.Module):
     def __init__(self, c, dtype, device):
         super().__init__()
         self.h, self.kv, self.d = c["heads"], c["kv_heads"], c["head_dim"]
-        self.q_proj = lin(c["hidden"], self.h * self.d, dtype, device)
-        self.k_proj = lin(c["hidden"], self.kv * self.d, dtype, device)
-        self.v_proj = lin(c["hidden"], self.kv * self.d, dtype, device)
-        self.o_proj = lin(self.h * self.d, c["hidden"], dtype, device)
+        self.q_proj = lin(c["hidden"], self.h * self.d, dtype, device, "q_proj")
+        self.k_proj = lin(c["hidden"], self.kv * self.d, dtype, device, "k_proj")
+        self.v_proj = lin(c["hidden"], self.kv * self.d, dtype, device, "v_proj")
+        self.o_proj = lin(self.h * self.d, c["hidden"], dtype, device, "o_proj")
         self.q_norm = RMSNorm(self.d, c["eps"], dtype, device)
         self.k_norm = RMSNorm(self.d, c["eps"], dtype, device)
 
@@ -104,9 +130,9 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, c, dtype, device):
         super().__init__()
-        self.gate_proj = lin(c["hidden"], c["ffn"], dtype, device)
-        self.up_proj = lin(c["hidden"], c["ffn"], dtype, device)
-        self.down_proj = lin(c["ffn"], c["hidden"], dtype, device)
+        self.gate_proj = lin(c["hidden"], c["ffn"], dtype, device, "gate_proj")
+        self.up_proj = lin(c["hidden"], c["ffn"], dtype, device, "up_proj")
+        self.down_proj = lin(c["ffn"], c["hidden"], dtype, device, "down_proj")
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -176,6 +202,134 @@ def host_inputs(ids, table, c=CFG):
             "rope_sin": np.sin(emb).astype(np.float32)}
 
 
+# ---------------------------------------------------------------- NVFP4 import
+# The ComfyUI repack's `qwen3vl_32b_minimax_h3_nvfp4_awq` (comfy-kitchen
+# layout): weight U8 [N, K/2] with the EVEN element in the HIGH nibble
+# (hi_first), weight_scale e4m3 [N, K/16] in cuBLAS's blocked/swizzled tile
+# order, weight_scale_2 fp32 scalar; value = e2m1 * block_scale * scale_2.
+# ONNX FLOAT4E2M1 puts element 0 in the LOW nibble, so the bytes are swapped,
+# and the scales are un-swizzled (comfy_kitchen.float_utils.from_blocked).
+
+E2M1 = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6],
+                np.float32)
+
+
+def st_header(path):
+    import json, struct
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        return json.loads(f.read(n)), 8 + n
+
+
+def st_bytes(path, header, base, name):
+    e = header[name]
+    a, b = e["data_offsets"]
+    return np.memmap(path, np.uint8, "r", offset=base + a, shape=(b - a,))
+
+
+def from_blocked(b, rows, cols):
+    nrb, ncb = -(-rows // 128), -(-cols // 4)
+    x = np.asarray(b).reshape(-1, 32, 4, 4).transpose(0, 2, 1, 3)
+    x = x.reshape(nrb, ncb, 4, 32, 4).reshape(nrb, ncb, 128, 4).transpose(0, 2, 1, 3)
+    return np.ascontiguousarray(x.reshape(nrb * 128, ncb * 4)[:rows, :cols])
+
+
+def nvfp4_parts(path, header, base, name):
+    """(low-nibble-first payload [N, K/2] u8, e4m3 bytes [N, K/16], g, N, K)."""
+    q = st_bytes(path, header, base, name + ".weight")
+    N, K2 = header[name + ".weight"]["shape"]
+    K = 2 * K2
+    q = np.asarray(q).reshape(N, K2)
+    lo_first = ((q << 4) | (q >> 4)).astype(np.uint8)
+    s = st_bytes(path, header, base, name + ".weight_scale")
+    s = from_blocked(np.asarray(s), N, K // 16)
+    g = np.frombuffer(bytes(st_bytes(path, header, base, name + ".weight_scale_2")),
+                      np.float32)[0]
+    return lo_first, s, float(g), N, K
+
+
+def nvfp4_dequant(lo_first, s, g, N, K):
+    codes = np.stack([lo_first & 15, lo_first >> 4], -1).reshape(N, K)
+    s32 = torch.from_numpy(s.copy()).view(torch.float8_e4m3fn).float().numpy()
+    return (E2M1[codes].reshape(N, K // 16, 16) * s32[:, :, None] * g).reshape(N, K)
+
+
+def nvfp4_splice(proto, path, qnames, weights_path, weights_file):
+    """Replace each traced W input by DequantizeLinear(W e2m1 [N, K],
+    DequantizeLinear(s e4m3 [N, K/16], g), axis=1, block_size=16), the bytes
+    appended to `weights_path` one tensor at a time."""
+    import onnx
+    from onnx import helper, TensorProto
+    header, base = st_header(path)
+    keep = [vi for vi in proto.graph.input if vi.name not in qnames]
+    del proto.graph.input[:]
+    proto.graph.input.extend(keep)
+    new_nodes = []
+    with open(weights_path, "ab") as out:
+        for name in qnames:
+            mod = name[: -len(".weight")]
+            q, s, g, N, K = nvfp4_parts(path, header, base, mod)
+            inits = []
+            for suffix, arr, dtype, dims in ((".nvfp4_q", q, TensorProto.FLOAT4E2M1, [N, K]),
+                                             (".nvfp4_s", s, TensorProto.FLOAT8E4M3FN,
+                                              [N, K // 16])):
+                off = out.tell()
+                out.write(arr.tobytes())
+                t = proto.graph.initializer.add()
+                t.name, t.data_type = name + suffix, dtype
+                t.dims.extend(dims)
+                t.data_location = TensorProto.EXTERNAL
+                for k, v in (("location", weights_file), ("offset", str(off)),
+                             ("length", str(arr.nbytes))):
+                    kv = t.external_data.add()
+                    kv.key, kv.value = k, v
+            gi = proto.graph.initializer.add()
+            gi.CopyFrom(onnx.numpy_helper.from_array(np.array(g, np.float32),
+                                                     name + ".nvfp4_g"))
+            new_nodes.append(helper.make_node(
+                "DequantizeLinear", [name + ".nvfp4_s", name + ".nvfp4_g"],
+                [name + ".nvfp4_sf32"], name=name + ".nvfp4_dq_scale"))
+            new_nodes.append(helper.make_node(
+                "DequantizeLinear", [name + ".nvfp4_q", name + ".nvfp4_sf32"],
+                [name], name=name + ".nvfp4_dq", axis=1, block_size=16))
+    nodes = new_nodes + list(proto.graph.node)
+    del proto.graph.node[:]
+    proto.graph.node.extend(nodes)
+    for op in proto.opset_import:
+        if op.domain in ("", "ai.onnx"):
+            op.version = max(op.version, 23)   # FLOAT4E2M1 / block_size
+
+
+def export_nvfp4(wrapper, dummies, ckpt, out_path):
+    """trace -> splice norms/pre_quant_scale -> splice NVFP4 chains -> save."""
+    import onnx
+    import h3_export_common as common
+    from onnx2vkop import stream_export as SE
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    proto, shapes = common.trace_weightless(wrapper, dummies, INPUT_NAMES,
+                                            OUTPUT_NAMES, DYNAMIC_AXES)
+    qnames = [n for n in shapes if n.endswith("_proj.weight")]
+    plain = {n: v for n, v in shapes.items() if n not in qnames}
+    ck_dir = os.path.join(out_dir, "ckpt", "te_nvfp4")
+    os.makedirs(ck_dir, exist_ok=True)
+    link = os.path.join(ck_dir, os.path.basename(ckpt))
+    if not os.path.lexists(link):
+        os.symlink(os.path.abspath(ckpt), link)
+    index = SE.SafetensorsIndex(ck_dir)
+    weights_file = os.path.splitext(os.path.basename(out_path))[0] + ".weights.bin"
+    wpath = os.path.join(out_dir, weights_file)
+    resolved = SE.splice_initializers(proto, plain, index, weights_file=weights_file)
+    if len(resolved) != len(plain):
+        raise SystemExit(f"[nvfp4] spliced {len(resolved)} of {len(plain)} plain tensors")
+    nbytes, offsets = SE.copy_weights(resolved, wpath)
+    SE.patch_offsets(proto, offsets)
+    nvfp4_splice(proto, ckpt, qnames, wpath, weights_file)
+    SE.resolve_shape_dims(proto, DYNAMIC_AXES)
+    onnx.save(proto, out_path)
+    print(f"[nvfp4] wrote {out_path}: {len(qnames)} NVFP4 Linear(s), "
+          f"{len(resolved)} plain tensor(s); {os.path.getsize(wpath) / 2**30:.2f} GiB")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -192,6 +346,12 @@ def main(argv=None):
                     help="run the truncated tower on CPU (fp32) and save "
                          "inputs/output to this .npz")
     ap.add_argument("--text", default="A red fox runs through a snowy forest at dawn.")
+    ap.add_argument("--nvfp4", action="store_true",
+                    help="--ckpt is qwen3vl_32b_minimax_h3_nvfp4_awq: import its "
+                         "NVFP4 weights as-is (two-level DequantizeLinear chains)")
+    ap.add_argument("--embed", default=None,
+                    help="bf16 embed_tokens.bf16 to look rows up in (default: "
+                         "written from --ckpt, which needs a bf16 table)")
     args = ap.parse_args(argv)
     c = dict(CFG, layers=args.num_layers)
     layer_ids = range(c["layers"])
@@ -208,30 +368,55 @@ def main(argv=None):
     tok = Qwen2Tokenizer.from_pretrained(tok_dir)
     ids = tok(args.text, add_special_tokens=False)["input_ids"]
 
+    if args.nvfp4:
+        header, _ = st_header(args.ckpt)
+        NVFP4["on"] = True
+        NVFP4["pqs"] = {k.split(".")[-2] for k in header
+                        if k.startswith("model.layers.0.") and
+                        k.endswith(".pre_quant_scale")}
+        print(f"[nvfp4] pre_quant_scale on {sorted(NVFP4['pqs'])}")
+    if args.embed:
+        # An existing bf16 table (the nvfp4 file stores embed_tokens as int8;
+        # the bf16 checkpoint's table is the same weights unquantized -- AWQ
+        # folds its smoothing into norms and weights, not into embeddings).
+        table = np.memmap(args.embed, np.uint16, "r",
+                          shape=(c["vocab"], c["hidden"]))
+        inputs = host_inputs(ids, table, c)
     # The embedding table as a raw bf16 file the driver mmaps.
     import json, struct
     with open(args.ckpt, "rb") as f:
         hlen = struct.unpack("<Q", f.read(8))[0]
         e = json.loads(f.read(hlen))["model.embed_tokens.weight"]
-    assert e["dtype"] == "BF16" and e["shape"] == [c["vocab"], c["hidden"]], e
-    table = np.memmap(args.ckpt, np.uint16, "r", offset=8 + hlen + e["data_offsets"][0],
+    if args.embed:
+        e = None
+    else:
+        assert e["dtype"] == "BF16" and e["shape"] == [c["vocab"], c["hidden"]], e
+    table = None if args.embed else np.memmap(args.ckpt, np.uint16, "r", offset=8 + hlen + e["data_offsets"][0],
                       shape=(c["vocab"], c["hidden"]))
     emb_path = os.path.join(out_dir, "embed_tokens.bf16")
-    if not os.path.exists(emb_path) or os.path.getsize(emb_path) != table.nbytes:
+    if table is not None and (not os.path.exists(emb_path)
+                              or os.path.getsize(emb_path) != table.nbytes):
         with open(emb_path, "wb") as dst:
             for r0 in range(0, c["vocab"], 8192):
                 dst.write(np.ascontiguousarray(table[r0:r0 + 8192]).tobytes())
         print(f"[embed] wrote {emb_path} ({table.nbytes / 2**30:.2f} GiB)")
-    inputs = host_inputs(ids, table, c)
+    if table is not None:
+        inputs = host_inputs(ids, table, c)
 
     if args.reference:
         from safetensors import safe_open
         model = TextTower(c, dtype=torch.float32, device="cpu",
                           layer_ids=layer_ids).eval()
         sd = {}
+        if args.nvfp4:
+            header, base = st_header(args.ckpt)
         with safe_open(args.ckpt, "pt") as f:
             for name in model.state_dict():
-                sd[name] = f.get_tensor(name).float()
+                if args.nvfp4 and name.endswith("_proj.weight"):
+                    sd[name] = torch.from_numpy(nvfp4_dequant(*nvfp4_parts(
+                        args.ckpt, header, base, name[: -len(".weight")])))
+                else:
+                    sd[name] = f.get_tensor(name).float()
         model.load_state_dict(sd, assign=True)
         with torch.no_grad():
             h = model(*[torch.from_numpy(inputs[n]) for n in INPUT_NAMES])
@@ -239,6 +424,13 @@ def main(argv=None):
         print(f"[ref] {args.reference}: L={len(ids)} hidden absmax "
               f"{h.abs().max():.1f} rms {h.pow(2).mean().sqrt():.3f}")
         del model, sd
+
+    if args.nvfp4:
+        wrapper = TextTower(c, device="meta", layer_ids=layer_ids).eval()
+        dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
+        with torch.no_grad():
+            export_nvfp4(wrapper, dummies, args.ckpt, args.out)
+        return 0
 
     import h3_export_common as common
     ck_dir = os.path.join(out_dir, "ckpt", "te")

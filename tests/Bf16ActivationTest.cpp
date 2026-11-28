@@ -801,6 +801,97 @@ TEST(Bf16ActivationTest, MatMulInt4WeightMatchesFp32) {
     }
 }
 
+// NVFP4 weight-only MatMul under a bf16 activation: [A bf16, W e2m1 [K, N]
+// (low nibble first), s e4m3 [K/16, N], g fp32 [1]] -- the form
+// PreQuantizedWeights folds a ModelOpt/ComfyUI NVFP4 Linear into.
+TEST(Bf16ActivationTest, MatMulNvfp4WeightMatchesFp32) {
+    Env e;
+    const bool ctl = std::getenv("VKOP_TEST_INT8_FP16") != nullptr;
+    static const float kE2M1[16] = {0.f,  0.5f,  1.f,  1.5f,  2.f,  3.f,  4.f,  6.f,
+                                    -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+    auto e4m3 = [](uint8_t b) {
+        const int sgn = b >> 7, ex = (b >> 3) & 15, man = b & 7;
+        const float v = ex == 0 ? std::ldexp(man / 8.0F, -6)
+                                : std::ldexp(1.0F + man / 8.0F, ex - 7);
+        return sgn ? -v : v;
+    };
+    struct Case {
+        int m, k, n;
+        bool outliers;
+        const char *why;
+    };
+    const std::vector<Case> cases = {
+        {1, 512, 256, false, "decode GEMV"},
+        {1, 1024, 4096, true, "decode WIDE GEMV"},
+        {11, 512, 256, true, "text rows"},
+        {53, 1024, 512, true, "prompt rows"},
+        {130, 256, 192, true, "M > 128"},
+    };
+    for (const Case &c : cases) {
+        auto av = bf16_values(static_cast<size_t>(c.m) * c.k, 111 + c.m);
+        if (c.outliers && !ctl) {
+            for (int r : {0, 3, 70, 129}) {
+                if (r >= c.m) continue;
+                av[static_cast<size_t>(r) * c.k + (r * 37 + 5) % c.k] =
+                    bf16_to_float(float_to_bf16((r & 1 ? -1.0F : 1.0F) * 9.0e4F));
+            }
+        }
+        const int nb = c.k / 16;
+        std::vector<uint8_t> code(static_cast<size_t>(c.k) * c.n), sb(static_cast<size_t>(nb) * c.n);
+        uint32_t st = 4321u + static_cast<uint32_t>(c.n);
+        for (auto &v : code) {
+            st = st * 1664525u + 1013904223u;
+            v = static_cast<uint8_t>(st >> 28);
+        }
+        for (auto &v : sb) {  // positive normal e4m3, exponents 3..10
+            st = st * 1664525u + 1013904223u;
+            v = static_cast<uint8_t>(((3 + (st >> 29)) << 3) | ((st >> 24) & 7));
+        }
+        const float g = 1.0F / 2048.0F;
+        std::vector<float> bv(code.size());
+        for (int kk = 0; kk < c.k; ++kk)
+            for (int j = 0; j < c.n; ++j) {
+                const size_t i = static_cast<size_t>(kk) * c.n + j;
+                bv[i] = kE2M1[code[i]] * e4m3(sb[static_cast<size_t>(kk / 16) * c.n + j]) * g;
+            }
+        std::vector<int8_t> bytes(code.size() / 2);
+        for (size_t i = 0; i < code.size(); i += 2)
+            bytes[i / 2] = static_cast<int8_t>(code[i] | (code[i + 1] << 4));
+
+        auto a = half_in(e, !ctl, {c.m, c.k}, av);
+        auto w = std::make_shared<Tensor<int8_t>>(std::vector<int>{c.k, c.n});
+        w->set_elem_kind(ElemKind::kFloat4E2M1);
+        w->set_payload_bytes(static_cast<int>(bytes.size()));
+        w->fillToCPU(bytes);
+        w->as_storage_buffer(e.dev);
+        w->copyToGPU(e.cmdpool);
+        auto s = std::make_shared<Tensor<int8_t>>(std::vector<int>{nb * c.n});
+        s->set_elem_kind(ElemKind::kFloat8E4M3FN);
+        s->fillToCPU(std::vector<int8_t>(sb.begin(), sb.end()));
+        s->as_storage_buffer(e.dev);
+        s->copyToGPU(e.cmdpool);
+        auto gt = std::make_shared<Tensor<float>>(std::vector<int>{1});
+        gt->fillToCPU(std::vector<float>{g});
+        gt->as_storage_buffer(e.dev);
+        gt->copyToGPU(e.cmdpool);
+        auto y = out<uint16_t>(e, {c.m, c.n},
+                               ctl ? ElemKind::kFloat16 : ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::MATMUL, ctl ? 1 : 2, {{"transB", "0"}});
+        op->onExecute({a, w, s, gt}, {y}, 0);
+        submit(e, op.get());
+        const auto got = read_half(e, !ctl, y);
+        std::vector<double> ref, mag;
+        mm_ref(1, 1, c.m, c.k, c.n, false, av, bv, &ref, &mag);
+        double worst = 0;
+        const int bad = count_bad_mm(got, ref, mag, 8e-3, 0.03, 2e-3, &worst);
+        EXPECT_EQ(bad, 0) << c.why << " (route " << op->route_tag() << ") m="
+                          << c.m << " k=" << c.k << " n=" << c.n
+                          << " worst/tol " << worst;
+        LOG_INFO("bf16 x nvfp4 MatMul %s: route %s, worst err/tol %g", c.why,
+                 op->route_tag().c_str(), worst);
+    }
+}
+
 // The 512-lane split-K builds are opt-in (VKOP_KSPLIT512=1, read once per
 // process), so this only runs in a process started with it.
 TEST(Bf16ActivationTest, MatMulKsplit512MatchesFp32) {

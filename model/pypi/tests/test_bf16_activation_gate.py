@@ -395,6 +395,23 @@ def test_mixed_half_kinds_exempts_the_int8_scale():
     assert GraphFp16.mixed_half_kinds(m)
 
 
+def test_imported_nvfp4_matmul_goes_bf16():
+    """The folded NVFP4 form [A, W e2m1, s e4m3, g fp32] has a bf16 kernel
+    (Bf16ActivationTest.MatMulNvfp4WeightMatchesFp32): it stays in the bf16
+    domain and its fp32 global is not a width conflict."""
+    m = build([node("MatMul", "mm",
+                    ["x", ref("w", T.FLOAT4E2M1), ref("s", T.FLOAT8E4M3FN),
+                     ref("g", F)], ["y"])],
+              inputs=["x"], outputs=["y"])
+    m.initializers["w"] = h.make_tensor("w", T.FLOAT4E2M1, [2], [0, 0])
+    m.initializers["s"] = h.make_tensor("s", T.FLOAT8E4M3FN, [1], [1.0])
+    m.initializers["g"] = h.make_tensor("g", F, [1], [1.0])
+    s = bf16(m)
+    assert "mm" not in s["blockers"]
+    assert dtype_of(m, "y") == _BFLOAT16
+    assert GraphFp16.mixed_half_kinds(m) == []
+
+
 def test_fp16_operand_beside_bf16_is_retyped():
     """An export that declares an fp16 operand of a bf16 node used to be
     refused (the _bf16 module would read it as bf16). FLOAT16 is a candidate

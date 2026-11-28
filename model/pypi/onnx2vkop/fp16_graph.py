@@ -83,6 +83,8 @@ _INT32 = onnx.TensorProto.INT32
 _INT64 = onnx.TensorProto.INT64
 _INT8 = onnx.TensorProto.INT8
 _INT4 = onnx.TensorProto.INT4
+_FLOAT4E2M1 = onnx.TensorProto.FLOAT4E2M1
+_FLOAT8E4M3FN = onnx.TensorProto.FLOAT8E4M3FN
 # -q formats whose plain weight-only MatMul has a bf16-activation kernel
 # (matmul.comp's _bf16 module decodes the payload to fp32 itself):
 # Bf16ActivationTest.MatMulInt8WeightMatchesFp32 / MatMulInt4WeightMatchesFp32.
@@ -323,6 +325,17 @@ class GraphFp16:
         wname = node.inputs[1].get("name")
         fmt = quantized.get(wname) if isinstance(quantized, dict) else None
         wd = decls.get(wname) or {}
+        # An imported NVFP4 weight (PreQuantizedWeights' fold of the two-level
+        # DequantizeLinear chain): [A, W e2m1, block scale e4m3, global fp32].
+        # Bf16ActivationTest.MatMulNvfp4WeightMatchesFp32.
+        if wd.get("elem") == _FLOAT4E2M1:
+            if len(node.inputs) != 4:
+                return ()
+            sd = decls.get(node.inputs[2].get("name")) or {}
+            gd = decls.get(node.inputs[3].get("name")) or {}
+            if sd.get("elem") == _FLOAT8E4M3FN and gd.get("elem") == _FLOAT:
+                return (1, 2, 3)
+            return ()
         if fmt not in _BF16_QUANT_FORMATS and \
                 wd.get("elem") not in _BF16_QUANT_FORMATS.values():
             return ()
@@ -1125,9 +1138,13 @@ class GraphFp16:
             wslots = _BF16_WEIGHT_SLOTS.get(node.op_type, ())
             # An int8 weight-only MatMul [A, W_int8, s_fp32]: the scale is read
             # at fp32 (core/Bf16Gate.cpp bf16_int8_weight_slot).
-            int8_w = (node.op_type == "MatMul" and len(node.inputs) == 3
-                      and (decls.get(node.inputs[1].get("name")) or {}).get(
-                          "elem") in _BF16_QUANT_FORMATS.values())
+            w_elem = ((decls.get(node.inputs[1].get("name")) or {}).get("elem")
+                      if node.op_type == "MatMul" and len(node.inputs) > 1
+                      else None)
+            int8_w = (len(node.inputs) == 3
+                      and w_elem in _BF16_QUANT_FORMATS.values())
+            # NVFP4's fp32 global (input 3) is read at fp32 the same way.
+            nvfp4_w = len(node.inputs) == 4 and w_elem == _FLOAT4E2M1
             bf, other = [], []
             for i, e in enumerate(node.inputs):
                 d = decls.get(e.get("name"))
@@ -1136,6 +1153,8 @@ class GraphFp16:
                 if i in wslots and e["name"] in dag_model.initializers:
                     continue
                 if int8_w and i == 2 and d["elem"] == _FLOAT:
+                    continue
+                if nvfp4_w and i == 3 and d["elem"] == _FLOAT:
                     continue
                 rule = _bf16_slot_rule(node.op_type, i)
                 if rule == "any" or (rule == "fp32" and
