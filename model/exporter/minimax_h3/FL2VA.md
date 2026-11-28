@@ -61,6 +61,7 @@ Everything comes from `~/.cache/modelscope/hub/models/Comfy-Org/MiniMax-H3/`.
 | model | file | size | dtype |
 |---|---|---|---|
 | text tower | `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (default) | 15.7 GB | NVFP4 + AWQ, imported as-is |
+| text tower (alternative, §3g) | `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | 27.1 GB | int8 + ConvRot, imported as-is (two halves) |
 | text tower (alternative, and the embedding table) | `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors` | 51.5 GB | bf16 (it also carries the vision tower, which t2va does not use) |
 | DiT | `diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors` | 40.2 GB | bf16 (adaLN fp16, patch projections and heads fp32) |
 | video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` | 5.2 GB | fp16 (encoder + decoder; only the decoder is used) |
@@ -405,13 +406,13 @@ than int8_convrot, and token 35 comes out at cos 0.49.
 The 200 online rotations add ~0.2 s of GPU time; the tower runs once per
 video.
 
-**Recommendation:** make int8_convrot the default text tower. It is the most
-accurate of the three by a wide margin (3× closer to bf16 than vkop's own
-int8, 10× closer than NVFP4), and it peaks lower than NVFP4 because it runs
-as two halves. It costs ~2.5 s more per prompt and 10.7 GB more disk. Keep
-NVFP4 as the option for the smaller download (15.7 GB) and single-graph
-simplicity. vkop's int8-from-bf16 path has no remaining advantage, except
-that it needs only the bf16 file. Whether the token-level gap changes the
+**Decision:** NVFP4 stays the default FL2VA text tower; int8_convrot is a
+supported alternative of the exporter and converter (pass its checkpoint, no
+flag: the exporter detects the format). It is the most accurate of the three
+by a wide margin (3× closer to bf16 than vkop's own int8, 10× closer than
+NVFP4) and peaks lower than NVFP4 because it runs as two halves, at ~2.5 s
+more per prompt and 10.7 GB more disk. vkop's int8-from-bf16 path has no
+remaining advantage, except that it needs only the bf16 file. Whether the token-level gap changes the
 video was not checked: no end-to-end run with the int8_convrot conditioning.
 
 ### 3h. Ref2VA: reference images in the text tower (`h3_export_ref2va_vision.py`, `--deepstack`)
@@ -533,6 +534,13 @@ CONV="$HOME/.venvs/h3/bin/python -m onnx2vkop.cli --act bf16 --target-backend bu
 $PY h3_export_fl2va_te.py --nvfp4 --ckpt $C/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
     --embed $M/h3_fl2va_te/embed_tokens.bf16 --out $M/h3_fl2va_te4/te.onnx
 $CONV -i $M/h3_fl2va_te4/te.onnx -o $M/h3_fl2va_te4/te.vkopbin -q bf16
+
+# text tower, int8_convrot as-is (alternative, §3g): detected from the file, no
+# flag; two halves of 12.2 GB, conversion peak ~4 GB. Run: --te A,B
+$PY h3_export_fl2va_te.py --ckpt $C/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+    --embed $M/h3_fl2va_te/embed_tokens.bf16 --out $M/h3_fl2va_te_i8cr_a/te.onnx --layers 0,25
+$PY h3_export_fl2va_te.py --ckpt ... --embed ... --out $M/h3_fl2va_te_i8cr_b/te.onnx --layers 25,50
+$CONV -i $M/h3_fl2va_te_i8cr_a/te.onnx -o $M/h3_fl2va_te_i8cr_a/te.vkopbin -q int8   # same for _b
 
 # text tower, int8 from bf16 (alternative): two halves of ~12 GB each (the
 # 24 GB whole does not load on 36 GB); also writes embed_tokens.bf16
