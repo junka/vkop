@@ -21,6 +21,8 @@
 // prompt. Outputs (--save DIR): video latent [24, T, H, W] and audio latent
 // [32, 2, Ta], raw little-endian fp32, in the sampler's (un-normalized) space.
 #include <algorithm>
+#include <cctype>
+#include <iterator>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -86,6 +88,10 @@ struct Options {
     // (h3_export_fl2va_vae_encoder.py); latents first, then images
     std::vector<std::string> ref_images;
     std::string vae_enc;
+    // ref2va text side (h3_ref2va_prep.py qwen --out DIR): ids, tags, MRoPE
+    // tables and the vision blocks' patches; the Qwen3-VL vision tower
+    // (h3_export_ref2va_vision.py) fills the pads and the DeepStack inputs
+    std::string qwen_dir, vision;
     std::string text_tags, dump_layout;
     double cond_aug = 0.999;  // comfy VISUAL_COND_TIMESTEP / noise aug
     int width = 256, height = 256, length = 22, steps = 8, text_len = 32;
@@ -114,6 +120,8 @@ void usage(const char *argv0) {
                  "[24, 1, HL, WL] (repeatable)\n"
                  "  --ref-image F.f32:TH:TW --vae-enc enc.vkopbin  reference image "
                  "pixels [3, TH, TW]\n"
+                 "  --qwen DIR --vision vision.vkopbin  ref2va prompt from "
+                 "h3_ref2va_prep.py qwen (with --te/--embed)\n"
                  "  --text-tags F.i64  per-token adaLN tags (1 text, 0 vision pad)\n"
                  "  --cond-aug 0.999   reference timestep / noise augmentation\n"
                  "  --steps 0          stop after the text tower / reference encoding\n"
@@ -150,6 +158,8 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--text-tags" && (v = next("--text-tags"))) o.text_tags = v;
         else if (a == "--ref-image" && (v = next("--ref-image"))) o.ref_images.push_back(v);
         else if (a == "--vae-enc" && (v = next("--vae-enc"))) o.vae_enc = v;
+        else if (a == "--qwen" && (v = next("--qwen"))) o.qwen_dir = v;
+        else if (a == "--vision" && (v = next("--vision"))) o.vision = v;
         else if (a == "--dump-layout" && (v = next("--dump-layout"))) o.dump_layout = v;
         else if (a == "--cond-aug" && (v = next("--cond-aug"))) o.cond_aug = std::atof(v);
         else if (a == "--width" && (v = next("--width"))) o.width = std::atoi(v);
@@ -434,9 +444,112 @@ constexpr double kTeTheta = 5.0e6;
 // (h3_export_fl2va_te.py --layers): each takes the previous one's hidden as
 // its inputs_embeds and is released before the next loads, so peak memory is
 // one slice, not the 24 GB tower.
+// --------------------------------------------------------- ref2va vision
+// Qwen3-VL-32B vision tower, one call per vision block (attention stays in a
+// block): pixel_values [S, 1536] + grid_thw [1, 3] -> image_features and
+// deepstack_features_0..2, each [S/4, 5120] in token order. Their rows
+// replace the block's pads in inputs_embeds, and deepstack_i (zero elsewhere)
+// is added after text layer i (graph inputs of a --deepstack text tower).
+struct VisionRows {
+    struct Block { int start = 0, rows = 0; std::vector<float> feat, ds[3]; };
+    std::vector<Block> blocks;
+    std::vector<float> rope_cos, rope_sin;  // [L, 128] MRoPE tables
+};
+
+// minimal reader for ref2va_qwen.json's "blocks" (written by our own prep)
+std::vector<std::map<std::string, std::string>> json_blocks(const std::string &path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    const std::string js((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<std::map<std::string, std::string>> out;
+    size_t p = js.find("\"blocks\"");
+    if (p == std::string::npos) return out;
+    p = js.find('[', p);
+    int depth = 0;
+    size_t obj = 0;
+    for (size_t i = p + 1; i < js.size(); ++i) {
+        const char c = js[i];
+        if (c == '{' && depth++ == 0) obj = i;
+        else if (c == '}' && --depth == 0) {
+            const std::string o = js.substr(obj + 1, i - obj - 1);
+            std::map<std::string, std::string> kv;
+            for (size_t q = o.find('"'); q != std::string::npos; q = o.find('"', q)) {
+                const size_t e = o.find('"', q + 1);
+                const std::string key = o.substr(q + 1, e - q - 1);
+                size_t v = o.find(':', e) + 1;
+                while (v < o.size() && std::isspace(static_cast<unsigned char>(o[v]))) ++v;
+                size_t ve;
+                if (o[v] == '"') { ve = o.find('"', v + 1); kv[key] = o.substr(v + 1, ve - v - 1); ++ve; }
+                else if (o[v] == '[') { ve = o.find(']', v) + 1; kv[key] = o.substr(v + 1, ve - v - 2); }
+                else { ve = o.find_first_of(",}", v); if (ve == std::string::npos) ve = o.size(); kv[key] = o.substr(v, ve - v); }
+                q = o.find('"', ve);
+                if (q == std::string::npos) break;
+            }
+            out.push_back(std::move(kv));
+        } else if (c == ']' && depth == 0) break;
+    }
+    return out;
+}
+
+VisionRows run_vision(const std::shared_ptr<VulkanCommandPool> &pool,
+                      const std::string &vision, const std::string &dir, int L) {
+    VisionRows vr;
+    vr.rope_cos = read_f32(dir + "/rope_cos.f32");
+    vr.rope_sin = read_f32(dir + "/rope_sin.f32");
+    if (vr.rope_cos.size() != static_cast<size_t>(L) * kTeHeadDim ||
+        vr.rope_sin.size() != vr.rope_cos.size())
+        throw std::runtime_error(dir + ": rope tables are not [L, 128]");
+    const auto blocks = json_blocks(dir + "/ref2va_qwen.json");
+    if (blocks.empty()) return vr;
+    auto t0 = std::chrono::steady_clock::now();
+    double ms = 0;
+    for (const auto &b : blocks) {
+        // A fresh runtime per block: re-running one loaded graph with a new
+        // grid_thw of the SAME patch count (e.g. 24x24 then 18x32, both 576)
+        // reuses the first grid's grid-derived indices -- the second block
+        // came out at cos 0.62. Loading costs ~0.3 s per block.
+        auto rt = std::make_shared<Runtime>(pool, vision, /*precision=*/0);
+        rt->set_backend_buffer(true);
+        rt->LoadModel();
+        VisionRows::Block vb;
+        vb.start = std::stoi(b.at("start"));
+        vb.rows = std::stoi(b.at("rows"));
+        const int S = std::stoi(b.at("patch_rows")), D = std::stoi(b.at("patch_dim"));
+        std::vector<int64_t> grid;
+        for (size_t a = 0, e; a < b.at("grid").size(); a = e + 1) {
+            e = b.at("grid").find(',', a);
+            if (e == std::string::npos) e = b.at("grid").size();
+            grid.push_back(std::stoll(b.at("grid").substr(a, e - a)));
+        }
+        const auto px = read_f32(dir + "/" + b.at("file"));
+        if (px.size() != static_cast<size_t>(S) * D || grid.size() != 3 || S / 4 != vb.rows ||
+            vb.start + vb.rows > L)
+            throw std::runtime_error(dir + "/" + b.at("file") + ": block does not match the json");
+        upload_float(rt, pool, "pixel_values", px, {static_cast<uint32_t>(S), static_cast<uint32_t>(D)});
+        upload<int64_t>(rt, pool, "grid_thw", grid, {1, 3});
+        ms += rt->Run();
+        rt->ReadResult();
+        vb.feat = read_output(rt, "image_features");
+        for (int i = 0; i < 3; ++i)
+            vb.ds[i] = read_output(rt, "deepstack_features_" + std::to_string(i));
+        if (vb.feat.size() != static_cast<size_t>(vb.rows) * kTextDim)
+            throw std::runtime_error("vision: image_features is not [rows, 5120]");
+        const Stats st = stats(vb.feat);
+        std::printf("[vision] block at %d: grid %lldx%lld -> %d rows, rms %.3f%s\n", vb.start,
+                    static_cast<long long>(grid[1]), static_cast<long long>(grid[2]), vb.rows,
+                    st.rms, st.nonfinite ? " NONFINITE" : "");
+        if (st.nonfinite) throw std::runtime_error("vision tower produced non-finite features");
+        vr.blocks.push_back(std::move(vb));
+    }
+    std::printf("[vision] %zu block(s), load+run %.1fs (gpu %.0f ms)\n", vr.blocks.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ms);
+    return vr;
+}
+
 std::vector<float> run_text_tower(const std::shared_ptr<VulkanCommandPool> &pool,
                                   const std::string &te, const std::string &embed,
-                                  const std::vector<int64_t> &ids) {
+                                  const std::vector<int64_t> &ids,
+                                  const VisionRows *vr = nullptr) {
     const int L = static_cast<int>(ids.size());
     std::vector<float> emb(static_cast<size_t>(L) * kTextDim);
     {
@@ -451,11 +564,21 @@ std::vector<float> run_text_tower(const std::shared_ptr<VulkanCommandPool> &pool
                 emb[static_cast<size_t>(i) * kTextDim + d] = vkop::core::bf16_to_float(row[d]);
         }
     }
+    // ref2va: vision features over the pads, DeepStack rows beside them
+    std::vector<float> ds[3];
+    if (vr) {
+        for (auto &d : ds) d.assign(emb.size(), 0.f);
+        for (const auto &b : vr->blocks) {
+            const size_t off = static_cast<size_t>(b.start) * kTextDim;
+            std::copy(b.feat.begin(), b.feat.end(), emb.begin() + off);
+            for (int i = 0; i < 3; ++i) std::copy(b.ds[i].begin(), b.ds[i].end(), ds[i].begin() + off);
+        }
+    }
     std::vector<float> bias(static_cast<size_t>(L) * L, 0.f);
     for (int i = 0; i < L; ++i)
         for (int j = i + 1; j < L; ++j) bias[static_cast<size_t>(i) * L + j] = -3.0e38f;
     std::vector<float> rc(static_cast<size_t>(L) * kTeHeadDim), rs(rc.size());
-    for (int p = 0; p < L; ++p)
+    for (int p = 0; p < L && !vr; ++p)
         for (int i = 0; i < kTeHeadDim / 2; ++i) {
             const float inv = static_cast<float>(
                 1.0 / std::pow(kTeTheta, 2.0 * i / kTeHeadDim));
@@ -482,8 +605,19 @@ std::vector<float> run_text_tower(const std::shared_ptr<VulkanCommandPool> &pool
         rt->LoadModel();
         upload_float(rt, pool, "inputs_embeds", hidden, {u(L), kTextDim});
         upload_float(rt, pool, "attention_bias", bias, {u(L), u(L)});
-        upload_float(rt, pool, "rope_cos", rc, {u(L), kTeHeadDim});
-        upload_float(rt, pool, "rope_sin", rs, {u(L), kTeHeadDim});
+        upload_float(rt, pool, "rope_cos", vr ? vr->rope_cos : rc, {u(L), kTeHeadDim});
+        upload_float(rt, pool, "rope_sin", vr ? vr->rope_sin : rs, {u(L), kTeHeadDim});
+        const auto names = rt->ListInputNames();
+        for (int i = 0; i < 3; ++i) {
+            const std::string n = "deepstack_" + std::to_string(i);
+            if (std::find(names.begin(), names.end(), n) == names.end()) continue;
+            if (!vr) ds[i].assign(static_cast<size_t>(L) * kTextDim, 0.f);  // plain prompt
+            upload_float(rt, pool, n, ds[i], {u(L), kTextDim});
+        }
+        if (vr && !vr->blocks.empty() &&
+            std::find(names.begin(), names.end(), "deepstack_0") == names.end() &&
+            &part == &parts.front())
+            throw std::runtime_error(part + " has no deepstack inputs: export it with --deepstack");
         ms += rt->Run();
         rt->ReadResult();
         hidden = read_output(rt, "hidden");
@@ -1047,11 +1181,12 @@ int main(int argc, char **argv) {
     int text_len = o.text_len;
     std::vector<int64_t> prompt_ids;
     if (!o.te.empty()) {
-        if (o.embed.empty() || o.prompt_ids.empty()) {
-            std::fprintf(stderr, "--te needs --embed and --prompt-ids\n");
+        const std::string ids_path = o.qwen_dir.empty() ? o.prompt_ids : o.qwen_dir + "/ids.i64";
+        if (o.embed.empty() || ids_path.empty() || (!o.qwen_dir.empty() && o.vision.empty())) {
+            std::fprintf(stderr, "--te needs --embed and --prompt-ids (or --qwen DIR --vision V)\n");
             return 2;
         }
-        prompt_ids = read_i64(o.prompt_ids);
+        prompt_ids = read_i64(ids_path);
         text_len = static_cast<int>(prompt_ids.size());
     } else if (!o.text_states.empty()) {
         text = read_f32(o.text_states);
@@ -1114,8 +1249,10 @@ int main(int argc, char **argv) {
     };
     if (ref_px.empty()) augment(ref_rows);
     std::vector<int64_t> text_tags(text_len, 1);
-    if (!o.text_tags.empty()) {
-        text_tags = read_i64(o.text_tags);
+    const std::string tags_path = !o.text_tags.empty() ? o.text_tags
+                                  : !o.qwen_dir.empty() ? o.qwen_dir + "/tags.i64" : "";
+    if (!tags_path.empty()) {
+        text_tags = read_i64(tags_path);
         if (static_cast<int>(text_tags.size()) != text_len) {
             std::fprintf(stderr, "--text-tags has %zu entries, text has %d tokens\n",
                          text_tags.size(), text_len);
@@ -1235,7 +1372,14 @@ int main(int argc, char **argv) {
     std::printf("gpu: %s\n", dev->getDeviceName().c_str());
     auto pool = std::make_shared<VulkanCommandPool>(dev);
 
-    if (!o.te.empty()) text = run_text_tower(pool, o.te, o.embed, prompt_ids);
+    if (!o.te.empty()) {
+        if (!o.qwen_dir.empty()) {
+            const VisionRows vr = run_vision(pool, o.vision, o.qwen_dir, text_len);
+            text = run_text_tower(pool, o.te, o.embed, prompt_ids, &vr);
+        } else {
+            text = run_text_tower(pool, o.te, o.embed, prompt_ids);
+        }
+    }
     if (!ref_px.empty() && o.text_out.empty()) {
         auto te0 = std::chrono::steady_clock::now();
         auto enc = std::make_shared<Runtime>(pool, o.vae_enc, /*precision=*/0);
