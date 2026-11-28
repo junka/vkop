@@ -81,6 +81,17 @@ _DOUBLE = onnx.TensorProto.DOUBLE
 _FLOAT_FAMILY = (_FLOAT, _FLOAT16, _BFLOAT16, _DOUBLE)
 _INT32 = onnx.TensorProto.INT32
 _INT64 = onnx.TensorProto.INT64
+_INT8 = onnx.TensorProto.INT8
+_INT4 = onnx.TensorProto.INT4
+# -q formats whose plain weight-only MatMul has a bf16-activation kernel
+# (matmul.comp's _bf16 module decodes the payload to fp32 itself):
+# Bf16ActivationTest.MatMulInt8WeightMatchesFp32 / MatMulInt4WeightMatchesFp32.
+_BF16_QUANT_FORMATS = {"int8": _INT8, "int4": _INT4}
+
+# MatMul attributes whose epilogue has not been verified with an int8 weight
+# beside a bf16 activation (Bf16ActivationTest covers the plain product only).
+_BF16_INT8_UNVERIFIED_ATTRS = ("swiglu", "epi_bias", "attn_softmax",
+                               "down_act")
 
 # The ops whose `_bf16` build decodes AND encodes bf16 end to end -- the
 # converter mirror of core/Bf16Gate.cpp's bf16_activation_op, which the
@@ -298,6 +309,31 @@ class GraphFp16:
         return decls
 
     @staticmethod
+    def _bf16_int8_matmul_slots(node, decls, quantized):
+        """Input slots of a plain int8 weight-only MatMul that may hold a
+        non-bf16 operand under --act bf16: the int8 B (1) and, once the
+        quantizer has added it, its fp32 per-column scale (2). Empty for any
+        other node. The weight is recognised either by the -q format the
+        caller recorded or, after quantization, by its INT8 declaration."""
+        if node.op_type != "MatMul" or len(node.inputs) < 2:
+            return ()
+        if any(node.attributes.get(a) not in (None, 0, "0", [0], [])
+               for a in _BF16_INT8_UNVERIFIED_ATTRS):
+            return ()
+        wname = node.inputs[1].get("name")
+        fmt = quantized.get(wname) if isinstance(quantized, dict) else None
+        wd = decls.get(wname) or {}
+        if fmt not in _BF16_QUANT_FORMATS and \
+                wd.get("elem") not in _BF16_QUANT_FORMATS.values():
+            return ()
+        if len(node.inputs) == 2:
+            return (1,)
+        sd = decls.get(node.inputs[2].get("name")) or {}
+        if len(node.inputs) == 3 and sd.get("elem") == _FLOAT:
+            return (1, 2)
+        return ()
+
+    @staticmethod
     def _bf16_node_blocker(node, decls, quantized):
         """Why an allow-listed op still cannot run this NODE in bf16."""
         if node.op_type == "MatMul":
@@ -305,11 +341,26 @@ class GraphFp16:
                 v = node.attributes.get(a)
                 if v not in (None, 0, "0", [0], []):
                     return f"MatMul {a}: no bf16 kernel for the fold"
-            if len(node.inputs) > 1 and \
-                    node.inputs[1].get("name") in quantized:
-                return ("MatMul: a quantized weight has no bf16-"
-                        "activation kernel")
-        for entry in list(node.inputs) + list(node.outputs):
+            wname = node.inputs[1].get("name") if len(node.inputs) > 1 \
+                else None
+            if wname in quantized:
+                # `quantized` maps a weight to its -q format when the caller
+                # knows it. A plain int8 weight-only MatMul runs in matmul.comp's
+                # _bf16 module (byte B decoded to fp32, fp32 per-column scale;
+                # Bf16ActivationTest.MatMulInt8WeightMatchesFp32); every other
+                # quantized format has no bf16-activation kernel.
+                fmt = quantized.get(wname) if isinstance(quantized, dict) \
+                    else None
+                folded = any(node.attributes.get(a) not in (None, 0, "0", [0],
+                                                            [])
+                             for a in _BF16_INT8_UNVERIFIED_ATTRS)
+                if fmt not in _BF16_QUANT_FORMATS or folded:
+                    return ("MatMul: a quantized weight has no bf16-"
+                            "activation kernel")
+        int8_slots = GraphFp16._bf16_int8_matmul_slots(node, decls, quantized)
+        for i, entry in enumerate(list(node.inputs) + list(node.outputs)):
+            if i in int8_slots:
+                continue
             d = decls.get(entry.get("name"))
             if d is None or d["float"] or d["elem"] in (0, _INT32,
                                                         _INT64):
@@ -900,7 +951,10 @@ class GraphFp16:
         only by islands/movers keeps its bytes; one read by both is split into
         a bf16 copy (`<name>__bf16`) for the bf16 readers.
         """
-        quantized = set(quantized or ())
+        # A dict ({weight: -q format}) is kept as is: _bf16_node_blocker reads
+        # the format from it.
+        if not isinstance(quantized, dict):
+            quantized = set(quantized or ())
         if keep_outputs is None:
             keep_outputs = _BF16_KEEP_OUTPUTS if "TopK" not in BF16_ACT_OPS \
                 else frozenset()
@@ -1069,12 +1123,19 @@ class GraphFp16:
                     or node.op_type in _STATE_SLOTS:
                 continue
             wslots = _BF16_WEIGHT_SLOTS.get(node.op_type, ())
+            # An int8 weight-only MatMul [A, W_int8, s_fp32]: the scale is read
+            # at fp32 (core/Bf16Gate.cpp bf16_int8_weight_slot).
+            int8_w = (node.op_type == "MatMul" and len(node.inputs) == 3
+                      and (decls.get(node.inputs[1].get("name")) or {}).get(
+                          "elem") in _BF16_QUANT_FORMATS.values())
             bf, other = [], []
             for i, e in enumerate(node.inputs):
                 d = decls.get(e.get("name"))
                 if d is None or not d["float"]:
                     continue
                 if i in wslots and e["name"] in dag_model.initializers:
+                    continue
+                if int8_w and i == 2 and d["elem"] == _FLOAT:
                     continue
                 rule = _bf16_slot_rule(node.op_type, i)
                 if rule == "any" or (rule == "fp32" and

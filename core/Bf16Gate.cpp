@@ -144,6 +144,29 @@ bool bf16_neighbour_ok(ElemKind kind) {
     return kind == ElemKind::kBFloat16 || kind == ElemKind::kInt32 ||
            kind == ElemKind::kInt64;
 }
+
+// An int8 or int4 weight-only MatMul, [A, W, scale_fp32]. matmul.comp's _bf16
+// module decodes the byte B to fp32 itself (byte stage / GEMV decode, never
+// through the bf16 unpack), applies the fp32 per-column scale in fp32, and
+// writes the output at A's width; matmul_coop8.comp's _bf16 module stages the
+// int8 codes as exact halves and applies the scale in its fp32 epilogue.
+// Tests: Bf16ActivationTest.MatMulInt8WeightMatchesFp32.
+bool bf16_int8_weight_slot(ops::OpType type,
+                           const std::vector<std::shared_ptr<ITensor>> &inputs,
+                           size_t index) {
+    // int4 (signed nibbles, fp32 [K/group, N] scale table) decodes through
+    // the same _bf16 module paths: Bf16ActivationTest.MatMulInt4WeightMatchesFp32.
+    if (type != ops::OpType::MATMUL || inputs.size() != 3 || !inputs[1] ||
+        (inputs[1]->elem_kind() != ElemKind::kInt8 &&
+         inputs[1]->elem_kind() != ElemKind::kInt4)) {
+        return false;
+    }
+    if (index == 1) {
+        return true;
+    }
+    return index == 2 && inputs[2] &&
+           inputs[2]->elem_kind() == ElemKind::kFloat32;
+}
 } // namespace
 
 bool has_bf16_activation(
@@ -232,6 +255,9 @@ bool check_bf16_activation(
     auto mixed = [&](const std::shared_ptr<ITensor> &t, const char *side,
                      size_t i) {
         if (t == nullptr || bf16_neighbour_ok(t->elem_kind())) {
+            return;
+        }
+        if (side[0] == 'i' && bf16_int8_weight_slot(type, inputs, i)) {
             return;
         }
         if (bf16_other_float_ok(type, side[0] == 'o', i, t->elem_kind())) {

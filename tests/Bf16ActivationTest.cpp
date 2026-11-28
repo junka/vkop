@@ -618,6 +618,189 @@ TEST(Bf16ActivationTest, MatMulRoutesMatchFp32) {
     }
 }
 
+// int8 weight-only MatMul under a bf16 activation: [A bf16, W int8, s fp32].
+// The byte B is decoded to fp32 (or staged as exact halves on coop8) and the
+// per-column scale applied in fp32, so the result must match the fp64
+// reference of A @ (q * s) as tightly as the bf16 MatMul above -- including A
+// rows past fp16's range, which a half stage would clamp.
+TEST(Bf16ActivationTest, MatMulInt8WeightMatchesFp32) {
+    Env e;
+    struct Case {
+        int m, k, n;
+        bool transB, outliers;
+        const char *why;
+    };
+    const std::vector<Case> cases = {
+        {1, 512, 256, false, false, "decode: split-K GEMV"},
+        {1, 1024, 4096, false, true, "decode: WIDE split-K GEMV"},
+        {1, 512, 256, true, false, "decode GEMV, transB"},
+        {3, 64, 12, false, false, "even N, K < 256"},
+        {2, 64, 12, true, false, "even N, transB"},
+        {20, 128, 96, false, true, "64x64 SIMT tile"},
+        {20, 128, 96, true, true, "64x64 SIMT tile, transB"},
+        {32, 512, 256, true, true, "text rows, transB"},
+        {130, 256, 192, false, true, "M > 128"},
+        {512, 256, 1024, false, true, "GEMM, outliers"},
+        {256, 512, 1024, true, true, "GEMM, transB, outliers"},
+        {4, 64, 7, false, false, "odd N"},
+    };
+    // VKOP_TEST_INT8_FP16=1: the same cases with fp16 activations (control).
+    const bool ctl = std::getenv("VKOP_TEST_INT8_FP16") != nullptr;
+    const char *c8env = std::getenv("VKOP_COOP8");
+    const bool apple = vkop::core::device_supports_apple_coop8(
+                           e.dev->device_traits()) &&
+                       (c8env == nullptr || std::atoi(c8env) != 0);
+    for (const Case &c : cases) {
+        const std::vector<int> ashape{c.m, c.k};
+        const std::vector<int> bshape =
+            c.transB ? std::vector<int>{c.n, c.k} : std::vector<int>{c.k, c.n};
+        auto av = bf16_values(numel(ashape), 71 + c.m);
+        if (c.outliers && !ctl) {
+            for (int r : {0, 3, 70, 129, 300, 511}) {
+                if (r >= c.m) continue;
+                const float v = (r & 1 ? -1.0F : 1.0F) * 9.0e4F * float(1 + r % 7);
+                av[static_cast<size_t>(r) * c.k + (r * 37 + 5) % c.k] =
+                    bf16_to_float(float_to_bf16(v));
+            }
+        }
+        // int8 codes over the whole range and a per-column scale spread over
+        // two decades, so a scale applied to the wrong column shows.
+        std::vector<int8_t> q(numel(bshape));
+        uint32_t st = 977u + static_cast<uint32_t>(c.n);
+        for (auto &v : q) {
+            st = st * 1664525u + 1013904223u;
+            v = static_cast<int8_t>(static_cast<int>(st >> 24) % 255 - 127);
+        }
+        std::vector<float> sc(c.n);
+        for (int j = 0; j < c.n; ++j)
+            sc[j] = 1e-3F * std::pow(10.0F, 2.0F * float(j % 17) / 16.0F);
+        std::vector<float> bv(q.size());
+        for (int kk = 0; kk < c.k; ++kk)
+            for (int j = 0; j < c.n; ++j) {
+                const size_t idx = c.transB ? static_cast<size_t>(j) * c.k + kk
+                                            : static_cast<size_t>(kk) * c.n + j;
+                bv[idx] = float(q[idx]) * sc[j];
+            }
+
+        auto a = half_in(e, !ctl, ashape, av);
+        auto w = std::make_shared<Tensor<int8_t>>(bshape);
+        w->fillToCPU(q);
+        w->as_storage_buffer(e.dev);
+        w->copyToGPU(e.cmdpool);
+        auto s = std::make_shared<Tensor<float>>(std::vector<int>{c.n});
+        s->fillToCPU(sc);
+        s->as_storage_buffer(e.dev);
+        s->copyToGPU(e.cmdpool);
+        auto y = out<uint16_t>(e, {c.m, c.n},
+                               ctl ? ElemKind::kFloat16 : ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::MATMUL, ctl ? 1 : 2,
+                          {{"transB", c.transB ? "1" : "0"}});
+        op->onExecute({a, w, s}, {y}, 0);
+        submit(e, op.get());
+        const auto got = read_half(e, !ctl, y);
+
+        std::vector<double> ref, mag;
+        mm_ref(1, 1, c.m, c.k, c.n, c.transB, av, bv, &ref, &mag);
+        double worst = 0;
+        const int bad = count_bad_mm(got, ref, mag, 8e-3, 0.03, 2e-3, &worst);
+        EXPECT_EQ(bad, 0) << c.why << " (route " << op->route_tag() << ") m="
+                          << c.m << " k=" << c.k << " n=" << c.n
+                          << " worst/tol " << worst;
+        // Apple: a [K, N] int8 B of a coop8 shape must really reach coop8
+        // under a bf16 activation (its int8 stage is what this covers).
+        if (apple && !ctl && !c.transB && c.m >= 64 && c.n % 64 == 0 &&
+            c.k % 16 == 0) {
+            EXPECT_EQ(op->route_tag(), "coop8") << c.why;
+        }
+        LOG_INFO("bf16 x int8 MatMul %s: route %s, worst err/tol %g", c.why,
+                 op->route_tag().c_str(), worst);
+    }
+}
+
+// int4 weight-only MatMul under a bf16 activation: [A bf16, W int4 [K, N]
+// (two signed nibbles per byte, low first), s fp32 [K/group, N]].
+TEST(Bf16ActivationTest, MatMulInt4WeightMatchesFp32) {
+    Env e;
+    const bool ctl = std::getenv("VKOP_TEST_INT8_FP16") != nullptr;
+    const char *c8env = std::getenv("VKOP_COOP8");
+    const bool apple = vkop::core::device_supports_apple_coop8(
+                           e.dev->device_traits()) &&
+                       (c8env == nullptr || std::atoi(c8env) != 0);
+    struct Case {
+        int m, k, n, group;
+        bool outliers;
+        const char *why;
+    };
+    const std::vector<Case> cases = {
+        {1, 512, 256, 128, false, "decode GEMV"},
+        {1, 1024, 4096, 128, true, "decode WIDE GEMV"},
+        {3, 256, 64, 64, false, "few rows"},
+        {32, 512, 256, 128, true, "text rows"},
+        {130, 256, 192, 128, true, "M > 128"},
+        {512, 512, 1024, 128, true, "GEMM, outliers"},
+        {256, 1024, 512, 64, true, "GEMM, group 64"},
+    };
+    for (const Case &c : cases) {
+        auto av = bf16_values(static_cast<size_t>(c.m) * c.k, 91 + c.m);
+        if (c.outliers && !ctl) {
+            for (int r : {0, 3, 70, 129, 300, 511}) {
+                if (r >= c.m) continue;
+                av[static_cast<size_t>(r) * c.k + (r * 37 + 5) % c.k] =
+                    bf16_to_float(float_to_bf16((r & 1 ? -1.0F : 1.0F) * 9.0e4F));
+            }
+        }
+        const int ng = c.k / c.group;
+        std::vector<int> code(static_cast<size_t>(c.k) * c.n);
+        uint32_t st = 1234u + static_cast<uint32_t>(c.n);
+        for (auto &v : code) {
+            st = st * 1664525u + 1013904223u;
+            v = static_cast<int>(st >> 24) % 15 - 7;  // [-7, 7]
+        }
+        std::vector<float> sc(static_cast<size_t>(ng) * c.n);
+        for (size_t i = 0; i < sc.size(); ++i)
+            sc[i] = 1e-3F * std::pow(10.0F, float(i % 13) / 12.0F);
+        std::vector<float> bv(code.size());
+        for (int kk = 0; kk < c.k; ++kk)
+            for (int j = 0; j < c.n; ++j)
+                bv[static_cast<size_t>(kk) * c.n + j] =
+                    float(code[static_cast<size_t>(kk) * c.n + j]) *
+                    sc[static_cast<size_t>(kk / c.group) * c.n + j];
+        std::vector<int8_t> bytes(code.size() / 2);
+        for (size_t i = 0; i < code.size(); i += 2)
+            bytes[i / 2] = static_cast<int8_t>((code[i] & 0xF) | ((code[i + 1] & 0xF) << 4));
+
+        auto a = half_in(e, !ctl, {c.m, c.k}, av);
+        auto w = std::make_shared<Tensor<int8_t>>(std::vector<int>{c.k, c.n});
+        w->set_elem_kind(ElemKind::kInt4);
+        w->set_payload_bytes(static_cast<int>(bytes.size()));
+        w->fillToCPU(bytes);
+        w->as_storage_buffer(e.dev);
+        w->copyToGPU(e.cmdpool);
+        auto s = std::make_shared<Tensor<float>>(std::vector<int>{ng * c.n});
+        s->fillToCPU(sc);
+        s->as_storage_buffer(e.dev);
+        s->copyToGPU(e.cmdpool);
+        auto y = out<uint16_t>(e, {c.m, c.n},
+                               ctl ? ElemKind::kFloat16 : ElemKind::kBFloat16);
+        auto op = make_op(e, OpType::MATMUL, ctl ? 1 : 2, {{"transB", "0"}});
+        op->onExecute({a, w, s}, {y}, 0);
+        submit(e, op.get());
+        const auto got = read_half(e, !ctl, y);
+        std::vector<double> ref, mag;
+        mm_ref(1, 1, c.m, c.k, c.n, false, av, bv, &ref, &mag);
+        double worst = 0;
+        const int bad = count_bad_mm(got, ref, mag, 8e-3, 0.03, 2e-3, &worst);
+        EXPECT_EQ(bad, 0) << c.why << " (route " << op->route_tag() << ") m="
+                          << c.m << " k=" << c.k << " n=" << c.n
+                          << " worst/tol " << worst;
+        if (apple && !ctl && c.m >= 64 && c.n % 64 == 0 && c.k % 16 == 0) {
+            EXPECT_EQ(op->route_tag(), "coop8") << c.why;
+        }
+        LOG_INFO("bf16 x int4 MatMul %s: route %s, worst err/tol %g", c.why,
+                 op->route_tag().c_str(), worst);
+    }
+}
+
 // The 512-lane split-K builds are opt-in (VKOP_KSPLIT512=1, read once per
 // process), so this only runs in a process started with it.
 TEST(Bf16ActivationTest, MatMulKsplit512MatchesFp32) {

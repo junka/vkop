@@ -350,6 +350,51 @@ def test_matmul_with_a_quantized_weight_is_an_island():
     assert m.nodes["mm"].outputs[0]["dtype"] == F
 
 
+@pytest.mark.parametrize("fmt", ["fp8", "nvfp4", "nf4"])
+def test_matmul_with_a_non_int8_quantized_weight_is_an_island(fmt):
+    m = build([node("MatMul", "mm", ["x", "w"], ["y"])],
+              inputs=["x"], outputs=["y"], initializers={"w": W})
+    s = bf16(m, skip_weights={"w"}, quantized={"w": fmt})
+    assert "quantized" in s["blockers"]["mm"]
+    assert m.nodes["mm"].outputs[0]["dtype"] == F
+
+
+@pytest.mark.parametrize("fmt", ["int8", "int4"])
+def test_matmul_with_an_int8_or_int4_weight_goes_bf16(fmt):
+    """matmul.comp's _bf16 module decodes a byte B to fp32 and applies the
+    fp32 per-column scale (Bf16ActivationTest.MatMulInt8WeightMatchesFp32),
+    so a plain -q int8 MatMul stays in the bf16 domain."""
+    m = build([node("MatMul", "mm", ["x", "w"], ["y"])],
+              inputs=["x"], outputs=["y"], initializers={"w": W})
+    s = bf16(m, skip_weights={"w"}, quantized={"w": fmt})
+    assert "mm" not in s["blockers"]
+    assert dtype_of(m, "y") == _BFLOAT16
+    assert casts(m) == {}
+
+
+@pytest.mark.parametrize("attr", ["swiglu", "epi_bias", "attn_softmax"])
+def test_int8_matmul_folds_stay_islands(attr):
+    """No test covers an int8 weight in these epilogues under bf16."""
+    m = build([node("MatMul", "mm", ["x", "w"], ["y"], **{attr: 1})],
+              inputs=["x"], outputs=["y"], initializers={"w": W})
+    s = bf16(m, skip_weights={"w"}, quantized={"w": "int8"})
+    assert "quantized" in s["blockers"]["mm"]
+
+
+def test_mixed_half_kinds_exempts_the_int8_scale():
+    """[A bf16, W int8, s fp32] is the int8 weight-only contract the runtime
+    gate admits (bf16_int8_weight_slot); an fp32 scale anywhere else is not."""
+    m = build([node("MatMul", "mm",
+                    [ref("x", _BFLOAT16), ref("w", T.INT8), ref("s", F)],
+                    [ref("y", _BFLOAT16)])])
+    m.initializers["w"] = h.make_tensor("w", T.INT8, [1], [0])
+    m.initializers["s"] = h.make_tensor("s", F, [1], [1.0])
+    assert GraphFp16.mixed_half_kinds(m) == []
+    m.nodes["add"] = node("Add", "add", [ref("y", _BFLOAT16), ref("s", F)],
+                          [ref("z", _BFLOAT16)])
+    assert GraphFp16.mixed_half_kinds(m)
+
+
 def test_fp16_operand_beside_bf16_is_retyped():
     """An export that declares an fp16 operand of a bf16 node used to be
     refused (the _bf16 module would read it as bf16). FLOAT16 is a candidate

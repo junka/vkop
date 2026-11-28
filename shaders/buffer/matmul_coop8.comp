@@ -12,7 +12,10 @@
 // Same plain fp16 shape as matmul.comp's 128x128 tile (uPC.tile == 2):
 //   A [batch, M, K], B [batch', K, N] (or [batch', N, K] under transB),
 //   C [batch, M, N], packed
-//   half2 words, no byte weight, no epilogue. B may be bf16 (uPC.bf16): it is
+//   half2 words, no epilogue. B may be int8 codes (uPC.weight_int8) with an
+//   fp32 per-column scale (binding 4): staged as exact halves, scaled in the
+//   fp32 epilogue; or plain int4 nibbles (uPC.w4, [K, N]) with an fp32
+//   [K/group, N] table: dequantized to halves while staging. B may be bf16 (uPC.bf16): it is
 //   re-encoded to half in the shared-memory stage, so the MMA stays fp16.
 // Host gates: K % BK == 0, N % BN == 0 (whole-tile columns), any M (rows past
 // M are zero-filled on load and skipped on store).
@@ -95,6 +98,27 @@ layout(set = 0, binding = 1) readonly buffer InA {
 layout(set = 0, binding = 2) readonly buffer InB {
     uvec4 data[];
 } uInputB;
+// int8 weight-only B (uPC.weight_int8): the same buffer as eight signed codes
+// per uvec2, so one staged word (eight consecutive values of a B row, or of a
+// column under transB) sits at the same index the fp16 path reads a uvec4 at.
+layout(set = 0, binding = 2) readonly buffer InB8 {
+    uvec2 data[];
+} uInputB8;
+// Its fp32 per-output-column scale -- matmul.comp's binding 4 (binding 3 is
+// that module's scratch). MatMulBuffer binds the same descriptor set for both
+// modules, so a plain B leaves a dummy here that this module never reads.
+layout(set = 0, binding = 4) readonly buffer Scale {
+    float data[];
+} uScale;
+// int4 weight-only B (uPC.w4, plain signed nibbles; [K, N] only): the same
+// buffer as eight two's-complement nibbles per uint, element 0 in the low
+// nibble -- one staged word of eight columns is one uint. Its scale table is
+// fp32 [K / uPC.group, N] (binding 4), one per (K group, column), so it varies
+// along K and is applied while staging: the word becomes eight halves of
+// code * scale (the SIMT tile's tile_load_b_w4 does the same).
+layout(set = 0, binding = 2) readonly buffer InBW4 {
+    uint data[];
+} uInputBW4;
 
 layout(push_constant) uniform PC {
     int M;
@@ -235,6 +259,41 @@ uint bf16_over(uint w) {
 #define FRA coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>
 #define FRB coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB>
 
+// Eight int8 codes (two words, element 0 in the low byte) -> eight halves.
+// Exact: |q| <= 127 is an integer fp16 represents, so B needs no scaling in
+// either build; the per-column scale is applied in the fp32 epilogue.
+uint i8x2_half2(uint w, int sh) {
+    return packHalf2x16(vec2(float(int(w << (24 - sh)) >> 24),
+                             float(int(w << (16 - sh)) >> 24)));
+}
+uvec4 i8x8_half8(uvec2 w) {
+    return uvec4(i8x2_half2(w.x, 0), i8x2_half2(w.x, 16),
+                 i8x2_half2(w.y, 0), i8x2_half2(w.y, 16));
+}
+// One staged B word for B row k (K index) and columns n .. n+7:
+//   fp16/bf16: the eight raw values;
+//   int8:      the eight codes in .xy (decoded by the stage, scaled in the
+//              epilogue);
+//   int4:      already the eight halves of code * scale[k / group][n + j].
+uvec4 load_b(int idx, int k, int n) {
+    if (uPC.w4 != 0) {
+        const uint w = uInputBW4.data[idx];
+        const int sb = (k / uPC.group) * uPC.N + n;
+        vec4 lo = vec4(float(int(w << 28) >> 28), float(int(w << 24) >> 28),
+                       float(int(w << 20) >> 28), float(int(w << 16) >> 28));
+        vec4 hi = vec4(float(int(w << 12) >> 28), float(int(w << 8) >> 28),
+                       float(int(w << 4) >> 28), float(int(w) >> 28));
+        lo *= vec4(uScale.data[sb], uScale.data[sb + 1], uScale.data[sb + 2],
+                   uScale.data[sb + 3]);
+        hi *= vec4(uScale.data[sb + 4], uScale.data[sb + 5], uScale.data[sb + 6],
+                   uScale.data[sb + 7]);
+        return uvec4(packHalf2x16(lo.xy), packHalf2x16(lo.zw),
+                     packHalf2x16(hi.xy), packHalf2x16(hi.zw));
+    }
+    return uPC.weight_int8 != 0 ? uvec4(uInputB8.data[idx], 0u, 0u)
+                                : uInputB.data[idx];
+}
+
 void store8(uint base, uvec4 v) { shA[base >> 3] = v; }
 void store8b(uint base, uvec4 v) { shB[base >> 3] = v; }
 
@@ -276,9 +335,13 @@ void main() {
         a_row[i] = r;
 #endif
     }
-    // B: BK rows x (BN/8) uvec4 per K step.
+    // B: BK rows x (BN/8) uvec4 per K step. b_k / b_n: the staged word's K row
+    // within the step and its first column (the int4 scale lookup's address;
+    // transB words are not int4).
     int b_idx[B_V];
     uint b_sh[B_V];
+    int b_k[B_V];
+    int b_n[B_V];
 #ifdef ACT_BF16
     int b_col[B_V]; // first tile column of the staged word (transB: its only)
 #endif
@@ -290,6 +353,8 @@ void main() {
             int c = e % (BK / 8);
             b_idx[i] = b_off + (col0 + r) * k8 + c;
             b_sh[i] = uint(r * LDBT + c * 8);
+            b_k[i] = c * 8;
+            b_n[i] = col0 + r;
 #ifdef ACT_BF16
             b_col[i] = r;
 #endif
@@ -298,6 +363,8 @@ void main() {
             int c = e % (BN / 8);
             b_idx[i] = b_off + r * n8 + (col0 >> 3) + c;
             b_sh[i] = uint(r * LDB + c * 8);
+            b_k[i] = r;
+            b_n[i] = col0 + c * 8;
 #ifdef ACT_BF16
             b_col[i] = c * 8;
 #endif
@@ -370,7 +437,8 @@ void main() {
                             : uvec4(0u);                                       \
         }                                                                      \
         for (int i = 0; i < B_V; ++i) {                                        \
-            rb[i] = uInputB.data[b_idx[i] + ((t) + 1) * bstep];                \
+            rb[i] = load_b(b_idx[i] + ((t) + 1) * bstep,                      \
+                           ((t) + 1) * BK + b_k[i], b_n[i]);                   \
         }                                                                      \
     }
 
@@ -404,6 +472,14 @@ void main() {
         }                                                                      \
         for (int i = 0; i < B_V; ++i) {                                        \
             uvec4 w = rb[i];                                                   \
+            if (uPC.weight_int8 != 0) {                                        \
+                hb[i] = i8x8_half8(w.xy);                                      \
+                continue;                                                      \
+            }                                                                  \
+            if (uPC.w4 != 0) {                                                 \
+                hb[i] = w;                                                     \
+                continue;                                                      \
+            }                                                                  \
             if (bf16x8_absmax(w) > HALF_MAX_BITS) {                            \
                 if (tb) {                                                      \
                     uint o = max(max(bf16_over(w.x), bf16_over(w.y)),          \
@@ -434,7 +510,11 @@ void main() {
             ha[i] = bf16x8_scaled(ra[i], exp2(-float(sc_re[a_row[i]])));       \
         }                                                                      \
         for (int i = 0; i < B_V; ++i) {                                        \
-            if (tb) {                                                          \
+            if (uPC.weight_int8 != 0) {                                        \
+                hb[i] = i8x8_half8(rb[i].xy);                                  \
+            } else if (uPC.w4 != 0) {                                          \
+                hb[i] = rb[i];                                                 \
+            } else if (tb) {                                                   \
                 hb[i] = bf16x8_scaled(rb[i], exp2(-float(sc_ce[b_col[i]])));   \
             } else {                                                           \
                 for (int q = 0; q < 4; ++q) {                                  \
@@ -466,7 +546,7 @@ void main() {
             ra[i] = a_ok[i] ? uInputA.data[a_idx[i]] : uvec4(0u);
         }
         for (int i = 0; i < B_V; ++i) {
-            rb[i] = uInputB.data[b_idx[i]];
+            rb[i] = load_b(b_idx[i], b_k[i], b_n[i]);
         }
         // The converted (half) words of the next stage. Converting right
         // after the MMA step that overlapped their loads -- not between the
@@ -495,7 +575,7 @@ void main() {
         ra[i] = a_ok[i] ? uInputA.data[a_idx[i]] : uvec4(0u);
     }
     for (int i = 0; i < B_V; ++i) {
-        rb[i] = uInputB.data[b_idx[i]];
+        rb[i] = load_b(b_idx[i], b_k[i], b_n[i]);
     }
 
 #define DECL_ROW(i) ACC c##i##0 = ACC(0.0); ACC c##i##1 = ACC(0.0); \
@@ -516,7 +596,11 @@ void main() {
         // A bf16 WEIGHT beside the fp16 activation is bit 0 of the
         // bitfield; testing the whole int would also fire on bit 1 (a bf16
         // activation, which runs the -DACT_BF16 module, never this one).
-        if ((uPC.bf16 & 1) != 0) {
+        if (uPC.weight_int8 != 0) {
+            for (int i = 0; i < B_V; ++i) store8b(b_sh[i], i8x8_half8(rb[i].xy));
+        } else if (uPC.w4 != 0) {
+            for (int i = 0; i < B_V; ++i) store8b(b_sh[i], rb[i]);
+        } else if ((uPC.bf16 & 1) != 0) {
             for (int i = 0; i < B_V; ++i) store8b(b_sh[i], bf16x8_to_half8(rb[i]));
         } else {
             for (int i = 0; i < B_V; ++i) store8b(b_sh[i], rb[i]);
@@ -528,7 +612,8 @@ void main() {
                                 : uvec4(0u);
             }
             for (int i = 0; i < B_V; ++i) {
-                rb[i] = uInputB.data[b_idx[i] + (t + 1) * bstep];
+                rb[i] = load_b(b_idx[i] + (t + 1) * bstep, (t + 1) * BK + b_k[i],
+                               b_n[i]);
             }
         }
         for (int kk = 0; kk < BK; kk += 8) {
@@ -588,6 +673,15 @@ void main() {
     const uint lr = lane >> 2;
     const uint lq = lane & 3u;
     const int ocol8 = (col0 + int(sgn) * (WN * 8)) / 8 + int(lq);
+    // int8 B: this lane's eight output columns' fp32 scales (uniform branch).
+    vec4 qs0 = vec4(1.0), qs1 = vec4(1.0);
+    if (uPC.weight_int8 != 0) {
+        const int c = ocol8 * 8;
+        qs0 = vec4(uScale.data[c], uScale.data[c + 1], uScale.data[c + 2],
+                   uScale.data[c + 3]);
+        qs1 = vec4(uScale.data[c + 4], uScale.data[c + 5], uScale.data[c + 6],
+                   uScale.data[c + 7]);
+    }
 #ifdef ACT_BF16
     // Pass 1 ran: undo the row/column power-of-two scales here, in fp32,
     // before the encode. Exact (a power of two), and uniform.
@@ -616,8 +710,8 @@ void main() {
         int grow = row0 + int(sgm) * (WM * 8) + i * 8 + int(lr); \
         uint s = c_base + lr * LDC + lq * 8u; \
         if (grow < M) { \
-            vec4 f0 = uintBitsToFloat(shA[s / 4]); \
-            vec4 f1 = uintBitsToFloat(shA[s / 4 + 1]); \
+            vec4 f0 = uintBitsToFloat(shA[s / 4]) * qs0; \
+            vec4 f1 = uintBitsToFloat(shA[s / 4 + 1]) * qs1; \
             SCALE_ROW(i) \
             if (uPC.wide == 2) { \
                 vec4 hv = f0 / (1.0 + exp(-f0)) * f1; \
@@ -643,15 +737,15 @@ void main() {
         int grow = row0 + int(sgm) * (WM * 8) + i * 8 + int(lr); \
         uint s = c_base + lr * LDC + lq * 8u; \
         if (grow < M && uPC.wide == 2) { \
-            vec4 g = uintBitsToFloat(shA[s / 4]); \
-            vec4 u = uintBitsToFloat(shA[s / 4 + 1]); \
+            vec4 g = uintBitsToFloat(shA[s / 4]) * qs0; \
+            vec4 u = uintBitsToFloat(shA[s / 4 + 1]) * qs1; \
             vec4 hv = g / (1.0 + exp(-g)) * u; \
             int o = (b * M + grow) * (N >> 1) + ocol8 * 4; \
             uOut2.data[o >> 2] = uvec2(packHalf2x16(hv.xy), packHalf2x16(hv.zw)); \
         } else if (grow < M) { \
             uvec4 w; \
-            vec4 f0 = uintBitsToFloat(shA[s / 4]); \
-            vec4 f1 = uintBitsToFloat(shA[s / 4 + 1]); \
+            vec4 f0 = uintBitsToFloat(shA[s / 4]) * qs0; \
+            vec4 f1 = uintBitsToFloat(shA[s / 4 + 1]) * qs1; \
             w.x = packHalf2x16(f0.xy); \
             w.y = packHalf2x16(f0.zw); \
             w.z = packHalf2x16(f1.xy); \

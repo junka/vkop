@@ -3954,9 +3954,22 @@ class MatMulBuffer : public BufferFactory {
         // tile route away, this keeps the swiglu probe honest too. Only with
         // an fp16 activation (bf16 == 1): under a bf16 one (bit 1) the module
         // scales B exactly instead of clamping.
-        return fp16_ != 0 && para_.weight_int8 == 0 &&
+        // An int8 weight-only B (codes staged as exact halves, fp32
+        // per-column scale in the epilogue) only under a bf16 activation for
+        // now: the fp16 int8 routes are the LLM prefill's and keep their
+        // measured SIMT tile. Bf16ActivationTest.MatMulInt8WeightMatchesFp32.
+        const bool int8_ok = para_.weight_int8 == 0 ||
+                             (fp16_ == 2 && para_.fp8 == 0 && para_.ksplit == 0);
+        // Plain signed int4 ([K, N], fp32 [K/group, N] scales): dequantized to
+        // halves in the B stage, same bf16-only scope as int8.
+        // Bf16ActivationTest.MatMulInt4WeightMatchesFp32.
+        const bool w4_ok = para_.w4 == 0 ||
+                           (fp16_ == 2 && para_.transB == 0 && para_.nf4 == 0 &&
+                            para_.uint4 == 0 && para_.nvfp4 == 0 &&
+                            para_.group > 0 && para_.ksplit == 0);
+        return fp16_ != 0 && int8_ok && w4_ok &&
                para_.epi_bias == 0 && para_.attn_softmax == 0 &&
-               para_.w4 == 0 && !(para_.bf16 == 1 && bf16_wide_) &&
+               !(para_.bf16 == 1 && bf16_wide_) &&
                n % 64 == 0 && k % 16 == 0 && m >= 64;
     }
 

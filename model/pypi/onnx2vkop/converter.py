@@ -1455,11 +1455,13 @@ class ModelConverter:
                 dag_model, _declared_widths_backend(args),
                 skip_weights=skip,
                 half=act,
-                # Under --act bf16 a MatMul whose B a byte/4-bit quantizer
-                # will replace has no bf16-activation kernel (the runtime
-                # refuses a quantized operand beside bf16), so the domain
-                # pass keeps it FP32. -q bf16's own weights are bf16 and fine.
-                quantized=skip if args.quant != "bf16" else set())
+                # Under --act bf16 a plain int8 or int4 MatMul has a bf16-
+                # activation kernel (fp16_graph._BF16_QUANT_FORMATS); fp8, nf4
+                # and nvfp4 weights do not, so the domain pass keeps those
+                # MatMuls FP32. The format rides along so the pass can tell.
+                # -q bf16's own weights are bf16 and fine.
+                quantized=({n: args.quant for n in skip}
+                           if args.quant != "bf16" else set()))
         elif (act == "fp32"
               and _declared_widths_backend(args) == "buffer"):
             # --act fp32 keeps the export's widths, so a node the export already
