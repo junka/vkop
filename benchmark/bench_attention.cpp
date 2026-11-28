@@ -120,6 +120,10 @@ int main(int argc, char **argv) {
          0, false},
         {"dit_seqmaj", "dit", 1, 32, 32, 1024, 1088, 128, false, true, false,
          24, true},
+        // MiniMax-H3 FL2VA DiT at 512x288x56f: 2687 joint rows, 56 heads,
+        // no mask (BENCH_SHAPES=h3).
+        {"h3_2687", "h3", 1, 56, 56, 2687, 2687, 128, false, false, false, 0,
+         false},
         // LLM prefill (GQA 16/8, D=128): causal attribute and causal mask.
         {"llm512c", "llm", 1, 16, 8, 512, 512, 128, true, false, false, 0,
          false},

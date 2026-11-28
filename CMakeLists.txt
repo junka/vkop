@@ -924,6 +924,9 @@ vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm64bn8_bda buffer/matmul_coo
 # power-of-two row/column scales, bf16 store. Its own module so the fp16 one
 # is unchanged; MatMulBuffer::coop8_pipeline resolves it for a _bf16 op.
 vkop_shader_variant(buffer_matmul_coop8_bf16 buffer/matmul_coop8 -DACT_BF16)
+# bf16-activation build of the Apple coopmat flash attention (range-scaled
+# fp16 staging; see attention_flash_coop8.comp ACT_BF16).
+vkop_shader_variant(buffer_attention_flash_coop8_bf16 buffer/attention_flash_coop8 -DACT_BF16)
 
 # Narrower-row builds of the Apple coopmat 3x3 conv (conv_coop8.comp, default
 # 256 output pixels per workgroup): 128 and 64 pixels for 128/64-wide maps.

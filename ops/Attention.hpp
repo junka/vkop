@@ -1023,16 +1023,18 @@ class AttentionBuffer : public BufferFactory {
         // Apple-GPU capability, so the coopmat build is chosen by device
         // (MoltenVK + vendor 0x106B); a missing key or a refused pipeline
         // falls through to the SIMT tiled kernel.
-        // Not for a bf16 activation (fp16_ == 2): the coopmat build stages
-        // Q/K/V as fp16 fragments, which would clamp bf16 values past 65504,
-        // and its lazily rescaled online softmax leaves no place to undo a
-        // per-tile operand scale. bf16 takes the SIMT kernel's -DBF16 build
-        // (fp32 math on bf16 decodes).
-        if (flash_coop8_ && fp16_ != 2 &&
+        // A bf16 activation (fp16_ == 2) takes the -DACT_BF16 build: it
+        // stages Q/K/V as fp16 fragments after a power-of-two range scale
+        // per Q block / K,V tile (undone on the fp32 scores and on O), so
+        // bf16 values past 65504 stay exact to fp16 precision. A model
+        // converted before that key existed keeps the SIMT -DBF16 kernel.
+        if (flash_coop8_ &&
             core::device_supports_apple_coop8(m_dev_->device_traits())) {
             std::pair<const uint32_t *, uint32_t> c8{nullptr, 0};
             try {
-                c8 = resolve_spv("buffer_attention_flash_coop8");
+                c8 = resolve_spv(fp16_ == 2
+                                     ? "buffer_attention_flash_coop8_bf16"
+                                     : "buffer_attention_flash_coop8");
             } catch (const std::exception &) {
                 // A model converted before the key existed: quietly keep
                 // the SIMT tiled kernel.

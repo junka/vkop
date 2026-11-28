@@ -1151,30 +1151,39 @@ struct AttnRun {
 // Row kernel and the tiled (flash) kernel, bf16 Q/K/V/mask/Y. V carries
 // entries past fp16's range (outlier channel), so a half stage would clamp
 // them; the output then sits past 65504 as well. Each shape is run against the
-// fp16 graph's route for the same shape: bf16 now reaches the flash kernel
-// (its SIMT -DBF16 build; the coop8 build has no bf16 form).
+// fp16 graph's route for the same shape: bf16 takes the same route, including
+// the Apple coop8 flash build (-DACT_BF16), which range-scales Q/K/V by powers
+// of two before its fp16 staging. `big_qk` also puts Q and K past 65504 (the
+// scale shrinks to match, so the scores are unchanged).
 TEST(Bf16ActivationTest, AttentionRoutesMatchFp32) {
     Env e;
     struct Case {
         int H, Hkv, S, D, kv;
         bool mask, causal;
         const char *why;
+        bool big_qk = false;
     } cases[] = {
         {4, 2, 3, 64, 300, true, false, "row kernel, multi-tile kv"},
         {4, 4, 1, 128, 77, true, false, "row kernel, decode"},
         {16, 8, 128, 64, 128, true, false, "flash"},
         {16, 8, 130, 128, 200, false, true, "flash, causal with a history"},
         {16, 16, 96, 64, 131, true, false, "flash, odd kv mask"},
+        {8, 8, 200, 128, 200, false, false, "flash, Q/K past fp16", true},
     };
     for (const Case &c : cases) {
-        const float scale = 1.0F / std::sqrt(static_cast<float>(c.D));
+        const float big = c.big_qk ? 4.0e4F : 1.0F;
+        const float scale = 1.0F / std::sqrt(static_cast<float>(c.D)) / (big * big);
         auto q = bf16_values(static_cast<size_t>(c.H) * c.S * c.D, 101);
         auto k = bf16_values(static_cast<size_t>(c.Hkv) * c.kv * c.D, 102);
+        for (float &x : q) x = bf16_to_float(float_to_bf16(x * big));
+        for (float &x : k) x = bf16_to_float(float_to_bf16(x * big));
         auto v = bf16_values(static_cast<size_t>(c.Hkv) * c.kv * c.D, 103);
         for (size_t i = 7; i < v.size(); i += static_cast<size_t>(c.D) * 5)
             v[i] = bf16_to_float(float_to_bf16(1.5e5F));
         std::vector<float> mask = attn_mask(c.S, c.kv, c.S > 2);
-        const Attrs attrs{{"scale", std::to_string(scale)},
+        char scale_s[32];
+        std::snprintf(scale_s, sizeof(scale_s), "%.9g", scale);
+        const Attrs attrs{{"scale", scale_s},
                           {"num_heads", std::to_string(c.H)},
                           {"num_kv_heads", std::to_string(c.Hkv)},
                           {"causal", c.causal ? "1" : "0"}};
@@ -1182,6 +1191,8 @@ TEST(Bf16ActivationTest, AttentionRoutesMatchFp32) {
             std::vector<float> qv = q, kvv = k, vv = v, mv = mask;
             if (!bf16) { // in-range data: only the route matters here
                 vv = bf16_values(v.size(), 3);
+                qv = bf16_values(q.size(), 101);
+                kvv = bf16_values(k.size(), 102);
                 for (float &x : mv) x = std::max(x, -65504.0F);
             }
             std::vector<std::shared_ptr<ITensor>> ins{
@@ -1198,9 +1209,7 @@ TEST(Bf16ActivationTest, AttentionRoutesMatchFp32) {
         };
         const AttnRun f16 = run(false);
         const AttnRun r = run(true);
-        // The coop8 flash build is fp16-only: bf16 takes the SIMT flash.
-        const std::string want = f16.route == "flash_coop8" ? "flash" : f16.route;
-        EXPECT_EQ(r.route, want) << c.why;
+        if (!c.big_qk) EXPECT_EQ(r.route, f16.route) << c.why;
         const auto ref = attn_ref(c.H, c.Hkv, c.S, c.D, c.kv, q, k, v,
                                   c.mask ? &mask : nullptr, scale, c.causal);
         double worst = 0;
@@ -1257,7 +1266,7 @@ TEST(Bf16ActivationTest, H3AttentionMatchesUnfusedBf16) {
                                  {{"h3_self_attention", "1"}});
         attention->onExecute({q, k, v}, {fused}, 0);
         submit(e, attention.get());
-        EXPECT_EQ(attention->route_tag(), "flash");
+        EXPECT_EQ(attention->route_tag(), "flash_coop8");
 
         const auto ref = read_bf16(e, baseline);
         const auto got = read_bf16(e, fused);

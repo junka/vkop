@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_16bit_storage : enable
@@ -141,6 +142,50 @@ int kv_slot(int j) {
 #define POOL (P_BASE + 8 * 8 * P_PITCH)
 shared uvec4 sPool[POOL];
 
+#ifdef ACT_BF16
+// bf16 activations (-DACT_BF16, key buffer_attention_flash_coop8_bf16).
+// Q/K/V arrive as bf16 and are staged as fp16 fragments; bf16 -> fp16 is
+// exact inside fp16's range, and every value is first scaled by a power of
+// two so the block (Q) or tile (K, V) max stays below 2^15:
+//   Q, K   exponents eq, ek are undone on the fp32 scores (scale * 2^(eq+ek))
+//   V      a running exponent ev_ref, only ever raised: O accumulates in
+//          units of 2^-ev_ref, a raise rescales O through the same path as the
+//          lazy softmax reference, and the store multiplies 2^ev_ref back.
+// In range all exponents are 0 and this is a plain conversion. Output, mask
+// and the KV cache are bf16 words.
+#include "../common/bf16.comp"
+shared float sRed[16];
+// Power-of-two exponent s >= 0 with m * 2^-s < 2^15.
+int range_exp(float m) {
+    int e = ((floatBitsToInt(m) >> 23) & 0xff) - 127;
+    return max(0, e - 14);
+}
+float absmax8(uvec4 w) {
+    vec2 a = abs(unpackBF16x2(w.x)), b = abs(unpackBF16x2(w.y));
+    vec2 c = abs(unpackBF16x2(w.z)), d = abs(unpackBF16x2(w.w));
+    return max(max(max(a.x, a.y), max(b.x, b.y)), max(max(c.x, c.y), max(d.x, d.y)));
+}
+uvec4 to_half8(uvec4 w, float sc) {
+    return uvec4(packHalf2x16(unpackBF16x2(w.x) * sc),
+                 packHalf2x16(unpackBF16x2(w.y) * sc),
+                 packHalf2x16(unpackBF16x2(w.z) * sc),
+                 packHalf2x16(unpackBF16x2(w.w) * sc));
+}
+// Workgroup max of two per-lane values (all lanes call; one barrier inside).
+vec2 wg_max2(float a, float b, int sg, int lane) {
+    a = subgroupMax(a);
+    b = subgroupMax(b);
+    if (lane == 0) { sRed[sg] = a; sRed[8 + sg] = b; }
+    barrier();
+    vec2 r = vec2(0.0);
+    [[unroll]] for (int i = 0; i < 8; ++i) {
+        r.x = max(r.x, sRed[i]);
+        r.y = max(r.y, sRed[8 + i]);
+    }
+    return r;
+}
+#endif
+
 #define FRA coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseA>
 #define FRB coopmat<float16_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseB>
 #define ACC coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>
@@ -228,6 +273,32 @@ void main() {
 
     // ---- Q block -> shared -> registers ----
     const int HQ = D >> 3; // uvec4 per row
+#ifdef ACT_BF16
+    // BR * HQ <= 64 * 16 = 4 * 256 words per lane
+    uvec4 qr[4];
+    float qmx = 0.0;
+    [[unroll]] for (int it = 0; it < 4; ++it) {
+        int e = lid + it * 256;
+        qr[it] = uvec4(0u);
+        if (e < BR * HQ) {
+            int rr = e / HQ;
+            int w = e - rr * HQ;
+            if (r0 + rr < S) {
+                qr[it] = uQ4.data[((q_base0 + rr * q_rstep) >> 3) + w];
+            }
+            qmx = max(qmx, absmax8(qr[it]));
+        }
+    }
+    const int eq = range_exp(wg_max2(qmx, 0.0, sg, lane).x);
+    [[unroll]] for (int it = 0; it < 4; ++it) {
+        int e = lid + it * 256;
+        if (e < BR * HQ) {
+            int rr = e / HQ;
+            sPool[rr * PKV + (e - rr * HQ)] = to_half8(qr[it], exp2(float(-eq)));
+        }
+    }
+    int ev_ref = 0;
+#else
     for (int e = lid; e < BR * HQ; e += 256) {
         int rr = e / HQ;
         int w = e - rr * HQ;
@@ -237,6 +308,7 @@ void main() {
         }
         sPool[rr * PKV + w] = v;
     }
+#endif
     barrier();
     FRA q0; FRA q1; FRA q2; FRA q3; FRA q4; FRA q5; FRA q6; FRA q7;
     FRA q8; FRA q9; FRA q10; FRA q11; FRA q12; FRA q13; FRA q14; FRA q15;
@@ -256,7 +328,13 @@ void main() {
     const int srow = r0 + sg * 8 + lr; // query row
     const int scr = SCR_BASE + sg * 64;
     const int pb = P_BASE + sg * 8 * P_PITCH;
+#ifdef ACT_BF16
+    // A bf16 mask spans fp32's range: finfo(bf16).min must still give a
+    // (uniform) softmax, -inf must give nothing, as in attention_flash.comp.
+    float m_ref = -3.402823466e38;
+#else
     float m_ref = -1e30;
+#endif
     float l = 0.0;
 
     int t_end = kv;
@@ -269,6 +347,64 @@ void main() {
     const bool v_vec = ((uA.v_base_extra | uA.v_step_extra) & 7) == 0;
     for (int t0 = 0; t0 < t_end; t0 += BC) {
         barrier(); // previous tile's (or the Q staging's) readers are done
+#ifdef ACT_BF16
+        // BC * HQ <= 32 * 16 = 2 * 256 uvec4 per lane for each of K and V.
+        // A V row off the 8-element grid (v_vec false) is gathered by words.
+        uvec4 kr[2];
+        uvec4 vr[2];
+        float kmx = 0.0;
+        float vmx = 0.0;
+        [[unroll]] for (int it = 0; it < 2; ++it) {
+            int e = lid + it * 256;
+            kr[it] = uvec4(0u);
+            vr[it] = uvec4(0u);
+            if (e < BC * HQ) {
+                int rr = e / HQ;
+                int w = e - rr * HQ;
+                int j = t0 + rr;
+                if (j < kv) {
+                    if (j < kv_past) {
+                        int slot = kv_slot(j);
+                        kr[it] = uCacheIn4.data[((c_base + slot * D) >> 3) + w];
+                        vr[it] = uCacheIn4.data[((c_v_base + slot * D) >> 3) + w];
+                    } else {
+                        int jn = j - kv_past;
+                        kr[it] = uK4.data[((k_base + jn * kv_step) >> 3) + w];
+                        if (v_vec) {
+                            vr[it] = uV4.data[((v_base + jn * v_step) >> 3) + w];
+                        } else {
+                            int vw = ((v_base + jn * v_step) >> 1) + w * 4;
+                            vr[it] = uvec4(uV.data[vw], uV.data[vw + 1],
+                                           uV.data[vw + 2], uV.data[vw + 3]);
+                        }
+                    }
+                }
+                kmx = max(kmx, absmax8(kr[it]));
+                vmx = max(vmx, absmax8(vr[it]));
+            }
+        }
+        const vec2 kvm = wg_max2(kmx, vmx, sg, lane);
+        const int ek = range_exp(kvm.x);
+        const int ev_tile = range_exp(kvm.y);
+        // V's reference only rises; a rise rescales O below (uniform).
+        const bool v_moved = ev_tile > ev_ref;
+        const float valpha = v_moved ? exp2(float(ev_ref - ev_tile)) : 1.0;
+        ev_ref = max(ev_ref, ev_tile);
+        [[unroll]] for (int it = 0; it < 2; ++it) {
+            int e = lid + it * 256;
+            if (e < BC * HQ) {
+                int rr = e / HQ;
+                int w = e - rr * HQ;
+                sPool[rr * PKV + w] = to_half8(kr[it], exp2(float(-ek)));
+                sPool[(kvw >> 2) + rr * PKV + w] =
+                    to_half8(vr[it], exp2(float(-ev_ref)));
+            }
+        }
+        const float s_scale = uA.scale * exp2(float(eq + ek));
+#else
+        const bool v_moved = false;
+        const float valpha = 1.0;
+        const float s_scale = uA.scale;
         if (v_vec) {
             for (int e = lid; e < BC * HQ; e += 256) {
                 int rr = e / HQ;
@@ -313,6 +449,7 @@ void main() {
                 pool_store_word(kvw + sw, vw);
             }
         }
+#endif
         barrier();
 
         // ---- S = Q · Kᵀ ----
@@ -355,17 +492,32 @@ void main() {
         const int lim = (uA.causal != 0) ? (past + srow) : 0x7fffffff;
         const bool mrow_ok = uA.has_mask != 0 && srow < S;
         const int mrow = (b * S + srow) * kv;
+#ifdef ACT_BF16
+        float tmax = -1.0 / 0.0;
+#else
         float tmax = -1e30;
+#endif
         [[unroll]] for (int c = 0; c < 8; ++c) {
             int j = j0 + c;
             float mk = 0.0;
             if (mrow_ok && j < kv) {
                 int e = mrow + j;
+#ifdef ACT_BF16
+                mk = unpackBF16x2(uMask.data[e >> 1])[e & 1];
+#else
                 mk = unpackHalf2x16(uMask.data[e >> 1])[e & 1];
+#endif
             }
-            float v = (x[c] * uA.scale + mk) * LOG2E;
+#ifdef ACT_BF16
+            float v = (x[c] * s_scale + mk) * LOG2E;
+            // a finite mask (finfo.min) that overflowed: clamp, not -inf
+            if (isinf(v) && !isinf(mk)) v = -3.4e38;
+            if (j > lim || j >= kv) v = -1.0 / 0.0;
+#else
+            float v = (x[c] * s_scale + mk) * LOG2E;
             if (j > lim) v = -65504.0 * LOG2E;
             if (j >= kv) v = -1e30;
+#endif
             x[c] = v;
             tmax = max(tmax, v);
         }
@@ -380,6 +532,8 @@ void main() {
             m_ref = tmax;
             l *= alpha;
         }
+        // l is in softmax units; only O carries V's exponent.
+        alpha *= valpha;
 
         // ---- P (fp16) into the subgroup's P tile ----
         uvec4 pw;
@@ -395,7 +549,7 @@ void main() {
         sPool[pb + lr * P_PITCH + lq] = pw;
 
         // ---- rescale O where a row's reference moved ----
-        if (subgroupAny(need)) {
+        if (subgroupAny(need) || v_moved) {
             // Fragment element e = lane*2 + {0,1} is row lane/4: the lane's
             // own softmax row, so its alpha is already in a register.
 #define RESC(i) if (i < nd) { \
@@ -445,8 +599,17 @@ void main() {
     // ---- row sums and the Y store, one O fragment at a time ----
     l += subgroupShuffleXor(l, 1u);
     l += subgroupShuffleXor(l, 2u);
+#ifdef ACT_BF16
+    const float inv = exp2(float(ev_ref)) / (l + 1e-30);
+#else
     const float inv = 1.0 / (l + 1e-30);
+#endif
     const bool row_ok = srow < S;
+#ifdef ACT_BF16
+#define OUT_PACK(y) packBF16x2(y)
+#else
+#define OUT_PACK(y) packHalf2x16(y)
+#endif
     const int yw = (q_base0 + (sg * 8 + lr) * q_rstep) >> 1;
 #define OUT(i) if (i < nd) { \
         coopMatStore(o##i, sPool, uint(scr), 2u, \
@@ -455,7 +618,7 @@ void main() {
         if (row_ok) { int u = scr + (lane >> 1); int cc = (lane & 1) * 2; \
             vec2 y = vec2(uintBitsToFloat(sPool[u][cc]), \
                           uintBitsToFloat(sPool[u][cc + 1])) * inv; \
-            uOutput.data[yw + i * 4 + lq] = packHalf2x16(y); } \
+            uOutput.data[yw + i * 4 + lq] = OUT_PACK(y); } \
         subgroupMemoryBarrierShared(); subgroupBarrier(); }
     FOR16(OUT)
 }

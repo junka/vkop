@@ -33,10 +33,15 @@ the zeros never reach the runtime. For a model written before that, use
 --shrink-dead to reclaim the UINT8 coop_i8 family (unreachable from a SINT8
 weight) instead.
 
+`--add-keys K1,K2` also copies those master keys in: a kernel variant added
+after conversion that an op resolves lazily by name (e.g.
+buffer_attention_flash_coop8_bf16, which the Attention op falls back from
+when absent). Extra keys are inert for keys a plan does not name.
+
 Usage:
   patch_model_shaders.py <model.vkopbin> <master vkop_shaders.bin>
                         [--out NEW.vkopbin] [--dry-run] [--force]
-                        [--shrink-dead]
+                        [--shrink-dead] [--add-keys K1,K2]
 """
 import argparse
 import mmap
@@ -114,7 +119,7 @@ def fb_field(data, table_off, field_index):
 
 
 def patch(model_path, master_path, out_path, dry_run, force,
-          shrink_dead=False):
+          shrink_dead=False, add_keys=()):
     # mmap, not read(): a DiT/text-tower model is 14 GB and this machine has
     # 36 GB, so a whole-file bytearray (plus the old whole-file backup) could
     # push it into swap or an OOM reboot. Only the archive range is touched.
@@ -166,8 +171,15 @@ def patch(model_path, master_path, out_path, dry_run, force,
               f"model has). Pass --force to proceed anyway.")
         added = []
 
+    extra = [k for k in add_keys if k and k not in old_ents]
+    absent = [k for k in extra if k not in new_all]
+    if absent:
+        raise SystemExit(f"--add-keys: master lacks {absent}")
+    if extra:
+        print(f"[patch] adding {len(extra)} key(s): {', '.join(extra)}")
+
     # Rebuild the model's subset with the master's bytes.
-    keys = sorted(old_ents)
+    keys = sorted(set(old_ents) | set(extra))
     blobs = [(k, master[new_all[k][0]:new_all[k][0] + new_all[k][1]])
              for k in keys]
     n = len(blobs)
@@ -242,6 +254,9 @@ def patch(model_path, master_path, out_path, dry_run, force,
               f" -> {new_size} bytes; would fit ({vec_len} available)")
         changed = []
         for name, blob in blobs:
+            if name not in old_ents:
+                changed.append(name + " (added)")
+                continue
             o_off, o_size = old_ents[name]
             if model[o_off:o_off + o_size] != blob:
                 changed.append(name)
@@ -268,7 +283,7 @@ def patch(model_path, master_path, out_path, dry_run, force,
 
     # Verify.
     check, _, _ = parse_vksp(model, vec_data)
-    ok = set(check) == set(old_ents)
+    ok = set(check) == set(old_ents) | set(extra)
     for name, blob in blobs:
         o_off, o_size = check.get(name, (0, -1))
         if o_size != len(blob) or model[o_off:o_off + o_size] != blob:
@@ -297,12 +312,15 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--add-keys", default="",
+                    help="comma list of master keys to add to the model")
     ap.add_argument("--shrink-dead", action="store_true",
                     help="free space by stubbing keys this graph can "
                          "never dispatch (UINT8 coop_i8 family)")
     a = ap.parse_args()
     return patch(a.model, a.master, a.out, a.dry_run, a.force,
-                 a.shrink_dead)
+                 shrink_dead=a.shrink_dead,
+                 add_keys=tuple((a.add_keys or "").split(",")))
 
 
 if __name__ == "__main__":
