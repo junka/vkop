@@ -70,6 +70,9 @@ struct Options {
     // write the text tower's states here and exit (the DiT then runs in a
     // fresh process with --text-states, after the system reclaimed the tower)
     std::string text_out;
+    // audio VAE decoder (h3_export_fl2va_audio_vae.py) -> stereo 32 kHz wav;
+    // --audio-latent decodes a saved [32, 2, T] audio latent with only it loaded
+    std::string audio_vae, wav, audio_latent;
     int width = 256, height = 256, length = 22, steps = 8, text_len = 32;
     uint32_t seed = 42;
 };
@@ -87,7 +90,10 @@ void usage(const char *argv0) {
                  "  --text-states raw fp32 [L, 5120] Qwen3-VL layer-50 states\n"
                  "  --te te.vkopbin --embed embed_tokens.bf16 --prompt-ids ids.i64\n"
                  "               run the text tower on the prompt instead\n"
-                 "  --vae vae.vkopbin --frames DIR   decode to DIR/frame_%%04d.ppm\n",
+                 "  --vae vae.vkopbin --frames DIR   decode to DIR/frame_%%04d.ppm\n"
+                 "  --audio-vae avae.vkopbin --wav OUT.wav   decode the audio latent\n"
+                 "               (float32 stereo, 32 kHz)\n"
+                 "  --audio-latent F.f32  decode a saved [32, 2, T] audio latent only\n",
                  argv0);
 }
 
@@ -113,6 +119,9 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--frames" && (v = next("--frames"))) o.frames_dir = v;
         else if (a == "--latent" && (v = next("--latent"))) o.latent = v;
         else if (a == "--text-out" && (v = next("--text-out"))) o.text_out = v;
+        else if (a == "--audio-vae" && (v = next("--audio-vae"))) o.audio_vae = v;
+        else if (a == "--wav" && (v = next("--wav"))) o.wav = v;
+        else if (a == "--audio-latent" && (v = next("--audio-latent"))) o.audio_latent = v;
         else if (a == "--width" && (v = next("--width"))) o.width = std::atoi(v);
         else if (a == "--height" && (v = next("--height"))) o.height = std::atoi(v);
         else if (a == "--length" && (v = next("--length"))) o.length = std::atoi(v);
@@ -122,7 +131,7 @@ bool parse(int argc, char **argv, Options &o) {
         else return false;
         if (v == nullptr) return false;
     }
-    return !o.dit.empty() || !o.latent.empty();
+    return !o.dit.empty() || !o.latent.empty() || !o.audio_latent.empty();
 }
 
 std::vector<float> read_f32(const std::string &path) {
@@ -179,12 +188,15 @@ void upload_float(const std::shared_ptr<Runtime> &rt,
         upload<float>(rt, pool, name, host, dims);
         return;
     }
-    if (probe->elem_kind() != vkop::core::ElemKind::kBFloat16)
+    const auto kind = probe->elem_kind();
+    if (kind != vkop::core::ElemKind::kBFloat16 && kind != vkop::core::ElemKind::kFloat16)
         throw std::runtime_error("graph input " + name +
-                                 " is neither fp32 nor bf16");
+                                 " is neither fp32, fp16 nor bf16");
     std::vector<uint16_t> bits(host.size());
     for (size_t i = 0; i < host.size(); ++i)
-        bits[i] = static_cast<uint16_t>(vkop::core::float_to_bf16(host[i]));
+        bits[i] = kind == vkop::core::ElemKind::kFloat16
+                      ? vkop::core::ITensor::fp32_to_fp16(host[i])
+                      : static_cast<uint16_t>(vkop::core::float_to_bf16(host[i]));
     upload<uint16_t>(rt, pool, name, bits, dims);
 }
 
@@ -196,12 +208,15 @@ std::vector<float> read_output(const std::shared_ptr<Runtime> &rt,
         auto f = as_tensor<float>(t);
         return {f->data().begin(), f->data().end()};
     }
-    if (t->elem_kind() != vkop::core::ElemKind::kBFloat16)
-        throw std::runtime_error("output " + name + " is neither fp32 nor bf16");
+    const auto kind = t->elem_kind();
+    if (kind != vkop::core::ElemKind::kBFloat16 && kind != vkop::core::ElemKind::kFloat16)
+        throw std::runtime_error("output " + name + " is neither fp32, fp16 nor bf16");
     auto h = as_tensor<uint16_t>(t);
     std::vector<float> out(h->num_elements());
     for (size_t i = 0; i < out.size(); ++i)
-        out[i] = vkop::core::bf16_to_float((*h)[i]);
+        out[i] = kind == vkop::core::ElemKind::kFloat16
+                     ? vkop::core::ITensor::fp16_to_fp32((*h)[i])
+                     : vkop::core::bf16_to_float((*h)[i]);
     return out;
 }
 
@@ -734,6 +749,67 @@ void write_ppm(const std::string &path, const Video &v, int f) {
 int decode_and_write(const Options &o, const std::shared_ptr<VulkanCommandPool> &pool,
                      const std::vector<float> &xv, int latent_t, int lat_h, int lat_w);
 
+// ---------------------------------------------------------------- audio VAE
+// MiniMax-H3 audio VAE decode (comfy MiniMaxH3AudioVAE.decode): the
+// normalized latent [32, 2, T] goes in as z [2, 32, 1, T] (one row per stereo
+// channel; the denormalization is folded into the graph's first conv), and
+// one call returns the clamped waveform [2, 1, 1, T*800] at 32 kHz. One call
+// covers the whole clip: the activations peak at ~12800*T floats per channel.
+constexpr int kAudioHop = 800;
+constexpr int kAudioRate = 32000;
+
+void write_wav_f32(const std::string &path, const std::vector<float> &planar,
+                   int channels, int rate) {
+    const uint32_t n = static_cast<uint32_t>(planar.size() / channels);
+    std::vector<float> inter(planar.size());
+    for (uint32_t i = 0; i < n; ++i)
+        for (int c = 0; c < channels; ++c)
+            inter[static_cast<size_t>(i) * channels + c] = planar[static_cast<size_t>(c) * n + i];
+    const uint32_t data = static_cast<uint32_t>(inter.size() * 4);
+    std::ofstream f(path, std::ios::binary);
+    auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char *>(&v), 4); };
+    auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char *>(&v), 2); };
+    f.write("RIFF", 4); u32(36 + data); f.write("WAVE", 4);
+    f.write("fmt ", 4); u32(16); u16(3 /* IEEE float */); u16(static_cast<uint16_t>(channels));
+    u32(static_cast<uint32_t>(rate)); u32(static_cast<uint32_t>(rate * channels * 4));
+    u16(static_cast<uint16_t>(channels * 4)); u16(32);
+    f.write("data", 4); u32(data);
+    f.write(reinterpret_cast<const char *>(inter.data()), data);
+}
+
+int decode_audio(const Options &o, const std::shared_ptr<VulkanCommandPool> &pool,
+                 const std::vector<float> &xa) {
+    if (o.audio_vae.empty()) return 0;
+    const int T = static_cast<int>(xa.size() / (kAudioC * 2));
+    auto t0 = std::chrono::steady_clock::now();
+    auto rt = std::make_shared<Runtime>(pool, o.audio_vae, /*precision=*/0);
+    rt->set_backend_buffer(true);
+    rt->LoadModel();
+    std::vector<float> z(xa.size());
+    for (int ch = 0; ch < 2; ++ch)
+        for (int c = 0; c < kAudioC; ++c)
+            for (int t = 0; t < T; ++t)
+                z[(static_cast<size_t>(ch) * kAudioC + c) * T + t] =
+                    xa[(static_cast<size_t>(c) * 2 + ch) * T + t];
+    upload_float(rt, pool, "z", z, {2, kAudioC, 1, static_cast<uint32_t>(T)});
+    const double ms = rt->Run();
+    rt->ReadResult();
+    const auto wave = read_output(rt, "wave");
+    const Stats s = stats(wave);
+    std::printf("[audio] %d latent frames -> %zu samples x 2 ch (%.2f s at %d Hz), "
+                "%.1fs (gpu %.0f ms); rms %.4f absmax %.3f%s\n", T, wave.size() / 2,
+                static_cast<double>(wave.size() / 2) / kAudioRate, kAudioRate,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                ms, s.rms, s.absmax, s.nonfinite ? " NONFINITE" : "");
+    if (wave.size() != static_cast<size_t>(2) * T * kAudioHop)
+        throw std::runtime_error("audio VAE: unexpected output size");
+    if (!o.wav.empty()) {
+        write_wav_f32(o.wav, wave, 2, kAudioRate);
+        std::printf("[audio] wrote %s\n", o.wav.c_str());
+    }
+    return s.nonfinite ? 3 : 0;
+}
+
 std::shared_ptr<VulkanDevice> pick_device() {
     std::shared_ptr<VulkanDevice> dev;
     for (auto *pdev : VulkanInstance::getVulkanInstance().getPhysicalDevices()) {
@@ -767,6 +843,19 @@ int main(int argc, char **argv) {
     const int audio_t = static_cast<int>(
         std::lround(static_cast<double>(frames) / kFps * kAudioLatentFps));
     const int lat_h = o.height / 16, lat_w = o.width / 16;
+
+    if (!o.audio_latent.empty()) {
+        const auto xa = read_f32(o.audio_latent);
+        if (xa.empty() || xa.size() % (kAudioC * 2)) {
+            std::fprintf(stderr, "%s is not [32, 2, T]\n", o.audio_latent.c_str());
+            return 2;
+        }
+        auto dev = pick_device();
+        if (!dev) return 1;
+        auto pool = std::make_shared<VulkanCommandPool>(dev);
+        const int rc = decode_audio(o, pool, xa);
+        if (rc || o.latent.empty()) return rc;
+    }
 
     if (!o.latent.empty()) {
         // decode only: --width/--height/--length give the latent's shape
@@ -956,7 +1045,8 @@ int main(int argc, char **argv) {
         std::printf("[save] %s/video_latent.f32 [24,%d,%d,%d], audio_latent.f32 "
                     "[32,2,%d]\n", o.save_dir.c_str(), latent_t, lat_h, lat_w, audio_t);
     }
-    rt.reset();  // the 20 GB DiT goes before the decoder loads
+    rt.reset();  // the 20 GB DiT goes before the decoders load
+    if (const int rc = decode_audio(o, pool, xa)) return rc;
     return decode_and_write(o, pool, xv, latent_t, lat_h, lat_w);
 }
 

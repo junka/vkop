@@ -8,14 +8,15 @@ the diffusers-layout base pipeline, which is a different architecture.
 
 ## 1. Pipeline
 
-One prompt runs three models in sequence. Only one model is resident at a time.
+One prompt runs four models in sequence. Only one model is resident at a time.
 
 ```
 prompt ──tokenize──► token ids ──[1] text tower──► layer-50 hidden [L, 5120]
                                                          │
 noise ──[2] DiT ×N steps (Euler, per-stream sigma)───────┘──► video latent [24, T, H/16, W/16]
-                                                              (+ audio latent, not decoded)
+                                                              + audio latent [32, 2, Ta]
 video latent ──[3] video VAE decoder──► frames [3, F, H, W] ──ffmpeg──► mp4
+audio latent ──[4] audio VAE decoder──► stereo 32 kHz wav ──ffmpeg (mux)──┘
 ```
 
 | # | model | role |
@@ -23,7 +24,7 @@ video latent ──[3] video VAE decoder──► frames [3, F, H, W] ──ffmp
 | 1 | Qwen3-VL-32B, first 50 of 64 LM layers | prompt → conditioning |
 | 2 | FL2VA DiT, 50 blocks + 2-block token refiner | one denoising step per call |
 | 3 | video VAE, ViT3D decoder, 36 layers | latent → pixels |
-| – | audio VAE (BigVGAN) | not run: missing runtime ops; the audio latent is generated but not decoded |
+| 4 | audio VAE, BigVGAN decoder (7 upsamplers, 21 AMP blocks) | latent → 32 kHz stereo waveform |
 
 The behaviour follows ComfyUI (`comfy/ldm/minimax/model.py`,
 `comfy/text_encoders/minimax.py`, `comfy/ldm/minimax/vae.py`,
@@ -91,6 +92,7 @@ every graph below was verified, at 1–2 layers.
 |---|---|---|---|
 | `h3_export_fl2va_te.py` | text tower, or the slice `--layers START,END` | `inputs_embeds [L,5120]`, `attention_bias [L,L]`, `rope_cos/sin [L,128]` → `hidden [L,5120]` | writes `embed_tokens.bf16` (raw [151936,5120] bf16) for host lookup; a Gather over it would be hydrated into the protobuf and overflow 2 GB |
 | `h3_export_fl2va.py` | one DiT step | `video_rows, audio_rows, text_states, pack_index, t_emb, mod_index, rope_cos/sin, video/audio_index, video/audio_t` → `video_v, audio_v` | writes `rope_inv_freq.f32` and `adaln_t_table.f32` for the host; `--dtype bf16` (default `fp32` only for the legacy fp32-activation artifact) |
+| `h3_export_fl2va_audio_vae.py` | audio decode, whole clip in one call | `z [2,32,1,Ta]` (normalized; one row per stereo channel) → `wave [2,1,1,Ta·800]` | see §3d; builds on CPU (decoder 250 MB fp32), no streaming |
 | `h3_export_fl2va_vae.py` | one decoder call (one clip/tile) | `z [N,24]` (denormalized), `rope_cos/sin [N+5,24]` → `pixels [N,3072]` | the zero suffix token is `h[:1]*0`, because `zeros_like` traces to ConstantOfShape, which has no kernel |
 
 ### 3a. NVFP4 text tower (`h3_export_fl2va_te.py --nvfp4`)
@@ -198,6 +200,41 @@ $PY h3_export_fl2va_vae.py --ckpt $C/vae/minimax_h3_video_vae_int8_convrot.safet
 $CONV -i $M/h3_fl2va_vae_i8cr/vae.onnx -o $M/h3_fl2va_vae_i8cr/vae.vkopbin -q int8 --external-blob-mb 1
 ```
 
+### 3d. Audio VAE (`h3_export_fl2va_audio_vae.py`)
+
+`vae/minimax_h3_audio_vae_fp32.safetensors` (605 MB) is ComfyUI's
+`MiniMaxH3AudioVAE` (`comfy/ldm/minimax/audio_vae.py`): a DAC encoder, an
+attention posterior head, then `dec_in_proj` (1×1 conv 32 → 2048) and a
+BigVGAN decoder (conv_pre 2048 → 1024; 7 ConvTranspose upsamplers ×5 ×5 ×2⁵ =
+800 samples per latent frame; after each, 3 AMP blocks with kernels 3/7/11
+and dilations 1/3/5 are averaged; anti-aliased SnakeBeta; conv_post without
+bias; clamp to [-1, 1]). The stereo channels are decoded independently as a
+batch of 2. Only the decode path is exported, and it needs no new runtime op.
+These rewrites make it fit the existing kernels:
+
+- Each Conv1d becomes a Conv2d over `[N, C, 1, L]`, because the runtime's Conv
+  is 4-D.
+- SnakeBeta `x + sin(eᵃx)² / (eᵇ + 1e-9)` gets `eᵃ` and `1/(eᵇ + 1e-9)` as
+  `[1, C, 1, 1]` constants computed at export, so the graph needs no Exp or
+  Reciprocal. The converter fuses the tail into FusedElemwise.
+- The alias-free 2× resampler, `pad(replicate) → depthwise ConvTranspose
+  stride 2 → slice → snake → pad(replicate) → depthwise Conv stride 2`, uses
+  per-channel `[C, 1, 1, 12]` filter weights (ratio 2 folded in) instead of
+  `filter.expand`. The replicate pads are emitted as `Pad mode=edge` with
+  constant pads, through an autograd.Function symbolic: `F.pad` traces its
+  pads to a ConstantOfShape/Concat chain.
+- The latent denormalization `z·std + mean` is folded into `dec_in_proj`
+  (`W·std`, `b + W·mean`).
+
+The graph has 2502 ONNX nodes (1160 after conversion: 256 Conv, 120
+ConvTranspose, 240 Pad, 113 Slice, 127 Sin, 134 FusedElemwise). `Ta` is
+dynamic, and one call decodes the whole clip: the largest activation is
+2 × 8 ch × 2·Ta·800 floats.
+
+The activations stay fp32. Against fp32 torch on the dog latent, fp16
+reaches only cos 0.9987 and bf16 0.9937, while fp32 is exact, and fp16 saves
+only ~25 % of the GPU time.
+
 ## 4. Commands
 
 ```bash
@@ -238,6 +275,12 @@ $PY h3_export_fl2va_vae.py --ckpt $C/vae/minimax_h3_video_vae_fp16.safetensors \
     --out $M/h3_fl2va_vae/vae.onnx
 $CONV -i $M/h3_fl2va_vae/vae.onnx -o $M/h3_fl2va_vae/vae.vkopbin -q int8 --external-blob-mb 1
 
+# audio VAE decoder (fp32, 268 MB; seconds). --reference also checks the
+# graph against a literal fp32 port of comfy's decode.
+$PY h3_export_fl2va_audio_vae.py --ckpt $C/vae/minimax_h3_audio_vae_fp32.safetensors \
+    --out $M/h3_fl2va_avae/avae.onnx [--reference ref.npz --frames 16]
+$CONV --act fp32 -q fp32 -i $M/h3_fl2va_avae/avae.onnx -o $M/h3_fl2va_avae/avae_fp32.vkopbin
+
 # driver
 make -C build -j16 minimax_h3_fl2va
 ```
@@ -258,11 +301,17 @@ build/minimax_h3_fl2va --te $M/h3_fl2va_te4/te.vkopbin \
 build/minimax_h3_fl2va --text-states text_states.f32 \
     --dit $M/h3_fl2va_cr/dit_int4.vkopbin \
     --width 512 --height 288 --length 56 --steps 50 --seed 42 --save run/ \
-    --vae $M/h3_fl2va_vae/vae.vkopbin --frames run/frames
-ffmpeg -framerate 24 -i run/frames/frame_%04d.ppm -c:v libx264 -pix_fmt yuv420p out.mp4
+    --vae $M/h3_fl2va_vae/vae.vkopbin --frames run/frames \
+    --audio-vae $M/h3_fl2va_avae/avae_fp32.vkopbin --wav run/audio.wav
+ffmpeg -framerate 24 -i run/frames/frame_%04d.ppm -i run/audio.wav \
+    -c:v libx264 -pix_fmt yuv420p -c:a aac -b:a 192k out.mp4
 ```
 
 `--latent FILE` decodes a saved latent with only the VAE loaded.
+`--audio-latent FILE` does the same for a saved audio latent
+(`audio_latent.f32`, [32, 2, Ta]), with only the audio VAE loaded. The audio
+is decoded after the DiT is released and before the video VAE loads. The
+`.wav` holds 32-bit float stereo at 32 kHz.
 `$M/tools/run_guard.sh LOG cmd...` runs a command under a memory guard: it
 kills the command when free memory falls under 3% or pressure stays critical
 for 6 s, and records the peak footprint.
@@ -274,6 +323,7 @@ for 6 s, and records the peak footprint.
 | text tower | NVFP4 + AWQ, imported (int8 alternative: 2 × 12.2 GB) | bf16 | 13.7 GB, plus a 1.56 GB host embedding table |
 | DiT | int4 group 128 on ConvRot-rotated weights; video head and condition_proj bf16 (int8: 20.2 GB) | bf16 | 10.8 GB (after a `.comp` change: `tools/patch_model_shaders.py`) |
 | VAE decoder | int8 | bf16 | 2.45 GB |
+| audio VAE decoder | fp32 | fp32 | 268 MB |
 
 Norms and biases stay bf16. The sampler state lives on the host in fp32.
 
@@ -301,7 +351,9 @@ checkout:
 | each graph at 1–2 layers vs fp32 torch port | DiT cos 0.99996, text tower cos 0.99998, VAE cos 0.99995, split text tower chained cos 0.99998 |
 | full 50-layer DiT, one step, bf16+int8 coop8 vs fp32 | video cos 0.99982, audio cos 0.99857 |
 | VAE decode of a sampled latent | coherent image |
-| torch port vs ComfyUI's own code | **not run** (ported by reading the source) |
+| torch port vs ComfyUI's own code | **not run** (ported by reading the source); the audio VAE is the exception, see below |
+| audio VAE graph (fp32) vs literal fp32 port of comfy decode, dog latent Ta = 93 | cos 1.0000000, max abs diff 8e-6 (vkop run) |
+| audio VAE: ComfyUI's own `MiniMaxH3AudioVAE` (stubbed `comfy.ops`) encodes a 1 s test signal (440 + 3000 Hz L, gated 660 Hz R); vkop decodes the latent | vs comfy's decode cos 1.0000000 on both channels; spectral peaks at 440/3000 and 660 Hz |
 
 | config | s/step | peak |
 |---|---|---|
@@ -315,6 +367,16 @@ checkout:
 | DiT int8, bf16, 2687 rows | – | 26.3 GB, killed: does not fit beside the other processes on 36 GB |
 | text tower int8, 53 tokens, two halves | 4.3 s total (run 0.7 s) | ~12 GB per half |
 | text tower NVFP4, 53 tokens, one graph | 2.5 s total (run 0.7 s) | 13.2 GB |
+| audio VAE fp32, Ta = 93 (2.3 s of audio) | 0.48 s GPU, 0.75 s with load (first run on a cold pipeline cache: 2–3 s) | 1.1 GB |
+| audio VAE fp32, Ta = 202 (5 s) | 0.99 s GPU, 1.2 s total | 1.8 GB |
+
+The decoded dog-prompt audio is finite and quiet. 50-step int4 runs give
+rms 0.007–0.009 (≈ −42 dBFS) with most energy at 4–12 kHz, a hiss-like spectrum
+(flatness 0.35–0.5). The 8-step turbo run (`t8_s12`) gives rms 0.048 with
+most energy at 100–1000 Hz. The sampled audio latents have rms 0.47–0.56,
+where an in-distribution latent is ≈ 1 (the test tone encodes to 0.65), so
+the quiet output most likely comes from the DiT/sampler, not from the
+decoder. The decoder itself matches comfy exactly.
 
 `VKOP_ACTIVATION_REUSE=1` is required. The DiT graph has dynamic shapes, so
 the load-time shape pool does not apply, and without reuse every intermediate
@@ -332,6 +394,7 @@ peak is weights plus a few GB.
 | `h3_fl2va_bf16/dit_int4.vkopbin`, `dit_int4h.vkopbin`, `dit_int8.vkopbin` | comparison | DiT without rotation (all int4 / head wide / int8) |
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |
 | `h3_fl2va_vae/vae.vkopbin` | yes | |
+| `h3_fl2va_avae/avae_fp32.vkopbin` | yes | audio VAE decoder (`avae_fp16`/`avae_bf16.vkopbin`: less accurate comparisons) |
 | `*/…weights.bin` | no | export intermediates, only needed to reconvert |
 
 The fp32-activation DiT, the unsplit tower and the 1–2-layer test models were
@@ -344,7 +407,12 @@ deleted on 2026-11-28. The exporters rebuild any of them.
   4–8.
 - The out_proj rotation could be folded into the V projection (per-head,
   group 64 or 128) instead of running online.
-- Audio VAE (BigVGAN ops).
+- Audio VAE speed: ~60 % of its GPU time goes to the 127 alias-free
+  activations (6 ops each). One fused `pad → up → snake → down` kernel would
+  remove ~760 dispatches. The audio VAE is < 1 s of a multi-minute run, so
+  this has not been done.
+- Audio loudness: the sampled audio latents are under-scaled (rms ≈ 0.5,
+  see §6). Check the audio stream of the DiT/sampler against ComfyUI.
 - A numeric check of the torch ports against ComfyUI itself.
 - FL2VA keyframes (first/last frame conditioning): the layout supports them
   in ComfyUI; the driver only does plain t2va.

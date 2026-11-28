@@ -1,5 +1,10 @@
 """Export the MiniMax-H3 audio VAE (BigVGAN) decoder -- and fail loudly.
 
+Superseded for the ComfyUI repack: `h3_export_fl2va_audio_vae.py` exports the
+same BigVGAN decoder with Exp/Reciprocal folded on the host, the replicate pads
+as static Pad(edge) and the 1-D convs as 4-D ones. It converts and runs
+(FL2VA.md section 3d). This diffusers-layout script is kept as it was.
+
 **This component cannot be converted today.** The script exists so the gap is
 recorded and testable rather than rediscovered, and so `--dry-run` prints the
 precise op set that blocks it.
