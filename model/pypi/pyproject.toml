@@ -60,7 +60,7 @@ Issues = "https://github.com/junka/vkop/issues"
 onnx2vkop = "onnx2vkop.cli:main"
 
 [tool.setuptools]
-packages = ["onnx2vkop", "onnx2vkop.generated", "onnx2vkop.generated.vkop", "onnx2vkop.generated.vkop.model"]
+packages = ["onnx2vkop", "onnx2vkop.hf_builders", "onnx2vkop.generated", "onnx2vkop.generated.vkop", "onnx2vkop.generated.vkop.model"]
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.txt"]

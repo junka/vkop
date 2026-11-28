@@ -68,18 +68,32 @@ and audit applies, and `weight_stream` streams the weights from the shards into
 the `.vkopbin` exactly as it would from an exporter's `llm.weights.bin`. Needs
 `torch` and `transformers`.
 
-- **Default builder**: Llama-family decoders (`llama`, `qwen2`, `qwen3`,
-  `mistral`; tied or untied head, GQA, optional q/k norm, RoPE variants that
-  only change `inv_freq` such as llama3/yarn/linear). The graph has the same
-  I/O as `llm/exporter/export/qwen3_export_onnx.py` (`inputs_embeds`,
-  `position_ids`, `attention_bias`, `past_key_values_i` -> `logits`,
-  `present_key_values_i`), so the result runs in `llm_chat`. The embedding
-  table is not in the graph; produce it with `llm/server/embed_table.py` as
-  usual.
+- **Builders** (`onnx2vkop/hf_builders/`, picked by config.json's
+  `model_type`; `--hf-builder NAME` forces one). Each module's
+  `make_wrapper(model)` is also what the matching
+  `llm/exporter/export/*_export_onnx.py` script exports from, so the script and
+  the CLI are one implementation:
+
+  | builder | model_type | graph | notes |
+  |---|---|---|---|
+  | `llama` | llama, mistral, qwen2, qwen3 | `qwen3_export_onnx.py` I/O | default for unknown types with a Llama block |
+  | `phi3` | phi3 | same I/O | fused qkv/gate_up, partial RoPE; longrope bakes the short branch: positions < original_max_position_embeddings |
+  | `glm` | glm | same I/O | interleaved RoPE rewritten half-split, repeat_kv-free GQA, both self-checked |
+  | `qwen3vl` | qwen3_vl | + MRoPE `position_ids (3,B,q)`, `deepstack_embeds_i`, `image_pad_mask` | language model only: visual.onnx still comes from the script |
+  | `qwen3_5` | qwen3_5 | + conv/recurrent state I/O, Conv1d/LinearAttention | zero-centred norm fold as `addend`, custom-op shapes via `post_splice`; batch 1; always traced fp16 |
+  | `qwen2_moe` | qwen2_moe | stage-1 dense graph with wired expert slots | slot s = expert s until paging; the paged variant (`make_moe_variant.py`) still needs the script path |
+
+  The standard LLM I/O is `inputs_embeds`, `position_ids`, `attention_bias`,
+  `past_key_values_i` -> `logits`, `present_key_values_i`, so results run in
+  `llm_chat`. The embedding table is not in the graph; produce it with
+  `llm/server/embed_table.py` as usual.
 - **Other architectures**: `--hf-builder pkg.module:fn` (or `file.py:fn`),
   called as `fn(config, torch_dtype, index)` and returning a
-  `hf_import.GraphSpec` (a meta-device wrapper, dummy inputs, I/O names,
-  dynamic axes, plus any computed constants or name aliases).
+  `hf_import.GraphSpec`: a meta-device wrapper, dummy inputs, I/O names,
+  dynamic axes, plus computed constants (`hf_constants()` on a module),
+  checkpoint-name aliases, `addend` (a stored value the graph uses offset,
+  e.g. a `1 + w` norm) and `post_splice(proto)` for edits the trace cannot
+  carry.
 - **Dtypes** (`--hf-trace-dtype`, default auto): the graph is traced at fp16,
   or at fp32 under `--act bf16/fp32` or for an fp32 checkpoint. A weight
   stored at that width, or stored as bf16 (the converter normalizes bf16), is

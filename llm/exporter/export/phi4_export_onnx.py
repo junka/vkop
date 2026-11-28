@@ -49,11 +49,7 @@ WEIGHTS_BIN = os.path.basename(EXPORT_PATH).replace(".onnx", ".weights.bin")
 
 print(f"[load] model = {MODEL_PATH}")
 
-from transformers.models.phi3.modeling_phi3 import (  # noqa: E402
-    Phi3ForCausalLM,
-    apply_rotary_pos_emb,
-    repeat_kv,
-)
+from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM  # noqa: E402
 
 OPSET = 17
 # ONNX 里位置编码的上限：超过它 HF 会换 long_factor，导出的图就不成立了。
@@ -103,116 +99,22 @@ assert torch.allclose(rotary.inv_freq.detach().float().cpu(), _manual_inv, atol=
 print(f"[rope] short 分支已确认：inv_freq == 默认，attention_scaling="
       f"{rotary.attention_scaling:.9f}（会乘进 cos/sin）")
 
-lm = model.model
-embed_tokens = lm.embed_tokens
-layers = lm.layers
-norm = lm.norm
-rotary_emb = lm.rotary_emb
-lm_head = model.lm_head
+# The wrapper lives in onnx2vkop/hf_builders/ so this script and
+# `onnx2vkop --hf-checkpoint` export the same graph from one implementation.
+_PYPI = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "..", "..", "..", "model", "pypi"))
+if _PYPI not in sys.path:
+    sys.path.insert(0, _PYPI)
+from onnx2vkop.hf_builders import phi3 as phi3_builder  # noqa: E402
 
-
-class Phi4LLMOnnx(torch.nn.Module):
-    """手写 forward：显式 KV cache 张量 I/O + 加法 attention bias，绕开 HF 的
-    DynamicCache 和 create_sliding_window_causal_mask（内部 torch.diff，opset17
-    trace 不过去）。子模块全部复用 HF 的，保证权重与算子顺序一致。"""
-
-    def __init__(self):
-        super().__init__()
-        self.embed_tokens = embed_tokens
-        self.layers = layers
-        self.norm = norm
-        self.rotary_emb = rotary_emb
-        self.lm_head = lm_head
-
-        self.num_heads = NUM_HEADS
-        self.num_kv_heads = NUM_KV_HEADS
-        self.num_kv_groups = NUM_KV_GROUPS
-        self.head_dim = HEAD_DIM
-        self.hidden = HIDDEN
-        self.scaling = SCALING
-        self.q_size = NUM_HEADS * HEAD_DIM           # 3072
-        self.kv_size = NUM_KV_HEADS * HEAD_DIM       # 1024
-        self.inter = INTERMEDIATE                    # 8192
-
-    def decoder_layer(self, layer, hidden, cos, sin, attention_bias, past_kv):
-        """单层前向，逐 op 对应 Phi3DecoderLayer.forward。返回 (hidden, present_kv)。"""
-        B, q_len, _ = hidden.shape
-        residual = hidden
-        h = layer.input_layernorm(hidden)
-
-        attn = layer.self_attn
-        # HF: qkv = qkv_proj(h)，再按 [q_size, kv_size, kv_size] 连续切片
-        qkv = attn.qkv_proj(h)
-        q = qkv[..., :self.q_size].view(B, q_len, self.num_heads, self.head_dim)
-        q = q.transpose(1, 2)
-        k = qkv[..., self.q_size:self.q_size + self.kv_size]
-        k = k.view(B, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = qkv[..., self.q_size + self.kv_size:]
-        v = v.view(B, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # partial RoPE：cos/sin (B, q, rotary_dim)，apply_rotary_pos_emb 内部
-        # unsqueeze(1) 广播到 (B, heads, q, rotary_dim)，再 Slice+Concat 拼回 128 维
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # concat past KV: past_kv (B, 2, nkv, past, hd)
-        past_k = past_kv[:, 0]
-        past_v = past_kv[:, 1]
-        k_new = torch.cat([past_k, k], dim=2)
-        v_new = torch.cat([past_v, v], dim=2)
-
-        k_r = repeat_kv(k_new, self.num_kv_groups)
-        v_r = repeat_kv(v_new, self.num_kv_groups)
-
-        # attention（手写，纯标准 ONNX op；与 eager_attention_forward 同序）
-        attn_w = torch.matmul(q, k_r.transpose(2, 3)) * self.scaling
-        attn_w = attn_w + attention_bias
-        attn_w = torch.nn.functional.softmax(
-            attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn_w, v_r)
-        out = out.transpose(1, 2).reshape(B, q_len, self.num_heads * self.head_dim)
-        out = attn.o_proj(out)
-
-        # HF 这里过 resid_attn_dropout，eval 下是恒等，直接加
-        hidden = residual + out
-
-        residual = hidden
-        h = layer.post_attention_layernorm(hidden)
-        mlp = layer.mlp
-        # HF: gate_up_proj 一次出 2*inter，chunk(2, -1) 拆成 gate / up。这里等价地
-        # 用常量边界切片：chunk 会被 trace 成 Shape→Gather→Add→Div→Mul 的**整数**
-        # shape 链，而转换器的 fuse_elemwise_chain 会把链尾的 Div 融成
-        # FUSED_ELEMWISE —— 那个内核只有 fp16/fp32 变体，融掉之后 /Slice 的 ends
-        # 不再是 int64 张量，runtime 的 as_tensor<int64_t> 空转一下就是 SIGSEGV
-        # （实测崩在 Tensor<long long>::copyToCPU，this=0）。常量切片既与 HF 逐位
-        # 等价，又少掉每层 4 个动态 shape 节点。
-        up_states = mlp.gate_up_proj(h)
-        gate = up_states[..., :self.inter]
-        up_states = up_states[..., self.inter:]
-        hidden = residual + mlp.down_proj(up_states * mlp.activation_fn(gate))
-
-        present_kv = torch.stack([k_new, v_new], dim=1)
-        return hidden, present_kv
-
-    def forward(self, inputs_embeds, position_ids, attention_bias, *past_kvs):
-        hidden = inputs_embeds
-        # 复用 HF rotary_emb：cos/sin = (B, q, rotary_dim)，且已乘 longrope 的
-        # attention_scaling。它内部按 max(position_ids) 选 short/long factor，是
-        # 数据相关分支 → trace 固化；上面已校验当前走的是 short 分支。
-        cos, sin = self.rotary_emb(hidden, position_ids)
-
-        presents = []
-        for idx, layer in enumerate(self.layers):
-            hidden, pk_new = self.decoder_layer(
-                layer, hidden, cos, sin, attention_bias, past_kvs[idx])
-            presents.append(pk_new)
-
-        hidden = self.norm(hidden)
-        logits = self.lm_head(hidden)
-        return (logits, *presents)
-
-
-wrapper = Phi4LLMOnnx()
-wrapper.eval()
+# Explicit KV tensors + additive attention bias around HF's submodules; RoPE
+# through StaticRope, which carries the same inv_freq (short branch, checked
+# above) and longrope attention_scaling as HF's rotary_emb. See
+# onnx2vkop/hf_builders/phi3.py for the three Phi-vs-Qwen differences.
+wrapper = phi3_builder.make_wrapper(model)
+assert torch.allclose(wrapper.rope.value, rotary.inv_freq.detach().float().cpu()), \
+    "StaticRope.inv_freq != rotary_emb.inv_freq"
+assert wrapper.rope.attention_scaling == rotary.attention_scaling
 
 # ---------------------------------------------------------------------------
 # 构造 prefill dummy inputs

@@ -108,9 +108,17 @@ import transformers  # noqa: E402
 from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM  # noqa: E402
 from transformers.models.qwen2_moe.modeling_qwen2_moe import (  # noqa: E402
     Qwen2MoeRotaryEmbedding,
-    apply_rotary_pos_emb,
-    repeat_kv,
 )
+
+# The wrapper (attention + SparseMoeOnnx) lives in onnx2vkop/hf_builders/ so
+# this script and `onnx2vkop --hf-checkpoint` export the same graph from one
+# implementation.
+import sys  # noqa: E402
+_PYPI = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "..", "..", "..", "model", "pypi"))
+if _PYPI not in sys.path:
+    sys.path.insert(0, _PYPI)
+from onnx2vkop.hf_builders import qwen2_moe as moe_builder  # noqa: E402
 
 OPSET = 17
 
@@ -280,70 +288,6 @@ def fill_non_expert():
 fill_non_expert()
 
 
-class Qwen2MoeLLMOnnx(nn.Module):
-    """decoder-only wrapper，attention 与稠密 Qwen2 逐字相同，mlp 换成稀疏 MoE。"""
-
-    def __init__(self):
-        super().__init__()
-        self.embed_tokens = lm.embed_tokens
-        self.layers = layers
-        self.norm = norm
-        self.rotary_emb = rotary_emb
-        self.lm_head = lm_head
-        self.num_heads = NUM_HEADS
-        self.num_kv_heads = NUM_KV_HEADS
-        self.num_kv_groups = NUM_KV_GROUPS
-        self.head_dim = HEAD_DIM
-        self.hidden = HIDDEN
-        self.scaling = SCALING
-
-    def decoder_layer(self, layer, hidden, cos, sin, attention_bias, past_kv):
-        B, q_len, _ = hidden.shape
-        residual = hidden
-        h = layer.input_layernorm(hidden)
-
-        attn = layer.self_attn
-        q = attn.q_proj(h).view(B, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        cs = (B, q_len, self.num_kv_heads, self.head_dim)
-        k = attn.k_proj(h).view(cs).transpose(1, 2)
-        v = attn.v_proj(h).view(cs).transpose(1, 2)
-
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # past_kv: (B, 2, NKV, past_len, HD) -> combined: (B, 2, NKV, past+q, HD)
-        k_new = torch.cat([past_kv[:, 0], k], dim=2)
-        v_new = torch.cat([past_kv[:, 1], v], dim=2)
-
-        k_r = repeat_kv(k_new, self.num_kv_groups)
-        v_r = repeat_kv(v_new, self.num_kv_groups)
-
-        attn_w = torch.matmul(q, k_r.transpose(2, 3)) * self.scaling
-        attn_w = attn_w + attention_bias
-        attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn_w, v_r)
-        out = out.transpose(1, 2).reshape(B, q_len, self.num_heads * self.head_dim)
-        hidden = residual + attn.o_proj(out)
-
-        residual = hidden
-        h = layer.post_attention_layernorm(hidden)
-        hidden = residual + layer.mlp(h)
-
-        return hidden, torch.stack([k_new, v_new], dim=1)
-
-    def forward(self, inputs_embeds, position_ids, attention_bias, *past_kvs):
-        hidden = inputs_embeds
-        cos, sin = self.rotary_emb(hidden, position_ids)
-
-        presents = []
-        for idx, layer in enumerate(self.layers):
-            hidden, pk = self.decoder_layer(
-                layer, hidden, cos, sin, attention_bias, past_kvs[idx])
-            presents.append(pk)
-
-        hidden = self.norm(hidden)
-        return (self.lm_head(hidden), *presents)
-
-
 # ---------------------------------------------------------------------------
 # 稀疏 MoE 一层。
 #
@@ -399,98 +343,12 @@ def _load_expert(layer_idx, expert_id):
     return tuple(p.contiguous() for p in parts)
 
 
-def _gate_weights(topv):
-    """槽位加权系数。
-
-    norm_topk_prob=false ⇒ 系数就是 softmax 后的 topv 本身。若换模型要开
-    norm_topk_prob，除了这里改成 `topv / (topv.sum(-1, keepdim=True) + 1e-6)`，
-    **还必须同时改运行期** —— 这是整层唯一一处「gate 的绝对尺度影响输出」的地方。
-    """
-    if NORM_TOPK:
-        return topv / (topv.sum(dim=-1, keepdim=True) + 1e-6)
-    return topv
-
-
-class SparseMoeOnnx(nn.Module):
-    """一层稀疏 MoE 的导出形态，整体**替换** Qwen2MoeSparseMoeBlock。
-
-    为什么是换模块而不是改 mlp.forward：实例级 forward 补丁（原方案）会让
-    torch 2.10 的 TorchScript tracer 在 alias_analysis.cpp:623 内部断言崩溃
-    （aten::view 参数类型不合法）—— 同样的数学走原始类 forward（router /
-    shared expert / 本类）都能 trace，唯独走过补丁 forward 的图不行。换容器
-    唯一的代价是 state_dict 前缀：本文件不按 state_dict 装载（参数全部
-    setattr 填充），wired 专家本来就是新参数，无迁移问题。
-
-    HF 的 router（Qwen2MoeTopKRouter.forward）：
-        router_logits = F.linear(h, weight)
-        probs = softmax(logits, dtype=float32)
-        topv, topi = topk(probs, top_k)
-        if norm_topk_prob: topv /= topv.sum(-1, keepdim=True)
-    Qwen1.5-MoE 是 norm_topk_prob=false，所以**不**重新归一化 —— 这一点在导出时
-    定死（图上没有这个分支），事后改 config 不会影响已有产物。
-    """
-
-    def __init__(self, old, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        # router / shared expert / shared_expert_gate 原样接管（它们的参数已在
-        # fill_non_expert 填成真 fp16，模块对象原封不动，参数身份不变）。
-        self.gate = old.gate
-        self.shared_expert = old.shared_expert
-        self.shared_expert_gate = old.shared_expert_gate
-        # 接线的 top_k 个专家成为**本模块自己的参数**。旧 fused-experts 子模块
-        # （meta 占位，26.7 GiB）随 old 一起被丢弃，从未进入 trace。
-        for slot in range(TOP_K):
-            g, u, d = _load_expert(layer_idx, slot)
-            setattr(self, f"wired_gate_{slot}",
-                    nn.Parameter(g, requires_grad=False))
-            setattr(self, f"wired_up_{slot}",
-                    nn.Parameter(u, requires_grad=False))
-            setattr(self, f"wired_down_{slot}",
-                    nn.Parameter(d, requires_grad=False))
-
-    def forward(self, x):
-        B, S, _ = x.shape
-        flat = x.reshape(-1, HIDDEN)                      # (B*S, H)
-
-        if self.gate.num_experts != NUM_EXPERTS or self.gate.top_k != TOP_K:
-            raise SystemExit(f"[fatal] layer {self.layer_idx} 的 router 是 "
-                             f"{self.gate.num_experts}/{self.gate.top_k}，"
-                             f"与 config 的 {NUM_EXPERTS}/{TOP_K} 不符")
-
-        # router 模块没被替换：它的 forward 就是 HF 的三行，且都是数据无关的
-        # 常规算子。软化的 topv 是 fp32（softmax(dtype=float32)），加权时按 HF
-        # 的 `.to(dtype)` 转回 fp16 —— 显式 to(fp16)，免得图上留下一个 fp32 乘法
-        # 把后续张量全抬成 fp32（那会改掉 MatMul 的 dispatch）。
-        _logits, topv, _topi = self.gate(flat)            # 已经 softmax + topk 过
-        gate_w = _gate_weights(topv).to(flat.dtype)       # (B*S, K) fp16
-
-        out = None
-        for slot in range(TOP_K):
-            # 导出阶段每个槽位接**槽位号本身**（0..K-1）：产出的图自洽（4 条分
-            # 支各读一个真实专家），阶段 2 只换 initializer 名，结构不动。
-            g = getattr(self, f"wired_gate_{slot}")
-            u = getattr(self, f"wired_up_{slot}")
-            d = getattr(self, f"wired_down_{slot}")
-            w = gate_w[:, slot:slot + 1]                  # (B*S, 1)
-            h = F.silu(F.linear(flat, g)) * F.linear(flat, u)
-            y = F.linear(h, d)                            # (B*S, H)
-            out = y * w if out is None else out + y * w
-
-        se = self.shared_expert
-        sh = se.down_proj(F.silu(se.gate_proj(flat)) * se.up_proj(flat))
-        sg = torch.sigmoid(self.shared_expert_gate(flat))  # (B*S, 1)
-
-        return (out + sh * sg).reshape(B, S, HIDDEN)
-
-
-# 整体替换每层 mlp。旧 Qwen2MoeSparseMoeBlock（含 26.7 GiB 的 meta 融合占位）
-# 在这里失去最后的引用，被 gc 掉。
-for _idx, _layer in enumerate(layers):
-    _layer.mlp = SparseMoeOnnx(_layer.mlp, _idx)
-
-wrapper = Qwen2MoeLLMOnnx()
-wrapper.eval()
+# Replace every layer's mlp with the export-form SparseMoeOnnx (router /
+# shared expert / shared_expert_gate taken over as is, top_k wired experts
+# read by _load_expert) and wrap: onnx2vkop/hf_builders/qwen2_moe.py. The old
+# Qwen2MoeSparseMoeBlock (with its 26.7 GiB meta fused placeholder) loses its
+# last reference here.
+wrapper = moe_builder.make_wrapper(model, load_expert=_load_expert)
 
 B = 1
 q_len = 32
@@ -608,6 +466,14 @@ side_f = open(LINWEIGHTS_NAME, "wb")
 try:
     for t in g.initializer:
         name = t.name
+        if t.data_type == TensorProto.FLOAT and (
+                name == "rope.inv_freq"
+                or [int(d) for d in t.dims] == [1, HEAD_DIM // 2, 1]):
+            # StaticRope 的 inv_freq 表（fp32，head_dim/2 个数；常量折叠后是
+            # inv_freq[None, :, None] 那个 [1, hd/2, 1] 副本）：内联，不计数。
+            # HF rotary_emb 的同一张表以前是非持久 buffer，不以 initializer
+            # 的身份出现。
+            continue
         if name in _param_names:
             # A 类：未转置参数（qkv bias + norms）。checkpoint 字节是 BF16，而图
             # 上的激活是 fp16 —— ONNX 里 Mul(MatMul) 混接 bf16/fp16 是非法类型
@@ -693,39 +559,10 @@ print(f"[rewrite] {rewritten} 参数 -> fp16 侧文件; "
       f"{side_n} 非专家 Linear -> {LINWEIGHTS_NAME} (共 {side_off / 1e9:.2f} GB fp16); "
       f"{folded} 折叠专家权重内联 fp16; {tiny} 小常量")
 
-# 与稠密导出器相同的声明：attention_bias 输入就是标准 causal bias（转换器据此
-# 走 fused attention / 免回读路径）。
-m.metadata_props.add(key="vkop_causal_mask:attention_bias", value="1")
-
-# TopK（router）输出的类型声明。torch 这次导出没写任何 value_info；转换器对无
-# 声明的输出只能猜 dtype —— indices 被猜成 fp16，而 vkop 的 TopK kernel 只写
-# int32（ops/Topk.hpp 的硬门，运行期构造即崩）。**value_info 会被 onnxoptimizer
-# 整体丢弃**（见 converter 对 metadata 的同一处理），所以两个输出都进
-# graph.output（I/O 声明在优化全程保留，converter.py 的输出查找也查它）。
-# indices 在本图里没有数据消费者（分支接线固定 0..3），改声明零数学影响；
-# M1 的聚合回读要的正是 int32 的 top-k id。
-from onnx import helper as onnx_helper  # noqa: E402
-
-_topk_n = 0
-for _n in g.node:
-    if _n.op_type != "TopK":
-        continue
-    vals, idxs = _n.output[0], _n.output[1]
-    # TopK(x [bs, 60], k=4) 的两个输出都是 [bs, 4] —— values 的宽度是 **k**，
-    # 不是专家数（第一版写成了 NUM_EXPERTS，runtime 按声明的 [1,60] 预分配，
-    # 路由权重就读错了张量 —— logits 相关但不对，正是这个错）。
-    # 只有 **indices** 进 graph.output（int32，M1 聚合回读要的就是它）：
-    # values 若也声明成 graph output，会被加载器按 precision_ 预绑定成 fp16，
-    # 而 kernel 按 fp32 输入写 fp32 —— dtype/形状两头都对不上。values 走普通
-    # 节点输出路径，runtime 按 fp32 输入自己推出 fp32。
-    vi = onnx_helper.make_tensor_value_info(idxs, TensorProto.INT32,
-                                            ["bs", TOP_K])
-    g.value_info.append(vi)
-    g.output.append(vi)
-    _topk_n += 1
-if _topk_n != NLAYERS:
-    raise SystemExit(f"[fatal] TopK 节点 {_topk_n} 个，期望 {NLAYERS}")
-print(f"[vi] {_topk_n} 个 TopK 输出声明为 values fp32 / indices int32")
+# attention_bias metadata + router TopK indices declared int32 graph outputs
+# (see moe_builder.annotate for why each one is required).
+_topk = moe_builder.annotate(m, NLAYERS, TOP_K)
+print(f"[vi] {len(_topk)} 个 TopK 输出声明为 values fp32 / indices int32")
 
 blob = m.SerializeToString()
 with open(EXPORT_PATH, "wb") as f:

@@ -38,12 +38,14 @@ defaults to fp16 (what every in-tree LLM exporter emits), or fp32 under
 `--act bf16/fp32` or for an fp32 checkpoint; see `pick_trace_dtype`.
 
 Builders. A checkpoint carries weights, not a graph, so something has to say
-what the graph is. `build_llama_decoder` (the default) reproduces the in-tree
-`qwen3_export_onnx.py` wrapper -- explicit KV I/O, `attention_bias`,
-`inputs_embeds` -- for any checkpoint with the Llama/Qwen2/Qwen3/Mistral block
-structure, so the result runs in llm_chat unchanged. `--hf-builder pkg.mod:fn`
-plugs in another one; it receives `(config, torch_dtype, index)` and returns a
-`GraphSpec`.
+what the graph is. That is a builder: `fn(config, torch_dtype, index) ->
+GraphSpec`. The in-tree ones live in `onnx2vkop/hf_builders/`, one module per
+architecture, and are picked by config.json's `model_type` (see
+`hf_builders.REGISTRY`); each module's `make_wrapper(model)` is ALSO what the
+matching llm/exporter/export/*_export_onnx.py script exports from, so the
+real-weight export and the meta trace are one implementation.
+`--hf-builder NAME` forces a registered one, `--hf-builder pkg.mod:fn` (or
+`file.py:fn`) plugs in another.
 
 torch and transformers are imported lazily: `-i model.onnx` conversions keep
 working without them.
@@ -109,6 +111,10 @@ class GraphSpec:
     aliases: Dict[str, str] = dataclasses.field(default_factory=dict)
     ckpt_prefix: Optional[str] = None
     addend: Dict[str, float] = dataclasses.field(default_factory=dict)
+    # Called with the ModelProto after the splice and before the shape repair
+    # and save: architecture knowledge the trace cannot carry (value_info for
+    # a custom op's outputs, metadata_props the runtime reads).
+    post_splice: Optional[Callable] = None
     # Free-form facts the caller prints (layers, heads, ...).
     summary: Dict[str, object] = dataclasses.field(default_factory=dict)
 
@@ -423,281 +429,23 @@ def splice_to_shards(proto, shapes: Mapping[str, list],
 
 
 # ---------------------------------------------------------------------------
-# default builder: Llama-family decoder with the in-tree llm I/O contract
+# builders
 # ---------------------------------------------------------------------------
 
-def _rotate_half(x):
-    import torch
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _make_decoder_wrapper(lm, lm_head, num_heads, num_kv_heads, head_dim,
-                          scaling, attention_scaling, inv_freq_len):
-    """Same graph as llm/exporter/export/qwen3_export_onnx.py's wrapper.
-
-    Kept op-for-op identical on purpose: the converter's attention / RMSNorm
-    / SwiGLU fusions were written against that export, and the runtime's LLM
-    driver reads its I/O names. q_norm/k_norm are applied only when the
-    checkpoint has them (Qwen3), which is the one place Qwen2/Llama/Mistral
-    differ in this block.
-
-    RoPE is computed here instead of through the HF rotary module: that module
-    moves its CPU `inv_freq` to the input's device and runs under autocast,
-    neither of which a meta trace survives. The arithmetic is the HF default
-    one -- `freqs = inv_freq x pos`, `cat(freqs, freqs)`, cos/sin scaled by
-    `attention_scaling` -- with `inv_freq` taken from the HF module itself, so
-    rope-scaling variants that only change `inv_freq`/`attention_scaling`
-    (linear, llama3, yarn, ...) come out right. Dynamic NTK, which changes
-    `inv_freq` with the sequence length at run time, is refused by the caller.
-    """
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    class DecoderLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layers = lm.layers
-            self.norm = lm.norm
-            self.lm_head = lm_head
-            self.rope_inv_freq = nn.Parameter(
-                torch.empty(inv_freq_len, dtype=torch.float32, device="meta"),
-                requires_grad=False)
-
-        def rope(self, position_ids, dtype):
-            inv = self.rope_inv_freq[None, :, None].float()
-            inv = inv.expand(position_ids.shape[0], -1, 1)
-            freqs = (inv @ position_ids[:, None, :].float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * attention_scaling
-            sin = emb.sin() * attention_scaling
-            return cos.to(dtype), sin.to(dtype)
-
-        def block(self, layer, hidden, cos, sin, attention_bias, past_kv):
-            B, q_len, _ = hidden.shape
-            residual = hidden
-            h = layer.input_layernorm(hidden)
-            attn = layer.self_attn
-            q = attn.q_proj(h).view(B, q_len, num_heads, head_dim)
-            if getattr(attn, "q_norm", None) is not None:
-                q = attn.q_norm(q)
-            q = q.transpose(1, 2)
-            k = attn.k_proj(h).view(B, q_len, num_kv_heads, head_dim)
-            if getattr(attn, "k_norm", None) is not None:
-                k = attn.k_norm(k)
-            k = k.transpose(1, 2)
-            v = attn.v_proj(h).view(B, q_len, num_kv_heads,
-                                    head_dim).transpose(1, 2)
-            c = cos.unsqueeze(1)
-            s = sin.unsqueeze(1)
-            q = (q * c) + (_rotate_half(q) * s)
-            k = (k * c) + (_rotate_half(k) * s)
-            k_new = torch.cat([past_kv[:, 0], k], dim=2)
-            v_new = torch.cat([past_kv[:, 1], v], dim=2)
-            groups = num_heads // num_kv_heads
-            if groups > 1:
-                b, nkv, slen, hd = k_new.shape
-                k_r = k_new[:, :, None, :, :].expand(
-                    b, nkv, groups, slen, hd).reshape(b, nkv * groups, slen, hd)
-                v_r = v_new[:, :, None, :, :].expand(
-                    b, nkv, groups, slen, hd).reshape(b, nkv * groups, slen, hd)
-            else:
-                k_r, v_r = k_new, v_new
-            w = torch.matmul(q, k_r.transpose(2, 3)) * scaling
-            w = w + attention_bias
-            w = F.softmax(w, dim=-1, dtype=torch.float32).to(q.dtype)
-            out = torch.matmul(w, v_r)
-            out = out.transpose(1, 2).reshape(B, q_len, num_heads * head_dim)
-            hidden = residual + attn.o_proj(out)
-            residual = hidden
-            h = layer.post_attention_layernorm(hidden)
-            mlp = layer.mlp
-            h = mlp.down_proj(mlp.act_fn(mlp.gate_proj(h)) * mlp.up_proj(h))
-            hidden = residual + h
-            return hidden, torch.stack([k_new, v_new], dim=1)
-
-        def forward(self, inputs_embeds, position_ids, attention_bias,
-                    *past_kvs):
-            hidden = inputs_embeds
-            cos, sin = self.rope(position_ids, hidden.dtype)
-            presents = []
-            for i, layer in enumerate(self.layers):
-                hidden, pk = self.block(layer, hidden, cos, sin,
-                                        attention_bias, past_kvs[i])
-                presents.append(pk)
-            hidden = self.norm(hidden)
-            return (self.lm_head(hidden), *presents)
-
-    return DecoderLM()
-
-
-def _text_prefix(index) -> Optional[str]:
-    """Checkpoint prefix of the text tower (`model.`, `model.language_model.`).
-
-    Found from the first layer's q_proj; a namesake under a vision tower or an
-    MTP head is ignored, since those are what the prefix exists to exclude.
-    """
-    tail = "layers.0.self_attn.q_proj.weight"
-    cands = [k[: -len(tail)] for k in index.entries if k.endswith(tail)]
-    skip = ("visual", "vision", "mtp", "audio", "speech")
-    cands = [c for c in cands if not any(s in c for s in skip)] or cands
-    if not cands:
-        return None
-    for pref in ("model.language_model.", "model.", ""):
-        if pref in cands:
-            return pref
-    return sorted(cands, key=len)[0]
-
-
-_LLAMA_FAMILY = {"llama", "qwen2", "qwen3", "mistral", "qwen3_text",
-                 "qwen2_text"}
-
-
 def build_llama_decoder(config, torch_dtype, index) -> GraphSpec:
-    """Default builder: the in-tree LLM I/O contract on a Llama-style block.
-
-    Inputs:  inputs_embeds [B,S,H], position_ids [B,S] int64,
-             attention_bias [B,1,q,kv], past_key_values_i [B,2,nkv,kv,hd]
-    Outputs: logits [B,S,V], present_key_values_i [B,2,nkv,kv,hd]
-
-    The embedding table is not in the graph (llm_chat reads it from its own
-    file; see llm/server/embed_table.py, which also reads safetensors).
-    """
-    import torch
-    from transformers import AutoModelForCausalLM
-
-    text_cfg = config.get_text_config() if hasattr(
-        config, "get_text_config") else config
-    mtype = getattr(text_cfg, "model_type", "?")
-    try:
-        text_cfg._attn_implementation = "eager"
-    except Exception:
-        pass
-    rope_params = (getattr(text_cfg, "rope_parameters", None)
-                   or getattr(text_cfg, "rope_scaling", None) or {})
-    rope_type = (rope_params.get("rope_type") or rope_params.get("type")
-                 or "default") if isinstance(rope_params, dict) else "default"
-    if rope_type == "dynamic":
-        raise HFImportError(
-            "dynamic-NTK RoPE recomputes inv_freq from the sequence length at "
-            "run time; the static graph cannot carry that. Use --hf-builder.")
-
-    with torch.device("meta"):
-        try:
-            model = AutoModelForCausalLM.from_config(text_cfg,
-                                                     dtype=torch_dtype)
-        except TypeError:
-            model = AutoModelForCausalLM.from_config(text_cfg,
-                                                     torch_dtype=torch_dtype)
-    model = model.to(torch_dtype).eval()
-    lm = getattr(model, "model", None)
-    lm_head = getattr(model, "lm_head", None)
-    need = []
-    if lm is None or not hasattr(lm, "layers") or not hasattr(lm, "norm"):
-        need.append("model.layers / model.norm")
-    if lm_head is None:
-        need.append("lm_head")
-    if not need:
-        l0 = lm.layers[0]
-        for path in ("input_layernorm", "post_attention_layernorm",
-                     "self_attn.q_proj", "self_attn.k_proj",
-                     "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj",
-                     "mlp.up_proj", "mlp.down_proj", "mlp.act_fn"):
-            obj = l0
-            for p in path.split("."):
-                obj = getattr(obj, p, None)
-            if obj is None:
-                need.append(f"layers.N.{path}")
-    if need:
-        raise HFImportError(
-            f"model_type {mtype!r} is not a Llama-style decoder (missing "
-            f"{', '.join(need)}); pass --hf-builder pkg.module:function")
-    if mtype not in _LLAMA_FAMILY:
-        print(f"[hf] model_type {mtype!r} has the Llama block structure but "
-              f"is not one of the tested families ({sorted(_LLAMA_FAMILY)}); "
-              f"verify its output against HF before trusting it",
-              file=sys.stderr)
-    if "gemma" in mtype:
-        raise HFImportError("Gemma's (1 + w) RMSNorm is not handled by the "
-                            "default builder; pass --hf-builder")
-
-    attn0 = lm.layers[0].self_attn
-    hidden = int(text_cfg.hidden_size)
-    num_heads = int(text_cfg.num_attention_heads)
-    num_kv = int(getattr(text_cfg, "num_key_value_heads", None) or num_heads)
-    head_dim = int(getattr(text_cfg, "head_dim", None)
-                   or hidden // num_heads)
-    scaling = float(getattr(attn0, "scaling", head_dim ** -0.5))
-    nlayers = len(lm.layers)
-
-    # The rotary module is cheap; build it for real (CPU) to read inv_freq
-    # and attention_scaling exactly as HF computes them for this config.
-    rot_cls = type(lm.rotary_emb)
-    rot = rot_cls(config=text_cfg)
-    inv_freq = rot.inv_freq.detach().float().cpu().numpy()
-    attention_scaling = float(getattr(rot, "attention_scaling", 1.0))
-
-    wrapper = _make_decoder_wrapper(lm, lm_head, num_heads, num_kv, head_dim,
-                                    scaling, attention_scaling,
-                                    inv_freq.shape[0]).eval()
-    # The wrapper's own blocks should carry no buffers (the rotary module is
-    # deliberately not part of it). One that appears has a value this builder
-    # cannot know, so refuse rather than leave a dangling graph input.
-    converted = buffers_to_params(wrapper)
-    if converted:
-        raise HFImportError(f"unexpected buffer(s) {converted[:4]} in the "
-                            f"decoder wrapper; the default builder does not "
-                            f"know their values. Pass --hf-builder.")
-    constants = {"rope_inv_freq": inv_freq}
-
-    prefix = _text_prefix(index)
-    aliases = {}
-    if "lm_head.weight" not in index.entries and not any(
-            k.endswith(".lm_head.weight") for k in index.entries):
-        tied = (prefix or "model.") + "embed_tokens.weight"
-        if tied in index.entries:
-            aliases["lm_head.weight"] = tied
-        else:
-            raise HFImportError("checkpoint has no lm_head.weight and no "
-                                f"{tied} to tie it to")
-
-    S = 8
-    dt = torch_dtype
-    dev = "meta"
-    dummies = (torch.empty(1, S, hidden, dtype=dt, device=dev),
-               torch.empty(1, S, dtype=torch.long, device=dev),
-               torch.empty(1, 1, S, S, dtype=dt, device=dev),
-               *[torch.empty(1, 2, num_kv, 0, head_dim, dtype=dt, device=dev)
-                 for _ in range(nlayers)])
-    input_names = (["inputs_embeds", "position_ids", "attention_bias"]
-                   + [f"past_key_values_{i}" for i in range(nlayers)])
-    output_names = (["logits"]
-                    + [f"present_key_values_{i}" for i in range(nlayers)])
-    dyn = {"inputs_embeds": {0: "batch", 1: "seq"},
-           "position_ids": {0: "batch", 1: "seq"},
-           "attention_bias": {0: "batch", 2: "q_len", 3: "kv_len"},
-           "logits": {0: "batch", 1: "seq"}}
-    for i in range(nlayers):
-        dyn[f"past_key_values_{i}"] = {0: "batch", 3: "kv_len"}
-        dyn[f"present_key_values_{i}"] = {0: "batch", 3: "kv_len"}
-
-    return GraphSpec(
-        wrapper=wrapper, dummies=dummies, input_names=input_names,
-        output_names=output_names, dynamic_axes=dyn, constants=constants,
-        aliases=aliases, ckpt_prefix=prefix,
-        summary={"model_type": mtype, "layers": nlayers, "hidden": hidden,
-                 "heads": num_heads, "kv_heads": num_kv,
-                 "head_dim": head_dim, "rope": rope_type,
-                 "ckpt_prefix": prefix, "tied_lm_head": bool(aliases)})
+    """The Llama-family builder (kept here for callers of the old name)."""
+    from .hf_builders import llama
+    return llama.build(config, torch_dtype, index)
 
 
-def resolve_builder(spec: Optional[str]) -> Callable:
+def resolve_builder(spec: Optional[str], config=None) -> Callable:
+    """`--hf-builder` if given, else the registered builder for model_type."""
     if not spec:
-        return build_llama_decoder
+        from . import hf_builders
+        return hf_builders.for_config(config)
     if ":" not in spec:
-        raise HFImportError(f"--hf-builder {spec!r}: expected pkg.module:function")
+        from . import hf_builders
+        return hf_builders.by_name(spec)
     mod_name, fn_name = spec.split(":", 1)
     if mod_name.endswith(".py") and os.path.isfile(mod_name):
         import importlib.util
@@ -710,8 +458,6 @@ def resolve_builder(spec: Optional[str]) -> Callable:
     if not callable(fn):
         raise HFImportError(f"--hf-builder {spec!r}: {fn_name} not callable")
     return fn
-
-
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
@@ -741,7 +487,7 @@ def export_graph_onnx(ckpt_dir: str, onnx_path: str, *,
     tdt = pick_trace_dtype(trace_dtype, act, index)
     torch_dtype = torch.float16 if tdt == "fp16" else torch.float32
     config = AutoConfig.from_pretrained(ckpt_dir, local_files_only=True)
-    spec = resolve_builder(builder)(config, torch_dtype, index)
+    spec = resolve_builder(builder, config)(config, torch_dtype, index)
     if not isinstance(spec, GraphSpec):
         raise HFImportError("the builder must return an onnx2vkop.hf_import."
                             "GraphSpec")
@@ -763,6 +509,10 @@ def export_graph_onnx(ckpt_dir: str, onnx_path: str, *,
           f"({counts['side_bytes'] / 2**20:.1f} MiB), {counts['const']} "
           f"computed constant(s)", flush=True)
 
+    if spec.post_splice is not None:
+        spec.post_splice(proto)
+    # Last: the dims recovered here may sit behind outputs post_splice
+    # declared (see stream_export.resolve_shape_dims).
     fixed = SE.resolve_shape_dims(proto, spec.dynamic_axes)
     onnx.save(proto, onnx_path)
     print(f"[hf] wrote {onnx_path} "

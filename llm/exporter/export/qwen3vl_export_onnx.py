@@ -32,17 +32,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Qwen3VLForConditionalGeneration
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    apply_rotary_pos_emb,
-    repeat_kv,
-)
 
 # 同目录的视觉塔实现（动态 grid，不再需要 transformers.vision_utils 那套
 # 预计算常量——5.3 里那个模块已经不存在了）。见该文件顶部说明。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qwen3vl_visual_dynamic import VisualDynamic  # noqa: E402
 
-MODEL_PATH = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
+MODEL_PATH = os.environ.get("MODEL_PATH") or os.path.expanduser(
+    "~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
+
+# The LLM wrapper lives in onnx2vkop/hf_builders/qwen3vl.py so this script and
+# `onnx2vkop --hf-checkpoint` export the same llm graph from one implementation.
+_PYPI = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "..", "..", "..", "model", "pypi"))
+if _PYPI not in sys.path:
+    sys.path.insert(0, _PYPI)
+from onnx2vkop.hf_builders import qwen3vl as qwen3vl_builder  # noqa: E402
 IMAGE_TOKEN_ID = 151655  # <|image_pad|>
 OPSET = 17
 
@@ -75,20 +80,6 @@ print(f"[config] layers={NUM_LAYERS} hidden={HIDDEN} heads={NUM_HEADS} kv_heads=
       f"head_dim={HEAD_DIM} scaling={SCALING:.6f} deepstack={DEEPSTACK_LAYERS}")
 
 
-# ---------------------------------------------------------------------------
-# 工具：把 (n_img, H) 的 deepstack_embed 加到 hidden 的 image_pad 位置。
-# 等价 HF _deepstack_process: hidden[mask,:] += embed。opset17 的 ScatterND 无 add
-# reduction，故用 gather+add+scatter 覆盖实现。
-# ---------------------------------------------------------------------------
-def scatter_add_visual(hidden, embed, mask):
-    B, L, H = hidden.shape
-    flat_mask = mask.reshape(-1)
-    idx = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)  # (n_img,)
-    flat = hidden.reshape(-1, H).clone()
-    gathered = flat[idx] + embed                                # 在视觉位置相加
-    idx2 = idx.unsqueeze(1).expand(-1, H)
-    flat = torch.scatter(flat, 0, idx2, gathered)               # 覆盖回原位
-    return flat.reshape(B, L, H)
 
 
 # ---------------------------------------------------------------------------
@@ -149,178 +140,10 @@ if not EXPORT_LLM_ONLY:
 # ---------------------------------------------------------------------------
 # 2. 语言模型：带 KV cache + deepstack 的自定义 wrapper
 # ---------------------------------------------------------------------------
-class StaticInterleavedMrope(nn.Module):
-    """HF Qwen3VLTextRotaryEmbedding 的静态等价实现（消灭 61-op 动态链）。
-
-    HF 路径把整条 mrope 交错选择 trace 成 Shape/Gather/Concat/Equal/Where/
-    Expand/ScatterND 的 int64 动态链（~57 ops + 4 个同步 readback），而选择
-    本身是「按列的静态行选择」：mrope 交错后的 freqs (B,q,64) 每一列 j 来自
-    t/h/w 三行的固定一行——
-      行(j) = 1(H) 若 j%3==1 且 j < 3*s1
-            = 2(W) 若 j%3==2 且 j < 3*s2
-            = 0(T) 其余
-    （s1/s2 = mrope_section[1]/[2]，对齐 apply_interleaved_mrope 的
-    slice(offset, length, 3)。）且 HF 的 freqs = pos[...,None] * inv_freq，
-    即 freqs[b,q,j] = pos[行(j),b,q] * inv_freq[j]。
-
-    于是整条链等价于一次 matmul：pos_t (B,q,3) @ M (3,64)，其中
-      M[r,j] = inv_freq[j] * (r == 行(j))
-    M 每列恰好一个非零元、其余列为 0（0*pos 精确为 0，+0 求和精确），
-    fp32 下与 HF 逐位一致。导出前有逐位自证断言。
-    """
-
-    def __init__(self, rotary_emb):
-        super().__init__()
-        inv_freq = rotary_emb.inv_freq.float()      # (64,)
-        half = inv_freq.shape[0]
-        section = rotary_emb.mrope_section           # [24,20,20]
-        assert len(section) == 3 and 3 * section[1] <= half and 3 * section[2] <= half
-        s1, s2 = section[1], section[2]
-        sel = torch.zeros(half, dtype=torch.long)
-        for j in range(half):
-            if j % 3 == 1 and j < 3 * s1:
-                sel[j] = 1
-            elif j % 3 == 2 and j < 3 * s2:
-                sel[j] = 2
-            else:
-                sel[j] = 0
-        M = torch.zeros(3, half, dtype=torch.float32)
-        M[sel, torch.arange(half)] = inv_freq
-        self.register_buffer("M", M)                 # (3,64)
-        self.attention_scaling = rotary_emb.attention_scaling
-
-    def forward(self, x, position_ids):
-        assert position_ids.ndim == 3 and position_ids.shape[0] == 3
-        pos = position_ids.to(torch.float32)         # (3,B,q)
-        pos_t = pos.permute(1, 2, 0)                 # (B,q,3)
-        freqs = torch.matmul(pos_t, self.M)          # (B,q,64) fp32
-        emb = torch.cat((freqs, freqs), dim=-1)      # (B,q,128) — HF 同款
-        cos = emb.cos() * self.attention_scaling
-        sin = emb.sin() * self.attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-def assert_static_mrope_bitwise(rotary_emb, static_mrope):
-    """与 HF rotary_emb 逐位对拍：纯文本（三行相等）+ 随机 3D 位置。"""
-    x = torch.zeros(1, 1, 4, dtype=torch.float16)    # HF 只用它取 dtype/device
-    gen = torch.Generator().manual_seed(0)
-    cases = [
-        torch.arange(4, dtype=torch.int64).reshape(1, 1, 4).expand(3, 1, 4),  # decode 形状 (3,1,q)
-        torch.arange(9, dtype=torch.int64).reshape(1, 1, 9).expand(3, 1, 9),  # t=h=w
-        torch.randint(0, 3000, (3, 1, 7), generator=gen),               # 3D 乱序
-    ]
-    with torch.no_grad():
-        for pid in cases:
-            c0, s0 = rotary_emb(x, pid)
-            c1, s1_ = static_mrope(x, pid)
-            assert c0.dtype == c1.dtype and torch.equal(c0, c1), \
-                f"cos mismatch {pid.shape}: maxdiff={(c0.float()-c1.float()).abs().max()}"
-            assert torch.equal(s0, s1_), f"sin mismatch {pid.shape}"
-    print("[mrope] bitwise-identical to HF on all probe shapes ✓")
-
-
-class Qwen3VLLMOnnx(nn.Module):
-    """复用 HF 层权重，自己写 forward 层循环，绕开 Cache 与 create_causal_mask。
-
-    每层手写 Q/K/V proj + qk_norm + RoPE + concat past KV + GQA repeat +
-    标准 attention + MLP；KV 作为显式输入/输出张量。deepstack 在 [5,11,17] 层后
-    加到 image_pad 位置。
-    """
-
-    def __init__(self, full_model):
-        super().__init__()
-        self.lm = full_model.model.language_model
-        self.embed_tokens = self.lm.embed_tokens
-        self.layers = self.lm.layers
-        self.norm = self.lm.norm
-        self.rotary_emb = self.lm.rotary_emb
-        # 静态 mrope：等价替换 HF rotary_emb 的 61-op 动态链（见类 docstring）。
-        # rotary_emb 仍保留作对拍基准。
-        self.mrope_static = StaticInterleavedMrope(self.lm.rotary_emb)
-        self.lm_head = full_model.lm_head
-
-        self.num_heads = NUM_HEADS
-        self.num_kv_heads = NUM_KV_HEADS
-        self.num_kv_groups = NUM_KV_GROUPS
-        self.head_dim = HEAD_DIM
-        self.hidden = HIDDEN
-        self.scaling = SCALING
-        self.deepstack_layers = TEXT_DEEPSTACK_LAYERS  # 文本注入位置 [0,1,2]
-
-    def decoder_layer(self, layer, hidden, cos, sin, attention_bias, past_kv):
-        """单层前向。返回 (hidden, present_kv)。"""
-        B, q_len, _ = hidden.shape
-        residual = hidden
-        h = layer.input_layernorm(hidden)
-
-        attn = layer.self_attn
-        # HF 顺序（严格对齐 modeling_qwen3_vl.py:472-474）：
-        #   hidden_shape = (B, q, heads, head_dim)
-        #   q = q_norm(q_proj(h).view(hidden_shape)).transpose(1,2)   # q_norm 在 view 后、transpose 前
-        #   k = k_norm(k_proj(h).view(hidden_shape)).transpose(1,2)
-        #   v = v_proj(h).view(hidden_shape).transpose(1,2)           # v 无 norm
-        hidden_shape = (B, q_len, self.num_heads, self.head_dim)
-        q = attn.q_proj(h).view(hidden_shape)
-        q = attn.q_norm(q)                  # RMSNorm over head_dim (last dim)
-        q = q.transpose(1, 2)               # (B, heads, q, head_dim)
-        kv_shape = (B, q_len, self.num_kv_heads, self.head_dim)
-        k = attn.k_norm(attn.k_proj(h).view(kv_shape))
-        k = k.transpose(1, 2)
-        v = attn.v_proj(h).view(kv_shape).transpose(1, 2)
-
-        # RoPE: cos/sin 形状 (B, q, head_dim)。apply_rotary_pos_emb 内部会
-        # unsqueeze(1) 成 (B,1,q,head_dim) 广播到 q/k 的 (B,heads,q,head_dim)。
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # concat past KV: past_kv (B,2,nkv,past,hd) -> K=past_kv[:,0], V=past_kv[:,1]
-        past_k = past_kv[:, 0]  # (B, nkv, past, hd)
-        past_v = past_kv[:, 1]
-        k_new = torch.cat([past_k, k], dim=2)  # (B, nkv, past+q, hd)
-        v_new = torch.cat([past_v, v], dim=2)
-
-        # GQA repeat
-        k_r = repeat_kv(k_new, self.num_kv_groups)
-        v_r = repeat_kv(v_new, self.num_kv_groups)
-
-        # attention
-        attn_w = torch.matmul(q, k_r.transpose(2, 3)) * self.scaling  # (B, heads, q, kv)
-        attn_w = attn_w + attention_bias
-        attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn_w, v_r)  # (B, heads, q, hd)
-        out = out.transpose(1, 2).reshape(B, q_len, self.hidden)
-        out = attn.o_proj(out)
-
-        hidden = residual + out
-
-        # MLP
-        residual = hidden
-        h = layer.post_attention_layernorm(hidden)
-        mlp = layer.mlp
-        h = mlp.down_proj(mlp.act_fn(mlp.gate_proj(h)) * mlp.up_proj(h))
-        hidden = residual + h
-
-        present_kv = torch.stack([k_new, v_new], dim=1)  # (B, 2, nkv, past+q, hd)
-        return hidden, present_kv
-
-    def forward(self, inputs_embeds, position_ids, attention_bias,
-                deepstack_0, deepstack_1, deepstack_2, image_pad_mask, *past_kvs):
-        hidden = inputs_embeds
-        cos, sin = self.mrope_static(hidden, position_ids)
-        deepstacks = [deepstack_0, deepstack_1, deepstack_2]
-
-        presents = []
-        for idx, layer in enumerate(self.layers):
-            hidden, pk_new = self.decoder_layer(
-                layer, hidden, cos, sin, attention_bias, past_kvs[idx])
-            presents.append(pk_new)
-            # deepstack 注入：真实层 5/11/17 后加对应 deepstack_embed
-            if idx in self.deepstack_layers:
-                ds_idx = self.deepstack_layers.index(idx)
-                hidden = scatter_add_visual(hidden, deepstacks[ds_idx], image_pad_mask)
-
-        hidden = self.norm(hidden)
-        logits = self.lm_head(hidden)
-        return (logits, *presents)
+# StaticInterleavedMrope (the 61-op dynamic mrope chain as one pos @ M matmul,
+# bit-checked against HF), the deepstack scatter-add and the Qwen3VLLM loop
+# (explicit KV, additive bias, deepstack after text layers 0..2) live in
+# onnx2vkop/hf_builders/qwen3vl.py.
 
 
 # --- 构造 prefill dummy inputs ---
@@ -399,8 +222,9 @@ for i in range(NUM_LAYERS):
     dynamic_axes[f"present_key_values_{i}"] = {0: "batch", 3: "kv_len"}
 
 print(f"[llm] exporting {NUM_LAYERS} layers, {len(input_names)} inputs / {len(output_names)} outputs ...")
-llm_wrapper = Qwen3VLLMOnnx(model)
-assert_static_mrope_bitwise(lm.rotary_emb, llm_wrapper.mrope_static)
+llm_wrapper = qwen3vl_builder.make_wrapper(model)
+assert llm_wrapper.deepstack_layers == TEXT_DEEPSTACK_LAYERS
+qwen3vl_builder.assert_static_mrope_bitwise(lm.rotary_emb, llm_wrapper.mrope_static)
 with torch.no_grad():
     torch.onnx.export(
         llm_wrapper, inputs, f"{LLM_STEM}.onnx",
