@@ -78,6 +78,45 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.weight, self.eps)
 
 
+def hadamard(g: int) -> np.ndarray:
+    """comfy-kitchen ConvRot's regular Hadamard: kron powers of a symmetric 4x4,
+    normalized. Symmetric and orthogonal, so H @ H = I and
+    x @ W.T == (x @ H) @ (W @ H).T for a block-diagonal H over the K dim."""
+    h4 = np.array([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+                  np.float32)
+    h = h4
+    while h.shape[0] < g:
+        h = np.kron(h, h4)
+    if h.shape[0] != g:
+        raise ValueError(f"convrot group must be a power of 4, got {g}")
+    return h / np.float32(math.sqrt(g))
+
+
+def rotate_in(w: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """[N, K] weight -> W @ blockdiag(H) along K (H symmetric)."""
+    n, k = w.shape
+    g = h.shape[0]
+    return (w.reshape(n, k // g, g) @ h).reshape(n, k)
+
+
+class _Rot:
+    """Online activation rotation x -> x @ blockdiag(H), H shared by the whole
+    model (`FL2VADiT.convrot_h`). A plain object, so assigning it to a module
+    does not register the owner as a submodule."""
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def __call__(self, x):
+        h = self.owner.convrot_h
+        g = h.shape[0]
+        return torch.matmul(x.reshape(-1, g), h).reshape(x.shape)
+
+
+def _ident(x):
+    return x
+
+
 def linear(dim_in, dim_out, bias, dtype, device):
     m = nn.Linear(dim_in, dim_out, bias=bias, dtype=dtype, device=device)
     m.requires_grad_(False)
@@ -94,6 +133,7 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, c["eps"], dtype, device)
         self.out_proj = linear(inner, c["hidden"], False, dtype, device)
         self.half = c["rope_half"]
+        self.rot = _ident
 
     def rope(self, x, cos, sin):
         # comfy-kitchen rms_rope_split_half, rot_dim = 2*half: pair i is
@@ -105,7 +145,7 @@ class Attention(nn.Module):
     def forward(self, x, cos=None, sin=None):
         s = x.shape[0]
         inner = self.heads * self.head_dim
-        qkv = self.qkv_proj(x)
+        qkv = self.qkv_proj(self.rot(x))
         q, k, v = qkv[:, :inner], qkv[:, inner:2 * inner], qkv[:, 2 * inner:]
         q = self.q_norm(q.reshape(s, self.heads, self.head_dim))
         k = self.k_norm(k.reshape(s, self.heads, self.head_dim))
@@ -120,7 +160,7 @@ class Attention(nn.Module):
         prob = torch.softmax(scores, dim=-1)
         out = torch.matmul(prob, v)                  # [1, H, S, D]
         out = out.squeeze(0).transpose(0, 1).reshape(s, inner)
-        return self.out_proj(out)
+        return self.out_proj(self.rot(out))
 
 
 class MLP(nn.Module):
@@ -129,11 +169,12 @@ class MLP(nn.Module):
         self.ffn = c["ffn"]
         self.fc1 = linear(c["hidden"], c["ffn"] * 2, False, dtype, device)
         self.fc2 = linear(c["ffn"], c["hidden"], False, dtype, device)
+        self.rot = _ident
 
     def forward(self, x):
-        h = self.fc1(x)
+        h = self.fc1(self.rot(x))
         gate, up = h[:, :self.ffn], h[:, self.ffn:]
-        return self.fc2(F.silu(gate) * up)
+        return self.fc2(self.rot(F.silu(gate) * up))
 
 
 class AdalnProj(nn.Module):
@@ -233,6 +274,25 @@ class FL2VADiT(nn.Module):
         self.blocks = nn.ModuleList(DiTBlock(c, dtype, device)
                                     for _ in range(c["num_layers"]))
         self.final_layer = FinalLayer(c, dtype, device)
+        g = c.get("convrot", 0)
+        if g:
+            # ConvRot-style: every attention/MLP linear sees x @ H; its weight
+            # is rotated to W @ H while streaming (`convrot_transforms`).
+            self.register_buffer("convrot_h", torch.empty(g, g, dtype=dtype,
+                                                          device=device))
+            for m in self.modules():
+                if isinstance(m, (Attention, MLP)):
+                    m.rot = _Rot(self)
+
+    def convrot_names(self):
+        """Checkpoint names of the weights the online rotation applies to."""
+        out = []
+        for name, m in self.named_modules():
+            if isinstance(m, Attention):
+                out += [f"{name}.qkv_proj.weight", f"{name}.out_proj.weight"]
+            elif isinstance(m, MLP):
+                out += [f"{name}.fc1.weight", f"{name}.fc2.weight"]
+        return out
 
     def forward(self, video_rows, audio_rows, text_states, pack_index, t_emb,
                 mod_index, rope_cos, rope_sin, video_index, video_t,
@@ -378,9 +438,17 @@ def load_real(model, ckpt):
     only use on a truncated model -- the full one is 40 GB)."""
     from safetensors import safe_open
     sd = {}
+    g = model.c.get("convrot", 0)
+    rot = set(model.convrot_names()) if g else set()
     with safe_open(ckpt, "pt") as f:
         for name, p in model.state_dict().items():
-            sd[name] = f.get_tensor(name).to(p.dtype)
+            if name == "convrot_h":
+                sd[name] = torch.from_numpy(hadamard(g)).to(p.dtype)
+                continue
+            t = f.get_tensor(name)
+            if name in rot:
+                t = torch.from_numpy(rotate_in(t.float().numpy(), hadamard(g)))
+            sd[name] = t.to(p.dtype)
     model.load_state_dict(sd, assign=True)
     return model
 
@@ -404,9 +472,14 @@ def main(argv=None):
                          "checkpoint tensor while streaming (the runtime has no "
                          "bf16-activation kernel beside quantized weights, and "
                          "H3 overflows fp16); bf16 mirrors ComfyUI exactly")
+    ap.add_argument("--convrot", type=int, default=0,
+                    help="ConvRot group (power of 4, e.g. 256): rotate every "
+                         "attention/MLP linear's input by a block Hadamard, in "
+                         "the graph for x and while streaming for W, so a "
+                         "later -q int4 quantizes outlier-free weights")
     args = ap.parse_args(argv)
 
-    c = dict(CFG, num_layers=args.num_layers)
+    c = dict(CFG, num_layers=args.num_layers, convrot=args.convrot)
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
@@ -447,12 +520,28 @@ def main(argv=None):
     wrapper = FL2VADiT(c, dtype=dtype, device="meta").eval()
     # every tensor of a weightless trace lives on meta, inputs included
     dummies = tuple(torch.from_numpy(inputs[n]).to("meta") for n in INPUT_NAMES)
+    transforms, computed = {}, {}
+    if args.convrot:
+        import onnx
+        h = hadamard(args.convrot)
+        transforms = {n: (lambda w, h=h: rotate_in(w, h))
+                      for n in wrapper.convrot_names()}
+        if dtype == torch.float32:
+            hp = onnx.numpy_helper.from_array(h, "convrot_h")
+        else:
+            # +-1/sqrt(g) is exact in bf16 for a power-of-4 g
+            bits = (h.view(np.uint32) >> 16).astype("<u2")
+            hp = onnx.helper.make_tensor("convrot_h", onnx.TensorProto.BFLOAT16,
+                                         h.shape, bits.tobytes(), raw=True)
+        computed = {"convrot_h": hp}
+        print(f"[convrot] group {args.convrot}: {len(transforms)} weights rotated")
     with torch.no_grad():
         common.export_streaming_real(
             wrapper, dummies, INPUT_NAMES, OUTPUT_NAMES, DYNAMIC_AXES,
             model_dir=os.path.join(out_dir, "ckpt"), component="dit",
             out_path=args.out,
-            target_dtype="F32" if dtype == torch.float32 else None)
+            target_dtype="F32" if dtype == torch.float32 else None,
+            transforms=transforms, computed=computed)
     return 0
 
 

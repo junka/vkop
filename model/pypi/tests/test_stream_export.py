@@ -301,3 +301,32 @@ if __name__ == "__main__":
         print("\nRESULT: stream_export regressions pass")
     else:
         main()
+
+
+def test_transform_rewrites_payload_in_checkpoint_shape():
+    """`entry["transform"]` sees the fp32 tensor in its checkpoint shape and its
+    result is what lands in the weights file (re-encoded to the source dtype
+    when no target_dtype is given) -- the MiniMax-H3 `--convrot` rotation."""
+    from safetensors.torch import save_file
+    w = torch.randn(4, 8).to(torch.bfloat16)
+    keep = torch.randn(3)
+    with tempfile.TemporaryDirectory() as tmp:
+        save_file({"w": w, "keep": keep}, os.path.join(tmp, "m.safetensors"))
+        index = stream_export.SafetensorsIndex(tmp)
+        resolved = {}
+        for n in ("w", "keep"):
+            e = dict(index.get(n))
+            e["onnx_name"] = n
+            resolved[n] = e
+        seen = []
+        resolved["w"]["transform"] = lambda a: (seen.append(a.shape), a[:, ::-1] * 2)[1]
+        out = os.path.join(tmp, "out.bin")
+        nbytes, offs = stream_export.copy_weights(resolved, out)
+        raw = open(out, "rb").read()
+        assert seen == [(4, 8)]
+        got = np.frombuffer(raw[offs["w"]:offs["w"] + 64], "<u2").astype(np.uint32)
+        got = (got << 16).view(np.float32).reshape(4, 8)
+        np.testing.assert_array_equal(got, w.float().numpy()[:, ::-1] * 2)
+        np.testing.assert_array_equal(
+            np.frombuffer(raw[offs["keep"]:offs["keep"] + 12], np.float32),
+            keep.numpy())

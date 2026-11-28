@@ -67,11 +67,12 @@ Everything comes from `~/.cache/modelscope/hub/models/Comfy-Org/MiniMax-H3/`.
 
 The text tower is imported from the repack's NVFP4 file as-is (§3a); the
 DiT and VAE are quantized from their full-precision files by vkop's streaming
-quantizer. The other pre-quantized files (`*_int8_convrot`, `*_fp8_scaled`,
-`*_w6a8`) are not used: fp8 weights save nothing over int8, and w6a8 has no
-kernel. Importing
-`int8_convrot` directly is still open: it needs a grouped Hadamard rotation of
-the activations and streaming of int8 DequantizeLinear payloads.
+quantizer. The DiT takes the `int8_convrot` recipe (§3b) without the file
+itself: rotating the bf16 weights and requantizing gives the same int4 as
+requantizing the rotated int8 file (weight error 0.1172 vs 0.1176). The other
+pre-quantized files (`*_fp8_scaled`, `*_w6a8`) are not used: fp8 weights save
+nothing over int8, Apple GPUs have no fp8 matmul (activations cannot go fp8),
+and w6a8 has no kernel.
 
 ## 3. Exporters (`model/exporter/minimax_h3/`)
 
@@ -126,6 +127,30 @@ End to end, with the same prompt, seed 42, 50 steps and the int4 coop8 DiT, the
 video looks the same as the int8-tower run (`h3_fl2va_run_dog/v2/dog_nvfp4.mp4`
 next to `dog.mp4`). That run took 13.7 s/step.
 
+### 3b. ConvRot rotation for the int4 DiT (`h3_export_fl2va.py --convrot 256`)
+
+The repack's `int8_convrot` DiT rotates every attention/MLP linear's input
+by a block-diagonal regular Hadamard H (kron powers of a symmetric 4×4,
+group 256, H·H = I), so `x·Wᵀ = (x·H)·(W·H)ᵀ`. `--convrot 256` does the same:
+`W·H` is applied to qkv/out/fc1/fc2 (main blocks and token refiner) while the
+weights stream (`export_streaming_real(transforms=)`), and the graph gets
+`reshape(x, [-1, 256]) @ H` before each of them, with H one shared bf16
+initializer (±1/16 is exact in bf16 and in int4).
+
+Measured on real weights, the rotation brings int4 group-128 error from
+0.117–0.176 down to 0.117 (the Gaussian floor); the gain is largest on the
+late-block fc2/qkv weights. One full-model step at 256×160×56f against
+the int8 DiT (rms of the `out` difference; `out` rms ≈ 3.0 video, 1.0 audio):
+
+| int4 DiT | video | audio | s/step |
+|---|---|---|---|
+| everything int4, output head included | 0.564 | 0.234 | – |
+| video head + condition_proj kept wide | 0.481 | 0.234 | 4.42 |
+| … plus `--convrot 256` | 0.478 | 0.161 | 4.52 |
+
+So the head exclusion is what helps video, and the rotation is what helps
+audio, for +2–3 % time. Both are in the default recipe.
+
 Environment: venv `~/.venvs/h3`, Python 3.12, with torch, onnx 1.19.1,
 onnxoptimizer, flatbuffers, safetensors, transformers and pytest. Put this
 checkout's `model/pypi` on `PYTHONPATH`.
@@ -153,11 +178,17 @@ $PY h3_export_fl2va_te.py --ckpt $C/text_encoders/qwen3vl_32b_minimax_h3_bf16.sa
 $PY h3_export_fl2va_te.py --ckpt ... --out $M/h3_fl2va_te_b/te.onnx --layers 25,50
 $CONV -i $M/h3_fl2va_te_a/te.onnx -o $M/h3_fl2va_te_a/te.vkopbin -q int8   # same for _b
 
-# DiT (37 GiB streamed, ~1 min)
+# DiT, int4 + ConvRot (default; 37 GiB streamed, a few minutes per command). The
+# excluded nodes are the video output head and condition_proj (look the names
+# up in dit.onnx: the Gemm reading final_layer.video_out.weight / condition_proj.weight).
 $PY h3_export_fl2va.py --ckpt $C/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors \
-    --out $M/h3_fl2va_bf16/dit.onnx --dtype bf16
-$CONV -i $M/h3_fl2va_bf16/dit.onnx -o $M/h3_fl2va_bf16/dit_int4.vkopbin -q int4 --group-size 128
-$CONV -i $M/h3_fl2va_bf16/dit.onnx -o $M/h3_fl2va_bf16/dit_int8.vkopbin -q int8   # faster, 20 GB
+    --out $M/h3_fl2va_cr/dit.onnx --dtype bf16 --convrot 256
+$CONV -i $M/h3_fl2va_cr/dit.onnx -o $M/h3_fl2va_cr/dit_int4.vkopbin -q int4 --group-size 128 \
+    --exclude-node Gemm_26143,Gemm_6339
+
+# DiT without rotation (int8 reference, 20 GB; does not fit at 2687 rows)
+$PY h3_export_fl2va.py --ckpt ... --out $M/h3_fl2va_bf16/dit.onnx --dtype bf16
+$CONV -i $M/h3_fl2va_bf16/dit.onnx -o $M/h3_fl2va_bf16/dit_int8.vkopbin -q int8
 
 # VAE decoder
 $PY h3_export_fl2va_vae.py --ckpt $C/vae/minimax_h3_video_vae_fp16.safetensors \
@@ -180,9 +211,9 @@ $HOME/.venvs/h3/bin/python -c "from transformers import Qwen2Tokenizer; import n
 export VKOP_ACTIVATION_REUSE=1     # required: dynamic shapes, see §6
 build/minimax_h3_fl2va --te $M/h3_fl2va_te4/te.vkopbin \
     --embed $M/h3_fl2va_te/embed_tokens.bf16 --prompt-ids ids.i64 --text-out text_states.f32 \
-    --dit $M/h3_fl2va_bf16/dit_int4.vkopbin --width 512 --height 288 --length 56
+    --dit $M/h3_fl2va_cr/dit_int4.vkopbin --width 512 --height 288 --length 56
 build/minimax_h3_fl2va --text-states text_states.f32 \
-    --dit $M/h3_fl2va_bf16/dit_int4.vkopbin \
+    --dit $M/h3_fl2va_cr/dit_int4.vkopbin \
     --width 512 --height 288 --length 56 --steps 50 --seed 42 --save run/ \
     --vae $M/h3_fl2va_vae/vae.vkopbin --frames run/frames
 ffmpeg -framerate 24 -i run/frames/frame_%04d.ppm -c:v libx264 -pix_fmt yuv420p out.mp4
@@ -198,7 +229,7 @@ for 6 s, and records the peak footprint.
 | model | weights | activations | artifact |
 |---|---|---|---|
 | text tower | NVFP4 + AWQ, imported (int8 alternative: 2 × 12.2 GB) | bf16 | 13.7 GB, plus a 1.56 GB host embedding table |
-| DiT | int4, group 128 (int8: 20.2 GB) | bf16 | 10.8 GB (after a `.comp` change: `tools/patch_model_shaders.py`) |
+| DiT | int4 group 128 on ConvRot-rotated weights; video head and condition_proj bf16 (int8: 20.2 GB) | bf16 | 10.8 GB (after a `.comp` change: `tools/patch_model_shaders.py`) |
 | VAE decoder | int8 | bf16 | 2.45 GB |
 
 Norms and biases stay bf16. The sampler state lives on the host in fp32.
@@ -236,6 +267,7 @@ checkout:
 | DiT int8, bf16, 554 rows (coop8) | 2.3 | 21.4 GB |
 | DiT int4, bf16, 512×288×56f = 2687 rows (SIMT tile) | 23.1 | 19.8 GB |
 | DiT int4, bf16, 2687 rows (coop8 int4 stage) | 12.8 | 19.8 GB |
+| DiT int4 + ConvRot 256, head wide, 2687 rows (coop8) | 14.1 | 19.9 GB |
 | VAE, 56 frames 512×288 (3 clips × 6 tiles) | 29 s total | – |
 | DiT int8, bf16, 2687 rows | – | 26.3 GB, killed: does not fit beside the other processes on 36 GB |
 | text tower int8, 53 tokens, two halves | 4.3 s total (run 0.7 s) | ~12 GB per half |
@@ -253,7 +285,8 @@ peak is weights plus a few GB.
 | `h3_fl2va_te4/te.vkopbin` | yes | NVFP4 text tower |
 | `h3_fl2va_te_a/te.vkopbin`, `h3_fl2va_te_b/te.vkopbin` | alternative | int8 text tower layers 0–24 / 25–49 |
 | `h3_fl2va_te/embed_tokens.bf16`, `h3_fl2va_te/tokenizer/` | yes | |
-| `h3_fl2va_bf16/dit_int4.vkopbin` (`dit_int8.vkopbin`) | yes | DiT |
+| `h3_fl2va_cr/dit_int4.vkopbin` (+ its host tables) | yes | DiT, int4 + ConvRot |
+| `h3_fl2va_bf16/dit_int4.vkopbin`, `dit_int4h.vkopbin`, `dit_int8.vkopbin` | comparison | DiT without rotation (all int4 / head wide / int8) |
 | `h3_fl2va_bf16/rope_inv_freq.f32`, `adaln_t_table.f32` | yes | DiT host tables (the driver reads them from the DiT's directory) |
 | `h3_fl2va_vae/vae.vkopbin` | yes | |
 | `*/…weights.bin` | no | export intermediates, only needed to reconvert |
@@ -263,8 +296,11 @@ deleted on 2026-11-28. The exporters rebuild any of them.
 
 ## 8. Open items
 
-- Import `int8_convrot` directly (Hadamard rotation in the graph, streamed
-  int8 DQ payloads).
+- The repack ships turbo LoRAs (`loras/minimax_h3_fl2v_turbo_{4,8}step_*`):
+  merging one into the bf16 weights before quantizing would cut 50 steps to
+  4–8.
+- The out_proj rotation could be folded into the V projection (per-head,
+  group 64 or 128) instead of running online.
 - Audio VAE (BigVGAN ops).
 - A numeric check of the torch ports against ComfyUI itself.
 - FL2VA keyframes (first/last frame conditioning): the layout supports them

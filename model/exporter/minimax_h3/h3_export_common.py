@@ -560,7 +560,9 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
                           out_path: str, weights_file: str | None = None,
                           ckpt_prefix: str = "", ckpt_rename: str | None = None,
                           rope_theta: float | None = None,
-                          target_dtype: str | None = None
+                          target_dtype: str | None = None,
+                          transforms: dict | None = None,
+                          computed: dict | None = None
                           ) -> str:
     """Export one component with its REAL weights, holding no more than a chunk.
 
@@ -579,6 +581,10 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
     does not carry (`model.` for the denoiser); `ckpt_rename` translates it to a
     different path inside the checkpoint (`lm.` -> `model.language_model.` for
     the text tower).
+
+    `transforms` maps a CHECKPOINT tensor name to a callable rewriting its
+    fp32 value on the way out (same shape); `computed` maps a graph input that
+    is in no checkpoint to a TensorProto to inline (e.g. a Hadamard matrix).
 
     Returns the ONNX path written. The weights land next to it.
     """
@@ -614,6 +620,16 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
         (hits.__setitem__(vi.name, base) if base in index
          else unresolved.append(vi.name))
 
+    for name in [n for n in unresolved if n in (computed or {})]:
+        init = proto.graph.initializer.add()
+        init.CopyFrom(computed[name])
+        init.name = name
+        for i, vi in enumerate(proto.graph.input):
+            if vi.name == name:
+                del proto.graph.input[i]
+                break
+        unresolved.remove(name)
+        print(f"[stream] inlined computed initializer {name}")
     # A `persistent=False` buffer is COMPUTED from config and is in no
     # checkpoint. `promote_computed_buffers` turns it into a real initializer.
     if unresolved:
@@ -646,6 +662,10 @@ def export_streaming_real(wrapper, dummies, input_names, output_names,
                 node.input[i] = back[name]
     if len(resolved) != len(hits):
         raise SystemExit(f"[stream] spliced {len(resolved)} of {len(hits)}")
+    for name, fn in (transforms or {}).items():
+        if name not in resolved:
+            raise SystemExit(f"[stream] transform for {name!r}: not spliced")
+        resolved[name]["transform"] = fn
 
     wpath = os.path.join(out_dir, weights_file)
     nbytes, offsets = SE.copy_weights(resolved, wpath,

@@ -372,10 +372,11 @@ def copy_weights(resolved: Dict[str, dict], out_path: str, *,
             offsets[name] = written
             want_conv = (target_dtype is not None
                          and entry["dtype"] != target_dtype)
-            if want_conv or entry.get("addend"):
+            if want_conv or entry.get("addend") or entry.get("transform"):
                 blob = _convert_tensor(entry, target_dtype or
                                        _ONNX_NAME_BY_ST[entry["dtype"]],
-                                       addend=entry.get("addend", 0.0))
+                                       addend=entry.get("addend", 0.0),
+                                       transform=entry.get("transform"))
                 dst.write(blob)
                 written += len(blob)
                 entry["target_dtype"] = target_dtype or entry["dtype"]
@@ -399,13 +400,17 @@ _ST_NP = {"F32": np.float32, "F16": np.float16, "BF16": None,
 
 
 def _convert_tensor(entry: dict, target: str,
-                    addend: float = 0.0) -> bytes:
+                    addend: float = 0.0, transform=None) -> bytes:
     """Read one tensor, optionally offset it, and re-encode it as `target`.
 
     `addend` is added in fp32 before the re-encode. It exists because a few
     parameters are not used as stored: the exporter rewrites them on the live
     model before tracing (see `splice_initializers` for the case that matters),
     and a meta model cannot hold that rewrite.
+
+    `transform` is the general form of the same thing: a callable taking the
+    fp32 tensor (checkpoint shape) and returning one of the same shape, e.g.
+    a Hadamard rotation of a linear's input dim (MiniMax-H3 `--convrot`).
     """
     src_np = _ST_NP.get(entry["dtype"])
     if src_np is None:
@@ -422,6 +427,14 @@ def _convert_tensor(entry: dict, target: str,
         arr = np.frombuffer(_read_all(entry), dtype=src_np)
     if addend:
         arr = arr.astype(np.float32) + addend
+    if transform is not None:
+        shape = [int(d) for d in entry["shape"]]
+        arr = np.asarray(transform(arr.astype(np.float32).reshape(shape)),
+                         dtype=np.float32)
+        if list(arr.shape) != shape:
+            raise ValueError(f"{entry['onnx_name']}: transform changed shape "
+                             f"{shape} -> {list(arr.shape)}")
+        arr = arr.reshape(-1)
     if target == "F16":
         with np.errstate(over="ignore"):
             return np.ascontiguousarray(arr.astype(np.float16)).tobytes()
