@@ -59,6 +59,8 @@ constexpr int kRopeAxes = 3;
 // Base-model shifts; the 4-step turbo LoRA wants video 6 (--shift-video).
 double kShiftVideo = 12.0;
 double kShiftAudio = 3.0;
+// comfy's spatial VAE tile in px; 0 = auto (Vae::auto_tile), comfy uses 256.
+int kTileSize = 0;
 constexpr double kFrameRescale = 5.0 / 3.0;
 constexpr int kFramePerToken[5] = {1, 4, 4, 4, 4};
 constexpr int kFps = 24;
@@ -103,7 +105,7 @@ void usage(const char *argv0) {
                  "usage: %s --dit dit.vkopbin [--host-dir DIR] [--width W] "
                  "[--height H]\n"
                  "          [--length FRAMES] [--steps N] [--seed S] "
-                 "[--shift-video 12] [--shift-audio 3] "
+                 "[--shift-video 12] [--shift-audio 3] [--vae-tile 0=auto|px] "
                  "[--text-len L | --text-states F.f32]\n"
                  "          [--save DIR]\n"
                  "  --host-dir   rope_inv_freq.f32 + adaln_t_table.f32 "
@@ -170,6 +172,9 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--seed" && (v = next("--seed"))) o.seed = static_cast<uint32_t>(std::atoll(v));
         else if (a == "--shift-video" && (v = next("--shift-video"))) kShiftVideo = std::atof(v);
         else if (a == "--shift-audio" && (v = next("--shift-audio"))) kShiftAudio = std::atof(v);
+        else if (a == "--vae-tile" && (v = next("--vae-tile"))) {
+            kTileSize = std::max(0, std::atoi(v));
+        }
         else return false;
         if (v == nullptr) return false;
     }
@@ -643,7 +648,7 @@ constexpr int kFramePrePad = ((-kClipLength) % kVaeRatioT + kVaeRatioT) % kVaeRa
 constexpr int kTokenOverlap = ((-kTokenDrop) % kTokensChunk + kTokensChunk) % kTokensChunk;  // 2
 constexpr int kFrameOverlap = kTokenOverlap * kVaeRatioT - kFramePrePad > 0
                                   ? kTokenOverlap * kVaeRatioT - kFramePrePad : 0;  // 5
-constexpr int kTileSize = 256, kTileOverlapMin = 64;
+constexpr int kTileOverlapMin = 64;
 constexpr float kLatentsMean[24] = {
     0.858090341091156f, -0.9606591463088989f, 1.0661640167236328f, -0.5090325474739075f,
     -0.2727581858634949f, -1.3675414323806763f, -0.2553254961967468f, -0.26907554268836975f,
@@ -708,7 +713,8 @@ void blend(const Video &a, Video &b, int extent, int dim) {
 }
 
 void split_tiles(int len, std::vector<int> &idx, std::vector<int> &lens,
-                 std::vector<int> &overlaps) {
+                 std::vector<int> &overlaps, int tile = kTileSize) {
+    const int kTileSize = tile;
     idx.clear(); lens.clear(); overlaps.clear();
     if (kTileSize >= len) {
         idx = {0};
@@ -785,9 +791,32 @@ struct Vae {
         return out;
     }
 
+    // --vae-tile auto: the decoder only holds up near its 256-px (16-latent)
+    // tile -- a whole 512x288 frame (32 latents wide) comes out as blocks --
+    // but is fine up to ~320 px, where the tile count drops a lot. Pick the
+    // size in [256, 320] with the least decoded area (calls x tile^2).
+    static int auto_tile(int H, int W) {
+        int best = 256;
+        long best_cost = -1;
+        for (int t = 256; t <= 320; t += kVaeRatio) {
+            std::vector<int> i, l, oy, ox;
+            split_tiles(H, i, l, oy, t);
+            const int ny = static_cast<int>(i.size());
+            split_tiles(W, i, l, ox, t);
+            const int nx = static_cast<int>(i.size());
+            const long th = std::min(t, H), tw = std::min(t, W);
+            const long cost = static_cast<long>(ny) * nx * th * tw;
+            if (best_cost < 0 || cost < best_cost) { best = t; best_cost = cost; }
+        }
+        return best;
+    }
+
     // comfy tiled_decode over one clip z [24][T][Hl][Wl].
     Video tiled(const std::vector<float> &z, int T, int Hl, int Wl) {
         const int H = Hl * kVaeRatio, W = Wl * kVaeRatio;
+        const int saved = kTileSize;
+        if (kTileSize == 0) kTileSize = auto_tile(H, W);
+        struct Restore { int &r; int v; ~Restore() { r = v; } } restore{kTileSize, saved};
         std::vector<int> yi, yl, yo, xi, xl, xo;
         split_tiles(H, yi, yl, yo);
         split_tiles(W, xi, xl, xo);

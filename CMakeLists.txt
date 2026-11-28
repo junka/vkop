@@ -1440,6 +1440,8 @@ target_link_libraries(ActivationReuseCheck PRIVATE vkop vload)
 add_executable(minimax_h3_fl2va EXCLUDE_FROM_ALL example/minimax_h3/fl2va.cpp)
 target_link_libraries(minimax_h3_fl2va PRIVATE vkop vload)
 target_compile_features(minimax_h3_fl2va PRIVATE cxx_std_20)
+# host-side VAE blending, RoPE tables and pixel unpacking: seconds at -O0
+target_compile_options(minimax_h3_fl2va PRIVATE -O2)
 
 # LLM conversational driver (Qwen3-VL, buffer backend). Text in → text out.
 # Links vkop + vload (graph runtime + model loader) and the standalone Qwen
