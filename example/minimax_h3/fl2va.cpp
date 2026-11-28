@@ -81,6 +81,11 @@ struct Options {
     // in presentation order) and the text tower's per-token adaLN tags (int64,
     // 1 text / 0 vision pad; default all 1)
     std::vector<std::string> ref_latents;
+    // ...or reference images as pixels [3, TH, TW] in [0, 1] ("PATH:TH:TW",
+    // h3_ref2va_prep.py vae), encoded here by the video VAE encoder
+    // (h3_export_fl2va_vae_encoder.py); latents first, then images
+    std::vector<std::string> ref_images;
+    std::string vae_enc;
     std::string text_tags, dump_layout;
     double cond_aug = 0.999;  // comfy VISUAL_COND_TIMESTEP / noise aug
     int width = 256, height = 256, length = 22, steps = 8, text_len = 32;
@@ -107,8 +112,11 @@ void usage(const char *argv0) {
                  "  --audio-latent F.f32  decode a saved [32, 2, T] audio latent only\n"
                  "  --ref-latent F.f32:HL:WL  ref2va reference image latent "
                  "[24, 1, HL, WL] (repeatable)\n"
+                 "  --ref-image F.f32:TH:TW --vae-enc enc.vkopbin  reference image "
+                 "pixels [3, TH, TW]\n"
                  "  --text-tags F.i64  per-token adaLN tags (1 text, 0 vision pad)\n"
                  "  --cond-aug 0.999   reference timestep / noise augmentation\n"
+                 "  --steps 0          stop after the text tower / reference encoding\n"
                  "  --dump-layout DIR  write position/pack/mod of step 1 and exit\n",
                  argv0);
 }
@@ -140,6 +148,8 @@ bool parse(int argc, char **argv, Options &o) {
         else if (a == "--audio-latent" && (v = next("--audio-latent"))) o.audio_latent = v;
         else if (a == "--ref-latent" && (v = next("--ref-latent"))) o.ref_latents.push_back(v);
         else if (a == "--text-tags" && (v = next("--text-tags"))) o.text_tags = v;
+        else if (a == "--ref-image" && (v = next("--ref-image"))) o.ref_images.push_back(v);
+        else if (a == "--vae-enc" && (v = next("--vae-enc"))) o.vae_enc = v;
         else if (a == "--dump-layout" && (v = next("--dump-layout"))) o.dump_layout = v;
         else if (a == "--cond-aug" && (v = next("--cond-aug"))) o.cond_aug = std::atof(v);
         else if (a == "--width" && (v = next("--width"))) o.width = std::atoi(v);
@@ -831,6 +841,107 @@ void write_wav_f32(const std::string &path, const std::vector<float> &planar,
     f.write(reinterpret_cast<const char *>(inter.data()), data);
 }
 
+// ------------------------------------------------------------ VAE encoder
+// comfy MiniMaxH3VideoVAE.encode for one reference image (T = 1 always goes
+// through tiled_encode): 256-px tiles with >= 64 px overlap, each encoded
+// alone (own GroupNorm statistics), blended in latent space against the
+// UNBLENDED neighbour above, then the one to the left. The graph folds the
+// imagenet pixel norm and the latent normalization: pixels [1, 3, h, w] in
+// [0, 1] -> latent [1, 24, h/16, w/16], already in the DiT's space.
+constexpr int kEncTile = 256, kEncOverlapMin = 64, kEncRatio = 16;
+
+void enc_tile_plan(int n, std::vector<int> &starts, std::vector<int> &lens,
+                   std::vector<int> &ov) {
+    starts.clear(); lens.clear(); ov.clear();
+    if (kEncTile >= n) { starts = {0}; lens = {n}; return; }
+    int N = (n + kEncTile - 1) / kEncTile, rem;
+    for (;;) {
+        ov.assign(N - 1, kEncOverlapMin);
+        rem = kEncTile * N - kEncOverlapMin * (N - 1) - n;
+        if (rem >= 0) break;
+        ++N;
+    }
+    for (int i = 0; i < rem / kEncRatio; ++i) ov[i % (N - 1)] += kEncRatio;
+    starts = {0};
+    for (int i = 0; i < N - 1; ++i) starts.push_back(starts.back() + kEncTile - ov[i]);
+    lens.assign(N, kEncTile);
+}
+
+struct LatTile {  // [24][h][w]
+    int h = 0, w = 0;
+    std::vector<float> v;
+    float &at(int c, int y, int x) { return v[(static_cast<size_t>(c) * h + y) * w + x]; }
+    float at(int c, int y, int x) const { return v[(static_cast<size_t>(c) * h + y) * w + x]; }
+};
+
+// comfy blend: b's first ext rows (dim 0) / cols (dim 1) <- a's last ext * (1 - i/ext) + b * i/ext
+LatTile enc_blend(const LatTile &a, LatTile b, int ext, int dim) {
+    ext = std::min({ext, dim == 0 ? a.h : a.w, dim == 0 ? b.h : b.w});
+    for (int c = 0; c < kVideoC; ++c)
+        for (int i = 0; i < ext; ++i) {
+            const float wb = static_cast<float>(i) / static_cast<float>(ext);
+            if (dim == 0)
+                for (int x = 0; x < b.w; ++x)
+                    b.at(c, i, x) = a.at(c, a.h - ext + i, x) * (1.f - wb) + b.at(c, i, x) * wb;
+            else
+                for (int y = 0; y < b.h; ++y)
+                    b.at(c, y, i) = a.at(c, y, a.w - ext + i) * (1.f - wb) + b.at(c, y, i) * wb;
+        }
+    return b;
+}
+
+// pixels [3, H, W] -> latent [24, H/16, W/16]
+std::vector<float> vae_encode_image(const std::shared_ptr<Runtime> &rt,
+                                    const std::shared_ptr<VulkanCommandPool> &pool,
+                                    const std::vector<float> &px, int H, int W, double &ms) {
+    std::vector<int> ys, yl, yo, xs, xl, xo;
+    enc_tile_plan(H, ys, yl, yo);
+    enc_tile_plan(W, xs, xl, xo);
+    std::vector<std::vector<LatTile>> rows(ys.size());
+    for (size_t i = 0; i < ys.size(); ++i)
+        for (size_t j = 0; j < xs.size(); ++j) {
+            const int h = yl[i], w = xl[j];
+            std::vector<float> tile(static_cast<size_t>(3) * h * w);
+            for (int c = 0; c < 3; ++c)
+                for (int y = 0; y < h; ++y)
+                    std::memcpy(&tile[(static_cast<size_t>(c) * h + y) * w],
+                                &px[(static_cast<size_t>(c) * H + ys[i] + y) * W + xs[j]],
+                                sizeof(float) * w);
+            upload_float(rt, pool, "pixels", tile, {1, 3, static_cast<uint32_t>(h),
+                                                    static_cast<uint32_t>(w)});
+            ms += rt->Run();
+            rt->ReadResult();
+            LatTile t;
+            t.h = h / kEncRatio;
+            t.w = w / kEncRatio;
+            t.v = read_output(rt, "latent");
+            rows[i].push_back(std::move(t));
+        }
+    const int HL = H / kEncRatio, WL = W / kEncRatio;
+    std::vector<float> out(static_cast<size_t>(kVideoC) * HL * WL);
+    int oy = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        int ox = 0, th = 0;
+        for (size_t j = 0; j < rows[i].size(); ++j) {
+            LatTile t = rows[i][j];
+            if (i > 0) t = enc_blend(rows[i - 1][j], t, yo[i - 1] / kEncRatio, 0);
+            if (j > 0) t = enc_blend(rows[i][j - 1], t, xo[j - 1] / kEncRatio, 1);
+            const int keep_h = i + 1 < rows.size() ? t.h - yo[i] / kEncRatio : t.h;
+            const int keep_w = j + 1 < rows[i].size() ? t.w - xo[j] / kEncRatio : t.w;
+            for (int c = 0; c < kVideoC; ++c)
+                for (int y = 0; y < keep_h; ++y)
+                    for (int x = 0; x < keep_w; ++x)
+                        out[(static_cast<size_t>(c) * HL + oy + y) * WL + ox + x] = t.at(c, y, x);
+            ox += keep_w;
+            th = keep_h;
+        }
+        if (ox != WL) throw std::runtime_error("vae encode: tile widths do not add up");
+        oy += th;
+    }
+    if (oy != HL) throw std::runtime_error("vae encode: tile heights do not add up");
+    return out;
+}
+
 int decode_audio(const Options &o, const std::shared_ptr<VulkanCommandPool> &pool,
                  const std::vector<float> &xa) {
     if (o.audio_vae.empty()) return 0;
@@ -975,12 +1086,33 @@ int main(int argc, char **argv) {
         ref_rows.insert(ref_rows.end(), r.begin(), r.end());
         ref_hw.emplace_back(rh, rw);
     }
-    if (o.cond_aug < 1.0 && !ref_rows.empty()) {
+    // reference images: sizes now (the layout needs them), encoded once the
+    // GPU is up
+    std::vector<std::pair<std::string, std::pair<int, int>>> ref_px;
+    for (const auto &spec : o.ref_images) {
+        const size_t c2 = spec.rfind(':'), c1 = spec.rfind(':', c2 - 1);
+        if (o.vae_enc.empty() || c1 == std::string::npos || c2 == std::string::npos || c1 == 0) {
+            std::fprintf(stderr, "--ref-image wants PATH:TH:TW and --vae-enc, got %s\n",
+                         spec.c_str());
+            return 2;
+        }
+        const int th = std::atoi(spec.c_str() + c1 + 1), tw = std::atoi(spec.c_str() + c2 + 1);
+        if (th % 32 || tw % 32 || th <= 0 || tw <= 0) {
+            std::fprintf(stderr, "%s: TH/TW must be positive multiples of 32\n", spec.c_str());
+            return 2;
+        }
+        ref_px.push_back({spec.substr(0, c1), {th, tw}});
+        ref_hw.emplace_back(th / kEncRatio, tw / kEncRatio);
+    }
+    // comfy _cond_video_rows: aug * r + (1 - aug) * noise, one fixed seed
+    const auto augment = [&](std::vector<float> &rows) {
+        if (o.cond_aug >= 1.0) return;
         std::mt19937 arng(o.seed ^ 0xa11ceU);
         std::normal_distribution<float> an(0.f, 1.f);
         const float a = static_cast<float>(o.cond_aug);
-        for (auto &v : ref_rows) v = a * v + (1.f - a) * an(arng);
-    }
+        for (auto &v : rows) v = a * v + (1.f - a) * an(arng);
+    };
+    if (ref_px.empty()) augment(ref_rows);
     std::vector<int64_t> text_tags(text_len, 1);
     if (!o.text_tags.empty()) {
         text_tags = read_i64(o.text_tags);
@@ -1104,6 +1236,40 @@ int main(int argc, char **argv) {
     auto pool = std::make_shared<VulkanCommandPool>(dev);
 
     if (!o.te.empty()) text = run_text_tower(pool, o.te, o.embed, prompt_ids);
+    if (!ref_px.empty() && o.text_out.empty()) {
+        auto te0 = std::chrono::steady_clock::now();
+        auto enc = std::make_shared<Runtime>(pool, o.vae_enc, /*precision=*/0);
+        enc->set_backend_buffer(true);
+        enc->LoadModel();
+        double ems = 0;
+        int ri = 0;
+        for (const auto &[path, hw] : ref_px) {
+            const auto px = read_f32(path);
+            if (px.size() != static_cast<size_t>(3) * hw.first * hw.second) {
+                std::fprintf(stderr, "%s: %zu floats, want [3, %d, %d]\n", path.c_str(),
+                             px.size(), hw.first, hw.second);
+                return 2;
+            }
+            const auto z = vae_encode_image(enc, pool, px, hw.first, hw.second, ems);
+            const Stats zs = stats(z);
+            std::printf("[vae-enc] %s %dx%d -> latent %dx%d, rms %.3f%s\n", path.c_str(),
+                        hw.second, hw.first, hw.first / kEncRatio, hw.second / kEncRatio,
+                        zs.rms, zs.nonfinite ? " NONFINITE" : "");
+            if (zs.nonfinite) return 3;
+            if (!o.save_dir.empty()) {
+                std::filesystem::create_directories(o.save_dir);
+                write_f32(o.save_dir + "/ref_latent_" + std::to_string(ri) + ".f32", z);
+            }
+            const auto r = patchify_thw(z, 1, hw.first / kEncRatio, hw.second / kEncRatio);
+            ref_rows.insert(ref_rows.end(), r.begin(), r.end());
+            ++ri;
+        }
+        augment(ref_rows);
+        std::printf("[vae-enc] %zu image(s) in %.1fs (gpu %.0f ms)\n", ref_px.size(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - te0).count(),
+                    ems);
+    }  // the encoder is released before the DiT loads
+    if (o.steps <= 0) return 0;  // --steps 0: prepare (text / refs) only
     if (!o.text_out.empty()) {
         write_f32(o.text_out, text);
         std::printf("[te] wrote %s [%d, %d]\n", o.text_out.c_str(), text_len, kTextDim);
