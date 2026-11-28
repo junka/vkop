@@ -1,0 +1,20 @@
+{
+  "roles": {
+    "system": {
+      "prefix": "<|im_start|>system\n",
+      "suffix": "<|im_end|>\n"
+    },
+    "user": {
+      "prefix": "<|im_start|>user\n",
+      "suffix": "<|im_end|>\n"
+    },
+    "assistant": {
+      "prefix": "<|im_start|>assistant\n<think>\n",
+      "suffix": "<|im_end|>\n"
+    }
+  },
+  "content_types": {},
+  "generation_prompt": "<|im_start|>assistant\n<think>\n",
+  "default_system_prompt": "",
+  "_comment": "llm_chat's Conversation uses the assistant prefix as the generation lead and as the head of every history turn, so '<think>\\n' goes there: replies (reasoning included) stay in history exactly as they sit in the KV / linear state."
+}

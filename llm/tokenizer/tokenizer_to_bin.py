@@ -56,6 +56,13 @@ def extract_chat_template():
         tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=False)
     except Exception:
         tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    # ENABLE_THINKING=1：把 enable_thinking=True 传给模板。混合思考模型（Qwen3、
+    # Qwen3.5）默认的 generation prompt 是 `<think>\n\n</think>\n\n`（直接跳过思考），
+    # 打开后变成 `<think>\n`，模型先写推理再给答案。不认这个变量的模板不受影响。
+    if os.environ.get("ENABLE_THINKING") == "1":
+        import functools
+        tok.apply_chat_template = functools.partial(tok.apply_chat_template,
+                                                    enable_thinking=True)
 
     # 每个角色两条哨兵：第二条只用来连发同角色轮做长度差分，两条必须等长，否则
     # 「len(two) - len(one)」量出来的一整轮会带上第二条约内容多出来的那几个字符。
@@ -441,8 +448,19 @@ def convert_tokenizer():
         # 用 HF apply_chat_template 探针提取 system/user/assistant 各角色的
         # prefix/suffix、image/video 内容占位格式、generation_prompt、
         # default_system_prompt，序列化为长度前缀字段，C++ load 顺序读取。
+        # CHAT_TEMPLATE_OVERRIDE=<json>：直接用给定的 processed 结构（与
+        # extract_chat_template 的返回值同形），跳过探针。给探针渲染不了的模板用，
+        # 例如 Qwen3.5 的模板在没有 user 消息时直接 raise，而探针要单独渲染 system 轮。
+        override = os.environ.get("CHAT_TEMPLATE_OVERRIDE")
         try:
-            chat_data = extract_chat_template()
+            if override:
+                with open(os.path.expanduser(override), encoding="utf-8") as jf:
+                    chat_data = json.load(jf)
+                chat_data.setdefault("content_types", {})
+                chat_data.setdefault("default_system_prompt", "")
+                print(f"[+] chat template from {override}")
+            else:
+                chat_data = extract_chat_template()
         except Exception as e:
             print(f"[!] Warning: failed to extract chat template: {e}. Skipping ChatTemplate section.")
             chat_data = None

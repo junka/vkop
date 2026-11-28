@@ -65,6 +65,7 @@ using vkop::core::elem_name;
 using vkop::export_::Conversation;
 using vkop::export_::ImageBlock;
 using vkop::export_::KVCache;
+using vkop::export_::LinearState;
 using vkop::export_::RenderedContext;
 using vkop::export_::get_rope_index;
 using vkop::export_::preprocess_image_noresize;
@@ -379,6 +380,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> image_paths;
     std::string visual_path;
     std::string kv_kind_opt = "auto";
+    // 采样（默认贪心，行为不变）。思考模型别用贪心：小模型会在 <think> 里原地
+    // 打转。Qwen3/3.5 思考模式推荐 --temp 0.6 --top-k 20 --top-p 0.95。
+    vkop::llm::SampleParams sp;
+    uint64_t seed = 0;
     // Parse optional positional max_new + --image/--visual flags (any order).
     // --image is repeatable: order defines the image→prompt binding.
     bool have_max = false;
@@ -388,6 +393,11 @@ int main(int argc, char** argv) {
         else if (a == "--visual" && i + 1 < argc) { visual_path = argv[++i]; }
         else if (a == "--max-kv" && i + 1 < argc) { max_kv = std::atoi(argv[++i]); }
         else if (a == "--kv-kind" && i + 1 < argc) { kv_kind_opt = argv[++i]; }
+        else if (a == "--temp" && i + 1 < argc) { sp.temperature = std::strtof(argv[++i], nullptr); }
+        else if (a == "--top-k" && i + 1 < argc) { sp.top_k = std::atoi(argv[++i]); }
+        else if (a == "--top-p" && i + 1 < argc) { sp.top_p = std::strtof(argv[++i], nullptr); }
+        else if (a == "--rep-pen" && i + 1 < argc) { sp.repetition_penalty = std::strtof(argv[++i], nullptr); }
+        else if (a == "--seed" && i + 1 < argc) { seed = std::strtoull(argv[++i], nullptr, 10); }
         else if (!a.empty() && a[0] != '-' && !have_max) {
             max_new = std::atoi(a.c_str()); have_max = true;
         }
@@ -398,7 +408,8 @@ int main(int argc, char** argv) {
                 "unknown arg: %s\n"
                 "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
                 "[max_new] [--image <img>]... --visual <visual.vkopbin> "
-                "[--max-kv N] [--kv-kind {auto,fp16,bf16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
+                "[--max-kv N] [--kv-kind {auto,fp16,bf16,fp8e4m3,fp8e5m2,int4,nf4}] "
+                "[--temp T] [--top-k K] [--top-p P] [--rep-pen R] [--seed S]\n",
                 argv[i], argv[0]);
             return 1;
         }
@@ -447,8 +458,16 @@ int main(int argc, char** argv) {
     rt->set_backend_buffer(true);
     std::printf("=== LoadModel ===\n");
     rt->LoadModel();
-    // GPU argmax：图末尾注册 TopK k=1 后处理（VKOP_GPU_ARGMAX=0 跳过）。
-    vkop::llm::register_gpu_argmax(rt, "perf");
+    // GPU argmax：图末尾注册 TopK 后处理（VKOP_GPU_ARGMAX=0 跳过）。贪心 k=1；
+    // 采样时 k=64，让 Sampler::pick_topk 多数步只读回候选而不是整行词表。
+    const bool sampling = sp.temperature > 0.0f || sp.repetition_penalty != 1.0f;
+    const int topk_k = vkop::llm::register_gpu_topk(
+        rt, "perf", sampling ? vkop::llm::kDefaultSampleTopK : 1);
+    vkop::llm::Sampler sampler(seed);
+    if (sampling)
+        std::printf("[sample] temp=%.2f top_k=%d top_p=%.2f rep_pen=%.2f seed=%llu\n",
+                    sp.temperature, sp.top_k, sp.top_p, sp.repetition_penalty,
+                    static_cast<unsigned long long>(seed));
     std::printf("=== LoadModel done ===\n");
 
     // 从 runtime inputs 动态推断架构参数（纯文本 vs 多模态 自动识别）。
@@ -539,6 +558,17 @@ int main(int argc, char** argv) {
     // --max-kv 可调：它同时是滑窗环的表观容量 W（见 Attention 的 ring）。
     KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, max_kv,
                arch.cache_kind, arch.kv_layers);
+    // 混合解码器（Qwen3.5）的 linear-attention 层不走 KV，而是每层一对定长 fp32
+    // 状态（conv_state_<L> / recurrent_state_<L>）。每次 Run 读进旧状态、写出新
+    // 状态，advance() 把输出拷回输入。状态只能往前推、不能回退到任意位置 ——
+    // 所以前缀复用只在新 prompt 完整覆盖上一轮全部序列时成立（见下面 P 的处理）。
+    LinearState lin(rt, cmdpool);
+    if (lin.present()) {
+        if (rt->GetInput("kv_ring_head") != nullptr)
+            throw std::runtime_error("linear-attention state + KV ring is unsupported");
+        lin.reset();
+        std::printf("[state] %zu linear-attention state pairs\n", lin.pair_count());
+    }
 
     // ---- 滑窗环（graph 侧带 kv_ring_head 时启用，见 ops/Attention.hpp）----
     // KV 变成 W 行的一个环：逻辑行 j 落在物理槽 (kv_head + j) % W，覆盖的绝对
@@ -778,6 +808,15 @@ int main(int argc, char** argv) {
                                            &rctx.mm_types, &covered.spans,
                                            &rctx.spans);
         }
+        // 线性状态里已经折进了上一轮的整段序列：只有 P 覆盖到那一整段时它才
+        // 等于「前 P 个 token 之后的状态」，否则只能从零整段重算。
+        if (lin.present() && P > 0 &&
+            static_cast<size_t>(P) < covered.ids.size()) {
+            std::printf("[prefill] prefix %d < previous coverage %zu: linear "
+                        "state cannot rewind — full prefill\n", P,
+                        covered.ids.size());
+            P = 0;
+        }
         if (!ring) P_abs = P;
         const int S = L - P_abs;
         // 本轮 decode 实际喂进去的 token（prefill 的 ids 之外的部分）—— 和
@@ -972,6 +1011,7 @@ int main(int argc, char** argv) {
         } else if (blk == 0) {
             kv.reset_for_prefill();
             kv.upload();
+            if (lin.present()) lin.reset();
         } else {
             kv.resume_from(0);   // 窗口丢空了：buffer 内容无所谓，读 0 行
         }
@@ -1011,6 +1051,8 @@ int main(int argc, char** argv) {
         // copyToCPU all 28 present_kv outputs (28 sync points) which we don't
         // need: feedback_kv does device→device, and argmax reads only logits.
         cmdpool->getVulkanDevice()->wait_all_done();
+        // GPU 空闲后才能交换：本块读的 buffer 就是下一块要写的。
+        if (lin.present()) lin.advance();
 
         if (chunked) {
             if (ring) kv_resident += C;   // 本块的 C 行已经写进环里
@@ -1113,7 +1155,26 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
 
-        int next_id = argmax_last_token(rt, cmdpool, vocab);
+        // 重复惩罚的历史：本轮生成过的 id（去重，首见顺序，与 llm_serve 同）。
+        std::vector<uint32_t> penalised;
+        std::vector<uint8_t> seen;
+        if (sp.repetition_penalty != 1.0f && vocab > 0)
+            seen.assign(static_cast<size_t>(vocab), 0);
+        const int vocab_n = vocab;  // C++17：lambda 不能捕获结构化绑定
+        auto pick = [&, vocab_n]() {
+            const int vocab = vocab_n;
+            const int id = sampling
+                ? vkop::llm::sample_last_token(rt, cmdpool, vocab, topk_k,
+                                               sampler, penalised, sp)
+                : argmax_last_token(rt, cmdpool, vocab);
+            if (!seen.empty() && id >= 0 && static_cast<size_t>(id) < seen.size() &&
+                !seen[id]) {
+                seen[id] = 1;
+                penalised.push_back(static_cast<uint32_t>(id));
+            }
+            return id;
+        };
+        int next_id = pick();
         std::printf("[prefill] %.1fms  → token %d  ", ms, next_id);
         std::vector<uint32_t> out_ids = {static_cast<uint32_t>(next_id)};
         std::printf("%s\n", tok.decode({static_cast<uint32_t>(next_id)}).c_str());
@@ -1135,7 +1196,13 @@ int main(int argc, char** argv) {
         // ---- install host-imported decode inputs for this round ----
         // (each round reinstalls; the next prefill's larger shapes drop the
         // imports and revert to the batched-upload path automatically)
-        dec_in.install(max_kv);
+        // 线性状态模型的 zero-copy decode 未逐 token 核对过（与 llm_serve 同），
+        // 默认走批量上传；VKOP_DECODE_ZEROCOPY=1 强制打开。
+        if (!lin.present() || [] {
+                const char* e = std::getenv("VKOP_DECODE_ZEROCOPY");
+                return e && std::strcmp(e, "1") == 0;
+            }())
+            dec_in.install(max_kv);
 
         // ---- Decode loop (q_len = 1) ----
         for (int step = 1; step < max_new; ++step) {
@@ -1177,8 +1244,10 @@ int main(int argc, char** argv) {
             auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();
             auto t1 = std::chrono::steady_clock::now();
-            next_id = argmax_last_token(rt, cmdpool, vocab);
+            next_id = pick();
             out_ids.push_back(static_cast<uint32_t>(next_id));
+            // argmax 读回了 logits，GPU 已空闲；本步喂进去的 token 折进状态。
+            if (lin.present()) lin.advance();
             // [seg-replay debug] checksum the raw logits row (NOT the TopK
             // output): if the logits checksum is fresh but argmax disagrees,
             // the TopK post-process read a stale row; if the checksum itself

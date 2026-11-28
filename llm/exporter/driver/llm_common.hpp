@@ -642,6 +642,121 @@ inline bool component_timer_on() {
     return on;
 }
 
+// Candidates the GPU TopK keeps per row. 1 is plain argmax; larger lets
+// non-greedy requests sample from K values instead of reading back the whole
+// vocabulary row (see Sampler::pick_topk). --sample-topk / VKOP_SAMPLE_TOPK.
+inline constexpr int kDefaultSampleTopK = 64;
+
+// The next token from the last logits row. `topk_k` is the k of the TopK
+// post-process registered at load (0: none, 1: argmax only).
+//
+// Greedy reads back one id per row from the GPU TopK. Sampling with k > 1
+// reads back the K candidates and lets Sampler::pick_topk decide, which only
+// reads the full 151936-wide row on the steps it cannot settle exactly from
+// the candidates. VKOP_LOGIT_TOP (debug: print the head of the distribution)
+// always takes the full row.
+inline int sample_last_token(const std::shared_ptr<Runtime> &rt,
+                      const std::shared_ptr<VulkanCommandPool> &cp,
+                      int fallback_vocab, int topk_k, Sampler &sampler,
+                      const std::vector<uint32_t> &history,
+                      const SampleParams &sp) {
+    const bool logit_top = std::getenv("VKOP_LOGIT_TOP") != nullptr;
+    const bool greedy = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+    // The full row decodes by the output's kind: fp16, or bf16 when the
+    // artifact left `logits` bf16 (onnx2vkop --act bf16 keeps it fp16).
+    ElemKind lk = ElemKind::kFloat16;
+    if (auto l = rt->GetOutput("logits")) lk = l->elem_kind();
+    sampler.set_logits_kind(lk);
+    auto idx_out = topk_k > 0 ? rt->GetOutput("post_TopK1") : nullptr;
+    if (idx_out && !logit_top && greedy) {
+        auto ti = as_tensor<int>(idx_out);
+        ti->copyToCPU(cp);
+        // (rows, k) sorted descending: the last row's first entry. With k == 1
+        // that is the last element, as before.
+        const auto shape = ti->getShape();
+        const int k = shape.empty() ? 1 : shape.back();
+        return ti->at(ti->num_elements() - k);
+    }
+
+    // The full row, read lazily: the candidate path below may not need it.
+    std::shared_ptr<vkop::core::Tensor<uint16_t>> lg;
+    int vocab = 0, q = 1;
+    auto full_row = [&]() -> const uint16_t * {
+        if (!lg) {
+            auto logits = rt->GetOutput("logits");
+            if (!logits) throw std::runtime_error("no 'logits' output");
+            lg = as_tensor<uint16_t>(logits);
+            lg->copyToCPU(cp);
+            const auto shape = lg->getShape();
+            vocab = shape.empty() ? 0 : shape.back();
+            q = shape.size() >= 2 ? shape[shape.size() - 2] : 1;
+            if (vocab <= 0 || q <= 0) {
+                vocab = fallback_vocab;
+                q = vocab > 0 ? lg->num_elements() / vocab : 1;
+            }
+        }
+        return reinterpret_cast<const uint16_t *>(lg->data().data()) +
+               static_cast<std::ptrdiff_t>(q - 1) * vocab;
+    };
+
+    if (idx_out && topk_k > 1 && !logit_top) {
+        auto vt = as_tensor<uint16_t>(rt->GetOutput("post_TopK0"));
+        auto ti = as_tensor<int>(idx_out);
+        vt->copyToCPU(cp);
+        ti->copyToCPU(cp);
+        const auto shape = ti->getShape();
+        const int k = shape.empty() ? 1 : shape.back();
+        const size_t off = static_cast<size_t>(ti->num_elements() - k);
+        const uint16_t *vals =
+            reinterpret_cast<const uint16_t *>(vt->data().data()) + off;
+        const int *ids = ti->data().data() + off;
+        const int v = fallback_vocab;
+        const int tok = sampler.pick_topk(vals, ids, k, v, history, sp,
+                                          full_row);
+        // VKOP_TOPK_VERIFY: the candidates must be exactly the row's k
+        // largest values (as a multiset) -- the premise the exactness
+        // argument rests on.
+        if (std::getenv("VKOP_TOPK_VERIFY")) {
+            const uint16_t *row = full_row();
+            std::vector<float> all(static_cast<size_t>(vocab));
+            for (int i = 0; i < vocab; ++i) all[i] = half_to_f32(row[i], lk);
+            std::partial_sort(all.begin(), all.begin() + k, all.end(),
+                              std::greater<float>());
+            std::vector<float> got(static_cast<size_t>(k));
+            for (int i = 0; i < k; ++i) got[i] = fp16_to_f32(vals[i]);
+            std::sort(got.begin(), got.end(), std::greater<float>());
+            bool ok = true;
+            for (int i = 0; i < k; ++i) {
+                ok = ok && got[i] == all[i] && ids[i] >= 0 && ids[i] < vocab &&
+                     half_to_f32(row[ids[i]], lk) == fp16_to_f32(vals[i]);
+            }
+            std::fprintf(stderr, "[topk-verify] %s\n", ok ? "ok" : "MISMATCH");
+        }
+        return tok;
+    }
+
+    const uint16_t *row = full_row();
+    if (logit_top) {
+        // The head of the distribution. A model producing plausible text has
+        // a broad top-5; one whose state or mask is wrong tends to pin a
+        // single token (often EOS) far above the rest.
+        std::vector<std::pair<float, int>> top;
+        for (int i = 0; i < vocab; ++i) {
+            const float v = half_to_f32(row[i], lk);
+            if (top.size() == 5 && v <= top.back().first) continue;
+            top.emplace_back(v, i);
+            std::sort(top.begin(), top.end(),
+                      [](const auto &a, const auto &b) { return a.first > b.first; });
+            if (top.size() > 5) top.pop_back();
+        }
+        std::printf("[logit] q=%d vocab=%d top:", q, vocab);
+        for (const auto &e : top) std::printf(" %d(%.3f)", e.second, e.first);
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+    return sampler.pick(row, vocab, history, sp);
+}
+
 // ------------------------------------------------------------ DecodeInputs ----
 // Writes the q_len=1 inputs of one decode step: inputs_embeds, position_ids,
 // attention_bias (all zero, only its length moves), and the deepstack /
